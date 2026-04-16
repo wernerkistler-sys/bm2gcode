@@ -1868,10 +1868,55 @@ class ImageViewerApp:
             if degree_map[r, c] == 0:
                 branches.append([(int(r), int(c))])
 
+        # Collapse junction pixel clusters: the thinning algorithm can leave
+        # a small connected cluster of junction pixels (degree ≥ 3) at each
+        # topological branch point instead of a single pixel.  Find each such
+        # cluster and remap every cluster pixel to one representative (the
+        # pixel closest to the centroid).  Applying the remap to the first and
+        # last pixel of every branch makes all branches that share a cluster
+        # meet at exactly the same point, so no retraction is needed between
+        # them.
+        junc_mask = degree_map >= 3
+        if junc_mask.any():
+            junc_labeled, n_junc = label(junc_mask,
+                                         structure=np.ones((3, 3), dtype=bool))
+            junc_remap = {}
+            for jid in range(1, n_junc + 1):
+                rows_j, cols_j = np.where(junc_labeled == jid)
+                if len(rows_j) == 1:
+                    continue                          # single pixel, no remap
+                cr, cc = rows_j.mean(), cols_j.mean()
+                dists   = (rows_j - cr) ** 2 + (cols_j - cc) ** 2
+                best    = int(np.argmin(dists))
+                rep     = (int(rows_j[best]), int(cols_j[best]))
+                for r, c in zip(rows_j.tolist(), cols_j.tolist()):
+                    if (r, c) != rep:
+                        junc_remap[(r, c)] = rep
+
+            if junc_remap:
+                remapped = []
+                for br in branches:
+                    if len(br) == 1:
+                        remapped.append([junc_remap.get(br[0], br[0])])
+                    else:
+                        remapped.append(
+                            [junc_remap.get(br[0], br[0])]
+                            + br[1:-1]
+                            + [junc_remap.get(br[-1], br[-1])]
+                        )
+                branches = remapped
+
+        # Drop any branch that collapsed after cluster remapping (start == end
+        # with no interior pixels — these were pure thinning-artifact stubs).
+        branches = [br for br in branches if not (len(br) <= 2 and br[0] == br[-1])]
+
         n_branches = len(branches)
         progress(75, f"Path ordering: {n_branches} branch(es).")
 
         # Greedy nearest-endpoint TSP ordering of branches.
+        # Gaps smaller than this threshold are chained as a direct cut move
+        # (no retract/plunge) — catches any residual near-gaps after pruning.
+        vcarve_link_mm = 2.0 / min(px_per_mm_x, px_per_mm_y)
         all_segments = []
         tool_pos     = np.array([0.0, 0.0])
         remaining    = list(range(n_branches))
@@ -1908,7 +1953,12 @@ class ImageViewerApp:
                 y = (H - 1 - r) / px_per_mm_y - _oy
                 z = -accessible_vcarve[r, c] * max_depth
                 cut_pts.append((x, y, z))
-            all_segments.append(('cut', cut_pts))
+            if all_segments and best_dist < vcarve_link_mm:
+                # Chain onto previous segment — gap is smaller than 2 pixels,
+                # so a direct cut move is safe and avoids a retract/plunge.
+                all_segments[-1][1].extend(cut_pts)
+            else:
+                all_segments.append(['cut', cut_pts])
 
             er, ec = path[-1]
             tool_pos[0] = ec / px_per_mm_x - _ox
@@ -2340,7 +2390,7 @@ class ImageViewerApp:
                 self._3d_zoom /= self.ZOOM_STEP
             else:
                 self._3d_zoom *= self.ZOOM_STEP
-            self._3d_zoom = max(0.1, min(20.0, self._3d_zoom))
+            self._3d_zoom = max(0.01, min(20.0, self._3d_zoom))
             self._render()
         else:
             if event.inaxes is not self.ax:
