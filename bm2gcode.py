@@ -432,7 +432,7 @@ class ImageViewerApp:
         self.root.geometry("1200x780")
         self.root.minsize(900, 560)
 
-        self.current_image   = None   # float32 [0,1] RGB/gray array
+        self.current_image   = None   # 2-D float32 [0,1] grayscale array
         self.image_path      = None
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
@@ -804,6 +804,32 @@ class ImageViewerApp:
     # ------------------------------------------------------------------ #
     #  File / image actions
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _to_grayscale(raw: np.ndarray) -> np.ndarray:
+        """Convert any loaded image array to a 2-D float32 [0, 1] grayscale array.
+
+        Alpha-channel handling: fully transparent pixels (alpha == 0) become white
+        (1.0), so a PNG that encodes shapes with black ink on a fully-transparent
+        background is treated as black-on-white rather than all-black.
+        """
+        img = raw.astype(np.float32)
+
+        # Normalise to [0, 1]
+        if img.max() > 1.0:
+            img = img / 255.0
+
+        # Composite alpha onto a white background before discarding the channel
+        if img.ndim == 3 and img.shape[2] == 4:
+            rgb   = img[..., :3]
+            alpha = img[..., 3:4]          # keep dims for broadcasting
+            img   = rgb * alpha + (1.0 - alpha)   # blend onto white
+
+        # Convert RGB to grayscale (ITU-R BT.601 luminance weights)
+        if img.ndim == 3:
+            img = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
+
+        return np.clip(img, 0.0, 1.0)
+
     def open_image(self):
         path = filedialog.askopenfilename(
             title="Select a PNG image",
@@ -812,7 +838,8 @@ class ImageViewerApp:
         if not path:
             return
         try:
-            self.current_image = mpimg.imread(path)
+            raw = mpimg.imread(path)
+            self.current_image = self._to_grayscale(raw)
             self.image_path    = path
         except Exception as exc:
             messagebox.showerror("Error", f"Could not load image:\n{exc}")
@@ -2011,24 +2038,13 @@ class ImageViewerApp:
 
         depth_map   : 2-D float32 [0, 1]  — 1.0 = maximum cut depth (intaglio).
         n_grey_levels: number of distinct depth steps the source image can encode.
-                      8-bit  → 256,  16-bit → 65536,  float → 65536 (conservative).
+                      current_image is stored as float32 so we use 65536 (16-bit
+                      equivalent) as a conservative estimate.
         """
-        raw = self.current_image
-        # Determine grey-level count from the source dtype before any conversion
-        if raw.dtype == np.uint8:
-            n_grey_levels = 256
-        elif raw.dtype == np.uint16:
-            n_grey_levels = 65536
-        else:
-            # float32/float64 images are treated as 16-bit equivalent
-            n_grey_levels = 65536
-
-        img = raw.astype(np.float32)
-        if img.max() > 1.0:
-            img /= (n_grey_levels - 1)
-        if img.ndim == 3:
-            img = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140])
-        img = np.clip(img, 0.0, 1.0)
+        # current_image is always a 2-D float32 [0, 1] grayscale array
+        # (alpha-composited and converted at load time by _to_grayscale)
+        img = np.clip(self.current_image, 0.0, 1.0)
+        n_grey_levels = 65536
         if self.surface.get() == "white":
             return 1.0 - img, n_grey_levels   # white = z=0, black = deepest cut
         else:
@@ -2095,6 +2111,12 @@ class ImageViewerApp:
         # ── Rebuild figure with a 3D axes ─────────────────────────────
         self.fig.clear()
         self.ax = self.fig.add_subplot(111, projection='3d')
+        # Disable matplotlib's built-in left-button rotation so our custom
+        # handler (which keeps self._3d_elev/azim in sync) is the only one.
+        try:
+            self.ax.mouse_init(rotate_btn=[], zoom_btn=[])
+        except Exception:
+            pass
         self.fig.patch.set_facecolor("#1e1e1e")
         self.ax.set_facecolor("#1e1e1e")
 
@@ -2278,12 +2300,9 @@ class ImageViewerApp:
 
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
                         DISPLAY_FINE_DETAIL, DISPLAY_VCARVE_MASK):
-            img = self.current_image.astype(np.float32)
-            if img.max() > 1.0:
-                img /= 255.0
-            if img.ndim == 3 and img.shape[2] == 4:
-                img = img[..., :3]
-            cmap  = None
+            # current_image is always a 2-D float32 [0, 1] grayscale array
+            img   = self.current_image
+            cmap  = "gray"
             title = ""
 
         saved_xlim = self._view_xlim
@@ -2349,9 +2368,16 @@ class ImageViewerApp:
 
     def _on_mouse_press(self, event):
         if self._is_3d_mode():
-            if event.button == 2:   # middle button
-                shift = event.guiEvent.state & 0x0001 if event.guiEvent else False
-                self._3d_mouse_start = ('pan' if shift else 'rot',
+            if event.button == 1:   # left button: rotate (or reset on double-click)
+                if event.dblclick:
+                    self._reset_zoom_and_render()
+                else:
+                    self._3d_mouse_start = ('rot',
+                                            event.x, event.y,
+                                            self._3d_elev, self._3d_azim,
+                                            self._3d_pan_offset.copy())
+            elif event.button == 2:  # middle button: pan
+                self._3d_mouse_start = ('pan',
                                         event.x, event.y,
                                         self._3d_elev, self._3d_azim,
                                         self._3d_pan_offset.copy())
@@ -2364,7 +2390,7 @@ class ImageViewerApp:
 
     def _on_mouse_release(self, event):
         if self._is_3d_mode():
-            if event.button == 2:
+            if event.button in (1, 2):  # left (rotate) or middle (pan)
                 self._3d_mouse_start = None
         else:
             if event.button == 2:
@@ -2384,19 +2410,27 @@ class ImageViewerApp:
                 self._3d_elev = max(-90, min(90,
                                    elev0 - dy * self.ROT_SENS))
             else:   # pan
-                # Map pixel delta to approximate world-space delta
+                # Map pixel delta to world-space XY delta, corrected for the
+                # current azimuth so panning always follows the visible axes.
+                # Derivation: the world "right" direction for screen +X is
+                # (-sin(a), cos(a), 0); rotating the naive (-dx, dy) vector
+                # by (a + 90°) gives the azimuth-correct world offset.
                 try:
                     w_mm = float(self.width_cm.get())  * 10
                     h_mm = float(self.height_cm.get()) * 10
                 except ValueError:
                     w_mm = h_mm = 100.0
-                scale = max(w_mm, h_mm) * self._3d_zoom
                 canvas_w = self.mpl_canvas.get_tk_widget().winfo_width()
-                canvas_h = self.mpl_canvas.get_tk_widget().winfo_height()
-                px_per_mm = canvas_w / scale if canvas_w > 0 else 1.0
+                scale = (max(w_mm, h_mm) * self._3d_zoom / canvas_w
+                         if canvas_w > 0 else 1.0)
+                a = np.radians(self._3d_azim)
+                c, s = np.cos(a), np.sin(a)
+                # Vertical screen drag must flip when elevation crosses zero
+                # (camera's effective up-direction in world XY reverses).
+                ev = 1.0 if self._3d_elev >= 0 else -1.0
                 self._3d_pan_offset = pan0 + np.array([
-                    -dx / px_per_mm,
-                     dy / px_per_mm,
+                    ( dx * s + dy * c * ev) * scale,
+                    (-dx * c + dy * s * ev) * scale,
                     0.0])
 
             self._render()
