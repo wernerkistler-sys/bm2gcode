@@ -826,7 +826,7 @@ class ImageViewerApp:
 
         # Convert RGB to grayscale (ITU-R BT.601 luminance weights)
         if img.ndim == 3:
-            img = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
+            img = np.dot(img[..., :3], [0.299, 0.587, 0.114]).astype(np.float32)
 
         return np.clip(img, 0.0, 1.0)
 
