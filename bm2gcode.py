@@ -208,6 +208,8 @@ DEFAULTS = {
     "step_vbit_angle":   "90",           # included angle in degrees
     "step_max_vcarve":   "6.0",          # maximum V-carve plunge depth (mm)
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
+    "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
+    "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
 }
 
 DISPLAY_ORIGINAL    = "Original"
@@ -699,6 +701,14 @@ class ImageViewerApp:
         min_fw.pack(fill=tk.X, pady=2)
         step['min_fw'] = min_fw
 
+        vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
+        vcarve_stepdown.pack(fill=tk.X, pady=2)
+        step['vcarve_stepdown'] = vcarve_stepdown
+
+        vcarve_final_stepdown = LabeledEntry(vcarve_frame, "Final step-down", "mm", DEFAULTS["step_vcarve_final_stepdown"])
+        vcarve_final_stepdown.pack(fill=tk.X, pady=2)
+        step['vcarve_final_stepdown'] = vcarve_final_stepdown
+
         # ── Shared controls ────────────────────────────────────────────
         feed = LabeledEntry(frame, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
         feed.pack(fill=tk.X, pady=2)
@@ -741,6 +751,8 @@ class ImageViewerApp:
         step['vbit_angle'].set(DEFAULTS["step_vbit_angle"])
         step['max_vcarve'].set(DEFAULTS["step_max_vcarve"])
         step['min_fw'].set(DEFAULTS["step_min_fw"])
+        step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
+        step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
 
     # ------------------------------------------------------------------ #
     #  Right panel: image canvas + display-mode selector
@@ -900,6 +912,8 @@ class ImageViewerApp:
                 max_vcarve_mm    = float(step['max_vcarve'].get())
                 min_feature_width_mm = float(step['min_fw'].get())
                 diam_mm          = float(step['diameter'].get())
+                vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
+                vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
             else:
                 diam_mm  = float(step['diameter'].get())
                 stepover = float(step['stepover'].get())
@@ -948,6 +962,8 @@ class ImageViewerApp:
                         feed_rate            = feed_rate,
                         threshold_um         = threshold_um,
                         min_feature_width_mm = min_feature_width_mm,
+                        stepdown_mm          = vcarve_stepdown_mm,
+                        final_stepdown_mm    = vcarve_final_stepdown_mm,
                         progress             = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
@@ -1634,7 +1650,8 @@ class ImageViewerApp:
                                   feed_rate, threshold_um,
                                   tool_diameter_mm=0.0,
                                   min_feature_width_mm=0.0, progress=None,
-                                  prior_residual=None):
+                                  prior_residual=None,
+                                  stepdown_mm=0.0, final_stepdown_mm=0.0):
         """Compute a V-carving toolpath for fine details not reachable by raster.
 
         Parameters
@@ -1914,12 +1931,10 @@ class ImageViewerApp:
         progress(75, f"Path ordering: {n_branches} branch(es).")
 
         # Greedy nearest-endpoint TSP ordering of branches.
-        # Gaps smaller than this threshold are chained as a direct cut move
-        # (no retract/plunge) — catches any residual near-gaps after pruning.
-        vcarve_link_mm = 2.0 / min(px_per_mm_x, px_per_mm_y)
-        all_segments = []
-        tool_pos     = np.array([0.0, 0.0])
-        remaining    = list(range(n_branches))
+        vcarve_link_mm  = 2.0 / min(px_per_mm_x, px_per_mm_y)
+        ordered_branches = []
+        tool_pos         = np.array([0.0, 0.0])
+        remaining        = list(range(n_branches))
 
         while remaining:
             best_idx  = None
@@ -1946,28 +1961,106 @@ class ImageViewerApp:
             path = branches[best_idx]
             if best_rev:
                 path = list(reversed(path))
-
-            cut_pts = []
-            for r, c in path:
-                x = c / px_per_mm_x - _ox
-                y = (H - 1 - r) / px_per_mm_y - _oy
-                z = -accessible_vcarve[r, c] * max_depth
-                cut_pts.append((x, y, z))
-            if all_segments and best_dist < vcarve_link_mm:
-                # Chain onto previous segment — gap is smaller than 2 pixels,
-                # so a direct cut move is safe and avoids a retract/plunge.
-                all_segments[-1][1].extend(cut_pts)
-            else:
-                all_segments.append(['cut', cut_pts])
+            ordered_branches.append(path)
 
             er, ec = path[-1]
             tool_pos[0] = ec / px_per_mm_x - _ox
             tool_pos[1] = (H - 1 - er) / px_per_mm_y - _oy
 
-        progress(80, f"Generated {len(all_segments)} segments.")
+        progress(80, f"Ordered {len(ordered_branches)} branches.")
 
-        # ── Stage 5 · Simplify and assemble ToolPath (80–100 %) ───────
-        progress(80, "Simplifying tool path (RDP)…")
+        # ── Stage 5 · Multi-pass segment building (80–90 %) ──────────
+
+        def _build_pass_segments(branches_ordered, depth_fn):
+            """Build cut segments from ordered branches using depth_fn(r,c).
+
+            depth_fn returns the Z cut depth in mm (negative) for a pixel, or
+            None to skip it. Contiguous included pixels form sub-segments;
+            adjacent sub-segments within vcarve_link_mm are chained together.
+            """
+            segs = []
+            for branch in branches_ordered:
+                sub = []
+                for r, c in branch:
+                    z = depth_fn(r, c)
+                    if z is None:
+                        if sub:
+                            segs.append(['cut', sub])
+                            sub = []
+                        continue
+                    x = c / px_per_mm_x - _ox
+                    y = (H - 1 - r) / px_per_mm_y - _oy
+                    sub.append((x, y, z))
+                if sub:
+                    if segs:
+                        dx = sub[0][0] - segs[-1][1][-1][0]
+                        dy = sub[0][1] - segs[-1][1][-1][1]
+                        if (dx * dx + dy * dy) ** 0.5 < vcarve_link_mm:
+                            segs[-1][1].extend(sub)
+                            continue
+                    segs.append(['cut', sub])
+            return segs
+
+        all_segments = []
+
+        if stepdown_mm <= 0.0:
+            # Single pass — original behavior
+            def _depth_single(r, c):
+                return -accessible_vcarve[r, c] * max_depth
+            all_segments = _build_pass_segments(ordered_branches, _depth_single)
+        else:
+            final_norm = final_stepdown_mm / max_depth
+            sd_norm    = stepdown_mm / max_depth
+
+            # Maximum roughable depth across all skeleton pixels (normalized).
+            skel_rows, skel_cols = np.where(skeleton)
+            if len(skel_rows):
+                max_roughable_norm = float(
+                    (accessible_vcarve[skel_rows, skel_cols] - final_norm)
+                    .clip(min=0).max()
+                )
+            else:
+                max_roughable_norm = 0.0
+
+            # Compute roughing pass ceilings (normalized depths).
+            if max_roughable_norm > 0 and sd_norm > 0:
+                n_rough = max(1, int(np.ceil(max_roughable_norm / sd_norm)))
+                pass_ceilings = [
+                    min((i + 1) * sd_norm, max_roughable_norm)
+                    for i in range(n_rough)
+                ]
+            else:
+                pass_ceilings = []
+
+            prev_ceiling = 0.0
+            for ceiling_norm in pass_ceilings:
+                _pc = prev_ceiling
+                _cn = ceiling_norm
+                _fn = final_norm
+
+                def _depth_rough(r, c, _pc=_pc, _cn=_cn, _fn=_fn):
+                    roughing_target = accessible_vcarve[r, c] - _fn
+                    if roughing_target <= _pc:
+                        return None  # already at full roughing depth for this pixel
+                    return -min(roughing_target, _cn) * max_depth
+
+                all_segments.extend(
+                    _build_pass_segments(ordered_branches, _depth_rough)
+                )
+                prev_ceiling = ceiling_norm
+
+            # Final finishing pass: re-trace full path at actual target depth.
+            if final_stepdown_mm > 0.0:
+                def _depth_final(r, c):
+                    return -accessible_vcarve[r, c] * max_depth
+                all_segments.extend(
+                    _build_pass_segments(ordered_branches, _depth_final)
+                )
+
+        progress(90, f"Generated {len(all_segments)} segments across all passes.")
+
+        # ── Stage 6 · Simplify and assemble ToolPath (90–100 %) ───────
+        progress(90, "Simplifying tool path (RDP)…")
         rdp_tol = max(
             1.0 / px_per_mm_x,
             1.0 / px_per_mm_y,
@@ -1988,6 +2081,8 @@ class ImageViewerApp:
                 'max_vcarve_mm':         max_vcarve_mm,
                 'min_feature_width_mm':  min_feature_width_mm,
                 'threshold_um':          threshold_um,
+                'stepdown_mm':           stepdown_mm,
+                'final_stepdown_mm':     final_stepdown_mm,
                 'max_depth':       max_depth,
                 'width_cm':        width_cm,
                 'height_cm':       height_cm,
