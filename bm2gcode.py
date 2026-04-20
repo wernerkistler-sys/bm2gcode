@@ -1672,7 +1672,7 @@ class ImageViewerApp:
         """
         from math import radians, tan
         from scipy.ndimage import grey_erosion, distance_transform_edt, label
-        from skimage.morphology import skeletonize
+        from skimage.morphology import medial_axis
 
         H, W = depth_map.shape
 
@@ -1764,8 +1764,8 @@ class ImageViewerApp:
             progress(43, f"Mask eroded: features narrower than "
                          f"{min_feature_width_mm:.2f} mm removed.")
 
-        progress(45, "Computing medial axis (skeletonize)…")
-        skeleton = skeletonize(mask_vcarve)
+        progress(45, "Computing medial axis…")
+        skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
         # Only keep skeleton pixels where V-bit can actually plunge
         skeleton = skeleton & (accessible_vcarve > 0)
 
