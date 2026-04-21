@@ -187,7 +187,7 @@ class ToolPath:
 # ---------------------------------------------------------------------------
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
 RASTER_DIRECTIONS = ["X", "Y", "Both"]
-ALGORITHMS        = ["Raster Scan", "V-Carving"]
+ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)"]
 
 DEFAULTS = {
     "width_cm":          "10.0",
@@ -725,7 +725,7 @@ class ImageViewerApp:
         # ── Wire up algorithm toggle ───────────────────────────────────
         def _on_algorithm_changed(*_):
             alg = algorithm_var.get()
-            if alg == "V-Carving":
+            if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_var'].set("V-Bit")
@@ -907,7 +907,7 @@ class ImageViewerApp:
             threshold_um = float(step['threshold'].get())
             width_cm     = float(self.width_cm.get())
             max_depth    = float(self.max_depth.get())
-            if algorithm == "V-Carving":
+            if algorithm.startswith("V-Carving"):
                 vbit_angle_deg   = float(step['vbit_angle'].get())
                 max_vcarve_mm    = float(step['max_vcarve'].get())
                 min_feature_width_mm = float(step['min_fw'].get())
@@ -926,7 +926,7 @@ class ImageViewerApp:
         dlg = ProgressDialog(self.root,
                              title=f"Computing Step {idx + 1} Tool Path")
 
-        if algorithm == "V-Carving":
+        if algorithm.startswith("V-Carving"):
             # Retrieve accessible surface and residual from previous raster step
             accessible_prior  = None
             prior_residual_tp = None
@@ -964,6 +964,9 @@ class ImageViewerApp:
                         min_feature_width_mm = min_feature_width_mm,
                         stepdown_mm          = vcarve_stepdown_mm,
                         final_stepdown_mm    = vcarve_final_stepdown_mm,
+                        skeleton_mode        = ("voronoi"
+                                                if algorithm == "V-Carving (Voronoi)"
+                                                else "medial_axis"),
                         progress             = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
@@ -1651,7 +1654,8 @@ class ImageViewerApp:
                                   tool_diameter_mm=0.0,
                                   min_feature_width_mm=0.0, progress=None,
                                   prior_residual=None,
-                                  stepdown_mm=0.0, final_stepdown_mm=0.0):
+                                  stepdown_mm=0.0, final_stepdown_mm=0.0,
+                                  skeleton_mode="medial_axis"):
         """Compute a V-carving toolpath for fine details not reachable by raster.
 
         Parameters
@@ -1672,7 +1676,9 @@ class ImageViewerApp:
         """
         from math import radians, tan
         from scipy.ndimage import grey_erosion, distance_transform_edt, label
-        from skimage.morphology import medial_axis
+
+        _alg_name = ('V-Carving (Voronoi)' if skeleton_mode == 'voronoi'
+                     else 'V-Carving')
 
         H, W = depth_map.shape
 
@@ -1713,7 +1719,7 @@ class ImageViewerApp:
                 segments=[],
                 residual=base_residual.copy(),
                 result=np.zeros_like(depth_map),
-                metadata={'algorithm': 'V-Carving',
+                metadata={'algorithm': _alg_name,
                           'vbit_angle_deg': vbit_angle_deg,
                           'max_vcarve_mm': max_vcarve_mm,
                           'threshold_um': threshold_um,
@@ -1764,10 +1770,92 @@ class ImageViewerApp:
             progress(43, f"Mask eroded: features narrower than "
                          f"{min_feature_width_mm:.2f} mm removed.")
 
-        progress(45, "Computing medial axis…")
-        skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
-        # Only keep skeleton pixels where V-bit can actually plunge
-        skeleton = skeleton & (accessible_vcarve > 0)
+        if skeleton_mode == 'voronoi':
+            progress(45, "Computing Voronoi skeleton…")
+            from scipy.spatial import Voronoi as _Voronoi
+            from skimage.measure import find_contours as _find_contours
+            from scipy.ndimage import gaussian_filter1d as _gauss1d
+
+            # Marching-squares contour at the 0.5 iso-level gives sub-pixel
+            # (row, col) coordinates — smoother than raster boundary pixels.
+            raw_contours = _find_contours(mask_vcarve.astype(np.float32), 0.5)
+            sigma = max(1.0, 0.5 * px_per_mm)
+            pts_list = []
+            for c in raw_contours:
+                if len(c) < 4:
+                    continue
+                sr = _gauss1d(c[:, 0], sigma=sigma, mode='wrap')
+                sc = _gauss1d(c[:, 1], sigma=sigma, mode='wrap')
+                pts_list.append(np.column_stack((sr, sc)))
+
+            boundary_pts = np.vstack(pts_list) if pts_list else np.empty((0, 2))
+
+            if len(boundary_pts) < 4:
+                skeleton = np.zeros_like(mask_vcarve, dtype=bool)
+            else:
+                max_pts = 8000
+                if len(boundary_pts) > max_pts:
+                    idx = np.round(
+                        np.linspace(0, len(boundary_pts) - 1, max_pts)
+                    ).astype(int)
+                    boundary_pts = boundary_pts[idx]
+
+                vor = _Voronoi(boundary_pts)
+
+                # Opening-angle criterion (Attali & Montanvert 1994):
+                # Each Voronoi ridge separates the regions of two boundary
+                # generators p_i, p_j.  At vertex v the inscribed-circle
+                # radius r satisfies |v-p_i| = |v-p_j| = r, so the
+                # opening angle θ obeys cos(θ) = 1 − d²/(2r²) where
+                # d = |p_i-p_j|.
+                #
+                # Genuine medial-axis ridge: generators are from opposite
+                # sides of the shape → d ≈ 2r → cos(θ) ≈ −1 → θ ≈ π.
+                # Spurious same-side rib: d ≈ 1 pixel, r >> 1 → θ ≈ 0.
+                # Threshold π/3 (cos = 0.5) cleanly separates the two
+                # regardless of shape orientation or staircase boundaries.
+                cos_thr = 0.8           # keep ridges with θ ≥ 60° at both ends
+                verts   = vor.vertices  # float (row, col)
+
+                skeleton = np.zeros_like(mask_vcarve, dtype=bool)
+                for ridge_idx, (v0i, v1i) in enumerate(vor.ridge_vertices):
+                    if v0i < 0 or v1i < 0:
+                        continue  # infinite ridge
+                    pi_idx, pj_idx = vor.ridge_points[ridge_idx]
+                    pi = boundary_pts[pi_idx]
+                    pj = boundary_pts[pj_idx]
+                    d2 = float((pi[0]-pj[0])**2 + (pi[1]-pj[1])**2)
+
+                    v0 = verts[v0i]; v1 = verts[v1i]
+                    r0sq = float((v0[0]-pi[0])**2 + (v0[1]-pi[1])**2)
+                    r1sq = float((v1[0]-pi[0])**2 + (v1[1]-pi[1])**2)
+                    cos0 = (1.0 - d2 / (2.0*r0sq)) if r0sq > 1e-12 else -1.0
+                    cos1 = (1.0 - d2 / (2.0*r1sq)) if r1sq > 1e-12 else -1.0
+                    # Prune if either vertex has a small opening angle
+                    if cos0 > cos_thr or cos1 > cos_thr:
+                        continue
+
+                    r0f, c0f = v0; r1f, c1f = v1
+                    # Sample at 2× density so half-integer vertices don't leave
+                    # alternating pixel gaps on near-horizontal/vertical ridges.
+                    n = max(3, int(np.ceil(np.hypot(r1f-r0f, c1f-c0f) * 2)) + 1)
+                    rs = np.clip(
+                        np.round(np.linspace(r0f, r1f, n)).astype(int), 0, H-1)
+                    cs = np.clip(
+                        np.round(np.linspace(c0f, c1f, n)).astype(int), 0, W-1)
+                    skeleton[rs, cs] = True
+
+                skeleton &= mask_vcarve & (accessible_vcarve > 0)
+                # Collapse double-lines produced by sub-pixel generator offsets
+                # on rotated edges (two near-coincident ridges → single centerline).
+                from skimage.morphology import thin as _thin
+                skeleton = _thin(skeleton)
+        else:
+            from skimage.morphology import medial_axis
+            progress(45, "Computing medial axis…")
+            skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
+            # Only keep skeleton pixels where V-bit can actually plunge
+            skeleton = skeleton & (accessible_vcarve > 0)
 
         # ── Compute V-bit swept material removal (for result/residual display) ──
         # The V-bit tip at each skeleton pixel sits at depth accessible_vcarve[s]
@@ -1799,7 +1887,7 @@ class ImageViewerApp:
                 segments=[],
                 residual=residual_vcarve,
                 result=material_removed_vcarve,
-                metadata={'algorithm': 'V-Carving',
+                metadata={'algorithm': _alg_name,
                           'vbit_angle_deg': vbit_angle_deg,
                           'max_vcarve_mm': max_vcarve_mm,
                           'threshold_um': threshold_um,
@@ -2076,7 +2164,7 @@ class ImageViewerApp:
             result=material_removed_vcarve,
             accessible=None,
             metadata={
-                'algorithm':       'V-Carving',
+                'algorithm':       _alg_name,
                 'vbit_angle_deg':  vbit_angle_deg,
                 'max_vcarve_mm':         max_vcarve_mm,
                 'min_feature_width_mm':  min_feature_width_mm,
