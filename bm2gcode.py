@@ -865,7 +865,9 @@ class ImageViewerApp:
         self._reset_zoom()
 
         self.placeholder.place_forget()
-        self.status_var.set(f"Loaded: {path}")
+        h, w = self.current_image.shape
+        levels = int(np.round((self.current_image.max() - self.current_image.min()) * 255)) + 1
+        self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
         self._render()
 
     def close_image(self):
