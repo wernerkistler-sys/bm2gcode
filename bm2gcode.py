@@ -397,7 +397,8 @@ class LabeledEntry(ttk.Frame):
         super().__init__(parent, **kw)
         ttk.Label(self, text=label).pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
-        ttk.Entry(self, textvariable=self.var, width=width).pack(side=tk.RIGHT)
+        self.entry = ttk.Entry(self, textvariable=self.var, width=width)
+        self.entry.pack(side=tk.RIGHT)
         ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
 
     def get(self):
@@ -405,6 +406,9 @@ class LabeledEntry(ttk.Frame):
 
     def set(self, value):
         self.var.set(value)
+
+    def set_state(self, state):
+        self.entry.config(state=state)
 
 
 class SectionFrame(ttk.LabelFrame):
@@ -538,9 +542,20 @@ class ImageViewerApp:
         sf.pack(fill=tk.X, pady=(0, 8))
         self.width_cm    = LabeledEntry(sf, "Width",         "cm", DEFAULTS["width_cm"])
         self.height_cm   = LabeledEntry(sf, "Height",        "cm", DEFAULTS["height_cm"])
-        self.max_depth   = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"])
-        for w in (self.width_cm, self.height_cm, self.max_depth):
-            w.pack(fill=tk.X, pady=2)
+        self.width_cm.pack(fill=tk.X, pady=2)
+        self.height_cm.pack(fill=tk.X, pady=2)
+
+        self._aspect_lock_var = tk.BooleanVar(value=True)
+        self._image_aspect    = None   # pixel W/H of the loaded image
+        ttk.Checkbutton(sf, text="Keep aspect ratio",
+                        variable=self._aspect_lock_var,
+                        command=self._on_aspect_lock_toggle
+                        ).pack(anchor=tk.W, pady=(0, 2))
+
+        self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"])
+        self.max_depth.pack(fill=tk.X, pady=2)
+        self.width_cm.var.trace_add("write", self._on_width_changed)
+        self._on_aspect_lock_toggle()   # apply initial locked state
 
         polarity_row = ttk.Frame(sf)
         polarity_row.pack(fill=tk.X, pady=(6, 2))
@@ -842,6 +857,29 @@ class ImageViewerApp:
 
         return np.clip(img, 0.0, 1.0)
 
+    def _on_aspect_lock_toggle(self):
+        if self._aspect_lock_var.get():
+            if self.current_image is not None:
+                h, w = self.current_image.shape
+                self._image_aspect = w / h
+            self.height_cm.set_state("disabled")
+            self._recalc_height()
+        else:
+            self._image_aspect = None
+            self.height_cm.set_state("normal")
+
+    def _recalc_height(self):
+        if not self._aspect_lock_var.get() or self._image_aspect is None:
+            return
+        try:
+            w = float(self.width_cm.get())
+            self.height_cm.set(f"{w / self._image_aspect:.4f}")
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    def _on_width_changed(self, *_):
+        self._recalc_height()
+
     def open_image(self):
         path = filedialog.askopenfilename(
             title="Select a PNG image",
@@ -857,6 +895,12 @@ class ImageViewerApp:
             messagebox.showerror("Error", f"Could not load image:\n{exc}")
             return
 
+        # Update stored aspect ratio from the new image's pixel dimensions
+        h, w = self.current_image.shape
+        if self._aspect_lock_var.get():
+            self._image_aspect = w / h
+            self._recalc_height()
+
         # Reset any previously computed tool paths
         self.toolpaths = [None] * len(self.steps)
         for i, s in enumerate(self.steps):
@@ -865,7 +909,6 @@ class ImageViewerApp:
         self._reset_zoom()
 
         self.placeholder.place_forget()
-        h, w = self.current_image.shape
         levels = int(np.round((self.current_image.max() - self.current_image.min()) * 255)) + 1
         self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
         self._render()
@@ -886,7 +929,8 @@ class ImageViewerApp:
 
     def reset_defaults(self):
         self.width_cm.set(DEFAULTS["width_cm"])
-        self.height_cm.set(DEFAULTS["height_cm"])
+        if not self._aspect_lock_var.get():
+            self.height_cm.set(DEFAULTS["height_cm"])
         self.max_depth.set(DEFAULTS["max_depth"])
         self.origin_var.set(DEFAULTS["origin"])
         self.surface.set(DEFAULTS["surface"])
