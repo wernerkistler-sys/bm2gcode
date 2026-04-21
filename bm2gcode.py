@@ -1842,13 +1842,6 @@ class ImageViewerApp:
             if len(boundary_pts) < 4:
                 skeleton = np.zeros_like(mask_vcarve, dtype=bool)
             else:
-                max_pts = 8000
-                if len(boundary_pts) > max_pts:
-                    idx = np.round(
-                        np.linspace(0, len(boundary_pts) - 1, max_pts)
-                    ).astype(int)
-                    boundary_pts = boundary_pts[idx]
-
                 vor = _Voronoi(boundary_pts)
 
                 # Opening-angle criterion (Attali & Montanvert 1994):
@@ -1863,28 +1856,34 @@ class ImageViewerApp:
                 # Spurious same-side rib: d ≈ 1 pixel, r >> 1 → θ ≈ 0.
                 # Threshold π/3 (cos = 0.5) cleanly separates the two
                 # regardless of shape orientation or staircase boundaries.
-                cos_thr = 0.8           # keep ridges with θ ≥ 60° at both ends
+                cos_thr = 0.5           # keep ridges with θ ≥ 60° at both ends
                 verts   = vor.vertices  # float (row, col)
 
+                # Vectorised filter: drop infinite ridges, then apply the
+                # opening-angle criterion in bulk before any rasterisation.
+                rv = np.array(vor.ridge_vertices)          # (R, 2)
+                rp = np.array(vor.ridge_points)            # (R, 2)
+                finite = (rv[:, 0] >= 0) & (rv[:, 1] >= 0)
+                rv = rv[finite];  rp = rp[finite]
+
+                pi_arr = boundary_pts[rp[:, 0]]            # (R, 2)
+                pj_arr = boundary_pts[rp[:, 1]]            # (R, 2)
+                d2_arr = np.sum((pi_arr - pj_arr) ** 2, axis=1)   # (R,)
+
+                va = verts[rv[:, 0]]                       # (R, 2)
+                vb = verts[rv[:, 1]]                       # (R, 2)
+                r0sq = np.sum((va - pi_arr) ** 2, axis=1)  # (R,)
+                r1sq = np.sum((vb - pi_arr) ** 2, axis=1)  # (R,)
+                cos0 = np.where(r0sq > 1e-12, 1.0 - d2_arr / (2.0 * r0sq), -1.0)
+                cos1 = np.where(r1sq > 1e-12, 1.0 - d2_arr / (2.0 * r1sq), -1.0)
+
+                keep = (cos0 <= cos_thr) & (cos1 <= cos_thr)
+                va_keep = va[keep]
+                vb_keep = vb[keep]
+
                 skeleton = np.zeros_like(mask_vcarve, dtype=bool)
-                for ridge_idx, (v0i, v1i) in enumerate(vor.ridge_vertices):
-                    if v0i < 0 or v1i < 0:
-                        continue  # infinite ridge
-                    pi_idx, pj_idx = vor.ridge_points[ridge_idx]
-                    pi = boundary_pts[pi_idx]
-                    pj = boundary_pts[pj_idx]
-                    d2 = float((pi[0]-pj[0])**2 + (pi[1]-pj[1])**2)
-
-                    v0 = verts[v0i]; v1 = verts[v1i]
-                    r0sq = float((v0[0]-pi[0])**2 + (v0[1]-pi[1])**2)
-                    r1sq = float((v1[0]-pi[0])**2 + (v1[1]-pi[1])**2)
-                    cos0 = (1.0 - d2 / (2.0*r0sq)) if r0sq > 1e-12 else -1.0
-                    cos1 = (1.0 - d2 / (2.0*r1sq)) if r1sq > 1e-12 else -1.0
-                    # Prune if either vertex has a small opening angle
-                    if cos0 > cos_thr or cos1 > cos_thr:
-                        continue
-
-                    r0f, c0f = v0; r1f, c1f = v1
+                for va_i, vb_i in zip(va_keep, vb_keep):
+                    r0f, c0f = va_i;  r1f, c1f = vb_i
                     # Sample at 2× density so half-integer vertices don't leave
                     # alternating pixel gaps on near-horizontal/vertical ridges.
                     n = max(3, int(np.ceil(np.hypot(r1f-r0f, c1f-c0f) * 2)) + 1)
