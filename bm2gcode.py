@@ -1037,7 +1037,6 @@ class ImageViewerApp:
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
                         f"Est. time: {_fmt_time(stats['est_minutes'])}"
                         f" @ {feed_rate:.0f} mm/min")
-                    self.status_var.set(f"Step {idx + 1} tool path computed.")
                     self.display_mode_var.set(DISPLAY_STEP_3D)
                     self.display_step_var.set(idx + 1)
                     self._on_display_mode_changed()
@@ -1105,7 +1104,6 @@ class ImageViewerApp:
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
                         f"Est. time: {_fmt_time(stats['est_minutes'])}"
                         f" @ {feed_rate:.0f} mm/min")
-                    self.status_var.set(f"Step {idx + 1} tool path computed.")
                     self.display_mode_var.set(DISPLAY_STEP_3D)
                     self.display_step_var.set(idx + 1)
                     self._on_display_mode_changed()
@@ -2568,7 +2566,7 @@ class ImageViewerApp:
                     from scipy.ndimage import distance_transform_edt
                     mask = distance_transform_edt(mask) > min_half_px
                 img  = mask.astype(np.float32)
-                cmap = "gray"
+                cmap = "Greens"
                 title = f"V-carve Mask (Step {step_idx + 1})"
 
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
