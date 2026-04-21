@@ -202,7 +202,7 @@ DEFAULTS = {
     "step_stepdown":     "6.0",
     "step_feed_rate":    "800",
     "step_raster_dir":   "X",
-    "step_threshold":    "0",    # µm; 0 = visit all pixels
+    "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"
     "step_vbit_angle":   "90",           # included angle in degrees
@@ -712,10 +712,6 @@ class ImageViewerApp:
         max_vcarve.pack(fill=tk.X, pady=2)
         step['max_vcarve'] = max_vcarve
 
-        min_fw = LabeledEntry(vcarve_frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
-        min_fw.pack(fill=tk.X, pady=2)
-        step['min_fw'] = min_fw
-
         vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
         vcarve_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_stepdown'] = vcarve_stepdown
@@ -732,10 +728,14 @@ class ImageViewerApp:
         # Threshold: skip pixels where prior residual ≤ this value.
         # For step 1 the prior residual is all-ones (flat stock), so
         # threshold=0 visits every pixel; a higher value skips shallow areas.
-        # For V-carving: minimum fine-detail depth (µm) to carve.
-        threshold = LabeledEntry(frame, "Threshold", "µm", DEFAULTS["step_threshold"])
+        # For V-carving: minimum fine-detail depth (mm) to carve.
+        threshold = LabeledEntry(frame, "Threshold", "mm", DEFAULTS["step_threshold"])
         threshold.pack(fill=tk.X, pady=2)
         step['threshold'] = threshold
+
+        min_fw = LabeledEntry(frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
+        step['min_fw'] = min_fw
+        # packed/unpacked by _on_algorithm_changed below
 
         # ── Wire up algorithm toggle ───────────────────────────────────
         def _on_algorithm_changed(*_):
@@ -743,12 +743,16 @@ class ImageViewerApp:
             if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
                 step['profile_var'].set("V-Bit")
                 step['profile_cb'].config(state="disabled")
             else:
                 step['vcarve_frame'].pack_forget()
+                step['min_fw'].pack_forget()
                 step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_cb'].config(state="readonly")
+            if hasattr(self, '_display_combo'):
+                self._on_display_mode_changed()
 
         algorithm_var.trace_add("write", _on_algorithm_changed)
 
@@ -950,7 +954,7 @@ class ImageViewerApp:
         algorithm = step['algorithm_var'].get()
         try:
             feed_rate    = float(step['feed_rate'].get())
-            threshold_um = float(step['threshold'].get())
+            threshold_mm = float(step['threshold'].get())
             width_cm     = float(self.width_cm.get())
             max_depth    = float(self.max_depth.get())
             if algorithm.startswith("V-Carving"):
@@ -1006,7 +1010,7 @@ class ImageViewerApp:
                         height_cm      = float(self.height_cm.get()),
                         origin         = self.origin_var.get(),
                         feed_rate            = feed_rate,
-                        threshold_um         = threshold_um,
+                        threshold_um         = threshold_mm * 1000.0,
                         min_feature_width_mm = min_feature_width_mm,
                         stepdown_mm          = vcarve_stepdown_mm,
                         final_stepdown_mm    = vcarve_final_stepdown_mm,
@@ -1036,7 +1040,7 @@ class ImageViewerApp:
                     self.status_var.set(f"Step {idx + 1} tool path computed.")
                     self.display_mode_var.set(DISPLAY_STEP_3D)
                     self.display_step_var.set(idx + 1)
-                    self._render()
+                    self._on_display_mode_changed()
 
                 self.root.after(0, _done)
 
@@ -1058,8 +1062,7 @@ class ImageViewerApp:
             else:
                 prior_residual = self.toolpaths[idx - 1].residual.copy()
 
-            # Convert threshold from µm to normalised [0,1] depth units
-            prior_resid_tol = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
+            prior_resid_tol = threshold_mm / max_depth if max_depth else 0.0
 
             step_mm = diam_mm * stepover / 100.0
             profile = step['profile_var'].get()
@@ -1105,7 +1108,7 @@ class ImageViewerApp:
                     self.status_var.set(f"Step {idx + 1} tool path computed.")
                     self.display_mode_var.set(DISPLAY_STEP_3D)
                     self.display_step_var.set(idx + 1)
-                    self._render()
+                    self._on_display_mode_changed()
 
                 self.root.after(0, _done)
 
@@ -2275,32 +2278,24 @@ class ImageViewerApp:
         mode = self.display_mode_var.get()
         idx  = self.display_step_var.get() - 1
 
-        # Show/hide V-carve Mask option in the combobox based on the selected step
+        # Update combobox to show only modes relevant to this step's algorithm/state
         is_vcarve_step = (
             0 <= idx < len(self.steps)
             and self.steps[idx].get('algorithm_var') is not None
-            and self.steps[idx]['algorithm_var'].get() == "V-Carving"
+            and self.steps[idx]['algorithm_var'].get().startswith("V-Carving")
         )
-        available_modes = DISPLAY_MODES if is_vcarve_step else [m for m in DISPLAY_MODES if m != DISPLAY_VCARVE_MASK]
+        has_accessible = self._accessible_for_step(idx) is not None
+        step_computed  = (0 <= idx < len(self.toolpaths) and self.toolpaths[idx] is not None)
+        available_modes = [
+            m for m in DISPLAY_MODES
+            if not (m == DISPLAY_VCARVE_MASK and not is_vcarve_step)
+            and not (m == DISPLAY_FINE_DETAIL and not has_accessible)
+            and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
+        ]
         self._display_combo['values'] = available_modes
-        if not is_vcarve_step and mode == DISPLAY_VCARVE_MASK:
+        if mode not in available_modes:
             self.display_mode_var.set(DISPLAY_ORIGINAL)
             mode = DISPLAY_ORIGINAL
-
-        if mode in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D):
-            if idx < 0 or idx >= len(self.toolpaths) or self.toolpaths[idx] is None:
-                messagebox.showinfo("Not computed",
-                                    f"Step {idx + 1} has not been computed yet.")
-                self.display_mode_var.set(DISPLAY_ORIGINAL)
-                return
-        if mode == DISPLAY_FINE_DETAIL:
-            if self._accessible_for_step(idx) is None:
-                messagebox.showinfo(
-                    "No accessible surface",
-                    f"Step {idx + 1} (or the step before it) has no computed "
-                    "accessible surface.\nCompute a Raster Scan step first.")
-                self.display_mode_var.set(DISPLAY_ORIGINAL)
-                return
         # Reset 3D view state when entering a 3D mode fresh
         if mode in DISPLAY_3D_MODES:
             self._3d_elev = 30.0
@@ -2551,11 +2546,11 @@ class ImageViewerApp:
                 title = f"Fine Detail (Step {step_idx + 1})"
             else:
                 try:
-                    threshold_um = float(self.steps[step_idx]['threshold'].get())
+                    threshold_mm = float(self.steps[step_idx]['threshold'].get())
                     max_depth    = float(self.max_depth.get())
                 except (ValueError, IndexError):
-                    threshold_um, max_depth = 0.0, 5.0
-                thr  = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
+                    threshold_mm, max_depth = 0.0, 5.0
+                thr  = threshold_mm / max_depth if max_depth else 0.0
                 mask = fine_detail > thr
                 # Apply min-feature-width erosion if set (same logic as _compute_vcarve_toolpath)
                 try:
