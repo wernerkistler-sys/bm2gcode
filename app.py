@@ -320,19 +320,39 @@ class GCodeGeneratorApp:
         # packed/unpacked by _on_algorithm_changed below
 
         # ── Wire up algorithm toggle ───────────────────────────────────
+        _VCARVE_PROFILES  = ["V-Bit", "Ball"]
+        _RASTER_PROFILES  = ["Ball", "End Mill"]
+
+        def _update_vbit_angle_state():
+            alg     = algorithm_var.get()
+            profile = step['profile_var'].get()
+            if alg.startswith("V-Carving") and profile == "Ball":
+                step['vbit_angle'].set_state("disabled")
+            else:
+                step['vbit_angle'].set_state("normal")
+
+        def _on_profile_changed(*_):
+            _update_vbit_angle_state()
+
+        profile_var.trace_add("write", _on_profile_changed)
+
         def _on_algorithm_changed(*_):
             alg = algorithm_var.get()
             if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
-                step['profile_var'].set("V-Bit")
-                step['profile_cb'].config(state="disabled")
+                step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
+                if step['profile_var'].get() not in _VCARVE_PROFILES:
+                    step['profile_var'].set("V-Bit")
             else:
                 step['vcarve_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
-                step['profile_cb'].config(state="readonly")
+                step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
+                if step['profile_var'].get() not in _RASTER_PROFILES:
+                    step['profile_var'].set("Ball")
+            _update_vbit_angle_state()
             if hasattr(self, '_display_combo'):
                 self._on_display_mode_changed()
 
@@ -540,7 +560,8 @@ class GCodeGeneratorApp:
             width_cm     = float(self.width_cm.get())
             max_depth    = float(self.max_depth.get())
             if algorithm.startswith("V-Carving"):
-                vbit_angle_deg   = float(step['vbit_angle'].get())
+                vcarve_profile   = step['profile_var'].get()
+                vbit_angle_deg   = float(step['vbit_angle'].get()) if vcarve_profile != "Ball" else 90.0
                 max_vcarve_mm    = float(step['max_vcarve'].get())
                 min_feature_width_mm = float(step['min_fw'].get())
                 diam_mm          = float(step['diameter'].get())
@@ -599,6 +620,7 @@ class GCodeGeneratorApp:
                         skeleton_mode        = ("voronoi"
                                                 if algorithm == "V-Carving (Voronoi)"
                                                 else "medial_axis"),
+                        profile              = vcarve_profile,
                         progress             = dlg.report,
                     )
                 except ProgressDialog.Cancelled:

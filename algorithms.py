@@ -508,7 +508,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels, accessible,
                             min_feature_width_mm=0.0, progress=None,
                             prior_residual=None,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
-                            skeleton_mode="medial_axis"):
+                            skeleton_mode="medial_axis",
+                            profile="V-Bit"):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
     Parameters
@@ -548,9 +549,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels, accessible,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    half_angle_rad = radians(vbit_angle_deg / 2.0)
-    tan_half       = tan(half_angle_rad)
-
     # ── Stage 1 · Fine-detail mask (0–10 %) ───────────────────────
     progress(0, "Computing fine-detail mask…")
     if accessible is None:
@@ -578,28 +576,53 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels, accessible,
 
     progress(10, f"Fine-detail mask: {np.count_nonzero(mask_vcarve)} pixels.")
 
-    # ── Stage 2 · V-bit accessible surface (10–40 %) ──────────────
-    progress(10, "Building V-bit cone kernel…")
-    cone_reach_mm = max_vcarve_mm * tan_half
-    if tool_diameter_mm > 0.0:
-        cone_reach_mm = min(cone_reach_mm, tool_diameter_mm / 2.0)
-    k_rad_vcarve     = int(np.ceil(cone_reach_mm * px_per_mm))
-    k_rad_vcarve     = max(1, k_rad_vcarve)
-    ky, kx      = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
-    r_px_vcarve      = np.sqrt(kx**2 + ky**2)
-    r_mm_vcarve      = r_px_vcarve / px_per_mm
-    kernel_vcarve    = (r_mm_vcarve / (tan_half * max_depth)).astype(np.float32)
-    footprint_vcarve = r_px_vcarve <= k_rad_vcarve
-
-    progress(20, f"Computing V-bit accessible surface "
-                 f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
-    accessible_vcarve = grey_erosion(
-        depth_map.astype(np.float64),
-        footprint=footprint_vcarve,
-        structure=-kernel_vcarve.astype(np.float64),
-    ).astype(np.float32)
-    accessible_vcarve = np.clip(accessible_vcarve, 0.0, max_vcarve_mm / max_depth)
-    progress(40, "V-bit accessible surface computed.")
+    # ── Stage 2 · Tool-accessible surface (10–40 %) ───────────────
+    if profile == "Ball":
+        if tool_diameter_mm <= 0.0:
+            raise ValueError("Ball profile requires a positive tool diameter.")
+        R_mm = tool_diameter_mm / 2.0
+        k_rad_vcarve = max(1, int(np.ceil(R_mm * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
+        r_px_vcarve = np.sqrt(kx**2 + ky**2)
+        r_mm_vcarve = r_px_vcarve / px_per_mm
+        footprint_vcarve = r_mm_vcarve <= R_mm
+        with np.errstate(invalid='ignore'):
+            kernel_vcarve = np.where(
+                r_mm_vcarve <= R_mm,
+                (R_mm - np.sqrt(np.maximum(0.0, R_mm**2 - r_mm_vcarve**2))) / max_depth,
+                0.0,
+            ).astype(np.float32)
+        progress(20, f"Computing ball accessible surface "
+                     f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
+        accessible_vcarve = grey_erosion(
+            depth_map.astype(np.float64),
+            footprint=footprint_vcarve,
+            structure=-kernel_vcarve.astype(np.float64),
+        ).astype(np.float32)
+        accessible_vcarve = np.clip(accessible_vcarve, 0.0,
+                                    min(max_vcarve_mm, R_mm) / max_depth)
+    else:  # V-Bit
+        progress(10, "Building V-bit cone kernel…")
+        half_angle_rad = radians(vbit_angle_deg / 2.0)
+        tan_half = tan(half_angle_rad)
+        cone_reach_mm = max_vcarve_mm * tan_half
+        if tool_diameter_mm > 0.0:
+            cone_reach_mm = min(cone_reach_mm, tool_diameter_mm / 2.0)
+        k_rad_vcarve = max(1, int(np.ceil(cone_reach_mm * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
+        r_px_vcarve = np.sqrt(kx**2 + ky**2)
+        r_mm_vcarve = r_px_vcarve / px_per_mm
+        kernel_vcarve = (r_mm_vcarve / (tan_half * max_depth)).astype(np.float32)
+        footprint_vcarve = r_px_vcarve <= k_rad_vcarve
+        progress(20, f"Computing V-bit accessible surface "
+                     f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
+        accessible_vcarve = grey_erosion(
+            depth_map.astype(np.float64),
+            footprint=footprint_vcarve,
+            structure=-kernel_vcarve.astype(np.float64),
+        ).astype(np.float32)
+        accessible_vcarve = np.clip(accessible_vcarve, 0.0, max_vcarve_mm / max_depth)
+    progress(40, "Accessible surface computed.")
 
     # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
     if min_feature_width_mm > 0.0:
@@ -957,6 +980,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels, accessible,
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
+            'profile':         profile,
             'vbit_angle_deg':  vbit_angle_deg,
             'max_vcarve_mm':         max_vcarve_mm,
             'min_feature_width_mm':  min_feature_width_mm,
