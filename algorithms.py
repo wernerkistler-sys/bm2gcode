@@ -1,0 +1,974 @@
+import numpy as np
+from toolpath import ToolPath
+
+
+def mask_spans(mask_1d):
+    """Return contiguous True-runs in a 1-D boolean array.
+
+    Uses the same edge-detection trick as FDM slicer infill algorithms:
+    pad with False on both ends, take np.diff, find +1 transitions
+    (run starts) and -1 transitions (run ends).
+
+    Parameters
+    ----------
+    mask_1d : 1-D bool array of length N
+
+    Returns
+    -------
+    list of (start, end) index pairs, both inclusive, in ascending order.
+    Empty list if no True pixels.
+    """
+    if not np.any(mask_1d):
+        return []
+    padded = np.concatenate(([False], mask_1d, [False])).astype(np.int8)
+    diff   = np.diff(padded)
+    starts = np.where(diff ==  1)[0]   # rising edges  → run begins here
+    ends   = np.where(diff == -1)[0]   # falling edges → run ends before here
+    return list(zip(starts.tolist(), (ends - 1).tolist()))
+
+
+def simplify_line(points, tol):
+    """Ramer-Douglas-Peucker path simplification in 3-D.
+
+    Recursively removes intermediate points whose perpendicular distance
+    from the line segment connecting the current endpoints is below *tol*
+    (in mm).  Collinear or near-collinear runs collapse to just their two
+    endpoints, dramatically reducing G-code line count on flat or gently
+    sloping raster passes.
+
+    Parameters
+    ----------
+    points : list of (x, y, z) tuples
+    tol    : maximum allowed deviation in mm — caller should pass the
+             coarsest source-data resolution (pixel size or grey-level
+             step, whichever is larger)
+
+    Returns
+    -------
+    list of (x, y, z) tuples — always includes first and last point
+    """
+    if len(points) <= 2:
+        return list(points)
+
+    # Convert to numpy for vectorised distance computation
+    pts = np.array(points, dtype=np.float64)   # shape (N, 3)
+    N   = len(pts)
+
+    # Iterative RDP using an explicit stack to avoid Python recursion limits.
+    # (Long V-carve skeleton branches can have O(N) worst-case recursion depth
+    # when the pivot is consistently near one end, exceeding Python's ~1000
+    # frame limit.)
+    keep  = np.zeros(N, dtype=bool)
+    keep[0]  = True
+    keep[-1] = True
+
+    stack = [(0, N - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end - start <= 1:
+            continue
+
+        seg     = pts[end] - pts[start]
+        seg_len = np.linalg.norm(seg)
+
+        if seg_len < 1e-12:
+            # Degenerate segment (start == end in 3-D)
+            dists = np.linalg.norm(pts[start+1:end] - pts[start], axis=1)
+        else:
+            diff  = pts[start+1:end] - pts[start]
+            t     = np.dot(diff, seg) / (seg_len * seg_len)
+            proj  = pts[start] + t[:, None] * seg
+            dists = np.linalg.norm(pts[start+1:end] - proj, axis=1)
+
+        max_idx  = int(np.argmax(dists))
+        max_dist = dists[max_idx]
+        pivot    = start + 1 + max_idx
+
+        if max_dist > tol:
+            keep[pivot] = True
+            stack.append((start, pivot))
+            stack.append((pivot, end))
+
+    return [points[i] for i in range(N) if keep[i]]
+
+
+def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm, profile,
+                            step_mm, stepdown, max_depth,
+                            width_cm, height_cm, raster_dir,
+                            origin="Bottom-Left",
+                            prior_residual=None, prior_resid_tol=None,
+                            feed_rate=800.0, progress=None):
+    """Real tool-path computation.
+
+    Parameters
+    ----------
+    depth_map       : 2-D float32 [0, 1]  — 1.0 = max cut depth (intaglio)
+    n_grey_levels   : number of grey levels in source image (e.g. 256)
+    radius_mm       : tool radius in mm
+    profile         : "Ball" | "End Mill" | others treated as End Mill
+    step_mm         : lateral step-over in mm
+    stepdown        : max depth increment per z-pass in mm
+    max_depth       : total maximum cut depth in mm
+    width_cm        : physical image width in cm
+    height_cm       : physical image height in cm
+    raster_dir      : "X" | "Y" | "Both"
+    prior_residual  : optional 2-D float32 [0,1] residual_raster from a previous
+                      tool path (e.g. post-roughing).  When provided, the
+                      first pass only visits spans where
+                      prior_residual > prior_resid_tol.
+    prior_resid_tol : threshold (normalised [0,1]) applied to prior_residual.
+                      0.0 (default) visits every pixel; higher values skip
+                      pixels where the prior residual_raster is already shallow.
+    feed_rate       : cutting feed rate in mm/min (used for G-code F word
+                      and for estimating execution time).
+    progress        : callable(pct, subtask) — thread-safe progress reporter
+
+    Returns
+    -------
+    ToolPath
+    """
+    from scipy.ndimage import grey_erosion, grey_dilation
+
+
+    H, W = depth_map.shape
+
+    # Initialise prior_residual to the depth map itself when not provided.
+    if prior_residual is None:
+        prior_residual  = depth_map.copy()
+    if prior_resid_tol is None:
+        prior_resid_tol = 0.0
+
+    px_per_mm_x = W / (width_cm  * 10.0)
+    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0   # isotropic approx
+
+    W_mm = (W - 1) / px_per_mm_x
+    H_mm = (H - 1) / px_per_mm_y
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm/2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm/2}.get(origin, 0)
+
+    # ── Stage 1 · Build tool kernel_raster (0–10 %) ──────────────────────
+    progress(0, "Building tool geometry kernel…")
+    k_rad_raster = max(1, int(np.ceil(radius_mm * px_per_mm)))
+    ksize = 2 * k_rad_raster + 1
+    ky, kx = np.mgrid[-k_rad_raster:k_rad_raster+1, -k_rad_raster:k_rad_raster+1]
+    r_px_raster = np.sqrt(kx**2 + ky**2)              # pixel radius from centre
+
+    if profile == "Ball":
+        # Spherical cap: z_offset = R − sqrt(R² − r²)  for r ≤ R, else +∞
+        r_mm_raster = r_px_raster / px_per_mm
+        with np.errstate(invalid="ignore"):
+            cap = radius_mm - np.sqrt(np.maximum(0.0,
+                                      radius_mm**2 - r_mm_raster**2))
+        cap[r_px_raster > k_rad_raster] = 1e9              # outside tool radius → wall
+    else:
+        # End Mill: flat bottom, vertical walls
+        cap = np.where(r_px_raster <= k_rad_raster, 0.0, 1e9).astype(np.float64)
+
+    # Normalise kernel_raster to depth-map units [0,1]
+    kernel_raster = (cap / max_depth).astype(np.float32)
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+
+    # ── Stage 2 · Compute tool-accessible_raster depth surface (10–35 %) ─
+    progress(10, "Computing tool-accessible surface (morphological erosion)…")
+    footprint_raster = (r_px_raster <= k_rad_raster)
+    structure = -kernel_raster.astype(np.float64)   # erosion subtracts structure
+
+    accessible_raster = grey_erosion(depth_map.astype(np.float64),
+                              footprint=footprint_raster,
+                              structure=structure).astype(np.float32)
+    accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
+    progress(35, "Tool-accessible surface computed.")
+
+    # ── Stage 3 · Plan depth passes (35–40 %) ─────────────────────
+    progress(35, "Planning depth passes…")
+    n_passes    = max(1, int(np.ceil(max_depth / stepdown)))
+    pass_depths = [min((i + 1) * stepdown, max_depth)
+                   for i in range(n_passes)]
+    step_px     = max(1, int(round(step_mm * px_per_mm)))
+
+    resid_tol_mm = max_depth / (n_grey_levels - 1)
+    resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
+
+    directions = []
+    if raster_dir in ("X", "Both"):
+        directions.append("X")
+    if raster_dir in ("Y", "Both"):
+        directions.append("Y")
+
+    progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
+                 f"({stepdown:.2f} mm each), "
+                 f"step-over {step_px} px = {step_mm:.2f} mm, "
+                 f"residual tol {resid_tol_mm*1000:.1f} µm.")
+
+    # ── Stage 4 · Adaptive multi-pass raster (40–80 %) ────────────
+
+    all_segments = []  # list of (segment_type, [(x,y,z),...]) for ToolPath
+    achieved_raster    = np.zeros_like(accessible_raster, dtype=np.float32)
+    tool_pos    = np.array([0.0, 0.0])
+    total_segs  = 0
+    n_links_inserted = 0
+    n_links          = 0
+
+    link_threshold_mm = 2.0 * step_mm
+
+    def bresenham_pixels(r0, c0, r1, c1):
+        """Yield (row, col) pixels along the line (r0,c0)→(r1,c1)."""
+        dr, dc = abs(r1 - r0), abs(c1 - c0)
+        sr, sc = (1 if r1 >= r0 else -1), (1 if c1 >= c0 else -1)
+        r, c = r0, c0
+        if dc >= dr:
+            err = 2 * dr - dc
+            for _ in range(dc + 1):
+                yield r, c
+                if err > 0:
+                    r   += sr
+                    err -= 2 * dc
+                err += 2 * dr
+                c   += sc
+        else:
+            err = 2 * dc - dr
+            for _ in range(dr + 1):
+                yield r, c
+                if err > 0:
+                    c   += sc
+                    err -= 2 * dr
+                err += 2 * dc
+                r   += sr
+
+    for pass_idx, z_depth_mm in enumerate(pass_depths):
+        z_norm = z_depth_mm / max_depth
+
+        # ── Compute per-pixel remaining depth at this z-level ─────
+        if pass_idx == 0 and prior_resid_tol > 0.0:
+            from scipy.ndimage import binary_dilation
+            prior_mask      = binary_dilation(
+                                  prior_residual > prior_resid_tol,
+                                  structure=footprint_raster,
+                              ).astype(np.float32)
+            remaining_depth = (np.minimum(accessible_raster, z_norm)
+                               * prior_mask).astype(np.float32)
+            progress(40 + 40 * pass_idx / n_passes,
+                     f"Pass {pass_idx+1}/{n_passes}: "
+                     f"threshold={prior_resid_tol*max_depth*1000:.0f} µm, "
+                     f"{int(np.sum(prior_mask))}/{H*W} pixels to visit.")
+        else:
+            remaining_depth = (np.minimum(accessible_raster, z_norm)
+                               - achieved_raster).astype(np.float32)
+
+        # ── Per direction: find which raster lines need revisiting ─
+        for direction in directions:
+
+            # All raster line indices for this direction
+            if direction == "X":
+                all_line_ids = np.arange(0, H, step_px)
+            else:
+                all_line_ids = np.arange(0, W, step_px)
+
+            n_lines = len(all_line_ids)
+
+            # 1-D boolean: does this raster line have any pixel whose
+            # remaining depth exceeds the tolerance?
+            line_needs_cut = np.zeros(n_lines, dtype=bool)
+            for li, idx in enumerate(all_line_ids):
+                if direction == "X":
+                    line_slice = remaining_depth[idx, :]
+                else:
+                    line_slice = remaining_depth[:, idx]
+                line_needs_cut[li] = np.any(line_slice > resid_tol)
+
+            n_active = int(np.sum(line_needs_cut))
+            progress(40 + 40 * pass_idx / n_passes,
+                     f"Pass {pass_idx+1}/{n_passes}, dir={direction} "
+                     f"at z={z_depth_mm:.3f} mm: "
+                     f"{n_active}/{n_lines} raster lines need cutting.")
+
+            if n_active == 0:
+                continue
+
+            # ── Collect all spans across all active raster lines ──
+            all_spans = []
+            for li, idx in enumerate(all_line_ids):
+                if not line_needs_cut[li]:
+                    continue
+                if direction == "X":
+                    line_resid = remaining_depth[idx, :]
+                else:
+                    line_resid = remaining_depth[:, idx]
+                for s, e in mask_spans(line_resid > resid_tol):
+                    all_spans.append((idx, s, e))
+
+            n_spans = len(all_spans)
+            progress(40 + 40 * pass_idx / n_passes,
+                     f"Pass {pass_idx+1}/{n_passes}, dir={direction}: "
+                     f"{n_spans} span(s) to cut across "
+                     f"{n_active} raster line(s).")
+
+            # ── Greedy nearest-endpoint TSP over all spans ─────────
+            def span_endpoints_mm(idx, s, e):
+                """Return (x_s,y_s), (x_e,y_e) for a span in G-code coords."""
+                if direction == "X":
+                    y = (H - 1 - idx) / px_per_mm_y - _oy
+                    return ((s / px_per_mm_x - _ox, y),
+                            (e / px_per_mm_x - _ox, y))
+                else:
+                    x = idx / px_per_mm_x - _ox
+                    return ((x, (H - 1 - s) / px_per_mm_y - _oy),
+                            (x, (H - 1 - e) / px_per_mm_y - _oy))
+
+            unvisited = list(range(n_spans))
+
+            while unvisited:
+                best_i    = 0
+                best_rev  = False
+                best_dist = np.inf
+
+                for ui, si in enumerate(unvisited):
+                    idx, s, e = all_spans[si]
+                    (x_s, y_s), (x_e, y_e) = span_endpoints_mm(idx, s, e)
+                    d_s = np.hypot(x_s - tool_pos[0], y_s - tool_pos[1])
+                    d_e = np.hypot(x_e - tool_pos[0], y_e - tool_pos[1])
+                    if d_s <= d_e:
+                        d, rev = d_s, False
+                    else:
+                        d, rev = d_e, True
+                    if d < best_dist:
+                        best_i, best_rev, best_dist = ui, rev, d
+
+                si = unvisited.pop(best_i)
+                idx, s, e = all_spans[si]
+                px_range = (range(s, e + 1) if not best_rev
+                            else range(e, s - 1, -1))
+
+                points = []
+                for px in px_range:
+                    row, col = ((idx, px) if direction == "X"
+                                else (px, idx))
+                    target = min(accessible_raster[row, col], z_norm)
+                    if target > achieved_raster[row, col]:
+                        achieved_raster[row, col] = target
+                    z_mm = achieved_raster[row, col] * max_depth
+                    x_mm = col / px_per_mm_x - _ox
+                    y_mm = (H - 1 - row) / px_per_mm_y - _oy   # flip: pixel rows go down, G-code Y goes up
+                    points.append((x_mm, y_mm, -z_mm))
+
+                if points:
+                    all_segments.append(('cut', points))
+                    total_segs += 1
+                    tool_pos = np.array([points[-1][0], points[-1][1]])
+
+                    # ── Inline terrain link to next span ──────────
+                    if unvisited:
+                        nxt_best_i    = 0
+                        nxt_best_rev  = False
+                        nxt_best_dist = np.inf
+                        for ui, si2 in enumerate(unvisited):
+                            idx2, s2, e2 = all_spans[si2]
+                            (xs2, ys2), (xe2, ye2) = span_endpoints_mm(
+                                idx2, s2, e2)
+                            d_s2 = np.hypot(xs2 - tool_pos[0],
+                                            ys2 - tool_pos[1])
+                            d_e2 = np.hypot(xe2 - tool_pos[0],
+                                            ye2 - tool_pos[1])
+                            if d_s2 <= d_e2:
+                                d2, rev2 = d_s2, False
+                            else:
+                                d2, rev2 = d_e2, True
+                            if d2 < nxt_best_dist:
+                                nxt_best_i, nxt_best_rev, nxt_best_dist \
+                                    = ui, rev2, d2
+
+                        if nxt_best_dist < link_threshold_mm:
+                            si2      = unvisited[nxt_best_i]
+                            idx2, s2, e2 = all_spans[si2]
+                            (xs2, ys2), (xe2, ye2) = span_endpoints_mm(
+                                idx2, s2, e2)
+                            if not nxt_best_rev:
+                                x_entry = xs2
+                                y_entry = ys2
+                            else:
+                                x_entry = xe2
+                                y_entry = ye2
+
+                            x_exit_lnk = tool_pos[0]
+                            y_exit_lnk = tool_pos[1]
+                            c0 = int(round((x_exit_lnk + _ox) * px_per_mm_x))
+                            r0 = int(round((H - 1) - (y_exit_lnk + _oy) * px_per_mm_y))
+                            c1 = int(round((x_entry    + _ox) * px_per_mm_x))
+                            r1 = int(round((H - 1) - (y_entry    + _oy) * px_per_mm_y))
+
+                            link_points = []
+                            for row_l, col_l in bresenham_pixels(
+                                    r0, c0, r1, c1):
+                                row_l = max(0, min(H - 1, row_l))
+                                col_l = max(0, min(W - 1, col_l))
+                                z_link = min(accessible_raster[row_l, col_l],
+                                             z_norm)
+                                if z_link > achieved_raster[row_l, col_l]:
+                                    achieved_raster[row_l, col_l] = z_link
+                                x_lmm = col_l / px_per_mm_x - _ox
+                                y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy   # flip Y
+                                link_points.append(
+                                    (x_lmm, y_lmm, -z_link * max_depth))
+
+                            if len(link_points) >= 2:
+                                all_segments.append(('link', link_points))
+                                n_links_inserted += 1
+
+                n_links += 1   # count every potential inter-span gap
+
+                if total_segs % max(1, n_spans // 10) == 0:
+                    done = n_spans - len(unvisited)
+                    pct  = 40 + 40 * (pass_idx + done / n_spans) / n_passes
+                    progress(pct,
+                             f"Pass {pass_idx+1}/{n_passes}, "
+                             f"dir={direction}: "
+                             f"{done}/{n_spans} spans cut, "
+                             f"{total_segs} segments total…")
+
+        # remaining_depth is recomputed fresh at the top of each pass
+
+    progress(80, f"Raster complete — {total_segs} cut segments, "
+                 f"{n_links_inserted} terrain links across all passes.")
+
+    progress(80, "Computing tool-swept removal surface (grey dilation)…")
+
+    dil_structure_raster    = -kernel_raster.astype(np.float64)
+    material_removed_raster = np.clip(
+        grey_dilation(
+            achieved_raster.astype(np.float64),
+            footprint = footprint_raster,
+            structure = dil_structure_raster,
+        ).astype(np.float32),
+        0.0, depth_map)   # ceiling: original material present
+
+    residual_raster = np.clip(depth_map - material_removed_raster, 0.0, 1.0
+                       ).astype(np.float32)
+
+    if prior_residual is not None:
+        residual_raster = np.minimum(residual_raster, prior_residual)
+
+    n_skip   = int(np.sum(material_removed_raster >= accessible_raster - resid_tol))
+    pct_done = 100.0 * n_skip / max(1, H * W)
+    label    = "post-refining" if prior_residual is not None else "post-roughing"
+    progress(88, f"{label.capitalize()} residual computed — "
+                 f"{pct_done:.1f}% of pixels at target depth "
+                 f"(within {resid_tol_mm*1000:.1f} µm).")
+
+    # ── Stage 6 · Create ToolPath object (88–100 %) ───────────────
+    progress(88, "Simplifying tool path…")
+    rdp_tol = max(
+        1.0 / px_per_mm_x,
+        1.0 / px_per_mm_y,
+        max_depth / (n_grey_levels - 1),
+    )
+    simplified = [(t, simplify_line(pts, rdp_tol))
+                  for t, pts in all_segments]
+
+    progress(92, "Creating ToolPath object...")
+    toolpath = ToolPath(
+        segments=simplified,
+        residual=residual_raster,
+        result=material_removed_raster,
+        accessible=accessible_raster,
+        metadata={
+            'profile': profile,
+            'radius_mm': radius_mm,
+            'step_mm': step_mm,
+            'stepdown': stepdown,
+            'max_depth': max_depth,
+            'width_cm': width_cm,
+            'height_cm': height_cm,
+            'n_passes': n_passes,
+            'rdp_tolerance': rdp_tol,
+            'link_threshold_mm': link_threshold_mm,
+            'n_links_inserted': n_links_inserted,
+            'n_links_total': n_links,
+        }
+    )
+
+    if prior_residual is not None and prior_resid_tol is not None:
+        toolpath.metadata['refining_threshold_um'] = \
+            prior_resid_tol * max_depth * 1000
+
+    progress(100, "Tool path computation complete!")
+
+    return toolpath
+
+
+def compute_vcarve_toolpath(depth_map, n_grey_levels, accessible,
+                            vbit_angle_deg, max_vcarve_mm, max_depth,
+                            width_cm, height_cm, origin,
+                            feed_rate, threshold_um,
+                            tool_diameter_mm=0.0,
+                            min_feature_width_mm=0.0, progress=None,
+                            prior_residual=None,
+                            stepdown_mm=0.0, final_stepdown_mm=0.0,
+                            skeleton_mode="medial_axis"):
+    """Compute a V-carving toolpath for fine details not reachable by raster.
+
+    Parameters
+    ----------
+    depth_map      : 2-D float32 [0, 1] — 1.0 = max cut depth
+    n_grey_levels  : number of grey levels (for RDP tolerance)
+    accessible     : 2-D float32 [0, 1] tool-accessible surface from prior
+                     raster step, or None to V-carve the full depth map
+    vbit_angle_deg : included angle of V-bit in degrees (e.g. 90)
+    max_vcarve_mm  : maximum V-carve plunge depth in mm (safety limit)
+    max_depth      : total max cut depth in mm (physical scale)
+    width_cm/height_cm : physical image size
+    origin         : G-code origin convention (same as raster step)
+    feed_rate      : mm/min
+    threshold_um   : minimum fine-detail depth in µm; regions shallower
+                     than this are skipped
+    progress       : callable(pct, message)
+    """
+    from math import radians, tan
+    from scipy.ndimage import grey_erosion, distance_transform_edt, label
+
+    _alg_name = ('V-Carving (Voronoi)' if skeleton_mode == 'voronoi'
+                 else 'V-Carving')
+
+    H, W = depth_map.shape
+
+    px_per_mm_x = W / (width_cm  * 10.0)
+    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+
+    W_mm = (W - 1) / px_per_mm_x
+    H_mm = (H - 1) / px_per_mm_y
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm/2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm/2}.get(origin, 0)
+
+    half_angle_rad = radians(vbit_angle_deg / 2.0)
+    tan_half       = tan(half_angle_rad)
+
+    # ── Stage 1 · Fine-detail mask (0–10 %) ───────────────────────
+    progress(0, "Computing fine-detail mask…")
+    if accessible is None:
+        fine_detail = depth_map.copy()
+    else:
+        fine_detail = np.clip(depth_map - accessible, 0.0, 1.0)
+
+    base_residual = prior_residual if prior_residual is not None else depth_map
+
+    threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
+    mask_vcarve    = fine_detail > threshold_norm
+
+    if not np.any(mask_vcarve):
+        progress(100, "No fine-detail regions found — nothing to V-carve.")
+        return ToolPath(
+            segments=[],
+            residual=base_residual.copy(),
+            result=np.zeros_like(depth_map),
+            metadata={'algorithm': _alg_name,
+                      'vbit_angle_deg': vbit_angle_deg,
+                      'max_vcarve_mm': max_vcarve_mm,
+                      'threshold_um': threshold_um,
+                      'max_depth': max_depth}
+        )
+
+    progress(10, f"Fine-detail mask: {np.count_nonzero(mask_vcarve)} pixels.")
+
+    # ── Stage 2 · V-bit accessible surface (10–40 %) ──────────────
+    progress(10, "Building V-bit cone kernel…")
+    cone_reach_mm = max_vcarve_mm * tan_half
+    if tool_diameter_mm > 0.0:
+        cone_reach_mm = min(cone_reach_mm, tool_diameter_mm / 2.0)
+    k_rad_vcarve     = int(np.ceil(cone_reach_mm * px_per_mm))
+    k_rad_vcarve     = max(1, k_rad_vcarve)
+    ky, kx      = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
+    r_px_vcarve      = np.sqrt(kx**2 + ky**2)
+    r_mm_vcarve      = r_px_vcarve / px_per_mm
+    kernel_vcarve    = (r_mm_vcarve / (tan_half * max_depth)).astype(np.float32)
+    footprint_vcarve = r_px_vcarve <= k_rad_vcarve
+
+    progress(20, f"Computing V-bit accessible surface "
+                 f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
+    accessible_vcarve = grey_erosion(
+        depth_map.astype(np.float64),
+        footprint=footprint_vcarve,
+        structure=-kernel_vcarve.astype(np.float64),
+    ).astype(np.float32)
+    accessible_vcarve = np.clip(accessible_vcarve, 0.0, max_vcarve_mm / max_depth)
+    progress(40, "V-bit accessible surface computed.")
+
+    # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
+    if min_feature_width_mm > 0.0:
+        min_half_px = (min_feature_width_mm / 2.0) * px_per_mm
+        mask_dist   = distance_transform_edt(mask_vcarve)
+        mask_vcarve = mask_dist > min_half_px
+        progress(43, f"Mask eroded: features narrower than "
+                     f"{min_feature_width_mm:.2f} mm removed.")
+
+    if skeleton_mode == 'voronoi':
+        progress(45, "Computing Voronoi skeleton…")
+        from scipy.spatial import Voronoi as _Voronoi
+        from skimage.measure import find_contours as _find_contours
+        from scipy.ndimage import gaussian_filter1d as _gauss1d
+
+        raw_contours = _find_contours(mask_vcarve.astype(np.float32), 0.5)
+        sigma = max(1.0, 0.5 * px_per_mm)
+        pts_list = []
+        for c in raw_contours:
+            if len(c) < 4:
+                continue
+            sr = _gauss1d(c[:, 0], sigma=sigma, mode='wrap')
+            sc = _gauss1d(c[:, 1], sigma=sigma, mode='wrap')
+            pts_list.append(np.column_stack((sr, sc)))
+
+        boundary_pts = np.vstack(pts_list) if pts_list else np.empty((0, 2))
+
+        if len(boundary_pts) < 4:
+            skeleton = np.zeros_like(mask_vcarve, dtype=bool)
+        else:
+            vor = _Voronoi(boundary_pts)
+
+            # Opening-angle criterion (Attali & Montanvert 1994):
+            # Each Voronoi ridge separates the regions of two boundary
+            # generators p_i, p_j.  At vertex v the inscribed-circle
+            # radius r satisfies |v-p_i| = |v-p_j| = r, so the
+            # opening angle θ obeys cos(θ) = 1 − d²/(2r²) where
+            # d = |p_i-p_j|.
+            #
+            # Genuine medial-axis ridge: generators are from opposite
+            # sides of the shape → d ≈ 2r → cos(θ) ≈ −1 → θ ≈ π.
+            # Spurious same-side rib: d ≈ 1 pixel, r >> 1 → θ ≈ 0.
+            # Threshold π/3 (cos = 0.5) cleanly separates the two
+            # regardless of shape orientation or staircase boundaries.
+            cos_thr = 0.5           # keep ridges with θ ≥ 60° at both ends
+            verts   = vor.vertices  # float (row, col)
+
+            rv = np.array(vor.ridge_vertices)          # (R, 2)
+            rp = np.array(vor.ridge_points)            # (R, 2)
+            finite = (rv[:, 0] >= 0) & (rv[:, 1] >= 0)
+            rv = rv[finite];  rp = rp[finite]
+
+            pi_arr = boundary_pts[rp[:, 0]]            # (R, 2)
+            pj_arr = boundary_pts[rp[:, 1]]            # (R, 2)
+            d2_arr = np.sum((pi_arr - pj_arr) ** 2, axis=1)   # (R,)
+
+            va = verts[rv[:, 0]]                       # (R, 2)
+            vb = verts[rv[:, 1]]                       # (R, 2)
+            r0sq = np.sum((va - pi_arr) ** 2, axis=1)  # (R,)
+            r1sq = np.sum((vb - pi_arr) ** 2, axis=1)  # (R,)
+            cos0 = np.where(r0sq > 1e-12, 1.0 - d2_arr / (2.0 * r0sq), -1.0)
+            cos1 = np.where(r1sq > 1e-12, 1.0 - d2_arr / (2.0 * r1sq), -1.0)
+
+            keep = (cos0 <= cos_thr) & (cos1 <= cos_thr)
+            va_keep = va[keep]
+            vb_keep = vb[keep]
+
+            skeleton = np.zeros_like(mask_vcarve, dtype=bool)
+            for va_i, vb_i in zip(va_keep, vb_keep):
+                r0f, c0f = va_i;  r1f, c1f = vb_i
+                n = max(3, int(np.ceil(np.hypot(r1f-r0f, c1f-c0f) * 2)) + 1)
+                rs = np.clip(
+                    np.round(np.linspace(r0f, r1f, n)).astype(int), 0, H-1)
+                cs = np.clip(
+                    np.round(np.linspace(c0f, c1f, n)).astype(int), 0, W-1)
+                skeleton[rs, cs] = True
+
+            skeleton &= mask_vcarve & (accessible_vcarve > 0)
+            from skimage.morphology import thin as _thin
+            skeleton = _thin(skeleton)
+    else:
+        from skimage.morphology import medial_axis
+        progress(45, "Computing medial axis…")
+        skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
+        skeleton = skeleton & (accessible_vcarve > 0)
+
+    # ── Compute V-bit swept material removal (for result/residual display) ──
+    from scipy.ndimage import grey_dilation as _grey_dilation
+    dil_structure_vcarve = -kernel_vcarve.astype(np.float64)
+    achieved_vcarve = (accessible_vcarve * skeleton).astype(np.float64)
+    vcarve_cone_depth = _grey_dilation(
+        achieved_vcarve,
+        footprint=footprint_vcarve,
+        structure=dil_structure_vcarve,
+    ).astype(np.float32)
+    accessible_arr = accessible if accessible is not None else np.zeros_like(depth_map)
+    material_removed_vcarve = np.clip(
+        vcarve_cone_depth - accessible_arr, 0.0, fine_detail)
+    residual_vcarve = np.clip(base_residual - material_removed_vcarve,
+                              0.0, 1.0).astype(np.float32)
+
+    if not np.any(skeleton):
+        progress(100, "Skeleton empty — no V-carve moves generated.")
+        return ToolPath(
+            segments=[],
+            residual=residual_vcarve,
+            result=material_removed_vcarve,
+            metadata={'algorithm': _alg_name,
+                      'vbit_angle_deg': vbit_angle_deg,
+                      'max_vcarve_mm': max_vcarve_mm,
+                      'threshold_um': threshold_um,
+                      'max_depth': max_depth}
+        )
+
+    n_skel_px = int(np.count_nonzero(skeleton))
+    progress(60, f"Skeleton: {n_skel_px} pixels, decomposing into branches…")
+
+    # ── Stage 4 · Skeleton branch decomposition + TSP (60–80 %) ───
+    from scipy.ndimage import convolve as ndconvolve
+
+    deg_kernel = np.ones((3, 3), dtype=np.int32)
+    deg_kernel[1, 1] = 0
+    degree_map = ndconvolve(skeleton.astype(np.int32), deg_kernel,
+                            mode='constant', cval=0)
+    degree_map[~skeleton] = 0
+
+    def _nb8(r, c):
+        """Return 8-connected skeleton neighbours of (r, c)."""
+        nb = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W and skeleton[nr, nc]:
+                    nb.append((nr, nc))
+        return nb
+
+    skel_rows, skel_cols = np.where(skeleton)
+    branch_starts = [(int(r), int(c))
+                     for r, c in zip(skel_rows.tolist(), skel_cols.tolist())
+                     if degree_map[r, c] != 2]
+
+    skel_labeled, n_comp = label(skeleton, structure=np.ones((3, 3), dtype=bool))
+    comp_ids_with_start  = {skel_labeled[r, c] for r, c in branch_starts}
+    for comp_id in range(1, n_comp + 1):
+        if comp_id not in comp_ids_with_start:
+            rows_c, cols_c = np.where(skel_labeled == comp_id)
+            branch_starts.append((int(rows_c[0]), int(cols_c[0])))
+
+    branches      = []
+    visited_edges = set()
+
+    for start in branch_starts:
+        for nb in _nb8(*start):
+            edge = frozenset({start, nb})
+            if edge in visited_edges:
+                continue
+            visited_edges.add(edge)
+            branch = [start, nb]
+            prev, cur = start, nb
+            while degree_map[cur] == 2:
+                nexts = [p for p in _nb8(*cur) if p != prev]
+                if not nexts:
+                    break
+                nxt = nexts[0]
+                e2  = frozenset({cur, nxt})
+                if e2 in visited_edges:
+                    break
+                visited_edges.add(e2)
+                branch.append(nxt)
+                prev, cur = cur, nxt
+            branches.append(branch)
+
+    for r, c in zip(skel_rows.tolist(), skel_cols.tolist()):
+        if degree_map[r, c] == 0:
+            branches.append([(int(r), int(c))])
+
+    # Collapse junction pixel clusters
+    junc_mask = degree_map >= 3
+    if junc_mask.any():
+        junc_labeled, n_junc = label(junc_mask,
+                                     structure=np.ones((3, 3), dtype=bool))
+        junc_remap = {}
+        for jid in range(1, n_junc + 1):
+            rows_j, cols_j = np.where(junc_labeled == jid)
+            if len(rows_j) == 1:
+                continue
+            cr, cc = rows_j.mean(), cols_j.mean()
+            dists   = (rows_j - cr) ** 2 + (cols_j - cc) ** 2
+            best    = int(np.argmin(dists))
+            rep     = (int(rows_j[best]), int(cols_j[best]))
+            for r, c in zip(rows_j.tolist(), cols_j.tolist()):
+                if (r, c) != rep:
+                    junc_remap[(r, c)] = rep
+
+        if junc_remap:
+            remapped = []
+            for br in branches:
+                if len(br) == 1:
+                    remapped.append([junc_remap.get(br[0], br[0])])
+                else:
+                    remapped.append(
+                        [junc_remap.get(br[0], br[0])]
+                        + br[1:-1]
+                        + [junc_remap.get(br[-1], br[-1])]
+                    )
+            branches = remapped
+
+    branches = [br for br in branches if not (len(br) <= 2 and br[0] == br[-1])]
+
+    n_branches = len(branches)
+    progress(75, f"Path ordering: {n_branches} branch(es).")
+
+    # Greedy nearest-endpoint TSP ordering of branches.
+    vcarve_link_mm  = 2.0 / min(px_per_mm_x, px_per_mm_y)
+    ordered_branches = []
+    tool_pos         = np.array([0.0, 0.0])
+    remaining        = list(range(n_branches))
+
+    while remaining:
+        best_idx  = None
+        best_dist = float('inf')
+        best_rev  = False
+        for i in remaining:
+            path = branches[i]
+            sr, sc = path[0]
+            er, ec = path[-1]
+            x_s = sc / px_per_mm_x - _ox
+            y_s = (H - 1 - sr) / px_per_mm_y - _oy
+            x_e = ec / px_per_mm_x - _ox
+            y_e = (H - 1 - er) / px_per_mm_y - _oy
+            d_s = float(np.hypot(x_s - tool_pos[0], y_s - tool_pos[1]))
+            d_e = float(np.hypot(x_e - tool_pos[0], y_e - tool_pos[1]))
+            if d_s <= d_e:
+                d, rev = d_s, False
+            else:
+                d, rev = d_e, True
+            if d < best_dist:
+                best_dist, best_idx, best_rev = d, i, rev
+
+        remaining.remove(best_idx)
+        path = branches[best_idx]
+        if best_rev:
+            path = list(reversed(path))
+        ordered_branches.append(path)
+
+        er, ec = path[-1]
+        tool_pos[0] = ec / px_per_mm_x - _ox
+        tool_pos[1] = (H - 1 - er) / px_per_mm_y - _oy
+
+    progress(80, f"Ordered {len(ordered_branches)} branches.")
+
+    # ── Stage 5 · Multi-pass segment building (80–90 %) ──────────
+
+    def _build_pass_segments(branches_ordered, depth_fn):
+        """Build cut segments from ordered branches using depth_fn(r,c).
+
+        depth_fn returns the Z cut depth in mm (negative) for a pixel, or
+        None to skip it. Contiguous included pixels form sub-segments;
+        adjacent sub-segments within vcarve_link_mm are chained together.
+        """
+        segs = []
+        for branch in branches_ordered:
+            sub = []
+            for r, c in branch:
+                z = depth_fn(r, c)
+                if z is None:
+                    if sub:
+                        segs.append(['cut', sub])
+                        sub = []
+                    continue
+                x = c / px_per_mm_x - _ox
+                y = (H - 1 - r) / px_per_mm_y - _oy
+                sub.append((x, y, z))
+            if sub:
+                if segs:
+                    dx = sub[0][0] - segs[-1][1][-1][0]
+                    dy = sub[0][1] - segs[-1][1][-1][1]
+                    if (dx * dx + dy * dy) ** 0.5 < vcarve_link_mm:
+                        segs[-1][1].extend(sub)
+                        continue
+                segs.append(['cut', sub])
+        return segs
+
+    all_segments = []
+
+    if stepdown_mm <= 0.0:
+        def _depth_single(r, c):
+            return -accessible_vcarve[r, c] * max_depth
+        all_segments = _build_pass_segments(ordered_branches, _depth_single)
+    else:
+        final_norm = final_stepdown_mm / max_depth
+        sd_norm    = stepdown_mm / max_depth
+
+        skel_rows, skel_cols = np.where(skeleton)
+        if len(skel_rows):
+            max_roughable_norm = float(
+                (accessible_vcarve[skel_rows, skel_cols] - final_norm)
+                .clip(min=0).max()
+            )
+        else:
+            max_roughable_norm = 0.0
+
+        if max_roughable_norm > 0 and sd_norm > 0:
+            n_rough = max(1, int(np.ceil(max_roughable_norm / sd_norm)))
+            pass_ceilings = [
+                min((i + 1) * sd_norm, max_roughable_norm)
+                for i in range(n_rough)
+            ]
+        else:
+            pass_ceilings = []
+
+        prev_ceiling = 0.0
+        for ceiling_norm in pass_ceilings:
+            _pc = prev_ceiling
+            _cn = ceiling_norm
+            _fn = final_norm
+
+            def _depth_rough(r, c, _pc=_pc, _cn=_cn, _fn=_fn):
+                roughing_target = accessible_vcarve[r, c] - _fn
+                if roughing_target <= _pc:
+                    return None
+                return -min(roughing_target, _cn) * max_depth
+
+            all_segments.extend(
+                _build_pass_segments(ordered_branches, _depth_rough)
+            )
+            prev_ceiling = ceiling_norm
+
+        if final_stepdown_mm > 0.0:
+            def _depth_final(r, c):
+                return -accessible_vcarve[r, c] * max_depth
+            all_segments.extend(
+                _build_pass_segments(ordered_branches, _depth_final)
+            )
+
+    progress(90, f"Generated {len(all_segments)} segments across all passes.")
+
+    # ── Stage 6 · Simplify and assemble ToolPath (90–100 %) ───────
+    progress(90, "Simplifying tool path (RDP)…")
+    rdp_tol = max(
+        1.0 / px_per_mm_x,
+        1.0 / px_per_mm_y,
+        max_depth / (n_grey_levels - 1),
+    )
+    simplified = [(t, simplify_line(pts, rdp_tol))
+                  for t, pts in all_segments]
+
+    progress(95, "Creating ToolPath object…")
+    toolpath = ToolPath(
+        segments=simplified,
+        residual=residual_vcarve,
+        result=material_removed_vcarve,
+        accessible=None,
+        metadata={
+            'algorithm':       _alg_name,
+            'vbit_angle_deg':  vbit_angle_deg,
+            'max_vcarve_mm':         max_vcarve_mm,
+            'min_feature_width_mm':  min_feature_width_mm,
+            'threshold_um':          threshold_um,
+            'stepdown_mm':           stepdown_mm,
+            'final_stepdown_mm':     final_stepdown_mm,
+            'max_depth':       max_depth,
+            'width_cm':        width_cm,
+            'height_cm':       height_cm,
+            'n_branches':      n_branches,
+            'rdp_tolerance':   rdp_tol,
+        }
+    )
+    progress(100, "V-carve tool path computation complete!")
+    return toolpath
