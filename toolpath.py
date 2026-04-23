@@ -7,12 +7,34 @@ from typing import List, Tuple
 class ToolPath:
     """Structured representation of a computed tool path."""
 
-    # Each segment is (type, points), e.g.:
-    # [("cut", [(0.0, 0.0, 5.0), (1.0, 2.0, 5.0)]), ("rapid", [(1.0, 2.0, 5.0), (3.0, 4.0, 5.0)]), ...]
+    # Ordered list of motion segments. Each entry is (type, points) where type is
+    # "cut" (feed-rate carving move), "link" (low terrain bridge — no retract), or
+    # "rapid" (air move at safe Z); points is a list of (x, y, z) mm triples.
     segments: List[Tuple[str, List[Tuple[float, float, float]]]] = field(default_factory=list)
+
+    # 2-D float32 array (same shape as depth_map, values in [0, 1]) representing
+    # how much material remains *above* the target surface after this pass at each
+    # pixel — i.e. depth_map minus depth actually removed, in the same normalised
+    # depth units as depth_map (1.0 = max_depth mm).  Non-zero where the tool
+    # could not reach, e.g. because step-down capped the pass.
+    # Pass this as `prior_residual` to the next compute_*_toolpath call so that
+    # step only generates spans over pixels that still have material left, avoiding
+    # redundant air-cutting.  None if the caller did not request residual tracking.
     residual: np.ndarray = None
-    result: np.ndarray = None        # material actually removed by this step [0,1]
-    accessible: np.ndarray = None   # tool-accessible surface from Stage 2; used by V-carve steps
+
+    # 2-D float32 array (same shape as depth_map, values in [0, 1]): depth of
+    # material actually removed by this pass at each pixel, in the same normalised
+    # depth units as depth_map (1.0 = max_depth mm).
+    result: np.ndarray = None
+
+    # 2-D float32 array (same shape as depth_map, values in [0, 1]): the
+    # theoretical depth limit the tool can reach at each pixel given its geometry,
+    # computed via grey-erosion of depth_map (Stage 2).  Equivalent to what the
+    # tool would achieve with infinitely dense raster lines.  Used as the per-pixel
+    # cut target in raster passes and to determine where the V-bit can engage in
+    # V-carve passes.
+    accessible: np.ndarray = None
+
     metadata: dict = field(default_factory=dict)
 
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
