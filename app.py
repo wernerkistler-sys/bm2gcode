@@ -294,10 +294,6 @@ class GCodeGeneratorApp:
         vbit_angle.pack(fill=tk.X, pady=2)
         step['vbit_angle'] = vbit_angle
 
-        max_vcarve = LabeledEntry(vcarve_frame, "Max V-carve depth", "mm", DEFAULTS["step_max_vcarve"])
-        max_vcarve.pack(fill=tk.X, pady=2)
-        step['max_vcarve'] = max_vcarve
-
         vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
         vcarve_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_stepdown'] = vcarve_stepdown
@@ -370,7 +366,6 @@ class GCodeGeneratorApp:
         step['threshold'].set(DEFAULTS["step_threshold"])
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
         step['vbit_angle'].set(DEFAULTS["step_vbit_angle"])
-        step['max_vcarve'].set(DEFAULTS["step_max_vcarve"])
         step['min_fw'].set(DEFAULTS["step_min_fw"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
@@ -562,7 +557,6 @@ class GCodeGeneratorApp:
             if algorithm.startswith("V-Carving"):
                 vcarve_profile   = step['profile_var'].get()
                 vbit_angle_deg   = float(step['vbit_angle'].get()) if vcarve_profile != "Ball" else 90.0
-                max_vcarve_mm    = float(step['max_vcarve'].get())
                 min_feature_width_mm = float(step['min_fw'].get())
                 diam_mm          = float(step['diameter'].get())
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
@@ -606,7 +600,6 @@ class GCodeGeneratorApp:
                         work_surface   = accessible_prior,
                         prior_residual = prior_residual_tp,
                         vbit_angle_deg = vbit_angle_deg,
-                        max_vcarve_mm  = max_vcarve_mm,
                         tool_diameter_mm = diam_mm,
                         max_depth      = max_depth,
                         width_cm       = width_cm,

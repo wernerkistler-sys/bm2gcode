@@ -505,7 +505,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
 
 
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
-                            vbit_angle_deg, max_vcarve_mm, max_depth,
+                            vbit_angle_deg, max_depth,
                             width_cm, height_cm,
                             origin="Bottom-Left",
                             feed_rate=800.0,
@@ -523,7 +523,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     depth_map             : 2-D float32 [0, 1] — 1.0 = max cut depth
     n_grey_levels         : number of grey levels (for RDP tolerance)
     vbit_angle_deg        : included angle of V-bit in degrees (e.g. 90)
-    max_vcarve_mm         : maximum V-carve plunge depth in mm (safety limit)
     max_depth             : total max cut depth in mm (physical scale)
     width_cm              : physical image width in cm
     height_cm             : physical image height in cm
@@ -593,7 +592,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             result=np.zeros_like(depth_map),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': vbit_angle_deg,
-                      'max_vcarve_mm': max_vcarve_mm,
                       'threshold_um': threshold_um,
                       'max_depth': max_depth}
         )
@@ -623,13 +621,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             footprint=footprint_vcarve,
             structure=-kernel_vcarve.astype(np.float64),
         ).astype(np.float32)
-        accessible_vcarve = np.clip(accessible_vcarve, 0.0,
-                                    min(max_vcarve_mm, R_mm) / max_depth)
+        accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
     else:  # V-Bit
         progress(10, "Building V-bit cone kernel…")
         half_angle_rad = radians(vbit_angle_deg / 2.0)
         tan_half = tan(half_angle_rad)
-        cone_reach_mm = max_vcarve_mm * tan_half
+        cone_reach_mm = max_depth * tan_half
         if tool_diameter_mm > 0.0:
             cone_reach_mm = min(cone_reach_mm, tool_diameter_mm / 2.0)
         k_rad_vcarve = max(1, int(np.ceil(cone_reach_mm * px_per_mm)))
@@ -645,7 +642,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             footprint=footprint_vcarve,
             structure=-kernel_vcarve.astype(np.float64),
         ).astype(np.float32)
-        accessible_vcarve = np.clip(accessible_vcarve, 0.0, max_vcarve_mm / max_depth)
+        accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
     progress(40, "Accessible surface computed.")
 
     # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
@@ -756,7 +753,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             result=material_removed_vcarve,
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': vbit_angle_deg,
-                      'max_vcarve_mm': max_vcarve_mm,
                       'threshold_um': threshold_um,
                       'max_depth': max_depth}
         )
@@ -1006,7 +1002,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'algorithm':       _alg_name,
             'profile':         profile,
             'vbit_angle_deg':  vbit_angle_deg,
-            'max_vcarve_mm':         max_vcarve_mm,
             'min_feature_width_mm':  min_feature_width_mm,
             'threshold_um':          threshold_um,
             'stepdown_mm':           stepdown_mm,
