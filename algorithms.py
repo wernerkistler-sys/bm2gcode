@@ -98,6 +98,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
                             origin="Bottom-Left",
                             feed_rate=800.0,
                             work_surface=None, work_surface_tol=None,
+                            prior_residual=None,
                             progress=None, profile="End Mill"):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
@@ -124,6 +125,14 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
     work_surface_tol  : threshold (normalised [0,1]) applied to work_surface.
                         0.0 (default) visits every pixel; higher values skip
                         pixels where the prior work is already shallow.
+    prior_residual    : optional 2-D float32 [0,1] actual residual from a
+                        prior step, used as the ceiling when computing the
+                        output residual.  When None (default) work_surface
+                        is used as the ceiling instead — which is correct
+                        when work_surface already represents the prior
+                        material state, but should be set explicitly when
+                        work_surface is a geometric profile rather than
+                        the true remaining-material map.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     profile           : "Ball" | "End Mill" | others treated as End Mill
 
@@ -453,8 +462,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
     residual_raster = np.clip(depth_map - material_removed_raster, 0.0, 1.0
                        ).astype(np.float32)
 
-    if work_surface is not None:
-        residual_raster = np.minimum(residual_raster, work_surface)
+    residual_ceiling = prior_residual if prior_residual is not None else work_surface
+    residual_raster  = np.minimum(residual_raster, residual_ceiling)
 
     n_skip   = int(np.sum(material_removed_raster >= accessible_raster - resid_tol))
     pct_done = 100.0 * n_skip / max(1, H * W)

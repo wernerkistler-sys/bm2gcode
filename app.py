@@ -307,7 +307,7 @@ class GCodeGeneratorApp:
         feed.pack(fill=tk.X, pady=2)
         step['feed_rate'] = feed
 
-        threshold = LabeledEntry(frame, "Threshold", "mm", DEFAULTS["step_threshold"])
+        threshold = LabeledEntry(frame, "Z-threshold", "mm", DEFAULTS["step_threshold"])
         threshold.pack(fill=tk.X, pady=2)
         step['threshold'] = threshold
 
