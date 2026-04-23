@@ -603,7 +603,7 @@ class GCodeGeneratorApp:
                     result = compute_vcarve_toolpath(
                         depth_map      = depth_map,
                         n_grey_levels  = n_grey_levels,
-                        accessible     = accessible_prior,
+                        work_surface   = accessible_prior,
                         prior_residual = prior_residual_tp,
                         vbit_angle_deg = vbit_angle_deg,
                         max_vcarve_mm  = max_vcarve_mm,
@@ -653,7 +653,7 @@ class GCodeGeneratorApp:
             # ── Raster scan ─────────────────────────────────────────────
             # Prior residual: ones (flat stock) for first step, previous otherwise
             if idx == 0:
-                prior_residual = None   # treats entire depth map as unfinished
+                work_surface = None   # treats entire depth map as unfinished
             elif self.toolpaths[idx - 1] is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
@@ -661,11 +661,11 @@ class GCodeGeneratorApp:
                         "Without its residual this step will treat the entire "
                         "depth map as unfinished.\n\nContinue anyway?"):
                     return
-                prior_residual = None
+                work_surface = None
             else:
-                prior_residual = self.toolpaths[idx - 1].residual.copy()
+                work_surface = self.toolpaths[idx - 1].residual.copy()
 
-            prior_resid_tol = threshold_mm / max_depth if max_depth else 0.0
+            work_surface_tol = threshold_mm / max_depth if max_depth else 0.0
 
             step_mm = diam_mm * stepover / 100.0
             profile = step['profile_var'].get()
@@ -679,14 +679,14 @@ class GCodeGeneratorApp:
                         radius_mm       = diam_mm / 2.0,
                         profile         = profile,
                         step_mm         = step_mm,
-                        stepdown        = stepdown,
+                        stepdown_mm     = stepdown,
                         max_depth       = max_depth,
                         width_cm        = width_cm,
                         height_cm       = float(self.height_cm.get()),
                         raster_dir      = step['raster_dir_var'].get(),
                         origin          = self.origin_var.get(),
-                        prior_residual  = prior_residual,
-                        prior_resid_tol = prior_resid_tol,
+                        work_surface    = work_surface,
+                        work_surface_tol= work_surface_tol,
                         feed_rate       = feed_rate,
                         progress        = dlg.report,
                     )
