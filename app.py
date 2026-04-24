@@ -13,7 +13,7 @@ from constants import (
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import ProgressDialog, LabeledEntry, SectionFrame, _fmt_time
-from algorithms import compute_raster_toolpath, compute_vcarve_toolpath
+from algorithms import compute_raster_toolpath, compute_vcarve_toolpath, compute_contour_toolpath
 
 
 class GCodeGeneratorApp:
@@ -302,6 +302,16 @@ class GCodeGeneratorApp:
         vcarve_final_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_final_stepdown'] = vcarve_final_stepdown
 
+        # ── Contour-only controls (hidden unless Contour algorithm) ───────
+        contour_frame = ttk.Frame(frame)
+        step['contour_frame'] = contour_frame
+        # (not packed initially — shown on demand by _on_algorithm_changed)
+
+        contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
+                                        DEFAULTS["step_contour_stepdown"])
+        contour_stepdown.pack(fill=tk.X, pady=2)
+        step['contour_stepdown'] = contour_stepdown
+
         # ── Shared controls ────────────────────────────────────────────
         feed = LabeledEntry(frame, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
         feed.pack(fill=tk.X, pady=2)
@@ -336,13 +346,23 @@ class GCodeGeneratorApp:
             alg = algorithm_var.get()
             if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
+                step['contour_frame'].pack_forget()
                 step['vcarve_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if step['profile_var'].get() not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
+            elif alg == "Contour":
+                step['raster_frame'].pack_forget()
+                step['vcarve_frame'].pack_forget()
+                step['min_fw'].pack_forget()
+                step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
+                if step['profile_var'].get() not in _RASTER_PROFILES:
+                    step['profile_var'].set("Ball")
             else:
                 step['vcarve_frame'].pack_forget()
+                step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
@@ -369,6 +389,7 @@ class GCodeGeneratorApp:
         step['min_fw'].set(DEFAULTS["step_min_fw"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
+        step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
 
     # ------------------------------------------------------------------ #
     #  Right panel: image canvas + display-mode selector
@@ -561,6 +582,9 @@ class GCodeGeneratorApp:
                 diam_mm          = float(step['diameter'].get())
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
                 vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
+            elif algorithm == "Contour":
+                diam_mm          = float(step['diameter'].get())
+                contour_stepdown = float(step['contour_stepdown'].get())
             else:
                 diam_mm  = float(step['diameter'].get())
                 stepover = float(step['stepover'].get())
@@ -615,6 +639,70 @@ class GCodeGeneratorApp:
                                                 else "medial_axis"),
                         profile              = vcarve_profile,
                         progress             = dlg.report,
+                    )
+                except ProgressDialog.Cancelled:
+                    self.root.after(0, lambda: dlg.close("Cancelled."))
+                    return
+                except Exception as exc:
+                    self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
+                    self.root.after(0, lambda e=exc: messagebox.showerror(
+                        "Computation error", str(e)))
+                    return
+
+                def _done():
+                    self.toolpaths[idx] = result
+                    result.metadata['feed_rate'] = feed_rate
+                    stats = result.get_stats(feed_rate=feed_rate)
+                    dlg.close("Completed.")
+                    step['info_var'].set(
+                        f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+                        f"Est. time: {_fmt_time(stats['est_minutes'])}"
+                        f" @ {feed_rate:.0f} mm/min")
+                    self.display_mode_var.set(DISPLAY_STEP_3D)
+                    self.display_step_var.set(idx + 1)
+                    self._on_display_mode_changed()
+
+                self.root.after(0, _done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        elif algorithm == "Contour":
+            # ── Contour (waterline) ─────────────────────────────────────
+            if idx == 0:
+                work_surface   = None
+                prior_residual = None
+            elif self.toolpaths[idx - 1] is None:
+                if not messagebox.askyesno(
+                        "Previous step not computed",
+                        f"Step {idx} has not been computed yet.\n\n"
+                        "Without its residual this step will treat the entire "
+                        "depth map as unfinished.\n\nContinue anyway?"):
+                    return
+                work_surface   = None
+                prior_residual = None
+            else:
+                work_surface   = self.toolpaths[idx - 1].residual.copy()
+                prior_residual = self.toolpaths[idx - 1].residual.copy()
+
+            profile = step['profile_var'].get()
+
+            def _worker():
+                try:
+                    depth_map, n_grey_levels = self._get_depth_map()
+                    result = compute_contour_toolpath(
+                        depth_map      = depth_map,
+                        n_grey_levels  = n_grey_levels,
+                        radius_mm      = diam_mm / 2.0,
+                        stepdown_mm    = contour_stepdown,
+                        max_depth      = max_depth,
+                        width_cm       = width_cm,
+                        height_cm      = float(self.height_cm.get()),
+                        origin         = self.origin_var.get(),
+                        feed_rate      = feed_rate,
+                        work_surface   = work_surface,
+                        prior_residual = prior_residual,
+                        progress       = dlg.report,
+                        profile        = profile,
                     )
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))

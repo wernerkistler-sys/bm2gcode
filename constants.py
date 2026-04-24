@@ -1,6 +1,6 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
 RASTER_DIRECTIONS = ["X", "Y", "Both"]
-ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)"]
+ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)", "Contour"]
 
 DEFAULTS = {
     "width_cm":          "10.0",
@@ -22,6 +22,8 @@ DEFAULTS = {
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
     "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
+    # Contour-specific defaults
+    "step_contour_stepdown":      "1.0", # Z increment between contour levels (mm)
 }
 
 DISPLAY_ORIGINAL    = "Original"

@@ -1024,3 +1024,228 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     )
     progress(100, "V-carve tool path computation complete!")
     return toolpath
+
+
+def compute_contour_toolpath(
+    depth_map, n_grey_levels,
+    radius_mm, stepdown_mm, max_depth,
+    width_cm, height_cm,
+    origin="Bottom-Left",
+    feed_rate=800.0,
+    work_surface=None,
+    prior_residual=None,
+    progress=None,
+    profile="End Mill",
+):
+    """Compute a waterline (contour) tool path from a normalised depth map.
+
+    The accessible depth surface is sliced at evenly-spaced Z-levels separated
+    by *stepdown_mm*.  At each level the iso-depth contour lines are extracted
+    and emitted as cut segments, giving a layer-by-layer waterline strategy.
+    To account for tool geometry, the accessible surface is first computed by
+    grey-eroding the depth map with the tool profile kernel.
+
+    Parameters
+    ----------
+    depth_map : 2-D float32 array, values in [0, 1]
+        Normalised depth map; 1.0 = maximum cut depth.
+    n_grey_levels : int
+        Number of grey levels in the source image (used for RDP tolerance).
+    radius_mm : float
+        Tool radius in mm.
+    stepdown_mm : float
+        Z increment between contour levels in mm.
+    max_depth : float
+        Total maximum cut depth in mm.
+    width_cm, height_cm : float
+        Physical dimensions of the work area in cm.
+    origin : str
+        G-code origin convention ("Bottom-Left", "Top-Left", etc.).
+    feed_rate : float
+        Cutting feed rate in mm/min.
+    work_surface : 2-D float32 array, values in [0, 1], or None
+        Reserved for future use (analogous to raster's *work_surface*).
+        Currently ignored; the accessible surface is always computed from
+        *depth_map*.
+    prior_residual : 2-D float32 array, values in [0, 1], or None
+        Actual residual from a prior step; used as the ceiling for the output
+        residual.  When None, *depth_map* is used.
+    progress : callable(pct, message)
+        Thread-safe progress reporter.
+    profile : str
+        Tool profile — "End Mill" (flat bottom) or "Ball" (spherical cap).
+
+    Returns
+    -------
+    ToolPath
+    """
+    import math
+    from scipy.ndimage import grey_erosion, grey_dilation
+    from skimage.measure import find_contours
+
+    H, W = depth_map.shape
+
+    px_per_mm_x = W / (width_cm  * 10.0)
+    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+
+    W_mm = (W - 1) / px_per_mm_x
+    H_mm = (H - 1) / px_per_mm_y
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm / 2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm / 2}.get(origin, 0)
+
+    # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
+    progress(0, "Building tool geometry kernel…")
+    k_rad = max(1, int(np.ceil(radius_mm * px_per_mm)))
+    ksize = 2 * k_rad + 1
+    ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
+    r_px   = np.sqrt(kx**2 + ky**2)
+
+    if profile == "Ball":
+        r_mm = r_px / px_per_mm
+        with np.errstate(invalid="ignore"):
+            cap = radius_mm - np.sqrt(np.maximum(0.0, radius_mm**2 - r_mm**2))
+        cap[r_px > k_rad] = 1e9
+    else:
+        cap = np.where(r_px <= k_rad, 0.0, 1e9).astype(np.float64)
+
+    kernel    = (cap / max_depth).astype(np.float32)
+    footprint = (r_px <= k_rad)
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+
+    # ── Stage 2 · Accessible surface (10–35 %) ────────────────────────────
+    progress(10, "Computing tool-accessible surface (morphological erosion)…")
+    structure = -kernel.astype(np.float64)
+    accessible = grey_erosion(depth_map.astype(np.float64),
+                              footprint=footprint,
+                              structure=structure).astype(np.float32)
+    accessible = np.clip(accessible, 0.0, 1.0)
+    progress(35, "Tool-accessible surface computed.")
+
+    # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
+    progress(35, "Planning contour levels…")
+    n_passes = max(1, math.ceil(max_depth / stepdown_mm))
+    z_levels = [min(i * stepdown_mm / max_depth, 1.0)
+                for i in range(1, n_passes + 1)]
+    progress(40, f"{n_passes} contour level{'s' if n_passes != 1 else ''}  "
+                 f"({stepdown_mm:.2f} mm each).")
+
+    # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
+    rdp_tol = max(1.0 / px_per_mm_x,
+                  1.0 / px_per_mm_y,
+                  max_depth / (n_grey_levels - 1))
+
+    all_segments    = []
+    all_contours_px = []   # (z_norm, ri, ci) tuples for Stage 5
+    current_pos     = np.array([0.0, 0.0])
+
+    for pass_idx, z_norm in enumerate(z_levels):
+        progress(40 + 40 * pass_idx // n_passes,
+                 f"Extracting contours at Z = {-z_norm * max_depth:.3f} mm…")
+        z_mm = -z_norm * max_depth
+
+        raw_contours = find_contours(accessible, z_norm)
+        contours     = [c for c in raw_contours if len(c) >= 3]
+        if not contours:
+            continue
+
+        # Greedy nearest-neighbour ordering across contours at this Z-level.
+        # For closed contours any rotation of the loop is valid, so we sample
+        # candidate start points; for open contours only the two endpoints are
+        # considered (flip=True covers the other end).
+        remaining = contours[:]
+        while remaining:
+            best_idx  = 0
+            best_flip = False
+            best_rot  = 0
+            best_dist = float('inf')
+
+            for i, c in enumerate(remaining):
+                n         = len(c)
+                is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
+                rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
+                for flip in (False, True):
+                    orient = c[::-1] if flip else c
+                    for j in rot_cands:
+                        row0, col0 = orient[j]
+                        x0 = col0 / px_per_mm_x - _ox
+                        y0 = (H - 1 - row0) / px_per_mm_y - _oy
+                        d  = (x0 - current_pos[0])**2 + (y0 - current_pos[1])**2
+                        if d < best_dist:
+                            best_dist = d
+                            best_idx  = i
+                            best_flip = flip
+                            best_rot  = j
+
+            c_chosen  = remaining.pop(best_idx)
+            is_closed = np.linalg.norm(c_chosen[0] - c_chosen[-1]) < 1.5
+            if best_flip:
+                c_chosen = c_chosen[::-1]
+            if best_rot > 0:
+                c_chosen = np.roll(c_chosen, -best_rot, axis=0)
+            if is_closed:
+                c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
+
+            points = [(col / px_per_mm_x - _ox,
+                       (H - 1 - row) / px_per_mm_y - _oy,
+                       z_mm)
+                      for row, col in c_chosen]
+            points = simplify_line(points, rdp_tol)
+            if len(points) < 2:
+                continue
+
+            all_segments.append(('cut', points))
+            for row, col in c_chosen:
+                all_contours_px.append((z_norm,
+                                        int(round(float(row))),
+                                        int(round(float(col)))))
+            last = points[-1]
+            current_pos[0] = last[0]
+            current_pos[1] = last[1]
+
+    progress(80, f"Contour segments built ({len(all_segments)} segments).")
+
+    # ── Stage 5 · Residual computation (80–90 %) ──────────────────────────
+    progress(80, "Computing residual…")
+    achieved = np.zeros_like(depth_map, dtype=np.float32)
+    for z_norm, ri, ci in all_contours_px:
+        if 0 <= ri < H and 0 <= ci < W:
+            if achieved[ri, ci] < z_norm:
+                achieved[ri, ci] = z_norm
+
+    material_removed = np.clip(
+        grey_dilation(achieved.astype(np.float64),
+                      footprint=footprint,
+                      structure=-kernel.astype(np.float64)).astype(np.float32),
+        0.0, depth_map)
+
+    ceiling  = prior_residual if prior_residual is not None else depth_map
+    residual = np.clip(ceiling - material_removed, 0.0, 1.0)
+    result   = material_removed
+    progress(90, "Residual computed.")
+
+    # ── Stage 6 · Assemble ToolPath (90–100 %) ────────────────────────────
+    progress(90, "Assembling tool path…")
+    tp = ToolPath(
+        segments=all_segments,
+        residual=residual,
+        result=result,
+        accessible=accessible,
+        metadata={
+            'algorithm':     'Contour',
+            'profile':       profile,
+            'max_depth':     max_depth,
+            'radius_mm':     radius_mm,
+            'stepdown_mm':   stepdown_mm,
+            'n_passes':      n_passes,
+            'width_cm':      width_cm,
+            'height_cm':     height_cm,
+            'rdp_tolerance': rdp_tol,
+        }
+    )
+    progress(100, "Contour tool path computation complete!")
+    return tp
