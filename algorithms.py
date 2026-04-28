@@ -92,6 +92,50 @@ def simplify_line(points, tol):
     return [points[i] for i in range(N) if keep[i]]
 
 
+def _build_kernel(profile, px_per_mm, max_depth,
+                  vbit_angle_deg=0.0, tool_diameter_mm=0.0):
+    """Return (kernel, footprint) for morphological grey erosion.
+
+    kernel    : float32 2-D array, depth offsets normalised to max_depth
+    footprint : bool 2-D array, True where the tool can contact material
+    """
+    from math import radians, tan
+
+    R_mm = tool_diameter_mm / 2.0
+
+    if profile == "Ball":
+        k_rad = max(1, int(np.ceil(R_mm * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
+        r_px = np.sqrt(kx**2 + ky**2)
+        r_mm = r_px / px_per_mm
+        with np.errstate(invalid="ignore"):
+            cap = R_mm - np.sqrt(np.maximum(0.0, R_mm**2 - r_mm**2))
+        cap[r_px > k_rad] = 1e9
+        kernel    = (cap / max_depth).astype(np.float32)
+        footprint = r_px <= k_rad
+    elif profile == "V-Bit":
+        half_angle_rad = radians(vbit_angle_deg / 2.0)
+        tan_half = tan(half_angle_rad)
+        cone_reach_mm = max_depth * tan_half
+        if tool_diameter_mm > 0.0:
+            cone_reach_mm = min(cone_reach_mm, R_mm)
+        k_rad = max(1, int(np.ceil(cone_reach_mm * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
+        r_px = np.sqrt(kx**2 + ky**2)
+        r_mm = r_px / px_per_mm
+        kernel    = (r_mm / (tan_half * max_depth)).astype(np.float32)
+        footprint = r_px <= k_rad
+    else:  # End Mill: flat bottom, vertical walls
+        k_rad = max(1, int(np.ceil(R_mm * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
+        r_px = np.sqrt(kx**2 + ky**2)
+        cap = np.where(r_px <= k_rad, 0.0, 1e9).astype(np.float64)
+        kernel    = (cap / max_depth).astype(np.float32)
+        footprint = r_px <= k_rad
+
+    return kernel, footprint
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
@@ -166,29 +210,13 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
 
     # ── Stage 1 · Build tool kernel_raster (0–10 %) ──────────────────────
     progress(0, "Building tool geometry kernel…")
-    k_rad_raster = max(1, int(np.ceil(radius_mm * px_per_mm)))
-    ksize = 2 * k_rad_raster + 1
-    ky, kx = np.mgrid[-k_rad_raster:k_rad_raster+1, -k_rad_raster:k_rad_raster+1]
-    r_px_raster = np.sqrt(kx**2 + ky**2)              # pixel radius from centre
-
-    if profile == "Ball":
-        # Spherical cap: z_offset = R − sqrt(R² − r²)  for r ≤ R, else +∞
-        r_mm_raster = r_px_raster / px_per_mm
-        with np.errstate(invalid="ignore"):
-            cap = radius_mm - np.sqrt(np.maximum(0.0,
-                                      radius_mm**2 - r_mm_raster**2))
-        cap[r_px_raster > k_rad_raster] = 1e9              # outside tool radius → wall
-    else:
-        # End Mill: flat bottom, vertical walls
-        cap = np.where(r_px_raster <= k_rad_raster, 0.0, 1e9).astype(np.float64)
-
-    # Normalise kernel_raster to depth-map units [0,1]
-    kernel_raster = (cap / max_depth).astype(np.float32)
+    kernel_raster, footprint_raster = _build_kernel(
+        profile, px_per_mm, max_depth, tool_diameter_mm=radius_mm * 2)
+    ksize = kernel_raster.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
 
     # ── Stage 2 · Compute tool-accessible_raster depth surface (10–35 %) ─
     progress(10, "Computing tool-accessible surface (morphological erosion)…")
-    footprint_raster = (r_px_raster <= k_rad_raster)
     structure = -kernel_raster.astype(np.float64)   # erosion subtracts structure
 
     accessible_raster = grey_erosion(depth_map.astype(np.float64),
@@ -560,7 +588,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     -------
     ToolPath
     """
-    from math import radians, tan
     from scipy.ndimage import grey_erosion, distance_transform_edt, label
 
     _alg_name = ('V-Carving (Voronoi)' if skeleton_mode == 'voronoi'
@@ -607,51 +634,25 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     progress(10, f"Fine-detail mask: {np.count_nonzero(mask_vcarve)} pixels.")
 
-    # ── Stage 2 · Tool-accessible surface (10–40 %) ───────────────
-    if profile == "Ball":
-        if tool_diameter_mm <= 0.0:
-            raise ValueError("Ball profile requires a positive tool diameter.")
-        R_mm = tool_diameter_mm / 2.0
-        k_rad_vcarve = max(1, int(np.ceil(R_mm * px_per_mm)))
-        ky, kx = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
-        r_px_vcarve = np.sqrt(kx**2 + ky**2)
-        r_mm_vcarve = r_px_vcarve / px_per_mm
-        footprint_vcarve = r_mm_vcarve <= R_mm
-        with np.errstate(invalid='ignore'):
-            kernel_vcarve = np.where(
-                r_mm_vcarve <= R_mm,
-                (R_mm - np.sqrt(np.maximum(0.0, R_mm**2 - r_mm_vcarve**2))) / max_depth,
-                0.0,
-            ).astype(np.float32)
-        progress(20, f"Computing ball accessible surface "
-                     f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
-        accessible_vcarve = grey_erosion(
-            depth_map.astype(np.float64),
-            footprint=footprint_vcarve,
-            structure=-kernel_vcarve.astype(np.float64),
-        ).astype(np.float32)
-        accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
-    else:  # V-Bit
-        progress(10, "Building V-bit cone kernel…")
-        half_angle_rad = radians(vbit_angle_deg / 2.0)
-        tan_half = tan(half_angle_rad)
-        cone_reach_mm = max_depth * tan_half
-        if tool_diameter_mm > 0.0:
-            cone_reach_mm = min(cone_reach_mm, tool_diameter_mm / 2.0)
-        k_rad_vcarve = max(1, int(np.ceil(cone_reach_mm * px_per_mm)))
-        ky, kx = np.mgrid[-k_rad_vcarve:k_rad_vcarve+1, -k_rad_vcarve:k_rad_vcarve+1]
-        r_px_vcarve = np.sqrt(kx**2 + ky**2)
-        r_mm_vcarve = r_px_vcarve / px_per_mm
-        kernel_vcarve = (r_mm_vcarve / (tan_half * max_depth)).astype(np.float32)
-        footprint_vcarve = r_px_vcarve <= k_rad_vcarve
-        progress(20, f"Computing V-bit accessible surface "
-                     f"(kernel {2*k_rad_vcarve+1}×{2*k_rad_vcarve+1} px)…")
-        accessible_vcarve = grey_erosion(
-            depth_map.astype(np.float64),
-            footprint=footprint_vcarve,
-            structure=-kernel_vcarve.astype(np.float64),
-        ).astype(np.float32)
-        accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
+    # ── Stage 2a · Build tool kernel (10–20 %) ────────────────────
+    progress(10, "Building tool geometry kernel…")
+    if profile == "Ball" and tool_diameter_mm <= 0.0:
+        raise ValueError("Ball profile requires a positive tool diameter.")
+    kernel_vcarve, footprint_vcarve = _build_kernel(
+        profile, px_per_mm, max_depth,
+        vbit_angle_deg=vbit_angle_deg,
+        tool_diameter_mm=tool_diameter_mm)
+    ksize = kernel_vcarve.shape[0]
+    progress(20, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+
+    # ── Stage 2b · Tool-accessible surface (20–40 %) ──────────────
+    progress(20, "Computing tool-accessible surface (morphological erosion)…")
+    accessible_vcarve = grey_erosion(
+        depth_map.astype(np.float64),
+        footprint=footprint_vcarve,
+        structure=-kernel_vcarve.astype(np.float64),
+    ).astype(np.float32)
+    accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
     progress(40, "Accessible surface computed.")
 
     # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
@@ -1100,21 +1101,9 @@ def compute_contour_toolpath(
 
     # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
     progress(0, "Building tool geometry kernel…")
-    k_rad = max(1, int(np.ceil(radius_mm * px_per_mm)))
-    ksize = 2 * k_rad + 1
-    ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
-    r_px   = np.sqrt(kx**2 + ky**2)
-
-    if profile == "Ball":
-        r_mm = r_px / px_per_mm
-        with np.errstate(invalid="ignore"):
-            cap = radius_mm - np.sqrt(np.maximum(0.0, radius_mm**2 - r_mm**2))
-        cap[r_px > k_rad] = 1e9
-    else:
-        cap = np.where(r_px <= k_rad, 0.0, 1e9).astype(np.float64)
-
-    kernel    = (cap / max_depth).astype(np.float32)
-    footprint = (r_px <= k_rad)
+    kernel, footprint = _build_kernel(
+        profile, px_per_mm, max_depth, tool_diameter_mm=radius_mm * 2)
+    ksize = kernel.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
 
     # ── Stage 2 · Accessible surface (10–35 %) ────────────────────────────
