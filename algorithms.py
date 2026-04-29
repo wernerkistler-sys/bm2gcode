@@ -142,7 +142,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
                             origin="Bottom-Left",
                             feed_rate=800.0,
                             work_surface=None, work_surface_tol=None,
-                            prior_residual=None,
+                            previous_result=None,
                             progress=None, profile="End Mill"):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
@@ -169,14 +169,10 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
     work_surface_tol  : threshold (normalised [0,1]) applied to work_surface.
                         0.0 (default) visits every pixel; higher values skip
                         pixels where the prior work is already shallow.
-    prior_residual    : optional 2-D float32 [0,1] actual residual from a
-                        prior step, used as the ceiling when computing the
-                        output residual.  When None (default) work_surface
-                        is used as the ceiling instead — which is correct
-                        when work_surface already represents the prior
-                        material state, but should be set explicitly when
-                        work_surface is a geometric profile rather than
-                        the true remaining-material map.
+    previous_result   : optional 2-D float32 [0,1] cumulative result from a
+                        prior step (i.e. ToolPath.result), used as the ceiling
+                        when computing the output result.  When None (default)
+                        work_surface is used as the ceiling instead.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     profile           : "Ball" | "End Mill" | others treated as End Mill
 
@@ -490,7 +486,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
     residual_raster = np.clip(depth_map - material_removed_raster, 0.0, 1.0
                        ).astype(np.float32)
 
-    residual_ceiling = prior_residual if prior_residual is not None else work_surface
+    residual_ceiling = (np.clip(depth_map - previous_result, 0.0, 1.0)
+                        if previous_result is not None else work_surface)
     residual_raster  = np.minimum(residual_raster, residual_ceiling)
 
     n_skip   = int(np.sum(material_removed_raster >= accessible_raster - resid_tol))
@@ -550,7 +547,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             min_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
-                            work_surface=None, prior_residual=None,
+                            work_surface=None, previous_result=None,
                             progress=None, profile="V-Bit"):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
@@ -577,9 +574,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             residual from a prior step, or the geometric residual
                             of a prior tool's profile.  None (default) treats the
                             full depth_map as unfinished.
-    prior_residual        : optional 2-D float32 [0,1] actual residual from a
-                            prior step, used to initialise the output residual
-                            correctly.  None defaults to depth_map.
+    previous_result       : optional 2-D float32 [0,1] cumulative result from a
+                            prior step (i.e. ToolPath.result), used as the ceiling
+                            when computing the output result.  None defaults to depth_map.
     progress              : callable(pct, message) — thread-safe progress reporter
     profile               : "V-Bit" | "Ball"
 
@@ -614,7 +611,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         fine_detail = np.clip(depth_map - work_surface, 0.0, 1.0)
 
-    base_residual = prior_residual if prior_residual is not None else depth_map
+    base_residual = (np.clip(depth_map - previous_result, 0.0, 1.0)
+                     if previous_result is not None else depth_map)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
     mask_vcarve    = fine_detail > threshold_norm
@@ -1030,7 +1028,7 @@ def compute_contour_toolpath(
     origin="Bottom-Left",
     feed_rate=800.0,
     work_surface=None,
-    prior_residual=None,
+    previous_result=None,
     progress=None,
     profile="End Mill",
 ):
@@ -1064,9 +1062,9 @@ def compute_contour_toolpath(
         Reserved for future use (analogous to raster's *work_surface*).
         Currently ignored; the accessible surface is always computed from
         *depth_map*.
-    prior_residual : 2-D float32 array, values in [0, 1], or None
-        Actual residual from a prior step; used as the ceiling for the output
-        residual.  When None, *depth_map* is used.
+    previous_result : 2-D float32 array, values in [0, 1], or None
+        Cumulative result from a prior step (i.e. ToolPath.result); used as the
+        ceiling for the output result.  When None, *depth_map* is used.
     progress : callable(pct, message)
         Thread-safe progress reporter.
     profile : str
@@ -1208,7 +1206,8 @@ def compute_contour_toolpath(
                       structure=-kernel.astype(np.float64)).astype(np.float32),
         0.0, depth_map)
 
-    ceiling  = prior_residual if prior_residual is not None else depth_map
+    ceiling  = (np.clip(depth_map - previous_result, 0.0, 1.0)
+                if previous_result is not None else depth_map)
     residual = np.clip(ceiling - material_removed, 0.0, 1.0)
     progress(90, "Residual computed.")
 

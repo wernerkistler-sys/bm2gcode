@@ -618,13 +618,11 @@ class GCodeGeneratorApp:
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
-                    prior_residual_tp = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
-                                         if _prev_tp is not None else None)
                     result = compute_vcarve_toolpath(
-                        depth_map      = depth_map,
-                        n_grey_levels  = n_grey_levels,
-                        work_surface   = accessible_prior,
-                        prior_residual = prior_residual_tp,
+                        depth_map       = depth_map,
+                        n_grey_levels   = n_grey_levels,
+                        work_surface    = accessible_prior,
+                        previous_result = _prev_tp.result if _prev_tp is not None else None,
                         vbit_angle_deg = vbit_angle_deg,
                         tool_diameter_mm = diam_mm,
                         max_depth      = max_depth,
@@ -688,22 +686,19 @@ class GCodeGeneratorApp:
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
-                    if _prev_tp is not None:
-                        _prev_residual = np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
-                    else:
-                        _prev_residual = None
                     result = compute_contour_toolpath(
-                        depth_map      = depth_map,
-                        n_grey_levels  = n_grey_levels,
-                        radius_mm      = diam_mm / 2.0,
-                        stepdown_mm    = contour_stepdown,
-                        max_depth      = max_depth,
-                        width_cm       = width_cm,
-                        height_cm      = float(self.height_cm.get()),
-                        origin         = self.origin_var.get(),
-                        feed_rate      = feed_rate,
-                        work_surface   = _prev_residual,
-                        prior_residual = _prev_residual,
+                        depth_map       = depth_map,
+                        n_grey_levels   = n_grey_levels,
+                        radius_mm       = diam_mm / 2.0,
+                        stepdown_mm     = contour_stepdown,
+                        max_depth       = max_depth,
+                        width_cm        = width_cm,
+                        height_cm       = float(self.height_cm.get()),
+                        origin          = self.origin_var.get(),
+                        feed_rate       = feed_rate,
+                        work_surface    = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
+                                           if _prev_tp is not None else None),
+                        previous_result = _prev_tp.result if _prev_tp is not None else None,
                         progress       = dlg.report,
                         profile        = profile,
                     )
