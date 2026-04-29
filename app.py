@@ -599,8 +599,8 @@ class GCodeGeneratorApp:
 
         if algorithm.startswith("V-Carving"):
             # Retrieve accessible surface and residual from previous raster step
-            accessible_prior  = None
-            prior_residual_tp = None
+            accessible_prior = None
+            _prev_tp         = None
             if idx == 0:
                 pass   # no prior step — V-carve the full depth map
             elif self.toolpaths[idx - 1] is None:
@@ -612,12 +612,14 @@ class GCodeGeneratorApp:
                         "Continue anyway?"):
                     return
             else:
-                accessible_prior  = self.toolpaths[idx - 1].accessible
-                prior_residual_tp = self.toolpaths[idx - 1].residual
+                accessible_prior = self.toolpaths[idx - 1].accessible
+                _prev_tp         = self.toolpaths[idx - 1]
 
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
+                    prior_residual_tp = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
+                                         if _prev_tp is not None else None)
                     result = compute_vcarve_toolpath(
                         depth_map      = depth_map,
                         n_grey_levels  = n_grey_levels,
@@ -669,8 +671,7 @@ class GCodeGeneratorApp:
         elif algorithm == "Contour":
             # ── Contour (waterline) ─────────────────────────────────────
             if idx == 0:
-                work_surface   = None
-                prior_residual = None
+                _prev_tp = None
             elif self.toolpaths[idx - 1] is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
@@ -678,17 +679,19 @@ class GCodeGeneratorApp:
                         "Without its residual this step will treat the entire "
                         "depth map as unfinished.\n\nContinue anyway?"):
                     return
-                work_surface   = None
-                prior_residual = None
+                _prev_tp = None
             else:
-                work_surface   = self.toolpaths[idx - 1].residual.copy()
-                prior_residual = self.toolpaths[idx - 1].residual.copy()
+                _prev_tp = self.toolpaths[idx - 1]
 
             profile = step['profile_var'].get()
 
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
+                    if _prev_tp is not None:
+                        _prev_residual = np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
+                    else:
+                        _prev_residual = None
                     result = compute_contour_toolpath(
                         depth_map      = depth_map,
                         n_grey_levels  = n_grey_levels,
@@ -699,8 +702,8 @@ class GCodeGeneratorApp:
                         height_cm      = float(self.height_cm.get()),
                         origin         = self.origin_var.get(),
                         feed_rate      = feed_rate,
-                        work_surface   = work_surface,
-                        prior_residual = prior_residual,
+                        work_surface   = _prev_residual,
+                        prior_residual = _prev_residual,
                         progress       = dlg.report,
                         profile        = profile,
                     )
@@ -732,19 +735,18 @@ class GCodeGeneratorApp:
 
         else:
             # ── Raster scan ─────────────────────────────────────────────
-            # Prior residual: ones (flat stock) for first step, previous otherwise
             if idx == 0:
-                work_surface = None   # treats entire depth map as unfinished
+                _prev_tp = None
             elif self.toolpaths[idx - 1] is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
                         f"Step {idx} has not been computed yet.\n\n"
-                        "Without its residual this step will treat the entire "
+                        "Without its result this step will treat the entire "
                         "depth map as unfinished.\n\nContinue anyway?"):
                     return
-                work_surface = None
+                _prev_tp = None
             else:
-                work_surface = self.toolpaths[idx - 1].residual.copy()
+                _prev_tp = self.toolpaths[idx - 1]
 
             work_surface_tol = threshold_mm / max_depth if max_depth else 0.0
 
@@ -754,6 +756,8 @@ class GCodeGeneratorApp:
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
+                    work_surface = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
+                                    if _prev_tp is not None else None)
                     result = compute_raster_toolpath(
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
@@ -826,12 +830,12 @@ class GCodeGeneratorApp:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(gcode)
             elif ext == "csv":
-                np.savetxt(path, toolpath.residual, delimiter=",")
+                np.savetxt(path, toolpath.result, delimiter=",")
             elif ext == "png":
                 import matplotlib
-                matplotlib.image.imsave(path, toolpath.residual, cmap="gray")
+                matplotlib.image.imsave(path, toolpath.result, cmap="gray")
             else:
-                np.save(path, toolpath.residual)
+                np.save(path, toolpath.result)
             self.status_var.set(f"Saved: {path}")
         except Exception as exc:
             messagebox.showerror("Save error", str(exc))
@@ -1065,8 +1069,9 @@ class GCodeGeneratorApp:
         if mode == DISPLAY_STEP_RES:
             tp = (self.toolpaths[step_idx]
                   if 0 <= step_idx < len(self.toolpaths) else None)
-            if tp is not None:
-                img   = tp.residual
+            if tp is not None and tp.result is not None:
+                depth_map, _ = self._get_depth_map()
+                img   = np.clip(depth_map - tp.result, 0.0, 1.0).astype(np.float32)
                 cmap  = "hot"
                 title = f"Step {step_idx + 1} Residual"
             else:
@@ -1075,9 +1080,8 @@ class GCodeGeneratorApp:
         elif mode == DISPLAY_STEP_RESULT:
             tp = (self.toolpaths[step_idx]
                   if 0 <= step_idx < len(self.toolpaths) else None)
-            if tp is not None and tp.residual is not None:
-                depth_map, _ = self._get_depth_map()
-                img   = np.clip(depth_map - tp.residual, 0.0, 1.0).astype(np.float32)
+            if tp is not None and tp.result is not None:
+                img   = tp.result
                 # Invert so that deeper cuts appear darker when z=0 is white
                 cmap  = "gray_r" if self.surface.get() == "white" else "gray"
                 title = f"Step {step_idx + 1} Result"

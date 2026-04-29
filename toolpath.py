@@ -12,19 +12,11 @@ class ToolPath:
     # "rapid" (air move at safe Z); points is a list of (x, y, z) mm triples.
     segments: List[Tuple[str, List[Tuple[float, float, float]]]] = field(default_factory=list)
 
-    # 2-D float32 array (same shape as depth_map, values in [0, 1]) representing
-    # how much material remains *above* the target surface after this pass at each
-    # pixel — i.e. depth_map minus depth actually removed, in the same normalised
-    # depth units as depth_map (1.0 = max_depth mm).  Non-zero where the tool
-    # could not reach, e.g. because step-down capped the pass.
-    # Pass this as `prior_residual` to the next compute_*_toolpath call so that
-    # step only generates spans over pixels that still have material left, avoiding
-    # redundant air-cutting.  None if the caller did not request residual tracking.
-    residual: np.ndarray = None
-
-    # 2-D float32 array (same shape as depth_map, values in [0, 1]): depth of
-    # material actually removed by this pass at each pixel, in the same normalised
-    # depth units as depth_map (1.0 = max_depth mm).
+    # 2-D float32 array (same shape as depth_map, values in [0, 1]): cumulative
+    # depth achieved across all passes up to and including this one, in the same
+    # normalised depth units as depth_map (1.0 = max_depth mm).  Equals
+    # depth_map minus the remaining material.  Pass depth_map − result as
+    # `prior_residual` / `work_surface` to the next compute_*_toolpath call.
     result: np.ndarray = None
 
     # 2-D float32 array (same shape as depth_map, values in [0, 1]): the
