@@ -475,13 +475,13 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
     progress(80, "Computing tool-swept removal surface (grey dilation)…")
 
     dil_structure_raster    = -kernel_raster.astype(np.float64)
-    material_removed_raster = np.clip(
+    material_removed_raster = np.maximum(
         grey_dilation(
             achieved_raster.astype(np.float64),
             footprint = footprint_raster,
             structure = dil_structure_raster,
         ).astype(np.float32),
-        0.0, 1.0)   # sanity check
+        0.0)
 
     residual_raster = np.clip(depth_map - material_removed_raster, 0.0, 1.0
                        ).astype(np.float32)
@@ -611,9 +611,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         fine_detail = np.clip(depth_map - work_surface, 0.0, 1.0)
 
-    base_residual = (np.clip(depth_map - previous_result, 0.0, 1.0)
-                     if previous_result is not None else depth_map)
-
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
     mask_vcarve    = fine_detail > threshold_norm
 
@@ -621,7 +618,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         progress(100, "No fine-detail regions found — nothing to V-carve.")
         return ToolPath(
             segments=[],
-            result=np.clip(depth_map - base_residual, 0.0, 1.0).astype(np.float32),
+            result=(previous_result.copy() if previous_result is not None
+                    else np.zeros_like(depth_map, dtype=np.float32)),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': vbit_angle_deg,
                       'threshold_um': threshold_um,
@@ -746,16 +744,16 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         structure=dil_structure_vcarve,
     ).astype(np.float32)
     accessible_arr = work_surface if work_surface is not None else np.zeros_like(depth_map)
-    material_removed_vcarve = np.clip(
-        vcarve_cone_depth - accessible_arr, 0.0, fine_detail)
-    residual_vcarve = np.clip(base_residual - material_removed_vcarve,
-                              0.0, 1.0).astype(np.float32)
+    material_removed_vcarve = np.maximum(
+        vcarve_cone_depth - accessible_arr, 0.0)
 
     if not np.any(skeleton):
         progress(100, "Skeleton empty — no V-carve moves generated.")
         return ToolPath(
             segments=[],
-            result=np.clip(depth_map - residual_vcarve, 0.0, 1.0).astype(np.float32),
+            result=np.maximum(
+                previous_result if previous_result is not None else 0.0,
+                accessible_arr + material_removed_vcarve).astype(np.float32),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': vbit_angle_deg,
                       'threshold_um': threshold_um,
@@ -1000,7 +998,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(95, "Creating ToolPath object…")
     toolpath = ToolPath(
         segments=simplified,
-        result=np.clip(depth_map - residual_vcarve, 0.0, 1.0).astype(np.float32),
+        result=np.maximum(
+            previous_result if previous_result is not None else 0.0,
+            accessible_arr + material_removed_vcarve).astype(np.float32),
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
@@ -1200,22 +1200,22 @@ def compute_contour_toolpath(
             if achieved[ri, ci] < z_norm:
                 achieved[ri, ci] = z_norm
 
-    material_removed = np.clip(
+    material_removed = np.maximum(
         grey_dilation(achieved.astype(np.float64),
                       footprint=footprint,
                       structure=-kernel.astype(np.float64)).astype(np.float32),
-        0.0, depth_map)
+        0.0)
 
-    ceiling  = (np.clip(depth_map - previous_result, 0.0, 1.0)
-                if previous_result is not None else depth_map)
-    residual = np.clip(ceiling - material_removed, 0.0, 1.0)
-    progress(90, "Residual computed.")
+    result = np.maximum(
+        previous_result if previous_result is not None else 0.0,
+        material_removed).astype(np.float32)
+    progress(90, "Result computed.")
 
     # ── Stage 6 · Assemble ToolPath (90–100 %) ────────────────────────────
     progress(90, "Assembling tool path…")
     tp = ToolPath(
         segments=all_segments,
-        result=np.clip(depth_map - residual, 0.0, 1.0).astype(np.float32),
+        result=result,
         accessible=accessible,
         metadata={
             'algorithm':     'Contour',
