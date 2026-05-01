@@ -352,12 +352,16 @@ class GCodeGeneratorApp:
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
-                step['vbit_frame'].pack_forget()
                 step['min_fw'].pack_forget()
-                step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
+                if profile == "V-Bit":
+                    step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['contour_frame'].pack(fill=tk.X, after=step['vbit_frame'])
+                else:
+                    step['vbit_frame'].pack_forget()
+                    step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
@@ -588,8 +592,10 @@ class GCodeGeneratorApp:
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
                 vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
             elif algorithm == "Contour":
-                tool             = Tool(step['profile_var'].get(),
-                                        float(step['diameter'].get()))
+                _profile    = step['profile_var'].get()
+                _vbit_angle = (float(step['vbit_angle'].get())
+                               if _profile == "V-Bit" else 0.0)
+                tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
                 contour_stepdown = float(step['contour_stepdown'].get())
             else:
                 _profile   = step['profile_var'].get()
