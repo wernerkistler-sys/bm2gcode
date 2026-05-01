@@ -929,9 +929,8 @@ class GCodeGeneratorApp:
         z_safe = 5.0  # must match to_gcode default
         rapids = []
         cuts   = []
-        links  = []
         prev_end = None
-        for typ, pts in toolpath.segments:
+        for pts in toolpath.segments:
             if not pts:
                 continue
             if prev_end is not None and prev_end != pts[0]:
@@ -943,10 +942,7 @@ class GCodeGeneratorApp:
                     (nx, ny, z_safe),    # traverse at safe height
                     (nx, ny, nz),        # plunge
                 ])
-            if typ == 'cut':
-                cuts.append(pts)
-            elif typ == 'link':
-                links.append(pts)
+            cuts.append(pts)
             prev_end = pts[-1]
 
         # ── Rebuild figure with a 3D axes ─────────────────────────────
@@ -994,7 +990,6 @@ class GCodeGeneratorApp:
 
         add_segments(rapids, "#ff0000",   1.0, 1.0, 'Rapids')
         add_segments(cuts,   "#61b970ff", 1.0, 1.0, 'Cut moves')
-        add_segments(links,  "#0026ff",   1.0, 1.0, 'Terrain links')
 
         # ── Axis labels & style ────────────────────────────────────────
         self.ax.set_xlabel('X (mm)', color='#aaaaaa', labelpad=6)

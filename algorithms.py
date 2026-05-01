@@ -392,7 +392,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     points.append((x_mm, y_mm, -z_mm))
 
                 if points:
-                    all_segments.append(('cut', points))
+                    all_segments.append(points)
                     total_segs += 1
                     tool_pos = np.array([points[-1][0], points[-1][1]])
 
@@ -451,7 +451,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                                     (x_lmm, y_lmm, -z_link * max_depth))
 
                             if len(link_points) >= 2:
-                                all_segments.append(('link', link_points))
+                                all_segments.append(link_points)
                                 n_links_inserted += 1
 
                 n_links += 1   # count every potential inter-span gap
@@ -502,8 +502,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         1.0 / px_per_mm_y,
         max_depth / (n_grey_levels - 1),
     )
-    simplified = [(t, simplify_line(pts, rdp_tol))
-                  for t, pts in all_segments]
+    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
 
     progress(92, "Creating ToolPath object...")
     toolpath = ToolPath(
@@ -907,7 +906,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 z = depth_fn(r, c)
                 if z is None:
                     if sub:
-                        segs.append(['cut', sub])
+                        segs.append(sub)
                         sub = []
                     continue
                 x = c / px_per_mm_x - _ox
@@ -915,12 +914,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 sub.append((x, y, z))
             if sub:
                 if segs:
-                    dx = sub[0][0] - segs[-1][1][-1][0]
-                    dy = sub[0][1] - segs[-1][1][-1][1]
+                    dx = sub[0][0] - segs[-1][-1][0]
+                    dy = sub[0][1] - segs[-1][-1][1]
                     if (dx * dx + dy * dy) ** 0.5 < vcarve_link_mm:
-                        segs[-1][1].extend(sub)
+                        segs[-1].extend(sub)
                         continue
-                segs.append(['cut', sub])
+                segs.append(sub)
         return segs
 
     all_segments = []
@@ -984,8 +983,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         1.0 / px_per_mm_y,
         max_depth / (n_grey_levels - 1),
     )
-    simplified = [(t, simplify_line(pts, rdp_tol))
-                  for t, pts in all_segments]
+    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
 
     progress(95, "Creating ToolPath object…")
     toolpath = ToolPath(
@@ -1169,7 +1167,7 @@ def compute_contour_toolpath(
             if len(points) < 2:
                 continue
 
-            all_segments.append(('cut', points))
+            all_segments.append(points)
             for row, col in c_chosen:
                 all_contours_px.append((z_norm,
                                         int(round(float(row))),

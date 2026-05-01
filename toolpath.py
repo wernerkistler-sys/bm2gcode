@@ -7,10 +7,10 @@ from typing import List, Tuple
 class ToolPath:
     """Structured representation of a computed tool path."""
 
-    # Ordered list of motion segments. Each entry is (type, points) where type is
-    # "cut" (feed-rate carving move), "link" (low terrain bridge — no retract), or
-    # "rapid" (air move at safe Z); points is a list of (x, y, z) mm triples.
-    segments: List[Tuple[str, List[Tuple[float, float, float]]]] = field(default_factory=list)
+    # Ordered list of motion segments. Each entry is a list of (x, y, z) mm
+    # triples. Consecutive segments whose endpoints touch are bridged at feed
+    # rate (no retract); a gap triggers retract → rapid → plunge.
+    segments: List[List[Tuple[float, float, float]]] = field(default_factory=list)
 
     # 2-D float32 array (same shape as depth_map, values in [0, 1]): cumulative
     # depth achieved across all passes up to and including this one, in the same
@@ -31,11 +31,11 @@ class ToolPath:
 
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
         """Compute statistics from the path segments."""
-        cut_dist = rapid_dist = link_dist = 0.0
+        cut_dist = rapid_dist = 0.0
         motion_count = 0
         prev_end = None
 
-        for seg_type, points in self.segments:
+        for points in self.segments:
             if not points:
                 continue
 
@@ -53,22 +53,17 @@ class ToolPath:
                 for i in range(len(points) - 1):
                     x0, y0, z0 = points[i]
                     x1, y1, z1 = points[i + 1]
-                    dist = ((x1-x0)**2 + (y1-y0)**2 + (z1-z0)**2) ** 0.5
-                    if seg_type == 'link':
-                        link_dist += dist
-                    else:  # 'cut'
-                        cut_dist += dist
+                    cut_dist += ((x1-x0)**2 + (y1-y0)**2 + (z1-z0)**2) ** 0.5
 
             prev_end = points[-1]
 
-        est_minutes = (cut_dist + link_dist) / max(feed_rate, 1.0) + \
+        est_minutes = cut_dist / max(feed_rate, 1.0) + \
                       rapid_dist / max(feed_rapid, 1.0)
 
         return {
             'motion_count': motion_count,
             'cut_distance_mm': cut_dist,
             'rapid_distance_mm': rapid_dist,
-            'link_distance_mm': link_dist,
             'est_minutes': est_minutes
         }
 
@@ -114,7 +109,6 @@ class ToolPath:
             f"; Total motion lines: {stats['motion_count']}",
             f"; Cut distance: {stats['cut_distance_mm']:.0f} mm",
             f"; Rapid distance: {stats['rapid_distance_mm']:.0f} mm",
-            f"; Link distance: {stats['link_distance_mm']:.0f} mm",
             f"; Estimated time: {fmt_time(stats['est_minutes'])} "
             f"@ {feed_rate:.0f} mm/min",
             "",
@@ -126,39 +120,31 @@ class ToolPath:
             "",
         ]
 
-        prev_end = None   # (x, y) of the last emitted cut/link endpoint
+        prev_end = None   # (x, y) of the last emitted endpoint
         at_safe  = True   # tool starts at z_safe after preamble
 
-        for seg_type, points in self.segments:
+        for points in self.segments:
             if not points:
                 continue
 
             x0, y0, z0 = points[0]
 
-            if seg_type == 'link':
-                lines.append("; --- terrain link ---")
-                for x, y, z in points:
-                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
-                prev_end = (points[-1][0], points[-1][1])
-                at_safe  = False
+            needs_rapid = (
+                prev_end is None
+                or abs(prev_end[0] - x0) > 1e-4
+                or abs(prev_end[1] - y0) > 1e-4
+            )
+            if needs_rapid:
+                if not at_safe:
+                    lines.append(f"G0 Z{z_safe:.3f}  ; retract")
+                lines.append(f"G0 X{x0:.3f} Y{y0:.3f}  ; rapid to span start")
+                lines.append(f"G1 Z{z0:.3f} F{feed_rate}  ; plunge")
+                at_safe = False
 
-            else:  # 'cut'
-                needs_rapid = (
-                    prev_end is None
-                    or abs(prev_end[0] - x0) > 1e-4
-                    or abs(prev_end[1] - y0) > 1e-4
-                )
-                if needs_rapid:
-                    if not at_safe:
-                        lines.append(f"G0 Z{z_safe:.3f}  ; retract")
-                    lines.append(f"G0 X{x0:.3f} Y{y0:.3f}  ; rapid to span start")
-                    lines.append(f"G1 Z{z0:.3f} F{feed_rate}  ; plunge")
-                    at_safe = False
+            for x, y, z in points[1:]:
+                lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
 
-                for x, y, z in points[1:]:
-                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
-
-                prev_end = (points[-1][0], points[-1][1])
+            prev_end = (points[-1][0], points[-1][1])
 
         lines += [
             "",
