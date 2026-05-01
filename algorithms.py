@@ -1,4 +1,5 @@
 import numpy as np
+from tool import Tool
 from toolpath import ToolPath
 
 
@@ -92,8 +93,7 @@ def simplify_line(points, tol):
     return [points[i] for i in range(N) if keep[i]]
 
 
-def _build_kernel(profile, px_per_mm, max_depth,
-                  vbit_angle_deg=0.0, tool_diameter_mm=0.0):
+def _build_kernel(tool, px_per_mm, max_depth):
     """Return (kernel, footprint) for morphological grey erosion.
 
     kernel    : float32 2-D array, depth offsets normalised to max_depth
@@ -101,9 +101,9 @@ def _build_kernel(profile, px_per_mm, max_depth,
     """
     from math import radians, tan
 
-    R_mm = tool_diameter_mm / 2.0
+    R_mm = tool.diameter_mm / 2.0
 
-    if profile == "Ball":
+    if tool.profile == "Ball":
         k_rad = max(1, int(np.ceil(R_mm * px_per_mm)))
         ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
         r_px = np.sqrt(kx**2 + ky**2)
@@ -113,11 +113,11 @@ def _build_kernel(profile, px_per_mm, max_depth,
         cap[r_px > k_rad] = 1e9
         kernel    = (cap / max_depth).astype(np.float32)
         footprint = r_px <= k_rad
-    elif profile == "V-Bit":
-        half_angle_rad = radians(vbit_angle_deg / 2.0)
+    elif tool.profile == "V-Bit":
+        half_angle_rad = radians(tool.vbit_angle_deg / 2.0)
         tan_half = tan(half_angle_rad)
         cone_reach_mm = max_depth * tan_half
-        if tool_diameter_mm > 0.0:
+        if tool.diameter_mm > 0.0:
             cone_reach_mm = min(cone_reach_mm, R_mm)
         k_rad = max(1, int(np.ceil(cone_reach_mm * px_per_mm)))
         ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
@@ -136,21 +136,21 @@ def _build_kernel(profile, px_per_mm, max_depth,
     return kernel, footprint
 
 
-def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
+def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
                             origin="Bottom-Left",
                             feed_rate=800.0,
                             work_surface=None, work_surface_tol=None,
                             previous_result=None,
-                            progress=None, profile="End Mill"):
+                            progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
     Parameters
     ----------
     depth_map         : 2-D float32 [0, 1]  — 1.0 = max cut depth (intaglio)
     n_grey_levels     : number of grey levels in source image (e.g. 256)
-    radius_mm         : tool radius in mm
+    tool              : Tool — encapsulates profile, diameter_mm, vbit_angle_deg
     step_mm           : lateral step-over in mm
     stepdown_mm       : max depth increment per z-pass in mm
     max_depth         : total maximum cut depth in mm
@@ -174,7 +174,6 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
                         when computing the output result.  When None (default)
                         work_surface is used as the ceiling instead.
     progress          : callable(pct, subtask) — thread-safe progress reporter
-    profile           : "Ball" | "End Mill" | others treated as End Mill
 
     Returns
     -------
@@ -206,10 +205,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
 
     # ── Stage 1 · Build tool kernel_raster (0–10 %) ──────────────────────
     progress(0, "Building tool geometry kernel…")
-    kernel_raster, footprint_raster = _build_kernel(
-        profile, px_per_mm, max_depth, tool_diameter_mm=radius_mm * 2)
+    kernel_raster, footprint_raster = _build_kernel(tool, px_per_mm, max_depth)
     ksize = kernel_raster.shape[0]
-    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2 · Compute tool-accessible_raster depth surface (10–35 %) ─
     progress(10, "Computing tool-accessible surface (morphological erosion)…")
@@ -513,8 +511,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
         result=np.clip(depth_map - residual_raster, 0.0, 1.0).astype(np.float32),
         accessible=accessible_raster,
         metadata={
-            'profile': profile,
-            'radius_mm': radius_mm,
+            'profile': tool.profile,
+            'radius_mm': tool.diameter_mm / 2,
             'step_mm': step_mm,
             'stepdown_mm': stepdown_mm,
             'max_depth': max_depth,
@@ -538,24 +536,23 @@ def compute_raster_toolpath(depth_map, n_grey_levels, radius_mm,
 
 
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
-                            vbit_angle_deg, max_depth,
+                            tool, max_depth,
                             width_cm, height_cm,
                             origin="Bottom-Left",
                             feed_rate=800.0,
                             threshold_um=0.0,
-                            tool_diameter_mm=0.0,
                             min_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
                             work_surface=None, previous_result=None,
-                            progress=None, profile="V-Bit"):
+                            progress=None):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
     Parameters
     ----------
     depth_map             : 2-D float32 [0, 1] — 1.0 = max cut depth
     n_grey_levels         : number of grey levels (for RDP tolerance)
-    vbit_angle_deg        : included angle of V-bit in degrees (e.g. 90)
+    tool                  : Tool — encapsulates profile, diameter_mm, vbit_angle_deg
     max_depth             : total max cut depth in mm (physical scale)
     width_cm              : physical image width in cm
     height_cm             : physical image height in cm
@@ -563,7 +560,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     feed_rate             : cutting feed rate in mm/min
     threshold_um          : minimum fine-detail depth in µm; regions shallower
                             than this are skipped
-    tool_diameter_mm      : tool diameter in mm (required for "Ball" profile)
     min_feature_width_mm  : features narrower than this (mm) are skipped
     stepdown_mm           : max depth increment per z-pass in mm; 0 = single pass
     final_stepdown_mm     : depth increment for the finishing pass
@@ -578,7 +574,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior step (i.e. ToolPath.result), used as the ceiling
                             when computing the output result.  None defaults to depth_map.
     progress              : callable(pct, message) — thread-safe progress reporter
-    profile               : "V-Bit" | "Ball"
 
     Returns
     -------
@@ -621,7 +616,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             result=(previous_result.copy() if previous_result is not None
                     else np.zeros_like(depth_map, dtype=np.float32)),
             metadata={'algorithm': _alg_name,
-                      'vbit_angle_deg': vbit_angle_deg,
+                      'vbit_angle_deg': tool.vbit_angle_deg,
                       'threshold_um': threshold_um,
                       'max_depth': max_depth}
         )
@@ -630,14 +625,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     # ── Stage 2a · Build tool kernel (10–20 %) ────────────────────
     progress(10, "Building tool geometry kernel…")
-    if profile == "Ball" and tool_diameter_mm <= 0.0:
+    if tool.profile == "Ball" and tool.diameter_mm <= 0.0:
         raise ValueError("Ball profile requires a positive tool diameter.")
-    kernel_vcarve, footprint_vcarve = _build_kernel(
-        profile, px_per_mm, max_depth,
-        vbit_angle_deg=vbit_angle_deg,
-        tool_diameter_mm=tool_diameter_mm)
+    kernel_vcarve, footprint_vcarve = _build_kernel(tool, px_per_mm, max_depth)
     ksize = kernel_vcarve.shape[0]
-    progress(20, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+    progress(20, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2b · Tool-accessible surface (20–40 %) ──────────────
     progress(20, "Computing tool-accessible surface (morphological erosion)…")
@@ -755,7 +747,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 previous_result if previous_result is not None else 0.0,
                 accessible_arr + material_removed_vcarve).astype(np.float32),
             metadata={'algorithm': _alg_name,
-                      'vbit_angle_deg': vbit_angle_deg,
+                      'vbit_angle_deg': tool.vbit_angle_deg,
                       'threshold_um': threshold_um,
                       'max_depth': max_depth}
         )
@@ -1004,8 +996,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
-            'profile':         profile,
-            'vbit_angle_deg':  vbit_angle_deg,
+            'profile':         tool.profile,
+            'vbit_angle_deg':  tool.vbit_angle_deg,
             'min_feature_width_mm':  min_feature_width_mm,
             'threshold_um':          threshold_um,
             'stepdown_mm':           stepdown_mm,
@@ -1023,14 +1015,13 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
 def compute_contour_toolpath(
     depth_map, n_grey_levels,
-    radius_mm, stepdown_mm, max_depth,
+    tool, stepdown_mm, max_depth,
     width_cm, height_cm,
     origin="Bottom-Left",
     feed_rate=800.0,
     work_surface=None,
     previous_result=None,
     progress=None,
-    profile="End Mill",
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -1046,8 +1037,8 @@ def compute_contour_toolpath(
         Normalised depth map; 1.0 = maximum cut depth.
     n_grey_levels : int
         Number of grey levels in the source image (used for RDP tolerance).
-    radius_mm : float
-        Tool radius in mm.
+    tool : Tool
+        Encapsulates profile, diameter_mm, and vbit_angle_deg.
     stepdown_mm : float
         Z increment between contour levels in mm.
     max_depth : float
@@ -1067,8 +1058,6 @@ def compute_contour_toolpath(
         ceiling for the output result.  When None, *depth_map* is used.
     progress : callable(pct, message)
         Thread-safe progress reporter.
-    profile : str
-        Tool profile — "End Mill" (flat bottom) or "Ball" (spherical cap).
 
     Returns
     -------
@@ -1095,10 +1084,9 @@ def compute_contour_toolpath(
 
     # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
     progress(0, "Building tool geometry kernel…")
-    kernel, footprint = _build_kernel(
-        profile, px_per_mm, max_depth, tool_diameter_mm=radius_mm * 2)
+    kernel, footprint = _build_kernel(tool, px_per_mm, max_depth)
     ksize = kernel.shape[0]
-    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {profile}).")
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2 · Accessible surface (10–35 %) ────────────────────────────
     progress(10, "Computing tool-accessible surface (morphological erosion)…")
@@ -1219,9 +1207,9 @@ def compute_contour_toolpath(
         accessible=accessible,
         metadata={
             'algorithm':     'Contour',
-            'profile':       profile,
+            'profile':       tool.profile,
             'max_depth':     max_depth,
-            'radius_mm':     radius_mm,
+            'radius_mm':     tool.diameter_mm / 2,
             'stepdown_mm':   stepdown_mm,
             'n_passes':      n_passes,
             'width_cm':      width_cm,

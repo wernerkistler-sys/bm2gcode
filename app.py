@@ -14,6 +14,7 @@ from constants import (
 )
 from widgets import ProgressDialog, LabeledEntry, SectionFrame, _fmt_time
 from algorithms import compute_raster_toolpath, compute_vcarve_toolpath, compute_contour_toolpath
+from tool import Tool
 
 
 class GCodeGeneratorApp:
@@ -285,14 +286,19 @@ class GCodeGeneratorApp:
             ttk.Radiobutton(dir_row, text=d, variable=dir_var,
                             value=d).pack(side=tk.LEFT, padx=(0, 6))
 
+        # ── V-bit angle (shown whenever V-Bit profile is active) ──────
+        vbit_frame = ttk.Frame(frame)
+        step['vbit_frame'] = vbit_frame
+        # (not packed initially — shown on demand)
+
+        vbit_angle = LabeledEntry(vbit_frame, "V-bit angle",      "°",  DEFAULTS["step_vbit_angle"])
+        vbit_angle.pack(fill=tk.X, pady=2)
+        step['vbit_angle'] = vbit_angle
+
         # ── V-carving-only controls (hidden when Raster Scan) ─────────
         vcarve_frame = ttk.Frame(frame)
         step['vcarve_frame'] = vcarve_frame
         # (not packed initially — shown on demand by _on_algorithm_changed)
-
-        vbit_angle = LabeledEntry(vcarve_frame, "V-bit angle",      "°",  DEFAULTS["step_vbit_angle"])
-        vbit_angle.pack(fill=tk.X, pady=2)
-        step['vbit_angle'] = vbit_angle
 
         vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
         vcarve_stepdown.pack(fill=tk.X, pady=2)
@@ -327,52 +333,51 @@ class GCodeGeneratorApp:
 
         # ── Wire up algorithm toggle ───────────────────────────────────
         _VCARVE_PROFILES  = ["V-Bit", "Ball"]
-        _RASTER_PROFILES  = ["Ball", "End Mill"]
+        _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
 
-        def _update_vbit_angle_state():
+        def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
-            if alg.startswith("V-Carving") and profile == "Ball":
-                step['vbit_angle'].set_state("disabled")
-            else:
-                step['vbit_angle'].set_state("normal")
-
-        def _on_profile_changed(*_):
-            _update_vbit_angle_state()
-
-        profile_var.trace_add("write", _on_profile_changed)
-
-        def _on_algorithm_changed(*_):
-            alg = algorithm_var.get()
             if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
-                step['vcarve_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
-                if step['profile_var'].get() not in _VCARVE_PROFILES:
+                if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
+                step['vbit_angle'].set_state(
+                    "disabled" if profile == "Ball" else "normal")
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
+                step['vbit_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
-                if step['profile_var'].get() not in _RASTER_PROFILES:
+                if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
-            else:
+                step['vbit_angle'].set_state("normal")
+            else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
-                step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
-                if step['profile_var'].get() not in _RASTER_PROFILES:
+                if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
-            _update_vbit_angle_state()
+                if profile == "V-Bit":
+                    step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['raster_frame'].pack(fill=tk.X, after=step['vbit_frame'])
+                else:
+                    step['vbit_frame'].pack_forget()
+                    step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['vbit_angle'].set_state("normal")
             if hasattr(self, '_display_combo'):
                 self._on_display_mode_changed()
 
-        algorithm_var.trace_add("write", _on_algorithm_changed)
+        profile_var.trace_add("write", _refresh_layout)
+        algorithm_var.trace_add("write", _refresh_layout)
 
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
@@ -576,17 +581,21 @@ class GCodeGeneratorApp:
             width_cm     = float(self.width_cm.get())
             max_depth    = float(self.max_depth.get())
             if algorithm.startswith("V-Carving"):
-                vcarve_profile   = step['profile_var'].get()
-                vbit_angle_deg   = float(step['vbit_angle'].get()) if vcarve_profile != "Ball" else 90.0
-                min_feature_width_mm = float(step['min_fw'].get())
-                diam_mm          = float(step['diameter'].get())
+                _profile   = step['profile_var'].get()
+                _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
+                tool       = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+                min_feature_width_mm     = float(step['min_fw'].get())
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
                 vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
             elif algorithm == "Contour":
-                diam_mm          = float(step['diameter'].get())
+                tool             = Tool(step['profile_var'].get(),
+                                        float(step['diameter'].get()))
                 contour_stepdown = float(step['contour_stepdown'].get())
             else:
-                diam_mm  = float(step['diameter'].get())
+                _profile   = step['profile_var'].get()
+                _vbit_angle = (float(step['vbit_angle'].get())
+                               if _profile == "V-Bit" else 0.0)
+                tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
                 stepover = float(step['stepover'].get())
                 stepdown = float(step['stepdown'].get())
         except ValueError:
@@ -621,10 +630,9 @@ class GCodeGeneratorApp:
                     result = compute_vcarve_toolpath(
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
+                        tool            = tool,
                         work_surface    = accessible_prior,
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
-                        vbit_angle_deg = vbit_angle_deg,
-                        tool_diameter_mm = diam_mm,
                         max_depth      = max_depth,
                         width_cm       = width_cm,
                         height_cm      = float(self.height_cm.get()),
@@ -637,7 +645,6 @@ class GCodeGeneratorApp:
                         skeleton_mode        = ("voronoi"
                                                 if algorithm == "V-Carving (Voronoi)"
                                                 else "medial_axis"),
-                        profile              = vcarve_profile,
                         progress             = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
@@ -681,15 +688,13 @@ class GCodeGeneratorApp:
             else:
                 _prev_tp = self.toolpaths[idx - 1]
 
-            profile = step['profile_var'].get()
-
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
                     result = compute_contour_toolpath(
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
-                        radius_mm       = diam_mm / 2.0,
+                        tool            = tool,
                         stepdown_mm     = contour_stepdown,
                         max_depth       = max_depth,
                         width_cm        = width_cm,
@@ -700,7 +705,6 @@ class GCodeGeneratorApp:
                                            if _prev_tp is not None else None),
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
                         progress       = dlg.report,
-                        profile        = profile,
                     )
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
@@ -745,8 +749,7 @@ class GCodeGeneratorApp:
 
             work_surface_tol = threshold_mm / max_depth if max_depth else 0.0
 
-            step_mm = diam_mm * stepover / 100.0
-            profile = step['profile_var'].get()
+            step_mm = tool.diameter_mm * stepover / 100.0
 
             def _worker():
                 try:
@@ -756,8 +759,7 @@ class GCodeGeneratorApp:
                     result = compute_raster_toolpath(
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
-                        radius_mm       = diam_mm / 2.0,
-                        profile         = profile,
+                        tool            = tool,
                         step_mm         = step_mm,
                         stepdown_mm     = stepdown,
                         max_depth       = max_depth,
