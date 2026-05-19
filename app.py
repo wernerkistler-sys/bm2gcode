@@ -49,6 +49,9 @@ class GCodeGeneratorApp:
     #  Menu
     # ------------------------------------------------------------------ #
     def _build_menu(self):
+        self.display_mode_var = tk.StringVar(value=DISPLAY_ORIGINAL)
+        self.display_step_var = tk.IntVar(value=1)
+
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
@@ -61,14 +64,47 @@ class GCodeGeneratorApp:
                               command=self.root.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
-        view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Reset Zoom  (double-click)",
-                              command=self._reset_zoom_and_render)
-        menubar.add_cascade(label="View", menu=view_menu)
+        self._view_menu = tk.Menu(menubar, tearoff=0)
+        self._view_menu.add_command(label="Reset Zoom  (double-click)",
+                                    command=self._reset_zoom_and_render)
+        self._view_menu.add_separator()
+
+        _display_hotkeys = [
+            (DISPLAY_ORIGINAL,    "1"),
+            (DISPLAY_STEP_RES,    "2"),
+            (DISPLAY_STEP_RESULT, "3"),
+            (DISPLAY_STEP_3D,     "4"),
+            (DISPLAY_FINE_DETAIL, "5"),
+            (DISPLAY_VCARVE_MASK, "6"),
+        ]
+        self._display_menu_indices = {}
+        for mode, key in _display_hotkeys:
+            self._view_menu.add_radiobutton(
+                label=mode,
+                accelerator=key,
+                variable=self.display_mode_var,
+                value=mode,
+                command=self._on_display_mode_changed,
+            )
+            self._display_menu_indices[mode] = self._view_menu.index(tk.END)
+
+        menubar.add_cascade(label="View", menu=self._view_menu)
 
         self.root.config(menu=menubar)
         self.root.bind("<Control-o>", lambda e: self.open_image())
         self.root.bind("<Control-q>", lambda e: self.root.quit())
+
+        def _make_mode_handler(mode):
+            def _handler(e):
+                fw = self.root.focus_get()
+                if fw is not None and hasattr(fw, 'insert'):
+                    return  # don't steal keypresses from text-entry widgets
+                self.display_mode_var.set(mode)
+                self._on_display_mode_changed()
+            return _handler
+
+        for mode, key in _display_hotkeys:
+            self.root.bind(f"<Key-{key}>", _make_mode_handler(mode))
 
     # ------------------------------------------------------------------ #
     #  Top-level layout
@@ -85,9 +121,7 @@ class GCodeGeneratorApp:
                               sashrelief=tk.RAISED, bg="#bbbbbb")
         pane.pack(fill=tk.BOTH, expand=True)
 
-        # ── Right column: image + display-mode bar ────────────────────
-        # Built first so display_mode_var exists before the sidebar's
-        # _add_step() call fires <<NotebookTabChanged>>.
+        # ── Right column: image canvas ────────────────────────────────
         right = ttk.Frame(pane)
         pane.add(right, minsize=420)
         self._build_right_panel(right)
@@ -377,7 +411,7 @@ class GCodeGeneratorApp:
                     step['vbit_frame'].pack_forget()
                     step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vbit_angle'].set_state("normal")
-            if hasattr(self, '_display_combo'):
+            if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()
 
         profile_var.trace_add("write", _refresh_layout)
@@ -401,39 +435,12 @@ class GCodeGeneratorApp:
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
 
     # ------------------------------------------------------------------ #
-    #  Right panel: image canvas + display-mode selector
+    #  Right panel: image canvas
     # ------------------------------------------------------------------ #
     def _build_right_panel(self, parent):
-        # Image canvas (expands to fill available space)
         canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
         self._build_image_canvas(canvas_frame)
-
-        # Display-mode selector bar
-        mode_bar = ttk.Frame(parent, padding=(8, 4))
-        mode_bar.pack(fill=tk.X, side=tk.BOTTOM)
-
-        ttk.Label(mode_bar, text="Display:",
-                  font=("Helvetica", 9, "bold")).grid(row=0, column=0,
-                                                       padx=(0, 8),
-                                                       sticky=tk.W)
-        self.display_mode_var = tk.StringVar(value=DISPLAY_ORIGINAL)
-        self._vcarve_mask_rb = None  # not used with combobox; kept for compatibility
-        self._display_combo = ttk.Combobox(
-            mode_bar,
-            textvariable=self.display_mode_var,
-            values=DISPLAY_MODES,
-            state="readonly",
-            width=16,
-        )
-        self._display_combo.grid(row=0, column=1, padx=(0, 8), sticky=tk.W)
-        self._display_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_display_mode_changed())
-
-        self.display_step_var = tk.IntVar(value=1)
-
-        ttk.Button(mode_bar, text="Reset View",
-                   command=self._reset_zoom_and_render
-                   ).grid(row=0, column=2, padx=(12, 0))
 
     def _build_image_canvas(self, parent):
         self.fig, self.ax = plt.subplots(figsize=(7, 5), tight_layout=True)
@@ -873,7 +880,9 @@ class GCodeGeneratorApp:
             and not (m == DISPLAY_FINE_DETAIL and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
         ]
-        self._display_combo['values'] = available_modes
+        for m in DISPLAY_MODES:
+            state = "normal" if m in available_modes else "disabled"
+            self._view_menu.entryconfig(self._display_menu_indices[m], state=state)
         if mode not in available_modes:
             self.display_mode_var.set(DISPLAY_ORIGINAL)
             mode = DISPLAY_ORIGINAL
@@ -1096,7 +1105,7 @@ class GCodeGeneratorApp:
             if mode == DISPLAY_FINE_DETAIL:
                 img   = fine_detail
                 cmap  = "hot"
-                title = f"Fine Detail (Step {step_idx + 1})"
+                title = f"Step Unaccessible (Step {step_idx + 1})"
             else:
                 try:
                     threshold_mm = float(self.steps[step_idx]['threshold'].get())
