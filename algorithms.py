@@ -141,7 +141,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             width_cm, height_cm, raster_dir,
                             origin="Bottom-Left",
                             feed_rate=800.0,
-                            work_surface=None, work_surface_tol=None,
+                            work_surface_tol=None,
                             previous_result=None,
                             progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
@@ -159,20 +159,14 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     raster_dir        : "X" | "Y" | "Both"
     origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate         : cutting feed rate in mm/min
-    work_surface      : optional 2-D float32 [0,1] depth map this step should
-                        work on — can be the original depth_map, the actual
-                        residual from a prior step, or the geometric residual
-                        of a prior tool's profile.  None (default) treats the
-                        full depth_map as unfinished.  On the first z-pass,
-                        pixels where work_surface <= work_surface_tol are
-                        skipped.
-    work_surface_tol  : threshold (normalised [0,1]) applied to work_surface.
-                        0.0 (default) visits every pixel; higher values skip
-                        pixels where the prior work is already shallow.
+    work_surface_tol  : threshold (normalised [0,1]) applied to the residual
+                        depth (depth_map − previous_result).  0.0 (default)
+                        visits every pixel; higher values skip pixels where
+                        the prior work is already shallow.
     previous_result   : optional 2-D float32 [0,1] cumulative result from a
-                        prior step (i.e. ToolPath.result), used as the ceiling
-                        when computing the output result.  When None (default)
-                        work_surface is used as the ceiling instead.
+                        prior step (i.e. ToolPath.result), used as the floor
+                        for the output result so material already removed is
+                        not un-cut.  When None (default) the floor is 0.
     progress          : callable(pct, subtask) — thread-safe progress reporter
 
     Returns
@@ -184,11 +178,10 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     H, W = depth_map.shape
 
-    # Initialise work_surface to the depth map itself when not provided.
-    if work_surface is None:
-        work_surface     = depth_map.copy()
     if work_surface_tol is None:
         work_surface_tol = 0.0
+    residual = (np.clip(depth_map - previous_result, 0.0, 1.0)
+                if previous_result is not None else depth_map)
 
     px_per_mm_x = W / (width_cm  * 10.0)
     px_per_mm_y = H / (height_cm * 10.0)
@@ -245,7 +238,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     if work_surface_tol > 0.0:
         from scipy.ndimage import binary_dilation
         prior_mask = binary_dilation(
-                         work_surface >= work_surface_tol,
+                         residual >= work_surface_tol,
                          structure=footprint_raster,
                      ).astype(np.float32)
         progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
@@ -481,16 +474,14 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         ).astype(np.float32),
         0.0)
 
-    residual_raster = np.clip(depth_map - material_removed_raster, 0.0, 1.0
-                       ).astype(np.float32)
-
-    residual_ceiling = (np.clip(depth_map - previous_result, 0.0, 1.0)
-                        if previous_result is not None else work_surface)
-    residual_raster  = np.minimum(residual_raster, residual_ceiling)
+    raster_result = np.minimum(
+        np.maximum(material_removed_raster,
+                   previous_result if previous_result is not None else 0.0),
+        depth_map).astype(np.float32)
 
     n_skip   = int(np.sum(material_removed_raster >= accessible_raster - resid_tol))
     pct_done = 100.0 * n_skip / max(1, H * W)
-    label    = "post-refining" if work_surface is not None else "post-roughing"
+    label    = "post-refining" if previous_result is not None else "post-roughing"
     progress(88, f"{label.capitalize()} residual computed — "
                  f"{pct_done:.1f}% of pixels at target depth "
                  f"(within {resid_tol_mm*1000:.1f} µm).")
@@ -507,7 +498,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     progress(92, "Creating ToolPath object...")
     toolpath = ToolPath(
         segments=simplified,
-        result=np.clip(depth_map - residual_raster, 0.0, 1.0).astype(np.float32),
+        result=raster_result,
         accessible=accessible_raster,
         metadata={
             'profile': tool.profile,
@@ -525,7 +516,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         }
     )
 
-    if work_surface is not None and work_surface_tol is not None:
+    if previous_result is not None and work_surface_tol is not None:
         toolpath.metadata['refining_threshold_um'] = \
             work_surface_tol * max_depth * 1000
 
@@ -543,7 +534,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             min_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
-                            work_surface=None, previous_result=None,
+                            prior_accessible=None, previous_result=None,
                             progress=None):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
@@ -564,11 +555,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     final_stepdown_mm     : depth increment for the finishing pass
                             (0 = same as stepdown_mm)
     skeleton_mode         : "medial_axis" | "voronoi"
-    work_surface          : optional 2-D float32 [0,1] depth map this step should
-                            work on — can be the original depth_map, the actual
-                            residual from a prior step, or the geometric residual
-                            of a prior tool's profile.  None (default) treats the
-                            full depth_map as unfinished.
+    prior_accessible      : optional 2-D float32 [0,1] geometrically accessible
+                            surface of the prior tool (ToolPath.accessible).
+                            Pixels where depth_map − prior_accessible > threshold
+                            are treated as fine detail to V-carve.  None (default)
+                            treats the full depth_map as fine detail.
     previous_result       : optional 2-D float32 [0,1] cumulative result from a
                             prior step (i.e. ToolPath.result), used as the ceiling
                             when computing the output result.  None defaults to depth_map.
@@ -600,10 +591,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     # ── Stage 1 · Fine-detail mask (0–10 %) ───────────────────────
     progress(0, "Computing fine-detail mask…")
-    if work_surface is None:
+    if prior_accessible is None:
         fine_detail = depth_map.copy()
     else:
-        fine_detail = np.clip(depth_map - work_surface, 0.0, 1.0)
+        fine_detail = np.clip(depth_map - prior_accessible, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
     mask_vcarve    = fine_detail > threshold_norm
@@ -734,9 +725,6 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         footprint=footprint_vcarve,
         structure=dil_structure_vcarve,
     ).astype(np.float32)
-    accessible_arr = work_surface if work_surface is not None else np.zeros_like(depth_map)
-    material_removed_vcarve = np.maximum(
-        vcarve_cone_depth - accessible_arr, 0.0)
 
     if not np.any(skeleton):
         progress(100, "Skeleton empty — no V-carve moves generated.")
@@ -744,7 +732,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             segments=[],
             result=np.maximum(
                 previous_result if previous_result is not None else 0.0,
-                accessible_arr + material_removed_vcarve).astype(np.float32),
+                vcarve_cone_depth).astype(np.float32),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': tool.vbit_angle_deg,
                       'threshold_um': threshold_um,
@@ -990,7 +978,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         segments=simplified,
         result=np.maximum(
             previous_result if previous_result is not None else 0.0,
-            accessible_arr + material_removed_vcarve).astype(np.float32),
+            vcarve_cone_depth).astype(np.float32),
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
@@ -1017,7 +1005,7 @@ def compute_contour_toolpath(
     width_cm, height_cm,
     origin="Bottom-Left",
     feed_rate=800.0,
-    work_surface=None,
+    prior_accessible=None,
     previous_result=None,
     progress=None,
 ):
@@ -1047,8 +1035,8 @@ def compute_contour_toolpath(
         G-code origin convention ("Bottom-Left", "Top-Left", etc.).
     feed_rate : float
         Cutting feed rate in mm/min.
-    work_surface : 2-D float32 array, values in [0, 1], or None
-        Reserved for future use (analogous to raster's *work_surface*).
+    prior_accessible : 2-D float32 array, values in [0, 1], or None
+        Reserved for future use (analogous to vcarve's *prior_accessible*).
         Currently ignored; the accessible surface is always computed from
         *depth_map*.
     previous_result : 2-D float32 array, values in [0, 1], or None

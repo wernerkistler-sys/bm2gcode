@@ -656,7 +656,7 @@ class GCodeGeneratorApp:
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
                         tool            = tool,
-                        work_surface    = accessible_prior,
+                        prior_accessible = accessible_prior,
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
                         max_depth      = max_depth,
                         width_cm       = width_cm,
@@ -726,8 +726,8 @@ class GCodeGeneratorApp:
                         height_cm       = float(self.height_cm.get()),
                         origin          = self.origin_var.get(),
                         feed_rate       = feed_rate,
-                        work_surface    = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
-                                           if _prev_tp is not None else None),
+                        prior_accessible = (_prev_tp.accessible
+                                            if _prev_tp is not None else None),
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
                         progress       = dlg.report,
                     )
@@ -779,23 +779,21 @@ class GCodeGeneratorApp:
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
-                    work_surface = (np.clip(depth_map - _prev_tp.result, 0.0, 1.0)
-                                    if _prev_tp is not None else None)
                     result = compute_raster_toolpath(
-                        depth_map       = depth_map,
-                        n_grey_levels   = n_grey_levels,
-                        tool            = tool,
-                        step_mm         = step_mm,
-                        stepdown_mm     = stepdown,
-                        max_depth       = max_depth,
-                        width_cm        = width_cm,
-                        height_cm       = float(self.height_cm.get()),
-                        raster_dir      = step['raster_dir_var'].get(),
-                        origin          = self.origin_var.get(),
-                        work_surface    = work_surface,
-                        work_surface_tol= work_surface_tol,
-                        feed_rate       = feed_rate,
-                        progress        = dlg.report,
+                        depth_map        = depth_map,
+                        n_grey_levels    = n_grey_levels,
+                        tool             = tool,
+                        step_mm          = step_mm,
+                        stepdown_mm      = stepdown,
+                        max_depth        = max_depth,
+                        width_cm         = width_cm,
+                        height_cm        = float(self.height_cm.get()),
+                        raster_dir       = step['raster_dir_var'].get(),
+                        origin           = self.origin_var.get(),
+                        work_surface_tol = work_surface_tol,
+                        previous_result  = _prev_tp.result if _prev_tp is not None else None,
+                        feed_rate        = feed_rate,
+                        progress         = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
@@ -1131,8 +1129,7 @@ class GCodeGeneratorApp:
                     # prior roughing tool's geometry couldn't reach.
                     ref = fine_detail
                 else:
-                    # Gate on the prior step's residual (depth_map - prior_result),
-                    # matching what compute_raster_toolpath uses as work_surface.
+                    # Gate on the prior step's residual (depth_map - prior_result).
                     prior_idx = step_idx - 1
                     prior_result = (
                         self.toolpaths[prior_idx].result
