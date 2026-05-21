@@ -242,6 +242,17 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 4 · Adaptive multi-pass raster (40–80 %) ────────────
 
+    if work_surface_tol > 0.0:
+        from scipy.ndimage import binary_dilation
+        prior_mask = binary_dilation(
+                         work_surface >= work_surface_tol,
+                         structure=footprint_raster,
+                     ).astype(np.float32)
+        progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
+                     f"{int(np.sum(prior_mask))}/{H*W} pixels in mask.")
+    else:
+        prior_mask = None
+
     all_segments = []  # list of (segment_type, [(x,y,z),...]) for ToolPath
     achieved_raster    = np.zeros_like(accessible_raster, dtype=np.float32)
     tool_pos    = np.array([0.0, 0.0])
@@ -279,21 +290,10 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         z_norm = z_depth_mm / max_depth
 
         # ── Compute per-pixel remaining depth at this z-level ─────
-        if pass_idx == 0 and work_surface_tol > 0.0:
-            from scipy.ndimage import binary_dilation
-            prior_mask      = binary_dilation(
-                                  work_surface > work_surface_tol,
-                                  structure=footprint_raster,
-                              ).astype(np.float32)
-            remaining_depth = (np.minimum(accessible_raster, z_norm)
-                               * prior_mask).astype(np.float32)
-            progress(40 + 40 * pass_idx / n_passes,
-                     f"Pass {pass_idx+1}/{n_passes}: "
-                     f"threshold={work_surface_tol*max_depth*1000:.0f} µm, "
-                     f"{int(np.sum(prior_mask))}/{H*W} pixels to visit.")
-        else:
-            remaining_depth = (np.minimum(accessible_raster, z_norm)
-                               - achieved_raster).astype(np.float32)
+        remaining_depth = (np.minimum(accessible_raster, z_norm)
+                           - achieved_raster).astype(np.float32)
+        if prior_mask is not None:
+            remaining_depth *= prior_mask
 
         # ── Per direction: find which raster lines need revisiting ─
         for direction in directions:

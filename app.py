@@ -9,7 +9,7 @@ import threading
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-    DISPLAY_STEP_3D, DISPLAY_FINE_DETAIL, DISPLAY_VCARVE_MASK,
+    DISPLAY_STEP_3D, DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import ProgressDialog, LabeledEntry, SectionFrame, _fmt_time
@@ -75,7 +75,7 @@ class GCodeGeneratorApp:
             (DISPLAY_STEP_RESULT, "3"),
             (DISPLAY_STEP_3D,     "4"),
             (DISPLAY_FINE_DETAIL, "5"),
-            (DISPLAY_VCARVE_MASK, "6"),
+            (DISPLAY_PROC_MASK,   "6"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -97,7 +97,7 @@ class GCodeGeneratorApp:
         def _make_mode_handler(mode):
             def _handler(e):
                 fw = self.root.focus_get()
-                if fw is not None and hasattr(fw, 'insert'):
+                if isinstance(fw, (tk.Entry, ttk.Entry, tk.Text)):
                     return  # don't steal keypresses from text-entry widgets
                 self.display_mode_var.set(mode)
                 self._on_display_mode_changed()
@@ -416,6 +416,18 @@ class GCodeGeneratorApp:
 
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
+
+        def _on_mask_param_changed(*_):
+            if not hasattr(self, '_view_menu'):
+                return
+            if self.display_mode_var.get() != DISPLAY_PROC_MASK:
+                return
+            idx = self.display_step_var.get() - 1
+            if 0 <= idx < len(self.steps) and self.steps[idx] is step:
+                self._render()
+
+        threshold.var.trace_add("write", _on_mask_param_changed)
+        min_fw.var.trace_add("write", _on_mask_param_changed)
 
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
@@ -867,16 +879,12 @@ class GCodeGeneratorApp:
         idx  = self.display_step_var.get() - 1
 
         # Update combobox to show only modes relevant to this step's algorithm/state
-        is_vcarve_step = (
-            0 <= idx < len(self.steps)
-            and self.steps[idx].get('algorithm_var') is not None
-            and self.steps[idx]['algorithm_var'].get().startswith("V-Carving")
-        )
+        has_step       = 0 <= idx < len(self.steps)
         has_accessible = self._accessible_for_step(idx) is not None
         step_computed  = (0 <= idx < len(self.toolpaths) and self.toolpaths[idx] is not None)
         available_modes = [
             m for m in DISPLAY_MODES
-            if not (m == DISPLAY_VCARVE_MASK and not is_vcarve_step)
+            if not (m == DISPLAY_PROC_MASK  and not has_step)
             and not (m == DISPLAY_FINE_DETAIL and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
         ]
@@ -1095,13 +1103,11 @@ class GCodeGeneratorApp:
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
-        elif mode in (DISPLAY_FINE_DETAIL, DISPLAY_VCARVE_MASK):
-            accessible = self._accessible_for_step(step_idx)
+        elif mode in (DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK):
             depth_map, _ = self._get_depth_map()
-            if accessible is None:
-                fine_detail = depth_map.copy()
-            else:
-                fine_detail = np.clip(depth_map - accessible, 0.0, 1.0)
+            accessible    = self._accessible_for_step(step_idx)
+            fine_detail   = (np.clip(depth_map - accessible, 0.0, 1.0)
+                             if accessible is not None else depth_map.copy())
             if mode == DISPLAY_FINE_DETAIL:
                 img   = fine_detail
                 cmap  = "hot"
@@ -1112,30 +1118,57 @@ class GCodeGeneratorApp:
                     max_depth    = float(self.max_depth.get())
                 except (ValueError, IndexError):
                     threshold_mm, max_depth = 0.0, 5.0
-                thr  = threshold_mm / max_depth if max_depth else 0.0
-                mask = fine_detail > thr
-                # Apply min-feature-width erosion if set (same logic as compute_vcarve_toolpath)
-                try:
-                    min_fw_mm = float(self.steps[step_idx]['min_fw'].get())
-                except (ValueError, IndexError, KeyError):
-                    min_fw_mm = 0.0
-                if min_fw_mm > 0.0:
+                thr = threshold_mm / max_depth if max_depth else 0.0
+
+                is_vcarve = (
+                    0 <= step_idx < len(self.steps)
+                    and self.steps[step_idx].get('algorithm_var') is not None
+                    and self.steps[step_idx]['algorithm_var'].get().startswith("V-Carving")
+                )
+
+                if is_vcarve:
+                    # Gate on fine_detail (depth_map - accessible): regions the
+                    # prior roughing tool's geometry couldn't reach.
+                    ref = fine_detail
+                else:
+                    # Gate on the prior step's residual (depth_map - prior_result),
+                    # matching what compute_raster_toolpath uses as work_surface.
+                    prior_idx = step_idx - 1
+                    prior_result = (
+                        self.toolpaths[prior_idx].result
+                        if (0 <= prior_idx < len(self.toolpaths)
+                            and self.toolpaths[prior_idx] is not None
+                            and self.toolpaths[prior_idx].result is not None)
+                        else None
+                    )
+                    ref = (np.clip(depth_map - prior_result, 0.0, 1.0)
+                           if prior_result is not None else depth_map.copy())
+
+                mask = ref >= thr
+
+                if is_vcarve:
                     try:
-                        H, W = fine_detail.shape
-                        px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
-                        px_per_mm_y = H / (float(self.height_cm.get()) * 10.0)
-                        px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
-                    except (ValueError, ZeroDivisionError):
-                        px_per_mm = 1.0
-                    min_half_px = (min_fw_mm / 2.0) * px_per_mm
-                    from scipy.ndimage import distance_transform_edt
-                    mask = distance_transform_edt(mask) > min_half_px
+                        min_fw_mm = float(self.steps[step_idx]['min_fw'].get())
+                    except (ValueError, IndexError, KeyError):
+                        min_fw_mm = 0.0
+                    if min_fw_mm > 0.0:
+                        try:
+                            H, W = ref.shape
+                            px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
+                            px_per_mm_y = H / (float(self.height_cm.get()) * 10.0)
+                            px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+                        except (ValueError, ZeroDivisionError):
+                            px_per_mm = 1.0
+                        min_half_px = (min_fw_mm / 2.0) * px_per_mm
+                        from scipy.ndimage import distance_transform_edt
+                        mask = distance_transform_edt(mask) > min_half_px
+
                 img  = mask.astype(np.float32)
                 cmap = "Greens"
-                title = f"V-carve Mask (Step {step_idx + 1})"
+                title = f"Processing Mask (Step {step_idx + 1})"
 
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-                        DISPLAY_FINE_DETAIL, DISPLAY_VCARVE_MASK):
+                        DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK):
             img   = self.current_image
             cmap  = "gray"
             title = ""
