@@ -1008,6 +1008,7 @@ def compute_contour_toolpath(
     prior_accessible=None,
     previous_result=None,
     progress=None,
+    adaptive_levels=False,
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -1026,7 +1027,13 @@ def compute_contour_toolpath(
     tool : Tool
         Encapsulates profile, diameter_mm, and vbit_angle_deg.
     stepdown_mm : float
-        Z increment between contour levels in mm.
+        Z increment between contour levels in mm.  Also controls the number of
+        passes in adaptive mode: n_passes = ceil(max_depth / stepdown_mm).
+    adaptive_levels : bool
+        When True, place the n_passes contour levels at equal-area (CDF-based)
+        depth intervals rather than uniform Z spacing.  This concentrates passes
+        where the depth map has the most pixels, avoiding redundant cuts between
+        discrete grey-level transitions.
     max_depth : float
         Total maximum cut depth in mm.
     width_cm, height_cm : float
@@ -1086,26 +1093,53 @@ def compute_contour_toolpath(
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")
     n_passes = max(1, math.ceil(max_depth / stepdown_mm))
-    z_levels = [min(i * stepdown_mm / max_depth, 1.0)
-                for i in range(1, n_passes + 1)]
-    progress(40, f"{n_passes} contour level{'s' if n_passes != 1 else ''}  "
-                 f"({stepdown_mm:.2f} mm each).")
+    if adaptive_levels:
+        flat = accessible[accessible > 1e-6].ravel()
+        if flat.size >= 2:
+            quantiles = np.linspace(1.0 / n_passes, 1.0, n_passes)
+            z_raw = np.quantile(flat, quantiles)
+            min_gap = 0.5 / max(n_grey_levels - 1, 1)
+            z_levels, prev = [], -1.0
+            for z in np.clip(z_raw, 0.0, 1.0):
+                if float(z) - prev >= min_gap:
+                    z_levels.append(float(z))
+                    prev = float(z)
+            if not z_levels or z_levels[-1] < 1.0 - min_gap:
+                z_levels.append(1.0)
+        else:
+            z_levels = [min(i * stepdown_mm / max_depth, 1.0)
+                        for i in range(1, n_passes + 1)]
+        progress(40, f"{len(z_levels)} contour level{'s' if len(z_levels) != 1 else ''}  "
+                     f"(adaptive, target stepdown {stepdown_mm:.2f} mm).")
+    else:
+        z_levels = [min(i * stepdown_mm / max_depth, 1.0)
+                    for i in range(1, n_passes + 1)]
+        progress(40, f"{n_passes} contour level{'s' if n_passes != 1 else ''}  "
+                     f"({stepdown_mm:.2f} mm each).")
 
     # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
     rdp_tol = max(1.0 / px_per_mm_x,
                   1.0 / px_per_mm_y,
                   max_depth / (n_grey_levels - 1))
 
+    # Half a grey-level step in normalised units.  Subtracting this from the
+    # find_contours threshold keeps flat-region pixels firmly "inside" even
+    # when z_norm lands at or just above their exact value (e.g. from CDF
+    # quantile rounding).  Without it the contour jumps to the inner wall of
+    # a flat step and the tool cuts air above the neighbouring deeper region.
+    _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
+
     all_segments    = []
     all_contours_px = []   # (z_norm, ri, ci) tuples for Stage 5
     current_pos     = np.array([0.0, 0.0])
 
+    n_levels = len(z_levels)
     for pass_idx, z_norm in enumerate(z_levels):
-        progress(40 + 40 * pass_idx // n_passes,
+        progress(40 + 40 * pass_idx // n_levels,
                  f"Extracting contours at Z = {-z_norm * max_depth:.3f} mm…")
         z_mm = -z_norm * max_depth
 
-        raw_contours = find_contours(accessible, z_norm)
+        raw_contours = find_contours(accessible, max(z_norm - _contour_eps, 0.0))
         contours     = [c for c in raw_contours if len(c) >= 3]
         if not contours:
             continue
@@ -1192,15 +1226,16 @@ def compute_contour_toolpath(
         result=result,
         accessible=accessible,
         metadata={
-            'algorithm':     'Contour',
-            'profile':       tool.profile,
-            'max_depth':     max_depth,
-            'radius_mm':     tool.diameter_mm / 2,
-            'stepdown_mm':   stepdown_mm,
-            'n_passes':      n_passes,
-            'width_cm':      width_cm,
-            'height_cm':     height_cm,
-            'rdp_tolerance': rdp_tol,
+            'algorithm':       'Contour',
+            'profile':         tool.profile,
+            'max_depth':       max_depth,
+            'radius_mm':       tool.diameter_mm / 2,
+            'stepdown_mm':     stepdown_mm,
+            'adaptive_levels': adaptive_levels,
+            'n_passes':        len(z_levels),
+            'width_cm':        width_cm,
+            'height_cm':       height_cm,
+            'rdp_tolerance':   rdp_tol,
         }
     )
     progress(100, "Contour tool path computation complete!")

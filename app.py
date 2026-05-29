@@ -352,6 +352,12 @@ class GCodeGeneratorApp:
         contour_stepdown.pack(fill=tk.X, pady=2)
         step['contour_stepdown'] = contour_stepdown
 
+        contour_adaptive_var = tk.BooleanVar(
+            value=bool(int(DEFAULTS["step_contour_adaptive"])))
+        ttk.Checkbutton(contour_frame, text="Adaptive levels (CDF)",
+                        variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
+        step['contour_adaptive_var'] = contour_adaptive_var
+
         # ── Shared controls ────────────────────────────────────────────
         feed = LabeledEntry(frame, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
         feed.pack(fill=tk.X, pady=2)
@@ -445,6 +451,7 @@ class GCodeGeneratorApp:
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
+        step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
 
     # ------------------------------------------------------------------ #
     #  Right panel: image canvas
@@ -615,7 +622,8 @@ class GCodeGeneratorApp:
                 _vbit_angle = (float(step['vbit_angle'].get())
                                if _profile == "V-Bit" else 0.0)
                 tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-                contour_stepdown = float(step['contour_stepdown'].get())
+                contour_stepdown  = float(step['contour_stepdown'].get())
+                contour_adaptive  = step['contour_adaptive_var'].get()
             else:
                 _profile   = step['profile_var'].get()
                 _vbit_angle = (float(step['vbit_angle'].get())
@@ -717,19 +725,20 @@ class GCodeGeneratorApp:
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
                     result = compute_contour_toolpath(
-                        depth_map       = depth_map,
-                        n_grey_levels   = n_grey_levels,
-                        tool            = tool,
-                        stepdown_mm     = contour_stepdown,
-                        max_depth       = max_depth,
-                        width_cm        = width_cm,
-                        height_cm       = float(self.height_cm.get()),
-                        origin          = self.origin_var.get(),
-                        feed_rate       = feed_rate,
+                        depth_map        = depth_map,
+                        n_grey_levels    = n_grey_levels,
+                        tool             = tool,
+                        stepdown_mm      = contour_stepdown,
+                        max_depth        = max_depth,
+                        width_cm         = width_cm,
+                        height_cm        = float(self.height_cm.get()),
+                        origin           = self.origin_var.get(),
+                        feed_rate        = feed_rate,
                         prior_accessible = (_prev_tp.accessible
                                             if _prev_tp is not None else None),
-                        previous_result = _prev_tp.result if _prev_tp is not None else None,
-                        progress       = dlg.report,
+                        previous_result  = _prev_tp.result if _prev_tp is not None else None,
+                        progress         = dlg.report,
+                        adaptive_levels  = contour_adaptive,
                     )
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))

@@ -24,6 +24,7 @@ DEFAULTS = {
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
     # Contour-specific defaults
     "step_contour_stepdown":      "1.0", # Z increment between contour levels (mm)
+    "step_contour_adaptive":      "0",   # 0 = fixed levels, 1 = adaptive CDF levels
 }
 
 DISPLAY_ORIGINAL    = "Original"
