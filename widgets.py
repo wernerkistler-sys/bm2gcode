@@ -1,6 +1,8 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import queue
+
+from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
 
 
 class ProgressDialog(tk.Toplevel):
@@ -203,3 +205,140 @@ def _fmt_time(minutes):
     h = int(minutes // 60)
     m = minutes % 60
     return f"{h}h {m:.0f}min"
+
+
+class SettingsDialog(tk.Toplevel):
+    """Modal dialog for editing global G-code settings (z_safe, feed_rapid,
+    preamble, postamble).  Modifies *settings* dict in-place on OK."""
+
+    def __init__(self, parent, settings):
+        super().__init__(parent)
+        self.title("Settings")
+        self.resizable(True, True)
+        self.minsize(480, 540)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self._settings = settings
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ── Machine parameters ────────────────────────────────────────
+        mf = SectionFrame(outer, "Machine Parameters")
+        mf.pack(fill=tk.X, pady=(0, 8))
+
+        self._z_safe = LabeledEntry(mf, "Safe height (z_safe)", "mm",
+                                    str(settings.get('z_safe', 5.0)))
+        self._z_safe.pack(fill=tk.X, pady=2)
+
+        self._feed_rapid = LabeledEntry(mf, "Rapid feed (time estimate only)", "mm/min",
+                                        str(settings.get('feed_rapid', 3000.0)))
+        self._feed_rapid.pack(fill=tk.X, pady=2)
+
+        # ── G-code preamble ───────────────────────────────────────────
+        pre_sf = SectionFrame(outer, "G-code Preamble")
+        pre_sf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        pre_hdr = ttk.Frame(pre_sf)
+        pre_hdr.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(pre_hdr, text="Inserted before tool path moves:").pack(side=tk.LEFT)
+        ttk.Button(pre_hdr, text="Reset to default",
+                   command=self._reset_preamble).pack(side=tk.RIGHT)
+
+        self._pre_text = self._make_text_area(pre_sf)
+        pre_init = settings.get('preamble') or self._default_preamble()
+        self._pre_text.insert('1.0', pre_init)
+
+        # ── G-code postamble ──────────────────────────────────────────
+        post_sf = SectionFrame(outer, "G-code Postamble")
+        post_sf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        post_hdr = ttk.Frame(post_sf)
+        post_hdr.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(post_hdr, text="Appended after tool path moves:").pack(side=tk.LEFT)
+        ttk.Button(post_hdr, text="Reset to default",
+                   command=self._reset_postamble).pack(side=tk.RIGHT)
+
+        self._post_text = self._make_text_area(post_sf, height=4)
+        post_init = settings.get('postamble') or self._default_postamble()
+        self._post_text.insert('1.0', post_init)
+
+        # ── Buttons ───────────────────────────────────────────────────
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        # Centre on parent
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+        self.wait_window()
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _make_text_area(parent, height=6):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.BOTH, expand=True)
+        txt = tk.Text(f, height=height, wrap=tk.NONE,
+                      font=("Courier", 9), relief=tk.SUNKEN)
+        sb_y = ttk.Scrollbar(f, orient=tk.VERTICAL,   command=txt.yview)
+        sb_x = ttk.Scrollbar(f, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        sb_y.pack(side=tk.RIGHT,  fill=tk.Y)
+        sb_x.pack(side=tk.BOTTOM, fill=tk.X)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        return txt
+
+    def _default_preamble(self):
+        try:
+            z = float(self._z_safe.get())
+        except ValueError:
+            z = 5.0
+        return DEFAULT_PREAMBLE.format(z_safe=z)
+
+    @staticmethod
+    def _default_postamble():
+        return DEFAULT_POSTAMBLE
+
+    def _reset_preamble(self):
+        self._pre_text.delete('1.0', tk.END)
+        self._pre_text.insert('1.0', self._default_preamble())
+
+    def _reset_postamble(self):
+        self._post_text.delete('1.0', tk.END)
+        self._post_text.insert('1.0', self._default_postamble())
+
+    def _confirm(self):
+        try:
+            z_safe     = float(self._z_safe.get())
+            feed_rapid = float(self._feed_rapid.get())
+        except ValueError:
+            messagebox.showerror("Invalid input",
+                                 "Safe height and rapid feed must be numbers.",
+                                 parent=self)
+            return
+
+        preamble  = self._pre_text.get('1.0', tk.END).rstrip('\n')
+        postamble = self._post_text.get('1.0', tk.END).rstrip('\n')
+
+        # Store '' when text matches the built-in default so to_gcode uses its
+        # own default (which stays in sync with z_safe at export time).
+        if preamble  == self._default_preamble():
+            preamble  = ''
+        if postamble == self._default_postamble():
+            postamble = ''
+
+        self._settings['z_safe']     = z_safe
+        self._settings['feed_rapid'] = feed_rapid
+        self._settings['preamble']   = preamble
+        self._settings['postamble']  = postamble
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.grab_release()
+        self.destroy()

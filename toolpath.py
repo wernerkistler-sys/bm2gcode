@@ -2,6 +2,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
+
 
 @dataclass
 class ToolPath:
@@ -67,8 +69,13 @@ class ToolPath:
             'est_minutes': est_minutes
         }
 
-    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
-        """Generate G-code string from the structured path."""
+    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
+                preamble=None, postamble=None):
+        """Generate G-code string from the structured path.
+
+        preamble / postamble: optional strings inserted before/after the motion
+        segments, replacing the built-in defaults.  None or '' → use built-in.
+        """
 
         def fmt_time(minutes):
             if minutes < 1.0:
@@ -103,7 +110,7 @@ class ToolPath:
                         f"{meta['refining_threshold_um']:.0f} µm "
                         f"(spans from prior residual only)")
 
-        stats = self.get_stats(feed_rate, feed_rapid)
+        stats = self.get_stats(feed_rate, feed_rapid, z_safe)
 
         lines += [
             f"; Total motion lines: {stats['motion_count']}",
@@ -112,13 +119,14 @@ class ToolPath:
             f"; Estimated time: {fmt_time(stats['est_minutes'])} "
             f"@ {feed_rate:.0f} mm/min",
             "",
-            "G21         ; units = mm",
-            "G90         ; absolute positioning",
-            "G17         ; XY plane",
-            f"G0 Z{z_safe:.3f}   ; move to safe height",
-            "G0 X0.000 Y0.000   ; move to origin",
-            "",
         ]
+
+        if preamble:
+            lines += preamble.splitlines()
+            lines.append("")
+        else:
+            lines += DEFAULT_PREAMBLE.format(z_safe=z_safe).splitlines()
+            lines.append("")
 
         prev_end = None   # (x, y) of the last emitted endpoint
         at_safe  = True   # tool starts at z_safe after preamble
@@ -146,11 +154,11 @@ class ToolPath:
 
             prev_end = (points[-1][0], points[-1][1])
 
-        lines += [
-            "",
-            "G0 X0.000 Y0.000   ; return to origin",
-            "M5   ; spindle off",
-            "M30  ; end of program",
-        ]
+        if postamble:
+            lines.append("")
+            lines += postamble.splitlines()
+        else:
+            lines.append("")
+            lines += DEFAULT_POSTAMBLE.splitlines()
 
         return "\n".join(lines)

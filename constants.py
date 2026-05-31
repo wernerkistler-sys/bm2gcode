@@ -2,12 +2,33 @@ TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
 RASTER_DIRECTIONS = ["X", "Y", "Both"]
 ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)", "Contour"]
 
+DEFAULT_PREAMBLE = (
+    "G21         ; units = mm\n"
+    "G90         ; absolute positioning\n"
+    "G17         ; XY plane\n"
+    "M3 S24000   ; spindle on (clockwise) at 24000 RPM\n"
+    "G4 P30      ; dwell for 30 seconds to allow spindle to reach speed\n"
+    "G0 Z{z_safe:.3f}   ; move to safe height\n"
+)
+
+DEFAULT_POSTAMBLE = (
+    "G0 Z{z_safe:.3f}   ; move to safe height\n"
+    "G0 X0.000 Y0.000   ; return to origin\n"
+    "M5   ; spindle off\n"
+    "M30  ; end of program"
+)
+
 DEFAULTS = {
     "width_cm":          "10.0",
     "height_cm":         "10.0",
     "max_depth":         "5.0",
     "origin":            "Bottom-Left",
     "surface":           "white",
+    # Global machine / G-code settings
+    "z_safe":            "5.0",
+    "feed_rapid":        "3000",
+    "preamble":          "",    # '' → use DEFAULT_PREAMBLE
+    "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
     # Per-step defaults (prefix-free; used for every new step tab)
     "step_profile":      "End Mill",
     "step_diameter":     "6.0",
@@ -18,7 +39,7 @@ DEFAULTS = {
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"
-    "step_vbit_angle":   "90",           # included angle in degrees
+    "step_vbit_angle":   "60",           # included angle in degrees
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
     "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none

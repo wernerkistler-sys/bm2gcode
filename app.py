@@ -12,7 +12,7 @@ from constants import (
     DISPLAY_STEP_3D, DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
-from widgets import ProgressDialog, LabeledEntry, SectionFrame, _fmt_time
+from widgets import ProgressDialog, LabeledEntry, SectionFrame, SettingsDialog, _fmt_time
 from algorithms import compute_raster_toolpath, compute_vcarve_toolpath, compute_contour_toolpath
 from tool import Tool
 
@@ -24,6 +24,13 @@ class GCodeGeneratorApp:
         self.root.title("CNC Relief Carving — Parameter Setup")
         self.root.geometry("1200x780")
         self.root.minsize(900, 560)
+
+        self._settings = {
+            'z_safe':     float(DEFAULTS['z_safe']),
+            'feed_rapid': float(DEFAULTS['feed_rapid']),
+            'preamble':   DEFAULTS['preamble'],
+            'postamble':  DEFAULTS['postamble'],
+        }
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
         self.image_path      = None
@@ -59,6 +66,8 @@ class GCodeGeneratorApp:
         file_menu.add_command(label="Close Image",  command=self.close_image)
         file_menu.add_separator()
         file_menu.add_command(label="Reset Defaults", command=self.reset_defaults)
+        file_menu.add_separator()
+        file_menu.add_command(label="Settings…",     command=self._open_settings)
         file_menu.add_separator()
         file_menu.add_command(label="Exit",          accelerator="Ctrl+Q",
                               command=self.root.quit)
@@ -584,6 +593,9 @@ class GCodeGeneratorApp:
         self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.status_var.set("No image loaded.")
 
+    def _open_settings(self):
+        SettingsDialog(self.root, self._settings)
+
     def reset_defaults(self):
         self.width_cm.set(DEFAULTS["width_cm"])
         if not self._aspect_lock_var.get():
@@ -692,7 +704,11 @@ class GCodeGeneratorApp:
                 def _done():
                     self.toolpaths[idx] = result
                     result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(feed_rate=feed_rate)
+                    stats = result.get_stats(
+                        feed_rate=feed_rate,
+                        feed_rapid=self._settings['feed_rapid'],
+                        z_safe=self._settings['z_safe'],
+                    )
                     dlg.close("Completed.")
                     step['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -752,7 +768,11 @@ class GCodeGeneratorApp:
                 def _done():
                     self.toolpaths[idx] = result
                     result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(feed_rate=feed_rate)
+                    stats = result.get_stats(
+                        feed_rate=feed_rate,
+                        feed_rapid=self._settings['feed_rapid'],
+                        z_safe=self._settings['z_safe'],
+                    )
                     dlg.close("Completed.")
                     step['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -816,7 +836,11 @@ class GCodeGeneratorApp:
                 def _done():
                     self.toolpaths[idx] = result
                     result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(feed_rate=feed_rate)
+                    stats = result.get_stats(
+                        feed_rate=feed_rate,
+                        feed_rapid=self._settings['feed_rapid'],
+                        z_safe=self._settings['z_safe'],
+                    )
                     dlg.close("Completed.")
                     step['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -855,7 +879,13 @@ class GCodeGeneratorApp:
             if ext in ("nc", "gcode", "tap"):
                 # Feed rate was stored in metadata when the toolpath was computed
                 feed_rate = toolpath.metadata.get('feed_rate', 800.0)
-                gcode = toolpath.to_gcode(feed_rate=feed_rate, feed_rapid=3000.0)
+                gcode = toolpath.to_gcode(
+                    feed_rate=feed_rate,
+                    feed_rapid=self._settings['feed_rapid'],
+                    z_safe=self._settings['z_safe'],
+                    preamble=self._settings['preamble'] or None,
+                    postamble=self._settings['postamble'] or None,
+                )
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(gcode)
             elif ext == "csv":
@@ -956,7 +986,7 @@ class GCodeGeneratorApp:
         from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
         import matplotlib.colors as mcolors
 
-        z_safe = 5.0  # must match to_gcode default
+        z_safe = self._settings['z_safe']
         rapids = []
         cuts   = []
         prev_end = None
