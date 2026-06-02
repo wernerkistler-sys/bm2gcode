@@ -9,7 +9,7 @@ import threading
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-    DISPLAY_STEP_3D, DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK,
+    DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import ProgressDialog, LabeledEntry, SectionFrame, SettingsDialog, _fmt_time
@@ -49,6 +49,9 @@ class GCodeGeneratorApp:
         self._3d_pan_offset  = np.array([0.0, 0.0, 0.0])  # XYZ pan offset
         self._3d_mouse_start = None   # (x_px, y_px, elev, azim) or pan variant
 
+        # Currently rendered 2D array (used for hover coordinate readout)
+        self._displayed_array = None
+
         self._build_menu()
         self._build_layout()
 
@@ -83,7 +86,7 @@ class GCodeGeneratorApp:
             (DISPLAY_STEP_RES,    "2"),
             (DISPLAY_STEP_RESULT, "3"),
             (DISPLAY_STEP_3D,     "4"),
-            (DISPLAY_FINE_DETAIL, "5"),
+            (DISPLAY_STEP_UNACCESSIBLE, "5"),
             (DISPLAY_PROC_MASK,   "6"),
         ]
         self._display_menu_indices = {}
@@ -120,10 +123,16 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     def _build_layout(self):
         # Status bar (pack first so it anchors to bottom reliably)
+        status_bar = ttk.Frame(self.root, relief=tk.SUNKEN)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="No image loaded.")
-        ttk.Label(self.root, textvariable=self.status_var,
-                  relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2)
-                  ).pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(status_bar, textvariable=self.status_var,
+                  anchor=tk.W, padding=(6, 2)
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.coord_var = tk.StringVar(value="")
+        ttk.Label(status_bar, textvariable=self.coord_var,
+                  anchor=tk.E, padding=(6, 2)
+                  ).pack(side=tk.RIGHT)
 
         # Horizontal pane: sidebar | right column
         pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=5,
@@ -485,6 +494,7 @@ class GCodeGeneratorApp:
         self.mpl_canvas.mpl_connect("button_press_event",   self._on_mouse_press)
         self.mpl_canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.mpl_canvas.mpl_connect("motion_notify_event",  self._on_mouse_move)
+        self.mpl_canvas.mpl_connect("axes_leave_event",     self._on_axes_leave)
 
         self.placeholder = ttk.Label(
             parent,
@@ -922,7 +932,7 @@ class GCodeGeneratorApp:
         available_modes = [
             m for m in DISPLAY_MODES
             if not (m == DISPLAY_PROC_MASK  and not has_step)
-            and not (m == DISPLAY_FINE_DETAIL and not has_accessible)
+            and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
         ]
         for m in DISPLAY_MODES:
@@ -1140,12 +1150,12 @@ class GCodeGeneratorApp:
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
-        elif mode in (DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK):
+        elif mode in (DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
             depth_map, _ = self._get_depth_map()
             accessible    = self._accessible_for_step(step_idx)
             fine_detail   = (np.clip(depth_map - accessible, 0.0, 1.0)
                              if accessible is not None else depth_map.copy())
-            if mode == DISPLAY_FINE_DETAIL:
+            if mode == DISPLAY_STEP_UNACCESSIBLE:
                 img   = fine_detail
                 cmap  = "hot"
                 title = f"Step Unaccessible (Step {step_idx + 1})"
@@ -1204,7 +1214,7 @@ class GCodeGeneratorApp:
                 title = f"Processing Mask (Step {step_idx + 1})"
 
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-                        DISPLAY_FINE_DETAIL, DISPLAY_PROC_MASK):
+                        DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
             img   = self.current_image
             cmap  = "gray"
             title = ""
@@ -1212,6 +1222,7 @@ class GCodeGeneratorApp:
         saved_xlim = self._view_xlim
         saved_ylim = self._view_ylim
 
+        self._displayed_array = img
         self.ax.cla()
         self.ax.set_visible(True)
         self.ax.imshow(img, interpolation="bilinear", aspect="equal",
@@ -1337,6 +1348,13 @@ class GCodeGeneratorApp:
 
             self._render()
         else:
+            if (event.inaxes is self.ax
+                    and event.xdata is not None and event.ydata is not None
+                    and self._displayed_array is not None):
+                self._update_coord_display(event.xdata, event.ydata)
+            else:
+                self.coord_var.set("")
+
             if self._pan_origin is None or event.inaxes is not self.ax:
                 return
             if event.xdata is None or event.ydata is None:
@@ -1351,6 +1369,56 @@ class GCodeGeneratorApp:
             self._view_xlim = new_xlim
             self._view_ylim = new_ylim
             self.mpl_canvas.draw_idle()
+
+    def _on_axes_leave(self, event):
+        self.coord_var.set("")
+
+    def _update_coord_display(self, xdata, ydata):
+        img = self._displayed_array
+        if img is None:
+            self.coord_var.set("")
+            return
+
+        H, W = img.shape
+        col = int(np.clip(round(xdata), 0, W - 1))
+        row = int(np.clip(round(ydata), 0, H - 1))
+
+        try:
+            width_mm  = float(self.width_cm.get())  * 10.0
+            height_mm = float(self.height_cm.get()) * 10.0
+            max_depth = float(self.max_depth.get())
+        except ValueError:
+            self.coord_var.set("")
+            return
+
+        px_per_mm_x = W / width_mm
+        px_per_mm_y = H / height_mm
+
+        origin = self.origin_var.get()
+        _ox = {"Bottom-Left": 0,         "Bottom-Right": width_mm,
+               "Top-Left":    0,         "Top-Right":    width_mm,
+               "Center":      width_mm / 2}.get(origin, 0)
+        _oy = {"Bottom-Left": 0,         "Bottom-Right": 0,
+               "Top-Left":    height_mm, "Top-Right":    height_mm,
+               "Center":      height_mm / 2}.get(origin, 0)
+
+        x_mm = col / px_per_mm_x - _ox
+        y_mm = (H - 1 - row) / px_per_mm_y - _oy
+
+        mode = self.display_mode_var.get()
+        if mode == DISPLAY_PROC_MASK:
+            val = float(img[row, col])
+            z_str = f"Z: {'1' if val > 0.5 else '0'}"
+        else:
+            if mode == DISPLAY_ORIGINAL:
+                depth_map, _ = self._get_depth_map()
+                val = float(depth_map[row, col])
+            else:
+                val = float(img[row, col])
+            sign = +1 if mode in (DISPLAY_STEP_RES, DISPLAY_STEP_UNACCESSIBLE) else -1
+            z_str = f"Z: {sign * val * max_depth:.2f} mm"
+
+        self.coord_var.set(f"X: {x_mm:+.2f}  Y: {y_mm:+.2f}  {z_str}")
 
     def _reset_zoom(self):
         """Clear saved view limits (next render will auto-fit)."""
