@@ -196,21 +196,31 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    # ── Stage 1 · Build tool kernel_raster (0–10 %) ──────────────────────
+    # ── Stage 1 · Build tool kernel (0–10 %) ─────────────────────────────
     progress(0, "Building tool geometry kernel…")
     kernel_raster, footprint_raster = _build_kernel(tool, px_per_mm, max_depth)
     ksize = kernel_raster.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
-    # ── Stage 2 · Compute tool-accessible_raster depth surface (10–35 %) ─
-    progress(10, "Computing tool-accessible surface (morphological erosion)…")
-    structure = -kernel_raster.astype(np.float64)   # erosion subtracts structure
+    # ── Stage 2 · Compute achievable depth surface (10–35 %) ─────────────
+    progress(10, "Computing achievable depth surface (morphological opening)…")
+    structure = -kernel_raster.astype(np.float64)
 
-    accessible_raster = grey_erosion(depth_map.astype(np.float64),
+    # Max depth the tool can reach when centred at each pixel (erosion).
+    # Used internally as per-pixel depth targets during toolpath planning.
+    center_depth_contour_raster = grey_erosion(depth_map.astype(np.float64),
                               footprint=footprint_raster,
                               structure=structure).astype(np.float32)
+    center_depth_contour_raster = np.clip(center_depth_contour_raster, 0.0, 1.0)
+
+    # Dilation of the erosion gives the true achievable depth at each material
+    # point: the tool can carve (x,y) while centred at an offset position.
+    # Erosion followed by dilation = morphological opening.
+    accessible_raster = grey_dilation(center_depth_contour_raster.astype(np.float64),
+                               footprint=footprint_raster,
+                               structure=structure).astype(np.float32)
     accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
-    progress(35, "Tool-accessible surface computed.")
+    progress(35, "Achievable depth surface computed.")
 
     # ── Stage 3 · Plan depth passes (35–40 %) ─────────────────────
     progress(35, "Planning depth passes…")
@@ -247,7 +257,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         prior_mask = None
 
     all_segments = []  # list of (segment_type, [(x,y,z),...]) for ToolPath
-    achieved_raster    = np.zeros_like(accessible_raster, dtype=np.float32)
+    achieved_raster    = np.zeros_like(center_depth_contour_raster, dtype=np.float32)
     tool_pos    = np.array([0.0, 0.0])
     total_segs  = 0
     n_links_inserted = 0
@@ -283,7 +293,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         z_norm = z_depth_mm / max_depth
 
         # ── Compute per-pixel remaining depth at this z-level ─────
-        remaining_depth = (np.minimum(accessible_raster, z_norm)
+        remaining_depth = (np.minimum(center_depth_contour_raster, z_norm)
                            - achieved_raster).astype(np.float32)
         if prior_mask is not None:
             remaining_depth *= prior_mask
@@ -376,7 +386,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 for px in px_range:
                     row, col = ((idx, px) if direction == "X"
                                 else (px, idx))
-                    target = min(accessible_raster[row, col], z_norm)
+                    target = min(center_depth_contour_raster[row, col], z_norm)
                     if target > achieved_raster[row, col]:
                         achieved_raster[row, col] = target
                     z_mm = achieved_raster[row, col] * max_depth
@@ -434,7 +444,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                                     r0, c0, r1, c1):
                                 row_l = max(0, min(H - 1, row_l))
                                 col_l = max(0, min(W - 1, col_l))
-                                z_link = min(accessible_raster[row_l, col_l],
+                                z_link = min(center_depth_contour_raster[row_l, col_l],
                                              z_norm)
                                 if z_link > achieved_raster[row_l, col_l]:
                                     achieved_raster[row_l, col_l] = z_link
@@ -479,7 +489,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                    previous_result if previous_result is not None else 0.0),
         depth_map).astype(np.float32)
 
-    n_skip   = int(np.sum(material_removed_raster >= accessible_raster - resid_tol))
+    n_skip   = int(np.sum(material_removed_raster >= center_depth_contour_raster - resid_tol))
     pct_done = 100.0 * n_skip / max(1, H * W)
     label    = "post-refining" if previous_result is not None else "post-roughing"
     progress(88, f"{label.capitalize()} residual computed — "
@@ -589,15 +599,15 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    # ── Stage 1 · Fine-detail mask (0–10 %) ───────────────────────
-    progress(0, "Computing fine-detail mask…")
+    # ── Stage 1 · Unaccessible-depth mask (0–10 %) ────────────────
+    progress(0, "Computing unaccessible-depth mask…")
     if prior_accessible is None:
-        fine_detail = depth_map.copy()
+        unaccessible = depth_map.copy()
     else:
-        fine_detail = np.clip(depth_map - prior_accessible, 0.0, 1.0)
+        unaccessible = np.clip(depth_map - prior_accessible, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
-    mask_vcarve    = fine_detail > threshold_norm
+    mask_vcarve    = unaccessible > threshold_norm
 
     if not np.any(mask_vcarve):
         progress(100, "No fine-detail regions found — nothing to V-carve.")
@@ -621,15 +631,15 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     ksize = kernel_vcarve.shape[0]
     progress(20, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
-    # ── Stage 2b · Tool-accessible surface (20–40 %) ──────────────
-    progress(20, "Computing tool-accessible surface (morphological erosion)…")
-    accessible_vcarve = grey_erosion(
+    # ── Stage 2b · Tool-centre depth limit (20–40 %) ─────────────
+    progress(20, "Computing tool-centre depth limit (morphological erosion)…")
+    center_depth_contour_vcarve = grey_erosion(
         depth_map.astype(np.float64),
         footprint=footprint_vcarve,
         structure=-kernel_vcarve.astype(np.float64),
     ).astype(np.float32)
-    accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
-    progress(40, "Accessible surface computed.")
+    center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
+    progress(40, "Tool-centre depth limit computed.")
 
     # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
     if min_feature_width_mm > 0.0:
@@ -707,19 +717,19 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                     np.round(np.linspace(c0f, c1f, n)).astype(int), 0, W-1)
                 skeleton[rs, cs] = True
 
-            skeleton &= mask_vcarve & (accessible_vcarve > 0)
+            skeleton &= mask_vcarve & (center_depth_contour_vcarve > 0)
             from skimage.morphology import thin as _thin
             skeleton = _thin(skeleton)
     else:
         from skimage.morphology import medial_axis
         progress(45, "Computing medial axis…")
         skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
-        skeleton = skeleton & (accessible_vcarve > 0)
+        skeleton = skeleton & (center_depth_contour_vcarve > 0)
 
     # ── Compute V-bit swept material removal (for result/residual display) ──
     from scipy.ndimage import grey_dilation as _grey_dilation
     dil_structure_vcarve = -kernel_vcarve.astype(np.float64)
-    achieved_vcarve = (accessible_vcarve * skeleton).astype(np.float64)
+    achieved_vcarve = (center_depth_contour_vcarve * skeleton).astype(np.float64)
     vcarve_cone_depth = _grey_dilation(
         achieved_vcarve,
         footprint=footprint_vcarve,
@@ -914,7 +924,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     if stepdown_mm <= 0.0:
         def _depth_single(r, c):
-            return -accessible_vcarve[r, c] * max_depth
+            return -center_depth_contour_vcarve[r, c] * max_depth
         all_segments = _build_pass_segments(ordered_branches, _depth_single)
     else:
         final_norm = final_stepdown_mm / max_depth
@@ -923,7 +933,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         skel_rows, skel_cols = np.where(skeleton)
         if len(skel_rows):
             max_roughable_norm = float(
-                (accessible_vcarve[skel_rows, skel_cols] - final_norm)
+                (center_depth_contour_vcarve[skel_rows, skel_cols] - final_norm)
                 .clip(min=0).max()
             )
         else:
@@ -945,7 +955,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             _fn = final_norm
 
             def _depth_rough(r, c, _pc=_pc, _cn=_cn, _fn=_fn):
-                roughing_target = accessible_vcarve[r, c] - _fn
+                roughing_target = center_depth_contour_vcarve[r, c] - _fn
                 if roughing_target <= _pc:
                     return None
                 return -min(roughing_target, _cn) * max_depth
@@ -957,7 +967,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
         if final_stepdown_mm > 0.0:
             def _depth_final(r, c):
-                return -accessible_vcarve[r, c] * max_depth
+                return -center_depth_contour_vcarve[r, c] * max_depth
             all_segments.extend(
                 _build_pass_segments(ordered_branches, _depth_final)
             )
@@ -1012,11 +1022,14 @@ def compute_contour_toolpath(
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
-    The accessible depth surface is sliced at evenly-spaced Z-levels separated
+    The achievable depth surface is sliced at evenly-spaced Z-levels separated
     by *stepdown_mm*.  At each level the iso-depth contour lines are extracted
     and emitted as cut segments, giving a layer-by-layer waterline strategy.
-    To account for tool geometry, the accessible surface is first computed by
-    grey-eroding the depth map with the tool profile kernel.
+    To account for tool geometry, the tool-centre depth limit is first computed
+    by grey-eroding the depth map with the tool profile kernel; contours are
+    extracted from this erosion.  The stored accessible surface is the full
+    morphological opening (erosion followed by dilation), representing the true
+    achievable depth at each material point.
 
     Parameters
     ----------
@@ -1077,24 +1090,35 @@ def compute_contour_toolpath(
 
     # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
     progress(0, "Building tool geometry kernel…")
-    kernel, footprint = _build_kernel(tool, px_per_mm, max_depth)
-    ksize = kernel.shape[0]
+    kernel_contour, footprint_contour = _build_kernel(tool, px_per_mm, max_depth)
+    ksize = kernel_contour.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
-    # ── Stage 2 · Accessible surface (10–35 %) ────────────────────────────
-    progress(10, "Computing tool-accessible surface (morphological erosion)…")
-    structure = -kernel.astype(np.float64)
-    accessible = grey_erosion(depth_map.astype(np.float64),
-                              footprint=footprint,
+    # ── Stage 2 · Compute achievable depth surface (10–35 %) ──────────────
+    progress(10, "Computing achievable depth surface (morphological opening)…")
+    structure = -kernel_contour.astype(np.float64)
+
+    # Max depth the tool can reach when centred at each pixel (erosion).
+    # Used for contour extraction and adaptive level planning.
+    center_depth_contour = grey_erosion(depth_map.astype(np.float64),
+                              footprint=footprint_contour,
                               structure=structure).astype(np.float32)
-    accessible = np.clip(accessible, 0.0, 1.0)
-    progress(35, "Tool-accessible surface computed.")
+    center_depth_contour = np.clip(center_depth_contour, 0.0, 1.0)
+
+    # Dilation of the erosion gives the true achievable depth at each material
+    # point: the tool can carve (x,y) while centred at an offset position.
+    # Erosion followed by dilation = morphological opening.
+    accessible_contour = grey_dilation(center_depth_contour.astype(np.float64),
+                                       footprint=footprint_contour,
+                                       structure=structure).astype(np.float32)
+    accessible_contour = np.clip(accessible_contour, 0.0, 1.0)
+    progress(35, "Achievable depth surface computed.")
 
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")
     n_passes = max(1, math.ceil(max_depth / stepdown_mm))
     if adaptive_levels:
-        flat = accessible[accessible > 1e-6].ravel()
+        flat = center_depth_contour[center_depth_contour > 1e-6].ravel()
         if flat.size >= 2:
             quantiles = np.linspace(1.0 / n_passes, 1.0, n_passes)
             z_raw = np.quantile(flat, quantiles)
@@ -1139,7 +1163,7 @@ def compute_contour_toolpath(
                  f"Extracting contours at Z = {-z_norm * max_depth:.3f} mm…")
         z_mm = -z_norm * max_depth
 
-        raw_contours = find_contours(accessible, max(z_norm - _contour_eps, 0.0))
+        raw_contours = find_contours(center_depth_contour, max(z_norm - _contour_eps, 0.0))
         contours     = [c for c in raw_contours if len(c) >= 3]
         if not contours:
             continue
@@ -1210,8 +1234,8 @@ def compute_contour_toolpath(
 
     material_removed = np.maximum(
         grey_dilation(achieved.astype(np.float64),
-                      footprint=footprint,
-                      structure=-kernel.astype(np.float64)).astype(np.float32),
+                      footprint=footprint_contour,
+                      structure=-kernel_contour.astype(np.float64)).astype(np.float32),
         0.0)
 
     result = np.maximum(
@@ -1224,7 +1248,7 @@ def compute_contour_toolpath(
     tp = ToolPath(
         segments=all_segments,
         result=result,
-        accessible=accessible,
+        accessible=accessible_contour,
         metadata={
             'algorithm':       'Contour',
             'profile':         tool.profile,

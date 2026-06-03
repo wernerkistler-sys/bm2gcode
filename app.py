@@ -971,10 +971,10 @@ class GCodeGeneratorApp:
         return self.display_mode_var.get() in DISPLAY_3D_MODES
 
     def _accessible_for_step(self, idx):
-        """Return the accessible surface relevant to step *idx*, or None.
+        """Return the achievable depth surface (morphological opening) for step *idx*, or None.
 
-        For a raster step: returns that step's own accessible array.
-        For a V-carve step (accessible=None): returns the prior step's accessible.
+        For a raster/contour step: returns that step's own opening array.
+        For a V-carve step (accessible=None): falls back to the prior step's opening.
         """
         if 0 <= idx < len(self.toolpaths):
             tp = self.toolpaths[idx]
@@ -1153,10 +1153,10 @@ class GCodeGeneratorApp:
         elif mode in (DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
             depth_map, _ = self._get_depth_map()
             accessible    = self._accessible_for_step(step_idx)
-            fine_detail   = (np.clip(depth_map - accessible, 0.0, 1.0)
+            unaccessible  = (np.clip(depth_map - accessible, 0.0, 1.0)
                              if accessible is not None else depth_map.copy())
             if mode == DISPLAY_STEP_UNACCESSIBLE:
-                img   = fine_detail
+                img   = unaccessible
                 cmap  = "hot"
                 title = f"Step Unaccessible (Step {step_idx + 1})"
             else:
@@ -1174,9 +1174,9 @@ class GCodeGeneratorApp:
                 )
 
                 if is_vcarve:
-                    # Gate on fine_detail (depth_map - accessible): regions the
+                    # Gate on unaccessible (depth_map - accessible): regions the
                     # prior roughing tool's geometry couldn't reach.
-                    ref = fine_detail
+                    ref = unaccessible
                 else:
                     # Gate on the prior step's residual (depth_map - prior_result).
                     prior_idx = step_idx - 1
