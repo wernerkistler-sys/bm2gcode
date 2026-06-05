@@ -59,8 +59,10 @@ class GCodeGeneratorApp:
     #  Menu
     # ------------------------------------------------------------------ #
     def _build_menu(self):
-        self.display_mode_var = tk.StringVar(value=DISPLAY_ORIGINAL)
-        self.display_step_var = tk.IntVar(value=1)
+        self.display_mode_var   = tk.StringVar(value=DISPLAY_ORIGINAL)
+        self.display_step_var   = tk.IntVar(value=1)
+        self.show_cut_moves_var = tk.BooleanVar(value=True)
+        self.show_rapids_var    = tk.BooleanVar(value=True)
 
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -77,17 +79,14 @@ class GCodeGeneratorApp:
         menubar.add_cascade(label="File", menu=file_menu)
 
         self._view_menu = tk.Menu(menubar, tearoff=0)
-        self._view_menu.add_command(label="Reset Zoom  (double-click)",
-                                    command=self._reset_zoom_and_render)
-        self._view_menu.add_separator()
 
         _display_hotkeys = [
-            (DISPLAY_ORIGINAL,    "1"),
-            (DISPLAY_STEP_RES,    "2"),
-            (DISPLAY_STEP_RESULT, "3"),
-            (DISPLAY_STEP_3D,     "4"),
+            (DISPLAY_ORIGINAL,          "1"),
+            (DISPLAY_STEP_3D,           "2"),
+            (DISPLAY_STEP_RESULT,       "3"),
+            (DISPLAY_STEP_RES,          "4"),
             (DISPLAY_STEP_UNACCESSIBLE, "5"),
-            (DISPLAY_PROC_MASK,   "6"),
+            (DISPLAY_PROC_MASK,         "6"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -99,6 +98,19 @@ class GCodeGeneratorApp:
                 command=self._on_display_mode_changed,
             )
             self._display_menu_indices[mode] = self._view_menu.index(tk.END)
+
+        self._view_menu.add_separator()
+        self._view_menu.add_checkbutton(label="Show cut moves",
+                                        accelerator="C",
+                                        variable=self.show_cut_moves_var,
+                                        command=self._on_display_mode_changed)
+        self._view_menu.add_checkbutton(label="Show rapids",
+                                        accelerator="R",
+                                        variable=self.show_rapids_var,
+                                        command=self._on_display_mode_changed)
+        self._view_menu.add_separator()
+        self._view_menu.add_command(label="Reset Zoom  (double-click)",
+                                    command=self._reset_zoom_and_render)
 
         menubar.add_cascade(label="View", menu=self._view_menu)
 
@@ -117,6 +129,18 @@ class GCodeGeneratorApp:
 
         for mode, key in _display_hotkeys:
             self.root.bind(f"<Key-{key}>", _make_mode_handler(mode))
+
+        def _make_toggle_handler(var):
+            def _handler(e):
+                fw = self.root.focus_get()
+                if isinstance(fw, (tk.Entry, ttk.Entry, tk.Text)):
+                    return
+                var.set(not var.get())
+                self._on_display_mode_changed()
+            return _handler
+
+        self.root.bind("<Key-c>", _make_toggle_handler(self.show_cut_moves_var))
+        self.root.bind("<Key-r>", _make_toggle_handler(self.show_rapids_var))
 
     # ------------------------------------------------------------------ #
     #  Top-level layout
@@ -947,6 +971,10 @@ class GCodeGeneratorApp:
             self._3d_azim = -60.0
             self._3d_zoom = 1.0
             self._3d_pan_offset = np.array([0.0, 0.0, 0.0])
+            # Ensure at least the path is visible — nothing to see without it
+            if not self.show_cut_moves_var.get() and not self.show_rapids_var.get():
+                self.show_cut_moves_var.set(True)
+                self.show_rapids_var.set(True)
         self._render()
 
     # ------------------------------------------------------------------ #
@@ -1058,8 +1086,10 @@ class GCodeGeneratorApp:
                                    alpha=alpha, label=label)
             self.ax.add_collection3d(col, autolim=False)
 
-        add_segments(rapids, "#ff0000",   1.0, 1.0, 'Rapids')
-        add_segments(cuts,   "#61b970ff", 1.0, 1.0, 'Cut moves')
+        if self.show_rapids_var.get():
+            add_segments(rapids, "#ff0000",   1.0, 1.0, 'Rapids')
+        if self.show_cut_moves_var.get():
+            add_segments(cuts,   "#61b970ff", 1.0, 1.0, 'Cut moves')
 
         # ── Axis labels & style ────────────────────────────────────────
         self.ax.set_xlabel('X (mm)', color='#aaaaaa', labelpad=6)
@@ -1217,7 +1247,7 @@ class GCodeGeneratorApp:
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
             img   = self.current_image
             cmap  = "gray"
-            title = ""
+            title = "Original"
 
         saved_xlim = self._view_xlim
         saved_ylim = self._view_ylim
@@ -1225,8 +1255,9 @@ class GCodeGeneratorApp:
         self._displayed_array = img
         self.ax.cla()
         self.ax.set_visible(True)
-        self.ax.imshow(img, interpolation="bilinear", aspect="equal",
+        self.ax.imshow(img, interpolation="none", aspect="equal",
                        cmap=cmap, vmin=0, vmax=1)
+        self._overlay_toolpath_2d(img, step_idx)
         self.ax.axis("off")
         if title:
             self.ax.set_title(title, color="white", fontsize=10, pad=6)
@@ -1237,6 +1268,64 @@ class GCodeGeneratorApp:
             self.ax.set_ylim(saved_ylim)
 
         self.mpl_canvas.draw()
+
+    def _overlay_toolpath_2d(self, img, step_idx):
+        """Overlay cut moves and rapids on the current 2D axes."""
+        show_cuts   = self.show_cut_moves_var.get()
+        show_rapids = self.show_rapids_var.get()
+        if not show_cuts and not show_rapids:
+            return
+        tp = (self.toolpaths[step_idx]
+              if 0 <= step_idx < len(self.toolpaths) else None)
+        if tp is None or not tp.segments:
+            return
+        try:
+            width_mm  = float(self.width_cm.get())  * 10.0
+            height_mm = float(self.height_cm.get()) * 10.0
+        except ValueError:
+            return
+        if width_mm == 0 or height_mm == 0:
+            return
+
+        H, W = img.shape[:2]
+        sx = W / width_mm
+        sy = H / height_mm
+
+        origin = self.origin_var.get()
+        _ox = {"Bottom-Left": 0,          "Bottom-Right": width_mm,
+               "Top-Left":    0,          "Top-Right":    width_mm,
+               "Center":      width_mm  / 2}.get(origin, 0)
+        _oy = {"Bottom-Left": 0,          "Bottom-Right": 0,
+               "Top-Left":    height_mm, "Top-Right":    height_mm,
+               "Center":      height_mm / 2}.get(origin, 0)
+
+        def to_px(x, y):
+            # Inverse of: x_mm = col/sx - _ox,  y_mm = (H-1-row)/sy - _oy
+            return (x + _ox) * sx, (H - 1) - (y + _oy) * sy
+
+        from matplotlib.collections import LineCollection
+
+        cut_lines   = []
+        rapid_lines = []
+        prev_end    = None
+
+        for pts in tp.segments:
+            if not pts:
+                continue
+            if prev_end is not None and prev_end != pts[0]:
+                rapid_lines.append([to_px(*prev_end[:2]), to_px(*pts[0][:2])])
+            if len(pts) >= 2:
+                cut_lines.append([to_px(x, y) for x, y, _ in pts])
+            prev_end = pts[-1]
+
+        if show_cuts and cut_lines:
+            self.ax.add_collection(LineCollection(
+                cut_lines, colors="#61b970", linewidths=0.8, alpha=0.85,
+                zorder=2))
+        if show_rapids and rapid_lines:
+            self.ax.add_collection(LineCollection(
+                rapid_lines, colors="#ff4444", linewidths=0.8, alpha=0.85,
+                zorder=2))
 
     # ------------------------------------------------------------------ #
     #  Zoom & Pan — 2D and 3D
