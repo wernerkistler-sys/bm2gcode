@@ -33,6 +33,7 @@ class GCodeGeneratorApp:
         }
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
+        self.n_grey_levels   = 256
         self.image_path      = None
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
@@ -610,11 +611,13 @@ class GCodeGeneratorApp:
 
         self.placeholder.place_forget()
         levels = int(np.round((self.current_image.max() - self.current_image.min()) * 255)) + 1
+        self.n_grey_levels = levels
         self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
         self._render()
 
     def close_image(self):
         self.current_image = None
+        self.n_grey_levels = 256
         self.image_path    = None
         self.toolpaths     = [None] * len(self.steps)
         for i, s in enumerate(self.steps):
@@ -989,7 +992,7 @@ class GCodeGeneratorApp:
                       equivalent) as a conservative estimate.
         """
         img = np.clip(self.current_image, 0.0, 1.0)
-        n_grey_levels = 65536
+        n_grey_levels = self.n_grey_levels
         if self.surface.get() == "white":
             return 1.0 - img, n_grey_levels   # white = z=0, black = deepest cut
         else:

@@ -337,8 +337,15 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     line_resid = remaining_depth[idx, :]
                 else:
                     line_resid = remaining_depth[:, idx]
-                for s, e in mask_spans(line_resid > resid_tol):
-                    all_spans.append((idx, s, e))
+                if pass_idx == 0 and prior_mask is None:
+                    # First pass with no prior-step gate: one continuous span
+                    # from first to last non-zero pixel so the tool doesn't
+                    # retract through zero-depth regions.
+                    nonzero = np.where(line_resid > resid_tol)[0]
+                    all_spans.append((idx, int(nonzero[0]), int(nonzero[-1])))
+                else:
+                    for s, e in mask_spans(line_resid > resid_tol):
+                        all_spans.append((idx, s, e))
 
             n_spans = len(all_spans)
             progress(40 + 40 * pass_idx / n_passes,
@@ -607,7 +614,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         unaccessible = np.clip(depth_map - prior_accessible, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
-    mask_vcarve    = unaccessible > threshold_norm
+    mask_vcarve    = unaccessible >= threshold_norm
 
     if not np.any(mask_vcarve):
         progress(100, "No fine-detail regions found — nothing to V-carve.")
