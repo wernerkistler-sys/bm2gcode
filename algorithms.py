@@ -289,6 +289,58 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 err += 2 * dc
                 r   += sr
 
+    def geodesic_link_pixels(r0, c0, r1, c1, z_norm_val):
+        """Dijkstra minimum-3D-arc-length path from (r0,c0) to (r1,c1).
+
+        Prefers routes that avoid sharp depth edges over the straight
+        Bresenham line, producing a smoother z-profile for terrain links.
+        Closes over center_depth_contour_raster, H, W, px_per_mm_x/y, max_depth.
+        """
+        import heapq
+        margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
+        rlo = max(0, min(r0, r1) - margin)
+        rhi = min(H - 1, max(r0, r1) + margin)
+        clo = max(0, min(c0, c1) - margin)
+        chi = min(W - 1, max(c0, c1) + margin)
+
+        DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        dist = {}
+        prev = {}
+        dist[(r0, c0)] = 0.0
+        heap = [(0.0, r0, c0)]
+
+        while heap:
+            d, r, c = heapq.heappop(heap)
+            if (r, c) == (r1, c1):
+                break
+            if d > dist.get((r, c), float('inf')):
+                continue
+            z_cur = min(float(center_depth_contour_raster[r, c]), z_norm_val)
+            for dr, dc in DIRS:
+                nr, nc = r + dr, c + dc
+                if not (rlo <= nr <= rhi and clo <= nc <= chi):
+                    continue
+                z_nb = min(float(center_depth_contour_raster[nr, nc]), z_norm_val)
+                dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
+                dz   = (z_nb - z_cur) * max_depth
+                nd   = d + (dxy2 + dz * dz) ** 0.5
+                if nd < dist.get((nr, nc), float('inf')):
+                    dist[(nr, nc)] = nd
+                    prev[(nr, nc)] = (r, c)
+                    heapq.heappush(heap, (nd, nr, nc))
+
+        if (r1, c1) not in prev and (r0, c0) != (r1, c1):
+            return list(bresenham_pixels(r0, c0, r1, c1))
+
+        path, cur = [], (r1, c1)
+        while cur != (r0, c0):
+            path.append(cur)
+            cur = prev[cur]
+        path.append((r0, c0))
+        path.reverse()
+        return path
+
     for pass_idx, z_depth_mm in enumerate(pass_depths):
         z_norm = z_depth_mm / max_depth
 
@@ -447,10 +499,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             r1 = int(round((H - 1) - (y_entry    + _oy) * px_per_mm_y))
 
                             link_points = []
-                            for row_l, col_l in bresenham_pixels(
-                                    r0, c0, r1, c1):
-                                row_l = max(0, min(H - 1, row_l))
-                                col_l = max(0, min(W - 1, col_l))
+                            for row_l, col_l in geodesic_link_pixels(
+                                    r0, c0, r1, c1, z_norm):
                                 z_link = min(center_depth_contour_raster[row_l, col_l],
                                              z_norm)
                                 if z_link > achieved_raster[row_l, col_l]:
