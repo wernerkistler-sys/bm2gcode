@@ -664,7 +664,22 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         unaccessible = np.clip(depth_map - prior_accessible, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
-    mask_vcarve    = unaccessible >= threshold_norm
+
+    # Grey erosion with a flat disk is equivalent to the binary EDT erosion that
+    # was previously applied after thresholding, but operates in the grey-level
+    # domain so the contour level threshold_norm can later be applied to the
+    # eroded grey array for sub-pixel accurate boundary placement.
+    unaccessible_filtered = unaccessible
+    if min_feature_width_mm > 0.0:
+        from skimage.morphology import disk as _disk
+        min_half_px = (min_feature_width_mm / 2.0) * px_per_mm
+        radius = max(1, int(np.ceil(min_half_px)))
+        unaccessible_filtered = grey_erosion(
+            unaccessible.astype(np.float64),
+            footprint=_disk(radius),
+        ).astype(np.float32)
+
+    mask_vcarve = unaccessible_filtered >= threshold_norm
 
     if not np.any(mask_vcarve):
         progress(100, "No fine-detail regions found — nothing to V-carve.")
@@ -698,21 +713,14 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
     progress(40, "Tool-centre depth limit computed.")
 
-    # ── Stage 3 · Mask clean-up + medial axis (40–60 %) ───────────
-    if min_feature_width_mm > 0.0:
-        min_half_px = (min_feature_width_mm / 2.0) * px_per_mm
-        mask_dist   = distance_transform_edt(mask_vcarve)
-        mask_vcarve = mask_dist > min_half_px
-        progress(43, f"Mask eroded: features narrower than "
-                     f"{min_feature_width_mm:.2f} mm removed.")
-
+    # ── Stage 3 · Medial axis (40–60 %) ───────────────────────────
     if skeleton_mode == 'voronoi':
         progress(45, "Computing Voronoi skeleton…")
         from scipy.spatial import Voronoi as _Voronoi
         from skimage.measure import find_contours as _find_contours
         from scipy.ndimage import gaussian_filter1d as _gauss1d
 
-        raw_contours = _find_contours(mask_vcarve.astype(np.float32), 0.5)
+        raw_contours = _find_contours(unaccessible_filtered, threshold_norm)
         sigma = max(1.0, 0.5 * px_per_mm)
         pts_list = []
         for c in raw_contours:
