@@ -909,7 +909,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                     )
             branches = remapped
 
-    branches = [br for br in branches if not (len(br) <= 2 and br[0] == br[-1])]
+    branches = [br for br in branches if not (len(br) == 2 and br[0] == br[-1])]
 
     n_branches = len(branches)
     progress(75, f"Path ordering: {n_branches} branch(es).")
