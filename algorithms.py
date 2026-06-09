@@ -29,30 +29,30 @@ def mask_spans(mask_1d):
 
 
 def simplify_line(points, tol):
-    """Ramer-Douglas-Peucker path simplification in 3-D.
+    """Ramer-Douglas-Peucker path simplification (2-D or 3-D).
 
-    Recursively removes intermediate points whose perpendicular distance
-    from the line segment connecting the current endpoints is below *tol*
-    (in mm).  Collinear or near-collinear runs collapse to just their two
-    endpoints, dramatically reducing G-code line count on flat or gently
-    sloping raster passes.
+    Removes intermediate points whose perpendicular distance from the line
+    segment connecting the current endpoints is below *tol*.  Collinear or
+    near-collinear runs collapse to just their two endpoints.
 
     Parameters
     ----------
-    points : list of (x, y, z) tuples
-    tol    : maximum allowed deviation in mm — caller should pass the
-             coarsest source-data resolution (pixel size or grey-level
-             step, whichever is larger)
+    points : list of (x, y, z) tuples  **or**  numpy array of shape (N, D)
+    tol    : maximum allowed deviation (same units as the coordinates)
 
     Returns
     -------
-    list of (x, y, z) tuples — always includes first and last point
+    Same type as input: list of tuples when given a list, numpy (M, D) array
+    when given an array.  Always includes first and last point.
     """
+    is_array = isinstance(points, np.ndarray)
     if len(points) <= 2:
-        return list(points)
+        return points.copy() if is_array else list(points)
 
-    # Convert to numpy for vectorised distance computation
-    pts = np.array(points, dtype=np.float64)   # shape (N, 3)
+    # Iterative RDP using an explicit stack to avoid Python recursion limits.
+    # (Long branches / contours can have O(N) worst-case recursion depth when
+    # the pivot is near one end, exceeding Python's ~1000-frame limit.)
+    pts = np.asarray(points, dtype=np.float64)  # (N, D) — works for any D
     N   = len(pts)
 
     # Iterative RDP using an explicit stack to avoid Python recursion limits.
@@ -73,7 +73,7 @@ def simplify_line(points, tol):
         seg_len = np.linalg.norm(seg)
 
         if seg_len < 1e-12:
-            # Degenerate segment (start == end in 3-D)
+            # Degenerate segment (start == end)
             dists = np.linalg.norm(pts[start+1:end] - pts[start], axis=1)
         else:
             diff  = pts[start+1:end] - pts[start]
@@ -90,7 +90,7 @@ def simplify_line(points, tol):
             stack.append((start, pivot))
             stack.append((pivot, end))
 
-    return [points[i] for i in range(N) if keep[i]]
+    return pts[keep] if is_array else [points[i] for i in range(N) if keep[i]]
 
 
 def _build_kernel(tool, px_per_mm, max_depth):
@@ -718,17 +718,39 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         progress(45, "Computing Voronoi skeleton…")
         from scipy.spatial import Voronoi as _Voronoi
         from skimage.measure import find_contours as _find_contours
-        from scipy.ndimage import gaussian_filter1d as _gauss1d
 
+        def _resample(pts, spacing):
+            # Walk the polyline and emit a new point every `spacing` units of
+            # arc length. `carry` tracks the fractional overshoot past the end
+            # of each segment so spacing remains uniform across segment boundaries.
+            out = [pts[0]]
+            carry = 0.0
+            for i in range(1, len(pts)):
+                seg = pts[i] - pts[i - 1]
+                seg_len = float(np.hypot(seg[0], seg[1]))
+                if seg_len < 1e-10:
+                    continue
+                pos = carry
+                while pos < seg_len:
+                    out.append(pts[i - 1] + (pos / seg_len) * seg)
+                    pos += spacing
+                carry = pos - seg_len
+            return np.array(out)
+
+        # eps = sqrt(2)/2 removes all single-pixel staircase steps (worst case: 45° line)
+        # while preserving corners whose deviation from a straight chord is >> 1 px.
+        rdp_eps = np.sqrt(2.0) / 2.0
         raw_contours = _find_contours(unaccessible_filtered, threshold_norm)
-        sigma = max(1.0, 0.5 * px_per_mm)
         pts_list = []
         for c in raw_contours:
             if len(c) < 4:
                 continue
-            sr = _gauss1d(c[:, 0], sigma=sigma, mode='wrap')
-            sc = _gauss1d(c[:, 1], sigma=sigma, mode='wrap')
-            pts_list.append(np.column_stack((sr, sc)))
+            simplified = simplify_line(c, rdp_eps)
+            if len(simplified) < 2:
+                continue
+            resampled = _resample(simplified, spacing=1.0)
+            if len(resampled) >= 2:
+                pts_list.append(resampled)
 
         boundary_pts = np.vstack(pts_list) if pts_list else np.empty((0, 2))
 
