@@ -621,7 +621,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     stepdown_mm           : max depth increment per z-pass in mm; 0 = single pass
     final_stepdown_mm     : depth increment for the finishing pass
                             (0 = same as stepdown_mm)
-    skeleton_mode         : "medial_axis" | "voronoi"
+    skeleton_mode         : "medial_axis" | "voronoi" | "inscribed"
     prior_accessible      : optional 2-D float32 [0,1] geometrically accessible
                             surface of the prior tool (ToolPath.accessible).
                             Pixels where depth_map − prior_accessible > threshold
@@ -638,7 +638,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     """
     from scipy.ndimage import grey_erosion, distance_transform_edt, label
 
-    _alg_name = ('V-Carving (Voronoi)' if skeleton_mode == 'voronoi'
+    _alg_name = ('V-Carving (Voronoi)'   if skeleton_mode == 'voronoi'
+                 else 'V-Carving (Inscribed)' if skeleton_mode == 'inscribed'
                  else 'V-Carving')
 
     H, W = depth_map.shape
@@ -714,7 +715,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(40, "Tool-centre depth limit computed.")
 
     # ── Stage 3 · Medial axis (40–60 %) ───────────────────────────
-    if skeleton_mode == 'voronoi':
+    if skeleton_mode in ('voronoi', 'inscribed'):
         progress(45, "Computing Voronoi skeleton…")
         from scipy.spatial import Voronoi as _Voronoi
         from skimage.measure import find_contours as _find_contours
@@ -794,8 +795,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             va_keep = va[keep]
             vb_keep = vb[keep]
 
-            skeleton = np.zeros_like(mask_vcarve, dtype=bool)
-            for va_i, vb_i in zip(va_keep, vb_keep):
+            r0_keep = np.sqrt(r0sq[keep])   # inscribed-circle radii at va_keep (px)
+            r1_keep = np.sqrt(r1sq[keep])   # inscribed-circle radii at vb_keep (px)
+
+            skeleton   = np.zeros((H, W), dtype=bool)
+            radius_map = np.zeros((H, W), dtype=np.float32)
+            for va_i, vb_i, r0_r, r1_r in zip(va_keep, vb_keep, r0_keep, r1_keep):
                 r0f, c0f = va_i;  r1f, c1f = vb_i
                 n = max(3, int(np.ceil(np.hypot(r1f-r0f, c1f-c0f) * 2)) + 1)
                 rs = np.clip(
@@ -803,6 +808,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 cs = np.clip(
                     np.round(np.linspace(c0f, c1f, n)).astype(int), 0, W-1)
                 skeleton[rs, cs] = True
+                radius_map[rs, cs] = np.linspace(r0_r, r1_r, n)
 
             skeleton &= mask_vcarve & (center_depth_contour_vcarve > 0)
             from skimage.morphology import thin as _thin
@@ -812,6 +818,27 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         progress(45, "Computing medial axis…")
         skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
         skeleton = skeleton & (center_depth_contour_vcarve > 0)
+
+    # ── Inscribed-circle depth map (for 'inscribed' mode only) ───────────────
+    if skeleton_mode == 'inscribed':
+        from math import radians, tan
+        if tool.profile == 'V-Bit':
+            _tan_half = tan(radians(tool.vbit_angle_deg / 2.0))
+            inscribed_depth_norm = (radius_map / px_per_mm) / (_tan_half * max_depth)
+        elif tool.profile == 'Ball':
+            _R_mm = tool.diameter_mm / 2.0
+            _r_mm = radius_map / px_per_mm
+            inscribed_depth_norm = (
+                _R_mm - np.sqrt(np.maximum(0.0, _R_mm**2 - _r_mm**2))
+            ) / max_depth
+        else:  # End Mill — inscribed circle does not constrain depth
+            progress(48, "Warning: 'inscribed' mode is not meaningful for End Mill; "
+                         "falling back to grey-erosion depth.")
+            inscribed_depth_norm = center_depth_contour_vcarve
+        inscribed_depth_norm = np.clip(inscribed_depth_norm, 0.0, 1.0)
+
+    _depth_norm = (inscribed_depth_norm if skeleton_mode == 'inscribed'
+                   else center_depth_contour_vcarve)
 
     # ── Compute V-bit swept material removal (for result/residual display) ──
     from scipy.ndimage import grey_dilation as _grey_dilation
@@ -1011,7 +1038,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     if stepdown_mm <= 0.0:
         def _depth_single(r, c):
-            return -center_depth_contour_vcarve[r, c] * max_depth
+            return -_depth_norm[r, c] * max_depth
         all_segments = _build_pass_segments(ordered_branches, _depth_single)
     else:
         final_norm = final_stepdown_mm / max_depth
@@ -1020,7 +1047,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         skel_rows, skel_cols = np.where(skeleton)
         if len(skel_rows):
             max_roughable_norm = float(
-                (center_depth_contour_vcarve[skel_rows, skel_cols] - final_norm)
+                (_depth_norm[skel_rows, skel_cols] - final_norm)
                 .clip(min=0).max()
             )
         else:
@@ -1042,7 +1069,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             _fn = final_norm
 
             def _depth_rough(r, c, _pc=_pc, _cn=_cn, _fn=_fn):
-                roughing_target = center_depth_contour_vcarve[r, c] - _fn
+                roughing_target = _depth_norm[r, c] - _fn
                 if roughing_target <= _pc:
                     return None
                 return -min(roughing_target, _cn) * max_depth
@@ -1054,7 +1081,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
         if final_stepdown_mm > 0.0:
             def _depth_final(r, c):
-                return -center_depth_contour_vcarve[r, c] * max_depth
+                return -_depth_norm[r, c] * max_depth
             all_segments.extend(
                 _build_pass_segments(ordered_branches, _depth_final)
             )
@@ -1079,6 +1106,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
+            'skeleton_mode':   skeleton_mode,
             'profile':         tool.profile,
             'vbit_angle_deg':  tool.vbit_angle_deg,
             'min_feature_width_mm':  min_feature_width_mm,

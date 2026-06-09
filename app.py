@@ -724,8 +724,8 @@ class GCodeGeneratorApp:
                         min_feature_width_mm = min_feature_width_mm,
                         stepdown_mm          = vcarve_stepdown_mm,
                         final_stepdown_mm    = vcarve_final_stepdown_mm,
-                        skeleton_mode        = ("voronoi"
-                                                if algorithm == "V-Carving (Voronoi)"
+                        skeleton_mode        = ("voronoi"    if algorithm == "V-Carving (Voronoi)"
+                                                else "inscribed" if algorithm == "V-Carving (Inscribed)"
                                                 else "medial_axis"),
                         progress             = dlg.report,
                     )

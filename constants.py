@@ -1,6 +1,7 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
 RASTER_DIRECTIONS = ["X", "Y", "Both"]
-ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)", "Contour"]
+ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)",
+                     "V-Carving (Inscribed)", "Contour"]
 
 DEFAULT_PREAMBLE = (
     "G21         ; units = mm\n"
