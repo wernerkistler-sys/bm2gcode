@@ -13,7 +13,8 @@ from constants import (
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import ProgressDialog, LabeledEntry, SectionFrame, SettingsDialog, _fmt_time
-from algorithms import compute_raster_toolpath, compute_vcarve_toolpath, compute_contour_toolpath
+from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
+                        compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
 
 
@@ -412,6 +413,9 @@ class GCodeGeneratorApp:
 
         min_fw = LabeledEntry(frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
         step['min_fw'] = min_fw
+        max_fw = LabeledEntry(frame, "Max feature width", "mm", DEFAULTS["step_max_fw"],
+                              auto_label="Auto")
+        step['max_fw'] = max_fw
         # packed/unpacked by _on_algorithm_changed below
 
         # ── Wire up algorithm toggle ───────────────────────────────────
@@ -427,6 +431,7 @@ class GCodeGeneratorApp:
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
+                step['max_fw'].pack(fill=tk.X, pady=2, after=step['min_fw'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -436,6 +441,7 @@ class GCodeGeneratorApp:
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
                 step['min_fw'].pack_forget()
+                step['max_fw'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -450,6 +456,7 @@ class GCodeGeneratorApp:
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
+                step['max_fw'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -475,8 +482,36 @@ class GCodeGeneratorApp:
             if 0 <= idx < len(self.steps) and self.steps[idx] is step:
                 self._render()
 
+        def _update_auto_max_fw(*_):
+            if not max_fw.auto_var.get():
+                return
+            try:
+                import math
+                profile   = step['profile_var'].get()
+                diameter  = float(step['diameter'].get())
+                angle     = float(step['vbit_angle'].get()) if profile != "Ball" else 90.0
+                max_depth = float(self.max_depth.get())
+            except (ValueError, AttributeError):
+                return
+            if profile == "V-Bit":
+                r = max_depth * math.tan(math.radians(angle / 2.0))
+            elif profile == "Ball":
+                R = diameter / 2.0
+                d = min(max_depth, R)
+                r = math.sqrt(max(0.0, 2.0 * R * d - d * d))
+            else:
+                return
+            max_fw.var.set(f"{2.0 * r:.3f}")
+
+        max_fw.auto_var.trace_add("write", _update_auto_max_fw)
+        step['profile_var'].trace_add("write", _update_auto_max_fw)
+        step['vbit_angle'].var.trace_add("write", _update_auto_max_fw)
+        step['diameter'].var.trace_add("write", _update_auto_max_fw)
+        self.max_depth.var.trace_add("write", _update_auto_max_fw)
+
         threshold.var.trace_add("write", _on_mask_param_changed)
         min_fw.var.trace_add("write", _on_mask_param_changed)
+        max_fw.var.trace_add("write", _on_mask_param_changed)
 
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
@@ -491,6 +526,8 @@ class GCodeGeneratorApp:
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
         step['vbit_angle'].set(DEFAULTS["step_vbit_angle"])
         step['min_fw'].set(DEFAULTS["step_min_fw"])
+        step['max_fw'].auto_var.set(False)
+        step['max_fw'].set(DEFAULTS["step_max_fw"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
@@ -664,6 +701,7 @@ class GCodeGeneratorApp:
                 _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
                 tool       = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
                 min_feature_width_mm     = float(step['min_fw'].get())
+                max_feature_width_mm     = float(step['max_fw'].get())
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
                 vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
             elif algorithm == "Contour":
@@ -722,6 +760,7 @@ class GCodeGeneratorApp:
                         feed_rate            = feed_rate,
                         threshold_um         = threshold_mm * 1000.0,
                         min_feature_width_mm = min_feature_width_mm,
+                        max_feature_width_mm = max_feature_width_mm,
                         stepdown_mm          = vcarve_stepdown_mm,
                         final_stepdown_mm    = vcarve_final_stepdown_mm,
                         skeleton_mode        = ("voronoi"    if algorithm == "V-Carving (Voronoi)"
@@ -1223,24 +1262,23 @@ class GCodeGeneratorApp:
                     ref = (np.clip(depth_map - prior_result, 0.0, 1.0)
                            if prior_result is not None else depth_map.copy())
 
-                mask = ref >= thr
-
+                min_fw_mm = 0.0
+                max_fw_mm = 0.0
                 if is_vcarve:
                     try:
                         min_fw_mm = float(self.steps[step_idx]['min_fw'].get())
+                        max_fw_mm = float(self.steps[step_idx]['max_fw'].get())
                     except (ValueError, IndexError, KeyError):
                         min_fw_mm = 0.0
-                    if min_fw_mm > 0.0:
-                        try:
-                            H, W = ref.shape
-                            px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
-                            px_per_mm_y = H / (float(self.height_cm.get()) * 10.0)
-                            px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
-                        except (ValueError, ZeroDivisionError):
-                            px_per_mm = 1.0
-                        min_half_px = (min_fw_mm / 2.0) * px_per_mm
-                        from scipy.ndimage import distance_transform_edt
-                        mask = distance_transform_edt(mask) > min_half_px
+                        max_fw_mm = 0.0
+                try:
+                    H, W = ref.shape
+                    px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
+                    px_per_mm_y = H / (float(self.height_cm.get()) * 10.0)
+                    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+                except (ValueError, ZeroDivisionError):
+                    px_per_mm = 1.0
+                _, mask = compute_vcarve_mask(ref, thr, min_fw_mm, px_per_mm, max_fw_mm)
 
                 img  = mask.astype(np.float32)
                 cmap = "Greens"

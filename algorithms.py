@@ -592,6 +592,36 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     return toolpath
 
 
+def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
+                        max_feature_width_mm=0.0):
+    """Return (filtered_ref, mask) for V-carve mask computation.
+
+    Grey opening removes features narrower than min_feature_width_mm while
+    leaving larger features at their original extent.  EDT-based filtering then
+    removes pixels where the inscribed-circle radius exceeds max_feature_width_mm/2
+    (the centre of features too wide for the tool to reach at the configured depth).
+
+    filtered_ref is zeroed wherever mask is False so that downstream Voronoi
+    contour extraction sees both the outer boundary and the inner hole boundary
+    of wide features, not just the original unclipped disc shape.
+    """
+    filtered = ref
+    if min_feature_width_mm > 0.0:
+        from skimage.morphology import disk as _disk
+        from scipy.ndimage import grey_opening as _grey_opening
+        radius = max(1, int(np.ceil((min_feature_width_mm / 2.0) * px_per_mm)))
+        filtered = _grey_opening(
+            ref.astype(np.float64), footprint=_disk(radius)
+        ).astype(np.float32)
+    mask = filtered >= threshold_norm
+    if max_feature_width_mm > 0.0:
+        from scipy.ndimage import distance_transform_edt as _edt
+        edt = _edt(mask)
+        mask &= edt <= (max_feature_width_mm / 2.0) * px_per_mm
+    filtered = np.where(mask, filtered, np.float32(0.0))
+    return filtered, mask
+
+
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             tool, max_depth,
                             width_cm, height_cm,
@@ -599,6 +629,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             feed_rate=800.0,
                             threshold_um=0.0,
                             min_feature_width_mm=0.0,
+                            max_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
                             prior_accessible=None, previous_result=None,
@@ -666,21 +697,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
 
-    # Grey erosion with a flat disk is equivalent to the binary EDT erosion that
-    # was previously applied after thresholding, but operates in the grey-level
-    # domain so the contour level threshold_norm can later be applied to the
-    # eroded grey array for sub-pixel accurate boundary placement.
-    unaccessible_filtered = unaccessible
-    if min_feature_width_mm > 0.0:
-        from skimage.morphology import disk as _disk
-        min_half_px = (min_feature_width_mm / 2.0) * px_per_mm
-        radius = max(1, int(np.ceil(min_half_px)))
-        unaccessible_filtered = grey_erosion(
-            unaccessible.astype(np.float64),
-            footprint=_disk(radius),
-        ).astype(np.float32)
-
-    mask_vcarve = unaccessible_filtered >= threshold_norm
+    unaccessible_filtered, mask_vcarve = compute_vcarve_mask(
+        unaccessible, threshold_norm, min_feature_width_mm, px_per_mm,
+        max_feature_width_mm,
+    )
 
     if not np.any(mask_vcarve):
         progress(100, "No fine-detail regions found — nothing to V-carve.")

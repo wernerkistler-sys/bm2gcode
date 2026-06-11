@@ -169,15 +169,33 @@ class ProgressDialog(tk.Toplevel):
 
 
 class LabeledEntry(ttk.Frame):
-    """Single-row widget: label on the left, unit tag + entry on the right."""
+    """Single-row widget: label on the left, unit tag + entry on the right.
 
-    def __init__(self, parent, label, unit, default, width=8, **kw):
+    If auto_label is given, a checkbutton with that text is inserted between
+    the unit tag and the label.  When checked, the entry is disabled;
+    unchecking re-enables it.  The BooleanVar is exposed as ``auto_var``.
+    Layout: [label ← spacer → [☐ auto_label] [unit] [entry]]
+    """
+
+    def __init__(self, parent, label, unit, default, width=8, auto_label=None, **kw):
         super().__init__(parent, **kw)
         ttk.Label(self, text=label).pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
         self.entry = ttk.Entry(self, textvariable=self.var, width=width)
         self.entry.pack(side=tk.RIGHT)
         ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
+        self.auto_var = None
+        if auto_label is not None:
+            self.auto_var = tk.BooleanVar(value=False)
+            self.auto_var.trace_add("write", self._on_auto_toggle)
+            ttk.Checkbutton(self, text=auto_label,
+                            variable=self.auto_var).pack(side=tk.RIGHT, padx=(0, 4))
+
+    def _on_auto_toggle(self, *_):
+        if self.auto_var and self.auto_var.get():
+            self.entry.config(state="disabled")
+        else:
+            self.entry.config(state="normal")
 
     def get(self):
         return self.var.get()

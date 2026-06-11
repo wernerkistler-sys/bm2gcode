@@ -42,6 +42,7 @@ DEFAULTS = {
     "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"
     "step_vbit_angle":   "60",           # included angle in degrees
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
+    "step_max_fw":       "0.0",          # max feature width for V-carve mask (mm)
     "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
     # Contour-specific defaults
