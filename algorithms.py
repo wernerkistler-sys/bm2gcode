@@ -925,6 +925,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     for r, c in zip(skel_rows.tolist(), skel_cols.tolist()):
         if degree_map[r, c] == 0:
+            if not np.all(mask_vcarve[max(0, r-1):r+2, max(0, c-1):c+2]):
+                continue  # boundary-clipping artifact
             branches.append([(int(r), int(c))])
 
     # Collapse junction pixel clusters
@@ -956,9 +958,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                         + br[1:-1]
                         + [junc_remap.get(br[-1], br[-1])]
                     )
-            branches = remapped
-
-    branches = [br for br in branches if not (len(br) == 2 and br[0] == br[-1])]
+            branches = [br for br in remapped if not (len(br) == 2 and br[0] == br[-1])]
 
     n_branches = len(branches)
     progress(75, f"Path ordering: {n_branches} branch(es).")
