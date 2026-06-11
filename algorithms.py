@@ -843,7 +843,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     # ── Compute V-bit swept material removal (for result/residual display) ──
     from scipy.ndimage import grey_dilation as _grey_dilation
     dil_structure_vcarve = -kernel_vcarve.astype(np.float64)
-    achieved_vcarve = (center_depth_contour_vcarve * skeleton).astype(np.float64)
+    achieved_vcarve = (_depth_norm * skeleton).astype(np.float64)
     vcarve_cone_depth = _grey_dilation(
         achieved_vcarve,
         footprint=footprint_vcarve,
