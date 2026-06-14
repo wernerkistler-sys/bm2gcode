@@ -136,6 +136,35 @@ def _build_kernel(tool, px_per_mm, max_depth):
     return kernel, footprint
 
 
+def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
+                              max_depth_mm, kernel, footprint, resample_spacing_px=0.5):
+    """Rasterize a toolpath's swept volume and return the material-removal surface.
+
+    Densely resamples *toolpath* segments at sub-pixel XY spacing, paints each
+    sample's depth into a pixel-space array, then grey-dilates with the tool
+    geometry kernel to produce the cumulative material-removal map (float32,
+    values in [0, 1] normalised depth units).
+    """
+    from scipy.ndimage import grey_dilation as _grey_dilation
+    H, W = shape
+    px_per_mm = (px_per_mm_x * px_per_mm_y) ** 0.5
+    pts = toolpath.resample(resample_spacing_px / px_per_mm)
+    achieved = np.zeros((H, W), dtype=np.float64)
+    if len(pts):
+        xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+        cs     = (xs + ox) * px_per_mm_x
+        rs     = (H - 1) - (ys + oy) * px_per_mm_y
+        depths = np.clip(-zs / max_depth_mm, 0.0, 1.0)
+        ris    = np.round(rs).astype(np.intp)
+        cis    = np.round(cs).astype(np.intp)
+        valid  = (ris >= 0) & (ris < H) & (cis >= 0) & (cis < W)
+        np.maximum.at(achieved, (ris[valid], cis[valid]), depths[valid])
+    return np.maximum(
+        _grey_dilation(achieved, footprint=footprint,
+                       structure=-kernel.astype(np.float64)).astype(np.float32),
+        0.0)
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
@@ -530,17 +559,21 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     progress(80, f"Raster complete — {total_segs} cut segments, "
                  f"{n_links_inserted} terrain links across all passes.")
 
-    progress(80, "Computing tool-swept removal surface (grey dilation)…")
+    # ── Stage 6 · Simplify, simulate result, create ToolPath (88–100 %) ─────
+    progress(80, "Simplifying tool path…")
+    rdp_tol = max(
+        1.0 / px_per_mm_x,
+        1.0 / px_per_mm_y,
+        max_depth / (n_grey_levels - 1),
+    )
+    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
 
-    dil_structure_raster    = -kernel_raster.astype(np.float64)
-    material_removed_raster = np.maximum(
-        grey_dilation(
-            achieved_raster.astype(np.float64),
-            footprint = footprint_raster,
-            structure = dil_structure_raster,
-        ).astype(np.float32),
-        0.0)
-
+    progress(88, "Simulating tool-swept removal surface…")
+    material_removed_raster = simulate_toolpath_result(
+        ToolPath(segments=simplified),
+        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        max_depth, kernel_raster, footprint_raster,
+    )
     raster_result = np.minimum(
         np.maximum(material_removed_raster,
                    previous_result if previous_result is not None else 0.0),
@@ -549,20 +582,11 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     n_skip   = int(np.sum(material_removed_raster >= center_depth_contour_raster - resid_tol))
     pct_done = 100.0 * n_skip / max(1, H * W)
     label    = "post-refining" if previous_result is not None else "post-roughing"
-    progress(88, f"{label.capitalize()} residual computed — "
+    progress(92, f"{label.capitalize()} residual computed — "
                  f"{pct_done:.1f}% of pixels at target depth "
                  f"(within {resid_tol_mm*1000:.1f} µm).")
 
-    # ── Stage 6 · Create ToolPath object (88–100 %) ───────────────
-    progress(88, "Simplifying tool path…")
-    rdp_tol = max(
-        1.0 / px_per_mm_x,
-        1.0 / px_per_mm_y,
-        max_depth / (n_grey_levels - 1),
-    )
-    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
-
-    progress(92, "Creating ToolPath object...")
+    progress(95, "Creating ToolPath object...")
     toolpath = ToolPath(
         segments=simplified,
         result=raster_result,
@@ -860,23 +884,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     _depth_norm = (inscribed_depth_norm if skeleton_mode == 'inscribed'
                    else center_depth_contour_vcarve)
 
-    # ── Compute V-bit swept material removal (for result/residual display) ──
-    from scipy.ndimage import grey_dilation as _grey_dilation
-    dil_structure_vcarve = -kernel_vcarve.astype(np.float64)
-    achieved_vcarve = (_depth_norm * skeleton).astype(np.float64)
-    vcarve_cone_depth = _grey_dilation(
-        achieved_vcarve,
-        footprint=footprint_vcarve,
-        structure=dil_structure_vcarve,
-    ).astype(np.float32)
-
     if not np.any(skeleton):
         progress(100, "Skeleton empty — no V-carve moves generated.")
         return ToolPath(
             segments=[],
-            result=np.maximum(
-                previous_result if previous_result is not None else 0.0,
-                vcarve_cone_depth).astype(np.float32),
+            result=(previous_result.astype(np.float32) if previous_result is not None
+                    else np.zeros_like(depth_map, dtype=np.float32)),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': tool.vbit_angle_deg,
                       'threshold_um': threshold_um,
@@ -943,6 +956,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 prev, cur = cur, nxt
             branches.append(branch)
 
+    # Degree-0 pixels (no 8-connected neighbours) are never reached by the
+    # branch-start traversal above, so they must be collected separately.
+    # Skip any that touch the mask boundary — those are Voronoi ridge clipping
+    # artifacts produced when the skeleton is masked to the carve region.
     for r, c in zip(skel_rows.tolist(), skel_cols.tolist()):
         if degree_map[r, c] == 0:
             if not np.all(mask_vcarve[max(0, r-1):r+2, max(0, c-1):c+2]):
@@ -1117,12 +1134,19 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     )
     simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
 
-    progress(95, "Creating ToolPath object…")
+    progress(93, "Simulating tool-swept removal surface…")
+    vcarve_result = simulate_toolpath_result(
+        ToolPath(segments=simplified),
+        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        max_depth, kernel_vcarve, footprint_vcarve,
+    )
+
+    progress(97, "Creating ToolPath object…")
     toolpath = ToolPath(
         segments=simplified,
         result=np.maximum(
             previous_result if previous_result is not None else 0.0,
-            vcarve_cone_depth).astype(np.float32),
+            vcarve_result).astype(np.float32),
         accessible=None,
         metadata={
             'algorithm':       _alg_name,
@@ -1288,9 +1312,8 @@ def compute_contour_toolpath(
     # a flat step and the tool cuts air above the neighbouring deeper region.
     _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
 
-    all_segments    = []
-    all_contours_px = []   # (z_norm, ri, ci) tuples for Stage 5
-    current_pos     = np.array([0.0, 0.0])
+    all_segments = []
+    current_pos  = np.array([0.0, 0.0])
 
     n_levels = len(z_levels)
     for pass_idx, z_norm in enumerate(z_levels):
@@ -1349,30 +1372,19 @@ def compute_contour_toolpath(
                 continue
 
             all_segments.append(points)
-            for row, col in c_chosen:
-                all_contours_px.append((z_norm,
-                                        int(round(float(row))),
-                                        int(round(float(col)))))
             last = points[-1]
             current_pos[0] = last[0]
             current_pos[1] = last[1]
 
     progress(80, f"Contour segments built ({len(all_segments)} segments).")
 
-    # ── Stage 5 · Residual computation (80–90 %) ──────────────────────────
-    progress(80, "Computing residual…")
-    achieved = np.zeros_like(depth_map, dtype=np.float32)
-    for z_norm, ri, ci in all_contours_px:
-        if 0 <= ri < H and 0 <= ci < W:
-            if achieved[ri, ci] < z_norm:
-                achieved[ri, ci] = z_norm
-
-    material_removed = np.maximum(
-        grey_dilation(achieved.astype(np.float64),
-                      footprint=footprint_contour,
-                      structure=-kernel_contour.astype(np.float64)).astype(np.float32),
-        0.0)
-
+    # ── Stage 5 · Simulate result (80–90 %) ───────────────────────────────
+    progress(80, "Simulating tool-swept removal surface…")
+    material_removed = simulate_toolpath_result(
+        ToolPath(segments=all_segments),
+        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        max_depth, kernel_contour, footprint_contour,
+    )
     result = np.maximum(
         previous_result if previous_result is not None else 0.0,
         material_removed).astype(np.float32)

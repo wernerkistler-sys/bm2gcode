@@ -31,6 +31,34 @@ class ToolPath:
 
     metadata: dict = field(default_factory=dict)
 
+    def resample(self, spacing_mm: float) -> 'np.ndarray':
+        """Densely sample all segments at *spacing_mm* XY arc-length intervals.
+
+        Returns a (N, 3) float64 array of (x, y, z) mm positions. Air moves
+        between non-adjacent segments are not interpolated.
+        """
+        pts_out = []
+        for seg in self.segments:
+            if not seg:
+                continue
+            pts = np.asarray(seg, dtype=np.float64)
+            pts_out.append(pts[0])
+            carry = 0.0
+            for i in range(1, len(pts)):
+                diff = pts[i] - pts[i - 1]
+                seg_len = float(np.hypot(diff[0], diff[1]))
+                if seg_len < 1e-10:
+                    continue
+                pos = carry
+                while pos < seg_len:
+                    t = pos / seg_len
+                    pts_out.append(pts[i - 1] + t * diff)
+                    pos += spacing_mm
+                carry = pos - seg_len
+        if not pts_out:
+            return np.empty((0, 3), dtype=np.float64)
+        return np.array(pts_out, dtype=np.float64)
+
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
         """Compute statistics from the path segments."""
         cut_dist = rapid_dist = 0.0
