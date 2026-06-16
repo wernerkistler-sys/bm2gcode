@@ -197,9 +197,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                         visits every pixel; higher values skip pixels where
                         the prior work is already shallow.
     previous_result   : optional 2-D float32 [0,1] cumulative result from a
-                        prior step (i.e. ToolPath.result), used as the floor
-                        for the output result so material already removed is
-                        not un-cut.  When None (default) the floor is 0.
+                        prior step (i.e. ToolPath.result).  Combined with the
+                        raster's own removal surface to produce the cumulative
+                        result of this step.  The residual
+                        (depth_map − previous_result) also gates which raster
+                        lines and spans are cut, via work_surface_tol.  None
+                        treats the prior removal as zero.
     progress          : callable(pct, subtask) — thread-safe progress reporter
 
     Returns
@@ -689,8 +692,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             are treated as fine detail to V-carve.  None (default)
                             treats the full depth_map as fine detail.
     previous_result       : optional 2-D float32 [0,1] cumulative result from a
-                            prior step (i.e. ToolPath.result), used as the ceiling
-                            when computing the output result.  None defaults to depth_map.
+                            prior step (i.e. ToolPath.result).  Combined with the
+                            V-carve's own removal surface to produce the cumulative
+                            result of this step.  Does not gate which regions are
+                            visited (that is prior_accessible's job).  None treats
+                            the prior removal as zero.
     progress              : callable(pct, message) — thread-safe progress reporter
 
     Returns
@@ -1225,8 +1231,9 @@ def compute_contour_toolpath(
         Currently ignored; the accessible surface is always computed from
         *depth_map*.
     previous_result : 2-D float32 array, values in [0, 1], or None
-        Cumulative result from a prior step (i.e. ToolPath.result); used as the
-        ceiling for the output result.  When None, *depth_map* is used.
+        Cumulative result from a prior step (i.e. ToolPath.result).  Combined
+        with the contour's own removal surface to produce the cumulative result
+        of this step.  None treats the prior removal as zero.
     progress : callable(pct, message)
         Thread-safe progress reporter.
 
