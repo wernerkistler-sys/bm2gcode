@@ -172,6 +172,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             feed_rate=800.0,
                             work_surface_tol=None,
                             previous_result=None,
+                            prior_reference=None,
                             raster_offset_pct=0.0,
                             progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
@@ -193,16 +194,21 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate         : cutting feed rate in mm/min
     work_surface_tol  : threshold (normalised [0,1]) applied to the residual
-                        depth (depth_map − previous_result).  0.0 (default)
-                        visits every pixel; higher values skip pixels where
-                        the prior work is already shallow.
+                        (depth_map − prior_reference).  0.0 (default) visits
+                        every pixel; higher values skip pixels where the
+                        residual is shallower than the threshold.
     previous_result   : optional 2-D float32 [0,1] cumulative result from a
                         prior step (i.e. ToolPath.result).  Combined with the
                         raster's own removal surface to produce the cumulative
-                        result of this step.  The residual
-                        (depth_map − previous_result) also gates which raster
-                        lines and spans are cut, via work_surface_tol.  None
-                        treats the prior removal as zero.
+                        result of this step.  None treats the prior removal
+                        as zero.
+    prior_reference   : optional 2-D float32 [0,1] reference surface from a
+                        prior step, subtracted from depth_map to obtain the
+                        residual that gates which raster lines and spans are
+                        cut (combined with work_surface_tol).  Pass
+                        prior_step.result for residual-based gating,
+                        prior_step.accessible for geometry-based gating, or
+                        None to process the full depth_map.
     progress          : callable(pct, subtask) — thread-safe progress reporter
 
     Returns
@@ -216,8 +222,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     if work_surface_tol is None:
         work_surface_tol = 0.0
-    residual = (np.clip(depth_map - previous_result, 0.0, 1.0)
-                if previous_result is not None else depth_map)
+    residual = (np.clip(depth_map - prior_reference, 0.0, 1.0)
+                if prior_reference is not None else depth_map)
 
     px_per_mm_x = W / (width_cm  * 10.0)
     px_per_mm_y = H / (height_cm * 10.0)
@@ -665,7 +671,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             max_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
-                            prior_accessible=None, previous_result=None,
+                            prior_reference=None, previous_result=None,
                             progress=None):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
@@ -686,16 +692,19 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     final_stepdown_mm     : depth increment for the finishing pass
                             (0 = same as stepdown_mm)
     skeleton_mode         : "medial_axis" | "voronoi" | "inscribed"
-    prior_accessible      : optional 2-D float32 [0,1] geometrically accessible
-                            surface of the prior tool (ToolPath.accessible).
-                            Pixels where depth_map − prior_accessible > threshold
-                            are treated as fine detail to V-carve.  None (default)
-                            treats the full depth_map as fine detail.
+    prior_reference       : optional 2-D float32 [0,1] reference surface from a
+                            prior step, subtracted from depth_map to obtain the
+                            region the V-carve operates on.  Pass
+                            prior_step.accessible for geometry-based gating
+                            (regions the prior tool couldn't reach), or
+                            prior_step.result for residual-based gating
+                            (material not yet removed).  None treats the full
+                            depth_map as the region to V-carve.
     previous_result       : optional 2-D float32 [0,1] cumulative result from a
                             prior step (i.e. ToolPath.result).  Combined with the
                             V-carve's own removal surface to produce the cumulative
                             result of this step.  Does not gate which regions are
-                            visited (that is prior_accessible's job).  None treats
+                            visited (that is prior_reference's job).  None treats
                             the prior removal as zero.
     progress              : callable(pct, message) — thread-safe progress reporter
 
@@ -726,10 +735,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     # ── Stage 1 · Unaccessible-depth mask (0–10 %) ────────────────
     progress(0, "Computing unaccessible-depth mask…")
-    if prior_accessible is None:
+    if prior_reference is None:
         unaccessible = depth_map.copy()
     else:
-        unaccessible = np.clip(depth_map - prior_accessible, 0.0, 1.0)
+        unaccessible = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
 

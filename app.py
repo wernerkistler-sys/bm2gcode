@@ -327,6 +327,7 @@ class GCodeGeneratorApp:
                 dst[key].auto_var.set(src[key].auto_var.get())
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
+        dst['gating_mode_var'].set(src['gating_mode_var'].get())
 
     def _remove_step(self, step):
         """Remove a step tab and its associated data."""
@@ -355,7 +356,7 @@ class GCodeGeneratorApp:
         """Populate a step tab with all tool-parameter widgets.
         Widget references are stored in the step dict. Values from DEFAULTS."""
 
-        # ── Algorithm selector ─────────────────────────────────────────
+        # ── Algorithm selector (top-level) ────────────────────────────
         ttk.Label(frame, text="Algorithm:").pack(anchor=tk.W)
         algorithm_var = tk.StringVar(value=DEFAULTS["step_algorithm"])
         step['algorithm_var'] = algorithm_var
@@ -363,25 +364,29 @@ class GCodeGeneratorApp:
                      values=ALGORITHMS, state="readonly", width=18
                      ).pack(anchor=tk.W, pady=(2, 6))
 
-        # ── Profile ────────────────────────────────────────────────────
-        ttk.Label(frame, text="Profile:").pack(anchor=tk.W)
+        # ── Tool group ─────────────────────────────────────────────────
+        tool_lf = ttk.LabelFrame(frame, text="Tool", padding=4)
+        tool_lf.pack(fill=tk.X, pady=(0, 4))
+        step['tool_lf'] = tool_lf
+
+        ttk.Label(tool_lf, text="Profile:").pack(anchor=tk.W)
         profile_var = tk.StringVar(value=DEFAULTS["step_profile"])
         step['profile_var'] = profile_var
-        profile_cb = ttk.Combobox(frame, textvariable=profile_var,
+        profile_cb = ttk.Combobox(tool_lf, textvariable=profile_var,
                                   values=TOOL_PROFILES, state="readonly", width=18)
         profile_cb.pack(anchor=tk.W, pady=(2, 6))
         step['profile_cb'] = profile_cb
 
-        diam = LabeledEntry(frame, "Diameter", "mm", DEFAULTS["step_diameter"])
+        diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"])
         diam.pack(fill=tk.X, pady=2)
         step['diameter'] = diam
 
         # ── Raster-only controls (hidden when V-Carving) ───────────────
-        raster_frame = ttk.Frame(frame)
-        raster_frame.pack(fill=tk.X)
+        raster_frame = ttk.Frame(tool_lf)
+        raster_frame.pack(fill=tk.X)   # initially shown (matches default algorithm)
         step['raster_frame'] = raster_frame
 
-        stepover = LabeledEntry(raster_frame, "Step-over",     "%",  DEFAULTS["step_stepover"])
+        stepover = LabeledEntry(raster_frame, "Step-over", "%", DEFAULTS["step_stepover"])
         stepover.pack(fill=tk.X, pady=2)
         step['stepover'] = stepover
 
@@ -403,18 +408,18 @@ class GCodeGeneratorApp:
         step['stepdown'] = stepdown
 
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
-        vbit_frame = ttk.Frame(frame)
+        vbit_frame = ttk.Frame(tool_lf)
         step['vbit_frame'] = vbit_frame
         # (not packed initially — shown on demand)
 
-        vbit_angle = LabeledEntry(vbit_frame, "V-bit angle",      "°",  DEFAULTS["step_vbit_angle"])
+        vbit_angle = LabeledEntry(vbit_frame, "V-bit angle", "°", DEFAULTS["step_vbit_angle"])
         vbit_angle.pack(fill=tk.X, pady=2)
         step['vbit_angle'] = vbit_angle
 
         # ── V-carving-only controls (hidden when Raster Scan) ─────────
-        vcarve_frame = ttk.Frame(frame)
+        vcarve_frame = ttk.Frame(tool_lf)
         step['vcarve_frame'] = vcarve_frame
-        # (not packed initially — shown on demand by _on_algorithm_changed)
+        # (not packed initially — shown on demand by _refresh_layout)
 
         vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
         vcarve_stepdown.pack(fill=tk.X, pady=2)
@@ -425,9 +430,9 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'] = vcarve_final_stepdown
 
         # ── Contour-only controls (hidden unless Contour algorithm) ───────
-        contour_frame = ttk.Frame(frame)
+        contour_frame = ttk.Frame(tool_lf)
         step['contour_frame'] = contour_frame
-        # (not packed initially — shown on demand by _on_algorithm_changed)
+        # (not packed initially — shown on demand by _refresh_layout)
 
         contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
                                         DEFAULTS["step_contour_stepdown"])
@@ -440,36 +445,59 @@ class GCodeGeneratorApp:
                         variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
         step['contour_adaptive_var'] = contour_adaptive_var
 
-        # ── Shared controls ────────────────────────────────────────────
-        feed = LabeledEntry(frame, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
+        feed = LabeledEntry(tool_lf, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
         feed.pack(fill=tk.X, pady=2)
         step['feed_rate'] = feed
 
-        threshold = LabeledEntry(frame, "Z-threshold", "mm", DEFAULTS["step_threshold"])
+        # ── Region group ───────────────────────────────────────────────
+        region_lf = ttk.LabelFrame(frame, text="Region", padding=4)
+        region_lf.pack(fill=tk.X, pady=(0, 4))
+        step['region_lf'] = region_lf
+
+        ttk.Label(region_lf, text="Process region:").pack(anchor=tk.W)
+        gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
+        step['gating_mode_var'] = gating_var
+        gating_cb = ttk.Combobox(region_lf, textvariable=gating_var,
+                                 values=["Full depth map",
+                                         "Residual from prior step",
+                                         "Inaccessible by prior tool"],
+                                 state="readonly", width=24)
+        gating_cb.pack(anchor=tk.W, pady=(2, 6))
+        step['gating_cb'] = gating_cb
+
+        threshold = LabeledEntry(region_lf, "Z-threshold", "mm", DEFAULTS["step_threshold"])
         threshold.pack(fill=tk.X, pady=2)
         step['threshold'] = threshold
 
-        min_fw = LabeledEntry(frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
+        min_fw = LabeledEntry(region_lf, "Min feature width", "mm", DEFAULTS["step_min_fw"])
         step['min_fw'] = min_fw
-        max_fw = LabeledEntry(frame, "Max feature width", "mm", DEFAULTS["step_max_fw"],
+        max_fw = LabeledEntry(region_lf, "Max feature width", "mm", DEFAULTS["step_max_fw"],
                               auto_label="Auto")
         step['max_fw'] = max_fw
-        # packed/unpacked by _on_algorithm_changed below
+        # min_fw/max_fw packed/unpacked by _refresh_layout below
 
-        # ── Wire up algorithm toggle ───────────────────────────────────
+        # ── Wire up algorithm / profile toggle ────────────────────────
         _VCARVE_PROFILES  = ["V-Bit", "Ball"]
         _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
+        _prev_alg = [algorithm_var.get()]
 
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
+            alg_changed = (alg != _prev_alg[0])
+            _prev_alg[0] = alg
+
             if alg.startswith("V-Carving"):
+                if alg_changed:
+                    step['gating_mode_var'].set("Inaccessible by prior tool")
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
-                step['min_fw'].pack(fill=tk.X, pady=2, after=step['threshold'])
-                step['max_fw'].pack(fill=tk.X, pady=2, after=step['min_fw'])
+                step['min_fw'].pack(fill=tk.X, pady=2)
+                step['max_fw'].pack(fill=tk.X, pady=2)
+                step['region_lf'].pack(fill=tk.X, pady=(0, 4),
+                                       after=step['tool_lf'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -480,6 +508,7 @@ class GCodeGeneratorApp:
                 step['vcarve_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
+                step['region_lf'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -491,10 +520,14 @@ class GCodeGeneratorApp:
                     step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
+                if alg_changed:
+                    step['gating_mode_var'].set("Residual from prior step")
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
+                step['region_lf'].pack(fill=tk.X, pady=(0, 4),
+                                       after=step['tool_lf'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -550,6 +583,7 @@ class GCodeGeneratorApp:
         threshold.var.trace_add("write", _on_mask_param_changed)
         min_fw.var.trace_add("write", _on_mask_param_changed)
         max_fw.var.trace_add("write", _on_mask_param_changed)
+        gating_var.trace_add("write", _on_mask_param_changed)
 
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
@@ -571,6 +605,7 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
+        step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
 
     # ------------------------------------------------------------------ #
     #  Right panel: image canvas
@@ -731,6 +766,7 @@ class GCodeGeneratorApp:
             'min_fw':               step['min_fw'].get(),
             'max_fw':               step['max_fw'].get(),
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
+            'gating_mode':          step['gating_mode_var'].get(),
         }
 
     def _apply_step_dict(self, step, d):
@@ -751,6 +787,7 @@ class GCodeGeneratorApp:
         step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
         step['max_fw'].auto_var.set(bool(d.get('max_fw_auto', False)))
         step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
+        step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
 
     def _save_project(self):
         path = filedialog.asksaveasfilename(
@@ -926,27 +963,32 @@ class GCodeGeneratorApp:
                                  f"Please check the settings for Step {idx + 1}.")
             return
 
+        # ── Derive prior step and gating reference ──────────────────────────
+        _prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
+
+        if algorithm != "Contour":
+            gating_mode = step['gating_mode_var'].get()
+            if gating_mode == "Residual from prior step":
+                prior_reference = _prev_tp.result if _prev_tp is not None else None
+            elif gating_mode == "Inaccessible by prior tool":
+                prior_reference = _prev_tp.accessible if _prev_tp is not None else None
+            else:
+                prior_reference = None
+            if gating_mode != "Full depth map" and idx > 0 and _prev_tp is None:
+                surf_name = ("accessible surface"
+                             if gating_mode == "Inaccessible by prior tool"
+                             else "result surface")
+                if not messagebox.askyesno(
+                        "Previous step not computed",
+                        f"Step {idx} has not been computed yet.\n\n"
+                        f"Without its {surf_name} this step will process the "
+                        f"full depth map.\n\nContinue anyway?"):
+                    return
+
         dlg = ProgressDialog(self.root,
                              title=f"Computing Step {idx + 1} Tool Path")
 
         if algorithm.startswith("V-Carving"):
-            # Retrieve accessible surface and residual from previous raster step
-            accessible_prior = None
-            _prev_tp         = None
-            if idx == 0:
-                pass   # no prior step — V-carve the full depth map
-            elif self.toolpaths[idx - 1] is None:
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        "Without its accessible surface this V-carving step "
-                        "will treat the entire depth map as fine detail.\n\n"
-                        "Continue anyway?"):
-                    return
-            else:
-                accessible_prior = self.toolpaths[idx - 1].accessible
-                _prev_tp         = self.toolpaths[idx - 1]
-
             def _worker():
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
@@ -954,7 +996,7 @@ class GCodeGeneratorApp:
                         depth_map       = depth_map,
                         n_grey_levels   = n_grey_levels,
                         tool            = tool,
-                        prior_accessible = accessible_prior,
+                        prior_reference = prior_reference,
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
                         max_depth      = max_depth,
                         width_cm       = width_cm,
@@ -1003,18 +1045,13 @@ class GCodeGeneratorApp:
 
         elif algorithm == "Contour":
             # ── Contour (waterline) ─────────────────────────────────────
-            if idx == 0:
-                _prev_tp = None
-            elif self.toolpaths[idx - 1] is None:
+            if idx > 0 and _prev_tp is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
                         f"Step {idx} has not been computed yet.\n\n"
-                        "Without its residual this step will treat the entire "
+                        "Without its result this step will treat the entire "
                         "depth map as unfinished.\n\nContinue anyway?"):
                     return
-                _prev_tp = None
-            else:
-                _prev_tp = self.toolpaths[idx - 1]
 
             def _worker():
                 try:
@@ -1067,19 +1104,6 @@ class GCodeGeneratorApp:
 
         else:
             # ── Raster scan ─────────────────────────────────────────────
-            if idx == 0:
-                _prev_tp = None
-            elif self.toolpaths[idx - 1] is None:
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        "Without its result this step will treat the entire "
-                        "depth map as unfinished.\n\nContinue anyway?"):
-                    return
-                _prev_tp = None
-            else:
-                _prev_tp = self.toolpaths[idx - 1]
-
             work_surface_tol = threshold_mm / max_depth if max_depth else 0.0
 
             step_mm = tool.diameter_mm * stepover / 100.0
@@ -1100,6 +1124,7 @@ class GCodeGeneratorApp:
                         origin            = self.origin_var.get(),
                         work_surface_tol  = work_surface_tol,
                         previous_result   = _prev_tp.result if _prev_tp is not None else None,
+                        prior_reference   = prior_reference,
                         raster_offset_pct = raster_offset_pct,
                         feed_rate         = feed_rate,
                         progress          = dlg.report,
@@ -1443,19 +1468,15 @@ class GCodeGeneratorApp:
                     threshold_mm, max_depth = 0.0, 5.0
                 thr = threshold_mm / max_depth if max_depth else 0.0
 
-                is_vcarve = (
-                    0 <= step_idx < len(self.steps)
-                    and self.steps[step_idx].get('algorithm_var') is not None
-                    and self.steps[step_idx]['algorithm_var'].get().startswith("V-Carving")
-                )
+                gating_mode = "Full depth map"
+                if (0 <= step_idx < len(self.steps)
+                        and self.steps[step_idx].get('gating_mode_var') is not None):
+                    gating_mode = self.steps[step_idx]['gating_mode_var'].get()
 
-                if is_vcarve:
-                    # Gate on unaccessible (depth_map - accessible): regions the
-                    # prior roughing tool's geometry couldn't reach.
-                    ref = unaccessible
-                else:
-                    # Gate on the prior step's residual (depth_map - prior_result).
-                    prior_idx = step_idx - 1
+                prior_idx = step_idx - 1
+                if gating_mode == "Inaccessible by prior tool":
+                    ref = unaccessible  # depth_map − accessible, computed above
+                elif gating_mode == "Residual from prior step":
                     prior_result = (
                         self.toolpaths[prior_idx].result
                         if (0 <= prior_idx < len(self.toolpaths)
@@ -1465,16 +1486,16 @@ class GCodeGeneratorApp:
                     )
                     ref = (np.clip(depth_map - prior_result, 0.0, 1.0)
                            if prior_result is not None else depth_map.copy())
+                else:  # "Full depth map"
+                    ref = depth_map.copy()
 
                 min_fw_mm = 0.0
                 max_fw_mm = 0.0
-                if is_vcarve:
-                    try:
-                        min_fw_mm = float(self.steps[step_idx]['min_fw'].get())
-                        max_fw_mm = float(self.steps[step_idx]['max_fw'].get())
-                    except (ValueError, IndexError, KeyError):
-                        min_fw_mm = 0.0
-                        max_fw_mm = 0.0
+                try:
+                    min_fw_mm = float(self.steps[step_idx]['min_fw'].get())
+                    max_fw_mm = float(self.steps[step_idx]['max_fw'].get())
+                except (ValueError, IndexError, KeyError):
+                    pass
                 try:
                     H, W = ref.shape
                     px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
