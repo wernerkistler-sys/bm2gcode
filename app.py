@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import json
+import os
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -72,6 +74,11 @@ class GCodeGeneratorApp:
                               command=self.open_image)
         file_menu.add_command(label="Close Image",  command=self.close_image)
         file_menu.add_separator()
+        file_menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
+                              command=self._load_project)
+        file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
+                              command=self._save_project)
+        file_menu.add_separator()
         file_menu.add_command(label="Reset Defaults", command=self.reset_defaults)
         file_menu.add_separator()
         file_menu.add_command(label="Settings…",     command=self._open_settings)
@@ -118,6 +125,8 @@ class GCodeGeneratorApp:
 
         self.root.config(menu=menubar)
         self.root.bind("<Control-o>", lambda e: self.open_image())
+        self.root.bind("<Control-s>", lambda e: self._save_project())
+        self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self.root.quit())
 
         def _make_mode_handler(mode):
@@ -257,6 +266,14 @@ class GCodeGeneratorApp:
 
     def _add_step(self):
         """Append a new step tab to the notebook."""
+        # Capture the currently selected step before adding a new tab.
+        src = None
+        if self.steps:
+            try:
+                src = self.steps[self._steps_nb.index("current")]
+            except Exception:
+                src = self.steps[-1]
+
         idx = len(self.steps)
         tab = ttk.Frame(self._steps_nb, padding=(8, 6))
         self._steps_nb.add(tab, text=f"Step {idx + 1}")
@@ -266,6 +283,9 @@ class GCodeGeneratorApp:
         self.toolpaths.append(None)
 
         self._build_step_widgets(tab, step)
+
+        if src is not None:
+            self._copy_step_settings(src, step)
 
         # Compute / Save buttons
         bf = ttk.Frame(tab)
@@ -293,6 +313,20 @@ class GCodeGeneratorApp:
         self._update_remove_buttons()
         self.display_mode_var.set(DISPLAY_ORIGINAL)
         self._steps_nb.select(tab)
+
+    def _copy_step_settings(self, src, dst):
+        """Copy all user-editable settings from src step dict to dst step dict."""
+        dst['algorithm_var'].set(src['algorithm_var'].get())
+        dst['profile_var'].set(src['profile_var'].get())
+        for key in ('diameter', 'stepover', 'stepdown', 'vbit_angle',
+                    'vcarve_stepdown', 'vcarve_final_stepdown',
+                    'contour_stepdown', 'feed_rate', 'threshold',
+                    'min_fw', 'max_fw'):
+            dst[key].set(src[key].get())
+            if dst[key].auto_var is not None and src[key].auto_var is not None:
+                dst[key].auto_var.set(src[key].auto_var.get())
+        dst['raster_dir_var'].set(src['raster_dir_var'].get())
+        dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
 
     def _remove_step(self, step):
         """Remove a step tab and its associated data."""
@@ -351,9 +385,9 @@ class GCodeGeneratorApp:
         stepover.pack(fill=tk.X, pady=2)
         step['stepover'] = stepover
 
-        stepdown = LabeledEntry(raster_frame, "Max step-down", "mm", DEFAULTS["step_stepdown"])
-        stepdown.pack(fill=tk.X, pady=2)
-        step['stepdown'] = stepdown
+        raster_offset = LabeledEntry(raster_frame, "Line offset", "%", DEFAULTS["step_raster_offset"])
+        raster_offset.pack(fill=tk.X, pady=2)
+        step['raster_offset'] = raster_offset
 
         ttk.Label(raster_frame, text="Scan direction:").pack(anchor=tk.W, pady=(6, 2))
         dir_var = tk.StringVar(value=DEFAULTS["step_raster_dir"])
@@ -363,6 +397,10 @@ class GCodeGeneratorApp:
         for d in RASTER_DIRECTIONS:
             ttk.Radiobutton(dir_row, text=d, variable=dir_var,
                             value=d).pack(side=tk.LEFT, padx=(0, 6))
+
+        stepdown = LabeledEntry(raster_frame, "Max step-down", "mm", DEFAULTS["step_stepdown"])
+        stepdown.pack(fill=tk.X, pady=2)
+        step['stepdown'] = stepdown
 
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
         vbit_frame = ttk.Frame(frame)
@@ -520,6 +558,7 @@ class GCodeGeneratorApp:
         step['profile_cb'].config(state="readonly")
         step['diameter'].set(DEFAULTS["step_diameter"])
         step['stepover'].set(DEFAULTS["step_stepover"])
+        step['raster_offset'].set(DEFAULTS["step_raster_offset"])
         step['stepdown'].set(DEFAULTS["step_stepdown"])
         step['feed_rate'].set(DEFAULTS["step_feed_rate"])
         step['threshold'].set(DEFAULTS["step_threshold"])
@@ -670,6 +709,169 @@ class GCodeGeneratorApp:
     def _open_settings(self):
         SettingsDialog(self.root, self._settings)
 
+    # ------------------------------------------------------------------ #
+    #  Project save / load
+    # ------------------------------------------------------------------ #
+    def _step_to_dict(self, step):
+        return {
+            'algorithm':            step['algorithm_var'].get(),
+            'profile':              step['profile_var'].get(),
+            'diameter':             step['diameter'].get(),
+            'stepover':             step['stepover'].get(),
+            'raster_offset':        step['raster_offset'].get(),
+            'stepdown':             step['stepdown'].get(),
+            'raster_dir':           step['raster_dir_var'].get(),
+            'vbit_angle':           step['vbit_angle'].get(),
+            'vcarve_stepdown':      step['vcarve_stepdown'].get(),
+            'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
+            'contour_stepdown':     step['contour_stepdown'].get(),
+            'contour_adaptive':     step['contour_adaptive_var'].get(),
+            'feed_rate':            step['feed_rate'].get(),
+            'threshold':            step['threshold'].get(),
+            'min_fw':               step['min_fw'].get(),
+            'max_fw':               step['max_fw'].get(),
+            'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
+        }
+
+    def _apply_step_dict(self, step, d):
+        step['algorithm_var'].set(d.get('algorithm', DEFAULTS['step_algorithm']))
+        step['profile_var'].set(d.get('profile', DEFAULTS['step_profile']))
+        step['diameter'].set(d.get('diameter', DEFAULTS['step_diameter']))
+        step['stepover'].set(d.get('stepover', DEFAULTS['step_stepover']))
+        step['raster_offset'].set(d.get('raster_offset', DEFAULTS['step_raster_offset']))
+        step['stepdown'].set(d.get('stepdown', DEFAULTS['step_stepdown']))
+        step['raster_dir_var'].set(d.get('raster_dir', DEFAULTS['step_raster_dir']))
+        step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
+        step['vcarve_stepdown'].set(d.get('vcarve_stepdown', DEFAULTS['step_vcarve_stepdown']))
+        step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
+        step['contour_stepdown'].set(d.get('contour_stepdown', DEFAULTS['step_contour_stepdown']))
+        step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
+        step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
+        step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
+        step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
+        step['max_fw'].auto_var.set(bool(d.get('max_fw_auto', False)))
+        step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
+
+    def _save_project(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Project",
+            defaultextension=".bm2",
+            filetypes=[("BM2GCODE project", "*.bm2"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        project = {
+            'version': 1,
+            'image_path': self.image_path,
+            'global': {
+                'width_cm':     self.width_cm.get(),
+                'height_cm':    self.height_cm.get(),
+                'max_depth':    self.max_depth.get(),
+                'surface':      self.surface.get(),
+                'origin':       self.origin_var.get(),
+                'aspect_locked': self._aspect_lock_var.get(),
+            },
+            'machine': {
+                'z_safe':     self._settings['z_safe'],
+                'feed_rapid': self._settings['feed_rapid'],
+                'preamble':   self._settings['preamble'],
+                'postamble':  self._settings['postamble'],
+            },
+            'steps': [self._step_to_dict(s) for s in self.steps],
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(project, f, indent=2)
+            self.status_var.set(f"Project saved: {path}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", f"Could not save project:\n{exc}")
+
+    def _load_project(self):
+        path = filedialog.askopenfilename(
+            title="Open Project",
+            filetypes=[("BM2GCODE project", "*.bm2"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                project = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read project file:\n{exc}")
+            return
+
+        if project.get('version', 1) != 1:
+            messagebox.showerror("Load Error", "Unsupported project file version.")
+            return
+
+        # ── Global image-size parameters ──────────────────────────────
+        g = project.get('global', {})
+        self._aspect_lock_var.set(bool(g.get('aspect_locked', True)))
+        self.width_cm.set(g.get('width_cm', DEFAULTS['width_cm']))
+        self.height_cm.set(g.get('height_cm', DEFAULTS['height_cm']))
+        self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
+        self.surface.set(g.get('surface', DEFAULTS['surface']))
+        self.origin_var.set(g.get('origin', DEFAULTS['origin']))
+
+        # ── Machine settings ──────────────────────────────────────────
+        m = project.get('machine', {})
+        self._settings['z_safe']     = m.get('z_safe',     self._settings['z_safe'])
+        self._settings['feed_rapid'] = m.get('feed_rapid', self._settings['feed_rapid'])
+        self._settings['preamble']   = m.get('preamble',   self._settings['preamble'])
+        self._settings['postamble']  = m.get('postamble',  self._settings['postamble'])
+
+        # ── Steps ─────────────────────────────────────────────────────
+        step_dicts = project.get('steps', [])
+        if not step_dicts:
+            messagebox.showwarning("Load Warning", "Project contains no steps.")
+            return
+
+        # Trim or extend the steps list to match the saved count.
+        while len(self.steps) > len(step_dicts):
+            self._remove_step(self.steps[-1])
+        while len(self.steps) < len(step_dicts):
+            self._add_step()
+
+        for step, d in zip(self.steps, step_dicts):
+            self._apply_step_dict(step, d)
+
+        # ── Image ─────────────────────────────────────────────────────
+        saved_image_path = project.get('image_path')
+        if saved_image_path:
+            if os.path.isfile(saved_image_path):
+                try:
+                    raw = mpimg.imread(saved_image_path)
+                    self.current_image = self._to_grayscale(raw)
+                    self.image_path    = saved_image_path
+                    h, w = self.current_image.shape
+                    if self._aspect_lock_var.get():
+                        self._image_aspect = w / h
+                        self._recalc_height()
+                    self.toolpaths = [None] * len(self.steps)
+                    for i, s in enumerate(self.steps):
+                        s['info_var'].set(f"Step {i + 1}: not computed")
+                    self.display_mode_var.set(DISPLAY_ORIGINAL)
+                    self._reset_zoom()
+                    self.placeholder.place_forget()
+                    levels = int(np.round(
+                        (self.current_image.max() - self.current_image.min()) * 255)) + 1
+                    self.n_grey_levels = levels
+                    self._render()
+                    self.status_var.set(
+                        f"Project loaded: {path}  |  Image: {saved_image_path}")
+                    return
+                except Exception as exc:
+                    messagebox.showwarning(
+                        "Image Load Warning",
+                        f"Project loaded but the image could not be opened:\n{exc}")
+            else:
+                messagebox.showwarning(
+                    "Image Not Found",
+                    f"Project loaded, but the saved image was not found:\n{saved_image_path}\n\n"
+                    "Use File → Open Image… to load an image manually.")
+
+        self.status_var.set(f"Project loaded: {path}")
+
     def reset_defaults(self):
         self.width_cm.set(DEFAULTS["width_cm"])
         if not self._aspect_lock_var.get():
@@ -715,9 +917,10 @@ class GCodeGeneratorApp:
                 _profile   = step['profile_var'].get()
                 _vbit_angle = (float(step['vbit_angle'].get())
                                if _profile == "V-Bit" else 0.0)
-                tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-                stepover = float(step['stepover'].get())
-                stepdown = float(step['stepdown'].get())
+                tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+                stepover         = float(step['stepover'].get())
+                raster_offset_pct = float(step['raster_offset'].get())
+                stepdown         = float(step['stepdown'].get())
         except ValueError:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
@@ -885,20 +1088,21 @@ class GCodeGeneratorApp:
                 try:
                     depth_map, n_grey_levels = self._get_depth_map()
                     result = compute_raster_toolpath(
-                        depth_map        = depth_map,
-                        n_grey_levels    = n_grey_levels,
-                        tool             = tool,
-                        step_mm          = step_mm,
-                        stepdown_mm      = stepdown,
-                        max_depth        = max_depth,
-                        width_cm         = width_cm,
-                        height_cm        = float(self.height_cm.get()),
-                        raster_dir       = step['raster_dir_var'].get(),
-                        origin           = self.origin_var.get(),
-                        work_surface_tol = work_surface_tol,
-                        previous_result  = _prev_tp.result if _prev_tp is not None else None,
-                        feed_rate        = feed_rate,
-                        progress         = dlg.report,
+                        depth_map         = depth_map,
+                        n_grey_levels     = n_grey_levels,
+                        tool              = tool,
+                        step_mm           = step_mm,
+                        stepdown_mm       = stepdown,
+                        max_depth         = max_depth,
+                        width_cm          = width_cm,
+                        height_cm         = float(self.height_cm.get()),
+                        raster_dir        = step['raster_dir_var'].get(),
+                        origin            = self.origin_var.get(),
+                        work_surface_tol  = work_surface_tol,
+                        previous_result   = _prev_tp.result if _prev_tp is not None else None,
+                        raster_offset_pct = raster_offset_pct,
+                        feed_rate         = feed_rate,
+                        progress          = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))

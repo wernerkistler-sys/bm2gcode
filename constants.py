@@ -34,6 +34,7 @@ DEFAULTS = {
     "step_profile":      "End Mill",
     "step_diameter":     "6.0",
     "step_stepover":     "50",
+    "step_raster_offset": "0",
     "step_stepdown":     "6.0",
     "step_feed_rate":    "800",
     "step_raster_dir":   "X",

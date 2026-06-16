@@ -172,6 +172,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             feed_rate=800.0,
                             work_surface_tol=None,
                             previous_result=None,
+                            raster_offset_pct=0.0,
                             progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
@@ -186,6 +187,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     width_cm          : physical image width in cm
     height_cm         : physical image height in cm
     raster_dir        : "X" | "Y" | "Both"
+    raster_offset_pct : percentage [0, 100) to shift raster lines relative to the
+                        step-over distance; e.g. 50 shifts every line by half a step,
+                        useful when combining with a previous raster step at 0%.
     origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate         : cutting feed rate in mm/min
     work_surface_tol  : threshold (normalised [0,1]) applied to the residual
@@ -256,7 +260,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     n_passes    = max(1, int(np.ceil(max_depth / stepdown_mm)))
     pass_depths = [min((i + 1) * stepdown_mm, max_depth)
                    for i in range(n_passes)]
-    step_px     = max(1, int(round(step_mm * px_per_mm)))
+    step_px        = max(1, int(round(step_mm * px_per_mm)))
+    raster_start_px = int(round(raster_offset_pct / 100.0 * step_px)) % step_px
 
     resid_tol_mm = max_depth / (n_grey_levels - 1)
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
@@ -384,9 +389,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
             # All raster line indices for this direction
             if direction == "X":
-                all_line_ids = np.arange(0, H, step_px)
+                all_line_ids = np.arange(raster_start_px, H, step_px)
             else:
-                all_line_ids = np.arange(0, W, step_px)
+                all_line_ids = np.arange(raster_start_px, W, step_px)
 
             n_lines = len(all_line_ids)
 
@@ -1125,7 +1130,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     progress(90, f"Generated {len(all_segments)} segments across all passes.")
 
-    # ── Stage 6 · Simplify and assemble ToolPath (90–100 %) ───────
+    # ── Stage 6 · Simplify, simulate result, Simplify and assemble ToolPath (90–100 %) ───────
     progress(90, "Simplifying tool path (RDP)…")
     rdp_tol = max(
         1.0 / px_per_mm_x,
