@@ -403,7 +403,10 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     line_slice = remaining_depth[idx, :]
                 else:
                     line_slice = remaining_depth[:, idx]
-                line_needs_cut[li] = np.any(line_slice > resid_tol)
+                line_needs_cut[li] = (
+                    (pass_idx == 0 and prior_mask is None)
+                    or np.any(line_slice > resid_tol)
+                )
 
             n_active = int(np.sum(line_needs_cut))
             progress(40 + 40 * pass_idx / n_passes,
@@ -424,11 +427,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 else:
                     line_resid = remaining_depth[:, idx]
                 if pass_idx == 0 and prior_mask is None:
-                    # First pass with no prior-step gate: one continuous span
-                    # from first to last non-zero pixel so the tool doesn't
-                    # retract through zero-depth regions.
-                    nonzero = np.where(line_resid > resid_tol)[0]
-                    all_spans.append((idx, int(nonzero[0]), int(nonzero[-1])))
+                    # work_surface_tol==0: visit the full line so z=0 regions
+                    # are not skipped.
+                    all_spans.append((idx, 0, len(line_resid) - 1))
                 else:
                     for s, e in mask_spans(line_resid > resid_tol):
                         all_spans.append((idx, s, e))
