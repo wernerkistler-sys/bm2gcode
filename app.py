@@ -253,9 +253,6 @@ class GCodeGeneratorApp:
         self._steps_nb.pack(fill=tk.X, pady=(0, 4))
         self._steps_nb.bind("<<NotebookTabChanged>>", self._on_step_tab_changed)
 
-        ttk.Button(p, text="Add Step",
-                   command=self._add_step).pack(fill=tk.X, pady=(0, 8))
-
         # ── 3. G-code Info ────────────────────────────────────────────
         # Must be created before _add_step() so that info labels can attach.
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
@@ -265,8 +262,8 @@ class GCodeGeneratorApp:
         self._add_step()   # start with one step
 
     def _add_step(self):
-        """Append a new step tab to the notebook."""
-        # Capture the currently selected step before adding a new tab.
+        """Insert a new step tab after the currently selected tab."""
+        # Capture the currently selected step for cloning its settings.
         src = None
         if self.steps:
             try:
@@ -274,41 +271,68 @@ class GCodeGeneratorApp:
             except Exception:
                 src = self.steps[-1]
 
-        idx = len(self.steps)
+        # Insert position: after the selected tab, or 0 on first call.
+        if self.steps:
+            try:
+                insert_at = self._steps_nb.index("current") + 1
+            except Exception:
+                insert_at = len(self.steps)
+        else:
+            insert_at = 0
+
         tab = ttk.Frame(self._steps_nb, padding=(8, 6))
-        self._steps_nb.add(tab, text=f"Step {idx + 1}")
+        if insert_at < len(self._steps_nb.tabs()):
+            self._steps_nb.insert(insert_at, tab, text=f"Step {insert_at + 1}")
+        else:
+            self._steps_nb.add(tab, text=f"Step {insert_at + 1}")
 
         step = {'tab': tab}
-        self.steps.append(step)
-        self.toolpaths.append(None)
+        self.steps.insert(insert_at, step)
+        self.toolpaths.insert(insert_at, None)
+
+        # Claim bottom space before content so buttons stay pinned to the bottom.
+        bf = ttk.Frame(tab)
+        bf.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        bf.columnconfigure(0, weight=1)
+        bf.columnconfigure(1, weight=1)
 
         self._build_step_widgets(tab, step)
 
         if src is not None:
             self._copy_step_settings(src, step)
 
-        # Compute / Save buttons
-        bf = ttk.Frame(tab)
-        bf.pack(fill=tk.X, pady=(8, 2))
+        # Renumber tabs that shifted due to the insertion.
+        for i in range(insert_at + 1, len(self.steps)):
+            s = self.steps[i]
+            self._steps_nb.tab(s['tab'], text=f"Step {i + 1}")
+            txt = s['info_var'].get()
+            s['info_var'].set(f"Step {i + 1}:" + txt.split(":", 1)[1])
+
+        # 2×2 button grid — all four buttons share equal width and height
         ttk.Button(bf, text="Compute",
                    command=lambda s=step: self._compute_step(s)
-                   ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+                   ).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
         ttk.Button(bf, text="Save…",
                    command=lambda s=step: self._save_step(s)
-                   ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
-
-        # Remove button (disabled when only one step exists)
+                   ).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
+        ttk.Button(bf, text="Add Step After",
+                   command=self._add_step
+                   ).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=(2, 0))
         step['remove_btn'] = ttk.Button(
-            tab, text="Remove this step",
+            bf, text="Remove this step",
             command=lambda s=step: self._remove_step(s))
-        step['remove_btn'].pack(fill=tk.X, pady=(2, 0))
+        step['remove_btn'].grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=(2, 0))
 
         # Info label (shown in the G-code Info area below the notebook)
-        step['info_var'] = tk.StringVar(value=f"Step {idx + 1}: not computed")
+        step['info_var'] = tk.StringVar(value=f"Step {insert_at + 1}: not computed")
         lbl = ttk.Label(self._info_frame, textvariable=step['info_var'],
                         wraplength=230, justify=tk.LEFT)
-        lbl.pack(anchor=tk.W, pady=(0, 4))
         step['info_label'] = lbl
+        # Repack all info labels in step order so the new one appears correctly.
+        for s in self.steps:
+            s['info_label'].pack_forget()
+        for s in self.steps:
+            s['info_label'].pack(anchor=tk.W, pady=(0, 4))
 
         self._update_remove_buttons()
         self.display_mode_var.set(DISPLAY_ORIGINAL)
