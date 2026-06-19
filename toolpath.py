@@ -2,8 +2,6 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
-
 
 @dataclass
 class ToolPath:
@@ -97,12 +95,12 @@ class ToolPath:
             'est_minutes': est_minutes
         }
 
-    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
-                preamble=None, postamble=None):
-        """Generate G-code string from the structured path.
+    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
+        """Generate G-code string for the motion segments.
 
-        preamble / postamble: optional strings inserted before/after the motion
-        segments, replacing the built-in defaults.  None or '' → use built-in.
+        The output is self-contained: it starts with a move to z_safe and ends
+        at z_safe.  Preamble and postamble (spindle on/off, units, etc.) are
+        handled by the caller and are not included here.
         """
 
         def fmt_time(minutes):
@@ -149,15 +147,12 @@ class ToolPath:
             "",
         ]
 
-        if preamble:
-            lines += preamble.splitlines()
-            lines.append("")
-        else:
-            lines += DEFAULT_PREAMBLE.format(z_safe=z_safe).splitlines()
-            lines.append("")
+        # Explicit safe-height move at the start — body is self-contained and
+        # does not rely on the preamble having done this.
+        lines.append(f"G0 Z{z_safe:.3f}  ; move to safe height")
+        at_safe = True
 
         prev_end = None   # (x, y) of the last emitted endpoint
-        at_safe  = True   # tool starts at z_safe after preamble
 
         for points in self.segments:
             if not points:
@@ -182,11 +177,7 @@ class ToolPath:
 
             prev_end = (points[-1][0], points[-1][1])
 
-        if postamble:
-            lines.append("")
-            lines += postamble.splitlines()
-        else:
-            lines.append("")
-            lines += DEFAULT_POSTAMBLE.splitlines()
+        if not at_safe:
+            lines.append(f"G0 Z{z_safe:.3f}  ; retract")
 
         return "\n".join(lines)

@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import queue
+import re
 
 from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
 
@@ -358,5 +359,119 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
     def _cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
+class ExportToolpathDialog(tk.Toplevel):
+    """Modal dialog for selecting which computed steps to include in a single
+    exported G-code file.
+
+    After ``wait_window`` returns, read:
+    - ``self.selected_indices`` — list of int step indices, or ``None`` if cancelled
+    - ``self.suggested_stem``   — suggested filename stem (no extension)
+    """
+
+    def __init__(self, parent, steps_info, precheck_indices=None):
+        """
+        steps_info      — list of dicts, one per step:
+                          'label' (str), 'computed' (bool),
+                          'profile' (str), 'diameter_mm' (float)
+        precheck_indices — list of indices to pre-check, or None to pre-check
+                           all computed steps
+        """
+        super().__init__(parent)
+        self.title("Export Toolpath")
+        self.resizable(True, True)
+        self.minsize(360, 300)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self.selected_indices = None
+        self.suggested_stem   = ""
+        self._steps_info      = steps_info
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ── Steps checkboxes ─────────────────────────────────────────────
+        sf = SectionFrame(outer, "Steps")
+        sf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        self._check_vars = []
+        for i, info in enumerate(steps_info):
+            var = tk.BooleanVar()
+            if info['computed']:
+                checked = (precheck_indices is None) or (i in precheck_indices)
+                var.set(checked)
+                state = tk.NORMAL
+            else:
+                var.set(False)
+                state = tk.DISABLED
+            var.trace_add("write", self._update_filename)
+            self._check_vars.append(var)
+            ttk.Checkbutton(sf, text=info['label'], variable=var,
+                            state=state).pack(anchor=tk.W, pady=1)
+
+        # ── Suggested filename ────────────────────────────────────────────
+        self._filename_var = tk.StringVar()
+        ttk.Label(outer, textvariable=self._filename_var,
+                  foreground="#555555").pack(anchor=tk.W, pady=(0, 8))
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        # Centre on parent
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+        self._update_filename()
+        self.wait_window()
+
+    # ------------------------------------------------------------------ #
+    def _update_filename(self, *_):
+        seen = []
+        seen_set = set()
+        for var, info in zip(self._check_vars, self._steps_info):
+            if var.get() and info['computed']:
+                key = (info['profile'], info['diameter_mm'])
+                if key not in seen_set:
+                    seen_set.add(key)
+                    seen.append(key)
+
+        if not seen:
+            self._filename_var.set("Suggested filename: (none selected)")
+            self.suggested_stem = ""
+            return
+
+        tokens = []
+        for profile, diam in seen:
+            diam_str = f"{diam:.4g}"   # drops trailing zeros: 6.0→6, 3.175→3.175
+            token = f"{profile}_{diam_str}mm".replace(" ", "_")
+            token = re.sub(r"[^\w.\-]", "_", token)
+            tokens.append(token)
+
+        stem = "_".join(tokens)
+        self.suggested_stem = stem
+        self._filename_var.set(f"Suggested filename: {stem}.nc")
+
+    def _confirm(self):
+        indices = [i for i, v in enumerate(self._check_vars) if v.get()]
+        if not indices:
+            messagebox.showwarning("No steps selected",
+                                   "Select at least one step to export.",
+                                   parent=self)
+            return
+        self.selected_indices = indices
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.selected_indices = None
         self.grab_release()
         self.destroy()

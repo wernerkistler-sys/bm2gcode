@@ -10,11 +10,13 @@ import threading
 
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, ALGORITHMS, DEFAULTS,
+    DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
-from widgets import ProgressDialog, LabeledEntry, SectionFrame, SettingsDialog, _fmt_time
+from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
+                     SettingsDialog, ExportToolpathDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
@@ -78,6 +80,8 @@ class GCodeGeneratorApp:
                               command=self._load_project)
         file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
                               command=self._save_project)
+        file_menu.add_command(label="Export Toolpath…",
+                              command=self._export_toolpaths)
         file_menu.add_separator()
         file_menu.add_command(label="Reset Defaults", command=self.reset_defaults)
         file_menu.add_separator()
@@ -312,8 +316,8 @@ class GCodeGeneratorApp:
         ttk.Button(bf, text="Compute",
                    command=lambda s=step: self._compute_step(s)
                    ).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
-        ttk.Button(bf, text="Save…",
-                   command=lambda s=step: self._save_step(s)
+        ttk.Button(bf, text="Export…",
+                   command=lambda s=step: self._export_from_step(s)
                    ).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
         ttk.Button(bf, text="Add Step After",
                    command=self._add_step
@@ -1194,50 +1198,78 @@ class GCodeGeneratorApp:
 
             threading.Thread(target=_worker, daemon=True).start()
 
-    def _save_step(self, step):
+    def _build_steps_info(self):
+        info = []
+        for i, (step, tp) in enumerate(zip(self.steps, self.toolpaths)):
+            profile = (tp.metadata.get('profile', step['profile_var'].get())
+                       if tp else step['profile_var'].get())
+            diam_mm = tp.metadata.get('radius_mm', 0) * 2 if tp else 0.0
+            info.append({
+                'label':       f"Step {i + 1} — {profile} ∅{diam_mm:.4g} mm",
+                'computed':    tp is not None,
+                'profile':     profile,
+                'diameter_mm': diam_mm,
+            })
+        return info
+
+    def _export_from_step(self, step):
         idx = self.steps.index(step)
         if self.toolpaths[idx] is None:
             messagebox.showinfo("Not computed",
                                 f"Compute Step {idx + 1} first.")
             return
-        self._save_toolpath(self.toolpaths[idx], f"step{idx + 1}_toolpath")
+        self._export_toolpaths(precheck_indices=[idx])
 
-    def _save_toolpath(self, toolpath, default_stem):
+    def _export_toolpaths(self, precheck_indices=None):
+        steps_info = self._build_steps_info()
+        dlg = ExportToolpathDialog(self.root, steps_info,
+                                   precheck_indices=precheck_indices)
+        indices = dlg.selected_indices
+        if not indices:
+            return
+
+        z_safe     = self._settings['z_safe']
+        feed_rapid = self._settings['feed_rapid']
+        preamble   = (self._settings['preamble']
+                      or DEFAULT_PREAMBLE.format(z_safe=z_safe))
+        postamble  = (self._settings['postamble']
+                      or DEFAULT_POSTAMBLE.format(z_safe=z_safe))
+
+        # Warn if the selected steps use different tools — tool changes are not
+        # supported in a single G-code file.
+        tools = {(steps_info[i]['profile'], steps_info[i]['diameter_mm'])
+                 for i in indices}
+        if len(tools) > 1:
+            proceed = messagebox.askokcancel(
+                "Tool change not supported",
+                "The selected steps use different tools. A single G-code file "
+                "cannot perform a tool change automatically. Export anyway?",
+            )
+            if not proceed:
+                return
+
         path = filedialog.asksaveasfilename(
-            title="Save tool path",
+            title="Export Toolpath",
             defaultextension=".nc",
-            initialfile=default_stem,
-            filetypes=[("G-code",       "*.nc *.gcode *.tap"),
-                       ("NumPy array",  "*.npy"),
-                       ("CSV file",     "*.csv"),
-                       ("PNG image",    "*.png")]
+            initialfile=dlg.suggested_stem,
+            filetypes=[("G-code", "*.nc *.gcode *.tap"), ("All files", "*.*")],
         )
         if not path:
             return
+
         try:
-            ext = path.rsplit(".", 1)[-1].lower()
-            if ext in ("nc", "gcode", "tap"):
-                # Feed rate was stored in metadata when the toolpath was computed
-                feed_rate = toolpath.metadata.get('feed_rate', 800.0)
-                gcode = toolpath.to_gcode(
-                    feed_rate=feed_rate,
-                    feed_rapid=self._settings['feed_rapid'],
-                    z_safe=self._settings['z_safe'],
-                    preamble=self._settings['preamble'] or None,
-                    postamble=self._settings['postamble'] or None,
-                )
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(gcode)
-            elif ext == "csv":
-                np.savetxt(path, toolpath.result, delimiter=",")
-            elif ext == "png":
-                import matplotlib
-                matplotlib.image.imsave(path, toolpath.result, cmap="gray")
-            else:
-                np.save(path, toolpath.result)
-            self.status_var.set(f"Saved: {path}")
+            bodies = []
+            for idx in indices:
+                tp = self.toolpaths[idx]
+                feed_rate = tp.metadata.get('feed_rate', 800.0)
+                bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe))
+
+            gcode = preamble + "\n\n" + "\n\n".join(bodies) + "\n\n" + postamble
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(gcode)
+            self.status_var.set(f"Exported: {path}")
         except Exception as exc:
-            messagebox.showerror("Save error", str(exc))
+            messagebox.showerror("Export error", str(exc))
 
     # ------------------------------------------------------------------ #
     #  Display mode
