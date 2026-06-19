@@ -433,6 +433,16 @@ class GCodeGeneratorApp:
                         variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
         step['contour_adaptive_var'] = contour_adaptive_var
 
+        tsp_frame = ttk.Frame(operation_lf)
+        step['tsp_frame'] = tsp_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        tsp_2opt_var = tk.BooleanVar(
+            value=bool(int(DEFAULTS["step_tsp_2opt"])))
+        ttk.Checkbutton(tsp_frame, text="Optimize path order (2-opt)",
+                        variable=tsp_2opt_var).pack(anchor=tk.W, pady=2)
+        step['tsp_2opt_var'] = tsp_2opt_var
+
         gating_frame = ttk.Frame(operation_lf)
         gating_frame.pack(fill=tk.X)
         step['gating_frame'] = gating_frame
@@ -533,6 +543,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack(fill=tk.X, pady=2)
                 step['max_fw'].pack(fill=tk.X, pady=2)
                 step['gating_frame'].pack(fill=tk.X)
+                step['tsp_frame'].pack(fill=tk.X)
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -545,6 +556,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack_forget()
+                step['tsp_frame'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -562,6 +574,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack(fill=tk.X)
+                step['tsp_frame'].pack(fill=tk.X)
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -640,6 +653,7 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
+        step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
 
     # ------------------------------------------------------------------ #
@@ -781,6 +795,7 @@ class GCodeGeneratorApp:
             'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
             'contour_stepdown':     step['contour_stepdown'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
+            'tsp_2opt':             step['tsp_2opt_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
             'threshold':            step['threshold'].get(),
             'min_fw':               step['min_fw'].get(),
@@ -802,6 +817,7 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
         step['contour_stepdown'].set(d.get('contour_stepdown', DEFAULTS['step_contour_stepdown']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
+        step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
         step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
         step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
@@ -951,6 +967,7 @@ class GCodeGeneratorApp:
                 max_feature_width_mm     = float(step['max_fw'].get())
                 vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
                 vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
+                use_2opt                 = step['tsp_2opt_var'].get()
             elif algorithm == "Contour":
                 _profile    = step['profile_var'].get()
                 _vbit_angle = (float(step['vbit_angle'].get())
@@ -966,6 +983,7 @@ class GCodeGeneratorApp:
                 stepover         = float(step['stepover'].get())
                 raster_offset_pct = float(step['raster_offset'].get())
                 stepdown         = float(step['stepdown'].get())
+                use_2opt         = step['tsp_2opt_var'].get()
         except ValueError:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
@@ -1019,6 +1037,7 @@ class GCodeGeneratorApp:
                         skeleton_mode        = ("voronoi"    if algorithm == "V-Carving (Voronoi)"
                                                 else "inscribed" if algorithm == "V-Carving (Inscribed)"
                                                 else "medial_axis"),
+                        use_2opt             = use_2opt,
                         progress             = dlg.report,
                     )
                 except ProgressDialog.Cancelled:
@@ -1135,6 +1154,7 @@ class GCodeGeneratorApp:
                         prior_reference   = prior_reference,
                         raster_offset_pct = raster_offset_pct,
                         feed_rate         = feed_rate,
+                        use_2opt          = use_2opt,
                         progress          = dlg.report,
                     )
                 except ProgressDialog.Cancelled:

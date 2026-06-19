@@ -3,6 +3,61 @@ from tool import Tool
 from toolpath import ToolPath
 
 
+def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
+                     link_threshold=0.0, per_rapid_overhead=0.0):
+    """Return (order, flipped) permutation that minimises rapid travel cost.
+
+    seg_entries[i], seg_exits[i]: (x, y) G-code mm for the i-th segment's
+    entry and exit points.  origin: tool XY position before the first segment.
+
+    link_threshold: connections shorter than this distance are treated as free
+        (they will be stitched at feed rate with no retract/plunge).
+    per_rapid_overhead: fixed cost added to every connection that exceeds
+        link_threshold, representing the retract + plunge distance overhead
+        (typically 2 × z_safe).  Without this the optimiser may break several
+        cheap stitches to save a few mm of traverse.
+
+    Returns parallel lists — order (indices into the original lists) and
+    flipped (bool: whether to reverse that segment's traversal direction).
+    """
+    n = len(seg_entries)
+    if n < 3:
+        return list(range(n)), [False] * n
+
+    ent     = list(seg_entries)
+    ext     = list(seg_exits)
+    order   = list(range(n))
+    flipped = [False] * n
+
+    def edge_cost(a, b):
+        d = ((a[0] - b[0])**2 + (a[1] - b[1])**2) ** 0.5
+        return 0.0 if d < link_threshold else per_rapid_overhead + d
+
+    for _ in range(max_passes):
+        improved = False
+        for i in range(-1, n - 2):
+            prev_ext = origin if i == -1 else ext[i]
+            for j in range(i + 2, n):
+                old = edge_cost(prev_ext, ent[i + 1])
+                new = edge_cost(prev_ext, ext[j])
+                if j + 1 < n:
+                    old += edge_cost(ext[j],     ent[j + 1])
+                    new += edge_cost(ent[i + 1], ent[j + 1])
+                if new < old - 1e-9:
+                    lo, hi = i + 1, j + 1
+                    block_e = ent[lo:hi]
+                    block_x = ext[lo:hi]
+                    ent[lo:hi]     = list(reversed(block_x))
+                    ext[lo:hi]     = list(reversed(block_e))
+                    order[lo:hi]   = list(reversed(order[lo:hi]))
+                    flipped[lo:hi] = [not f for f in reversed(flipped[lo:hi])]
+                    improved = True
+        if not improved:
+            break
+
+    return order, flipped
+
+
 def mask_spans(mask_1d):
     """Return contiguous True-runs in a 1-D boolean array.
 
@@ -174,6 +229,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             previous_result=None,
                             prior_reference=None,
                             raster_offset_pct=0.0,
+                            use_2opt=False,
                             progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
@@ -449,7 +505,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                      f"{n_spans} span(s) to cut across "
                      f"{n_active} raster line(s).")
 
-            # ── Greedy nearest-endpoint TSP over all spans ─────────
+            # ── Path ordering: greedy + optional 2-opt ─────────────
             def span_endpoints_mm(idx, s, e):
                 """Return (x_s,y_s), (x_e,y_e) for a span in G-code coords."""
                 if direction == "X":
@@ -461,28 +517,57 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     return ((x, (H - 1 - s) / px_per_mm_y - _oy),
                             (x, (H - 1 - e) / px_per_mm_y - _oy))
 
+            # Phase 1 – greedy nearest-endpoint ordering
+            ordered_spans = []
+            cur_pos   = np.array([tool_pos[0], tool_pos[1]])
             unvisited = list(range(n_spans))
-
             while unvisited:
                 best_i    = 0
                 best_rev  = False
                 best_dist = np.inf
-
                 for ui, si in enumerate(unvisited):
                     idx, s, e = all_spans[si]
                     (x_s, y_s), (x_e, y_e) = span_endpoints_mm(idx, s, e)
-                    d_s = np.hypot(x_s - tool_pos[0], y_s - tool_pos[1])
-                    d_e = np.hypot(x_e - tool_pos[0], y_e - tool_pos[1])
+                    d_s = np.hypot(x_s - cur_pos[0], y_s - cur_pos[1])
+                    d_e = np.hypot(x_e - cur_pos[0], y_e - cur_pos[1])
                     if d_s <= d_e:
                         d, rev = d_s, False
                     else:
                         d, rev = d_e, True
                     if d < best_dist:
                         best_i, best_rev, best_dist = ui, rev, d
-
                 si = unvisited.pop(best_i)
                 idx, s, e = all_spans[si]
-                px_range = (range(s, e + 1) if not best_rev
+                ordered_spans.append((idx, s, e, best_rev))
+                (x_s, y_s), (x_e, y_e) = span_endpoints_mm(idx, s, e)
+                if best_rev:
+                    cur_pos = np.array([x_s, y_s])
+                else:
+                    cur_pos = np.array([x_e, y_e])
+
+            # Phase 2 – optional 2-opt refinement
+            if use_2opt and len(ordered_spans) > 2:
+                ent_xy = []
+                ext_xy = []
+                for idx, s, e, rev in ordered_spans:
+                    (xs, ys), (xe, ye) = span_endpoints_mm(idx, s, e)
+                    ent_xy.append((xe, ye) if rev else (xs, ys))
+                    ext_xy.append((xs, ys) if rev else (xe, ye))
+                origin_2opt = (tool_pos[0], tool_pos[1])
+                order, flips = _two_opt_reorder(ent_xy, ext_xy,
+                                                origin=origin_2opt,
+                                                link_threshold=link_threshold_mm,
+                                                per_rapid_overhead=10.0)
+                ordered_spans = [
+                    (ordered_spans[i][0], ordered_spans[i][1],
+                     ordered_spans[i][2],
+                     ordered_spans[i][3] ^ flips[k])
+                    for k, i in enumerate(order)
+                ]
+
+            # Phase 3 – build segments and terrain links
+            for i, (idx, s, e, rev) in enumerate(ordered_spans):
+                px_range = (range(s, e + 1) if not rev
                             else range(e, s - 1, -1))
 
                 points = []
@@ -502,39 +587,16 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     total_segs += 1
                     tool_pos = np.array([points[-1][0], points[-1][1]])
 
-                    # ── Inline terrain link to next span ──────────
-                    if unvisited:
-                        nxt_best_i    = 0
-                        nxt_best_rev  = False
-                        nxt_best_dist = np.inf
-                        for ui, si2 in enumerate(unvisited):
-                            idx2, s2, e2 = all_spans[si2]
-                            (xs2, ys2), (xe2, ye2) = span_endpoints_mm(
-                                idx2, s2, e2)
-                            d_s2 = np.hypot(xs2 - tool_pos[0],
-                                            ys2 - tool_pos[1])
-                            d_e2 = np.hypot(xe2 - tool_pos[0],
-                                            ye2 - tool_pos[1])
-                            if d_s2 <= d_e2:
-                                d2, rev2 = d_s2, False
-                            else:
-                                d2, rev2 = d_e2, True
-                            if d2 < nxt_best_dist:
-                                nxt_best_i, nxt_best_rev, nxt_best_dist \
-                                    = ui, rev2, d2
+                    # ── Terrain link to next ordered span ──────────
+                    if i + 1 < len(ordered_spans):
+                        idx2, s2, e2, rev2 = ordered_spans[i + 1]
+                        (xs2, ys2), (xe2, ye2) = span_endpoints_mm(idx2, s2, e2)
+                        x_entry = xe2 if rev2 else xs2
+                        y_entry = ye2 if rev2 else ys2
+                        nxt_dist = np.hypot(x_entry - tool_pos[0],
+                                            y_entry - tool_pos[1])
 
-                        if nxt_best_dist < link_threshold_mm:
-                            si2      = unvisited[nxt_best_i]
-                            idx2, s2, e2 = all_spans[si2]
-                            (xs2, ys2), (xe2, ye2) = span_endpoints_mm(
-                                idx2, s2, e2)
-                            if not nxt_best_rev:
-                                x_entry = xs2
-                                y_entry = ys2
-                            else:
-                                x_entry = xe2
-                                y_entry = ye2
-
+                        if nxt_dist < link_threshold_mm:
                             x_exit_lnk = tool_pos[0]
                             y_exit_lnk = tool_pos[1]
                             c0 = int(round((x_exit_lnk + _ox) * px_per_mm_x))
@@ -561,12 +623,11 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 n_links += 1   # count every potential inter-span gap
 
                 if total_segs % max(1, n_spans // 10) == 0:
-                    done = n_spans - len(unvisited)
-                    pct  = 40 + 40 * (pass_idx + done / n_spans) / n_passes
+                    pct = 40 + 40 * (pass_idx + (i + 1) / n_spans) / n_passes
                     progress(pct,
                              f"Pass {pass_idx+1}/{n_passes}, "
                              f"dir={direction}: "
-                             f"{done}/{n_spans} spans cut, "
+                             f"{i + 1}/{n_spans} spans cut, "
                              f"{total_segs} segments total…")
 
         # remaining_depth is recomputed fresh at the top of each pass
@@ -672,6 +733,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
                             prior_reference=None, previous_result=None,
+                            use_2opt=False,
                             progress=None):
     """Compute a V-carving toolpath for fine details not reachable by raster.
 
@@ -1092,12 +1154,37 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                 segs.append(sub)
         return segs
 
+    def _two_opt_pass(segs, origin):
+        """2-opt reorder of already-built segments for one pass.
+
+        Uses actual segment endpoints (not branch endpoints) so that
+        multi-pass skipping of skeleton pixels doesn't mislead the optimiser.
+        """
+        if not use_2opt or len(segs) < 3:
+            return segs
+        ent_xy = [(s[0][0],  s[0][1])  for s in segs]
+        ext_xy = [(s[-1][0], s[-1][1]) for s in segs]
+        order, flips = _two_opt_reorder(ent_xy, ext_xy, origin=origin,
+                                        link_threshold=vcarve_link_mm,
+                                        per_rapid_overhead=10.0)
+        return [
+            list(reversed(segs[i])) if flips[k] else segs[i]
+            for k, i in enumerate(order)
+        ]
+
+    def _pass_origin(segs_so_far):
+        if segs_so_far:
+            last = segs_so_far[-1][-1]
+            return (last[0], last[1])
+        return (0.0, 0.0)
+
     all_segments = []
 
     if stepdown_mm <= 0.0:
         def _depth_single(r, c):
             return -_depth_norm[r, c] * max_depth
-        all_segments = _build_pass_segments(ordered_branches, _depth_single)
+        pass_segs = _build_pass_segments(ordered_branches, _depth_single)
+        all_segments = _two_opt_pass(pass_segs, _pass_origin(all_segments))
     else:
         final_norm = final_stepdown_mm / max_depth
         sd_norm    = stepdown_mm / max_depth
@@ -1132,16 +1219,18 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                     return None
                 return -min(roughing_target, _cn) * max_depth
 
+            pass_segs = _build_pass_segments(ordered_branches, _depth_rough)
             all_segments.extend(
-                _build_pass_segments(ordered_branches, _depth_rough)
+                _two_opt_pass(pass_segs, _pass_origin(all_segments))
             )
             prev_ceiling = ceiling_norm
 
         if final_stepdown_mm > 0.0:
             def _depth_final(r, c):
                 return -_depth_norm[r, c] * max_depth
+            pass_segs = _build_pass_segments(ordered_branches, _depth_final)
             all_segments.extend(
-                _build_pass_segments(ordered_branches, _depth_final)
+                _two_opt_pass(pass_segs, _pass_origin(all_segments))
             )
 
     progress(90, f"Generated {len(all_segments)} segments across all passes.")

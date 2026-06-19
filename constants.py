@@ -50,6 +50,8 @@ DEFAULTS = {
     # Contour-specific defaults
     "step_contour_stepdown":      "1.0", # Z increment between contour levels (mm)
     "step_contour_adaptive":      "0",   # 0 = fixed levels, 1 = adaptive CDF levels
+    # Path-ordering
+    "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
 }
 
 DISPLAY_ORIGINAL    = "Original"
