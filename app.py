@@ -74,16 +74,12 @@ class GCodeGeneratorApp:
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
                               command=self.open_image)
-        file_menu.add_command(label="Close Image",  command=self.close_image)
-        file_menu.add_separator()
         file_menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
                               command=self._load_project)
         file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
                               command=self._save_project)
         file_menu.add_command(label="Export Toolpath…",
                               command=self._export_toolpaths)
-        file_menu.add_separator()
-        file_menu.add_command(label="Reset Defaults", command=self.reset_defaults)
         file_menu.add_separator()
         file_menu.add_command(label="Settings…",     command=self._open_settings)
         file_menu.add_separator()
@@ -765,21 +761,6 @@ class GCodeGeneratorApp:
         self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
         self._render()
 
-    def close_image(self):
-        self.current_image = None
-        self.n_grey_levels = 256
-        self.image_path    = None
-        self.toolpaths     = [None] * len(self.steps)
-        for i, s in enumerate(self.steps):
-            s['info_var'].set(f"Step {i + 1}: not computed")
-        self.display_mode_var.set(DISPLAY_ORIGINAL)
-        self._reset_zoom()
-        self.ax.cla()
-        self.ax.set_visible(False)
-        self.mpl_canvas.draw()
-        self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-        self.status_var.set("No image loaded.")
-
     def _open_settings(self):
         SettingsDialog(self.root, self._settings)
 
@@ -947,18 +928,6 @@ class GCodeGeneratorApp:
                     "Use File → Open Image… to load an image manually.")
 
         self.status_var.set(f"Project loaded: {path}")
-
-    def reset_defaults(self):
-        self.width_cm.set(DEFAULTS["width_cm"])
-        if not self._aspect_lock_var.get():
-            self.height_cm.set(DEFAULTS["height_cm"])
-        self.max_depth.set(DEFAULTS["max_depth"])
-        self.origin_var.set(DEFAULTS["origin"])
-        self.surface.set(DEFAULTS["surface"])
-        # Remove all steps except the first, then reset its fields
-        while len(self.steps) > 1:
-            self._remove_step(self.steps[-1])
-        self._reset_step_widgets(self.steps[0])
 
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
