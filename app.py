@@ -221,10 +221,10 @@ class GCodeGeneratorApp:
 
         self._aspect_lock_var = tk.BooleanVar(value=True)
         self._image_aspect    = None   # pixel W/H of the loaded image
-        ttk.Checkbutton(sf, text="Keep aspect ratio",
+        ttk.Checkbutton(self.height_cm, text="Lock",
                         variable=self._aspect_lock_var,
                         command=self._on_aspect_lock_toggle
-                        ).pack(anchor=tk.W, pady=(0, 2))
+                        ).pack(side=tk.RIGHT, padx=(0, 4))
 
         self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"])
         self.max_depth.pack(fill=tk.X, pady=2)
@@ -237,7 +237,7 @@ class GCodeGeneratorApp:
         self.surface = tk.StringVar(value=DEFAULTS["surface"])
         ttk.Combobox(polarity_row, textvariable=self.surface,
                      values=["white", "black"],
-                     state="readonly", width=6).pack(side=tk.RIGHT)
+                     state="readonly", width=22).pack(side=tk.RIGHT)
 
         origin_row = ttk.Frame(sf)
         origin_row.pack(fill=tk.X, pady=(0, 2))
@@ -246,7 +246,7 @@ class GCodeGeneratorApp:
         ttk.Combobox(origin_row, textvariable=self.origin_var,
                      values=["Bottom-Left", "Bottom-Right",
                              "Top-Left", "Top-Right", "Center"],
-                     state="readonly", width=14).pack(side=tk.RIGHT)
+                     state="readonly", width=22).pack(side=tk.RIGHT)
 
         # ── 2. Tool path steps (dynamic notebook) ─────────────────────
         self._steps_nb = ttk.Notebook(p)
@@ -356,34 +356,24 @@ class GCodeGeneratorApp:
         """Populate a step tab with all tool-parameter widgets.
         Widget references are stored in the step dict. Values from DEFAULTS."""
 
-        # ── Algorithm selector (top-level) ────────────────────────────
-        ttk.Label(frame, text="Algorithm:").pack(anchor=tk.W)
+        # ── Operation group ────────────────────────────────────────────
+        operation_lf = ttk.LabelFrame(frame, text="Operation", padding=4)
+        operation_lf.pack(fill=tk.X, pady=(0, 4))
+        step['operation_lf'] = operation_lf
+
+        alg_row = ttk.Frame(operation_lf)
+        alg_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(alg_row, text="Algorithm:").pack(side=tk.LEFT)
         algorithm_var = tk.StringVar(value=DEFAULTS["step_algorithm"])
         step['algorithm_var'] = algorithm_var
-        ttk.Combobox(frame, textvariable=algorithm_var,
-                     values=ALGORITHMS, state="readonly", width=18
-                     ).pack(anchor=tk.W, pady=(2, 6))
+        ttk.Combobox(alg_row, textvariable=algorithm_var,
+                     values=ALGORITHMS, state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
+        step['alg_row'] = alg_row
 
-        # ── Tool group ─────────────────────────────────────────────────
-        tool_lf = ttk.LabelFrame(frame, text="Tool", padding=4)
-        tool_lf.pack(fill=tk.X, pady=(0, 4))
-        step['tool_lf'] = tool_lf
-
-        ttk.Label(tool_lf, text="Profile:").pack(anchor=tk.W)
-        profile_var = tk.StringVar(value=DEFAULTS["step_profile"])
-        step['profile_var'] = profile_var
-        profile_cb = ttk.Combobox(tool_lf, textvariable=profile_var,
-                                  values=TOOL_PROFILES, state="readonly", width=18)
-        profile_cb.pack(anchor=tk.W, pady=(2, 6))
-        step['profile_cb'] = profile_cb
-
-        diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"])
-        diam.pack(fill=tk.X, pady=2)
-        step['diameter'] = diam
-
-        # ── Raster-only controls (hidden when V-Carving) ───────────────
-        raster_frame = ttk.Frame(tool_lf)
-        raster_frame.pack(fill=tk.X)   # initially shown (matches default algorithm)
+        # ── Raster-only op controls (hidden when V-Carving or Contour) ─
+        raster_frame = ttk.Frame(operation_lf)
+        raster_frame.pack(fill=tk.X, after=alg_row)   # initially shown
         step['raster_frame'] = raster_frame
 
         stepover = LabeledEntry(raster_frame, "Step-over", "%", DEFAULTS["step_stepover"])
@@ -394,17 +384,81 @@ class GCodeGeneratorApp:
         raster_offset.pack(fill=tk.X, pady=2)
         step['raster_offset'] = raster_offset
 
-        ttk.Label(raster_frame, text="Scan direction:").pack(anchor=tk.W, pady=(6, 2))
+        dir_row = ttk.Frame(raster_frame)
+        dir_row.pack(fill=tk.X, pady=2)
+        ttk.Label(dir_row, text="Scan direction:").pack(side=tk.LEFT)
         dir_var = tk.StringVar(value=DEFAULTS["step_raster_dir"])
         step['raster_dir_var'] = dir_var
-        dir_row = ttk.Frame(raster_frame)
-        dir_row.pack(anchor=tk.W)
-        for d in RASTER_DIRECTIONS:
-            ttk.Radiobutton(dir_row, text=d, variable=dir_var,
-                            value=d).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Combobox(dir_row, textvariable=dir_var,
+                     values=RASTER_DIRECTIONS, state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
 
-        stepdown = LabeledEntry(raster_frame, "Max step-down", "mm", DEFAULTS["step_stepdown"])
-        stepdown.pack(fill=tk.X, pady=2)
+        # ── Contour-only op controls (hidden unless Contour algorithm) ──
+        contour_frame = ttk.Frame(operation_lf)
+        step['contour_frame'] = contour_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
+                                        DEFAULTS["step_contour_stepdown"])
+        contour_stepdown.pack(fill=tk.X, pady=2)
+        step['contour_stepdown'] = contour_stepdown
+
+        contour_adaptive_var = tk.BooleanVar(
+            value=bool(int(DEFAULTS["step_contour_adaptive"])))
+        ttk.Checkbutton(contour_frame, text="Adaptive levels (CDF)",
+                        variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
+        step['contour_adaptive_var'] = contour_adaptive_var
+
+        gating_frame = ttk.Frame(operation_lf)
+        gating_frame.pack(fill=tk.X)
+        step['gating_frame'] = gating_frame
+
+        region_row = ttk.Frame(gating_frame)
+        region_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(region_row, text="Process region:").pack(side=tk.LEFT)
+        gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
+        step['gating_mode_var'] = gating_var
+        gating_cb = ttk.Combobox(region_row, textvariable=gating_var,
+                                 values=["Full depth map",
+                                         "Residual from prior step",
+                                         "Inaccessible by prior tool"],
+                                 state="readonly", width=22)
+        gating_cb.pack(side=tk.RIGHT)
+        step['gating_cb'] = gating_cb
+
+        threshold = LabeledEntry(gating_frame, "Z-threshold", "mm", DEFAULTS["step_threshold"])
+        threshold.pack(fill=tk.X, pady=2)
+        step['threshold'] = threshold
+
+        min_fw = LabeledEntry(gating_frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
+        step['min_fw'] = min_fw
+        max_fw = LabeledEntry(gating_frame, "Max feature width", "mm", DEFAULTS["step_max_fw"],
+                              auto_label="Auto")
+        step['max_fw'] = max_fw
+        # min_fw/max_fw packed/unpacked by _refresh_layout below
+
+        # ── Tool group ─────────────────────────────────────────────────
+        tool_lf = ttk.LabelFrame(frame, text="Tool", padding=4)
+        tool_lf.pack(fill=tk.X, pady=(0, 4))
+        step['tool_lf'] = tool_lf
+
+        profile_row = ttk.Frame(tool_lf)
+        profile_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(profile_row, text="Profile:").pack(side=tk.LEFT)
+        profile_var = tk.StringVar(value=DEFAULTS["step_profile"])
+        step['profile_var'] = profile_var
+        profile_cb = ttk.Combobox(profile_row, textvariable=profile_var,
+                                  values=TOOL_PROFILES, state="readonly", width=22)
+        profile_cb.pack(side=tk.RIGHT)
+        step['profile_cb'] = profile_cb
+
+        diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"])
+        diam.pack(fill=tk.X, pady=2)
+        step['diameter'] = diam
+
+        # ── Raster step-down (shown for Raster Scan only) ─────────────
+        stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"])
+        stepdown.pack(fill=tk.X, pady=2)   # initially shown (default = Raster Scan)
         step['stepdown'] = stepdown
 
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
@@ -429,52 +483,9 @@ class GCodeGeneratorApp:
         vcarve_final_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_final_stepdown'] = vcarve_final_stepdown
 
-        # ── Contour-only controls (hidden unless Contour algorithm) ───────
-        contour_frame = ttk.Frame(tool_lf)
-        step['contour_frame'] = contour_frame
-        # (not packed initially — shown on demand by _refresh_layout)
-
-        contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
-                                        DEFAULTS["step_contour_stepdown"])
-        contour_stepdown.pack(fill=tk.X, pady=2)
-        step['contour_stepdown'] = contour_stepdown
-
-        contour_adaptive_var = tk.BooleanVar(
-            value=bool(int(DEFAULTS["step_contour_adaptive"])))
-        ttk.Checkbutton(contour_frame, text="Adaptive levels (CDF)",
-                        variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
-        step['contour_adaptive_var'] = contour_adaptive_var
-
         feed = LabeledEntry(tool_lf, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
         feed.pack(fill=tk.X, pady=2)
         step['feed_rate'] = feed
-
-        # ── Region group ───────────────────────────────────────────────
-        region_lf = ttk.LabelFrame(frame, text="Region", padding=4)
-        region_lf.pack(fill=tk.X, pady=(0, 4))
-        step['region_lf'] = region_lf
-
-        ttk.Label(region_lf, text="Process region:").pack(anchor=tk.W)
-        gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
-        step['gating_mode_var'] = gating_var
-        gating_cb = ttk.Combobox(region_lf, textvariable=gating_var,
-                                 values=["Full depth map",
-                                         "Residual from prior step",
-                                         "Inaccessible by prior tool"],
-                                 state="readonly", width=24)
-        gating_cb.pack(anchor=tk.W, pady=(2, 6))
-        step['gating_cb'] = gating_cb
-
-        threshold = LabeledEntry(region_lf, "Z-threshold", "mm", DEFAULTS["step_threshold"])
-        threshold.pack(fill=tk.X, pady=2)
-        step['threshold'] = threshold
-
-        min_fw = LabeledEntry(region_lf, "Min feature width", "mm", DEFAULTS["step_min_fw"])
-        step['min_fw'] = min_fw
-        max_fw = LabeledEntry(region_lf, "Max feature width", "mm", DEFAULTS["step_max_fw"],
-                              auto_label="Auto")
-        step['max_fw'] = max_fw
-        # min_fw/max_fw packed/unpacked by _refresh_layout below
 
         # ── Wire up algorithm / profile toggle ────────────────────────
         _VCARVE_PROFILES  = ["V-Bit", "Ball"]
@@ -492,12 +503,12 @@ class GCodeGeneratorApp:
                     step['gating_mode_var'].set("Inaccessible by prior tool")
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
+                step['stepdown'].pack_forget()
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2)
                 step['max_fw'].pack(fill=tk.X, pady=2)
-                step['region_lf'].pack(fill=tk.X, pady=(0, 4),
-                                       after=step['tool_lf'])
+                step['gating_frame'].pack(fill=tk.X)
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -506,18 +517,18 @@ class GCodeGeneratorApp:
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
+                step['stepdown'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
-                step['region_lf'].pack_forget()
+                step['gating_frame'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
                 if profile == "V-Bit":
                     step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
-                    step['contour_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 else:
                     step['vbit_frame'].pack_forget()
-                    step['contour_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
                 if alg_changed:
@@ -526,17 +537,17 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
-                step['region_lf'].pack(fill=tk.X, pady=(0, 4),
-                                       after=step['tool_lf'])
+                step['gating_frame'].pack(fill=tk.X)
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
                 if profile == "V-Bit":
                     step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
-                    step['raster_frame'].pack(fill=tk.X, after=step['vbit_frame'])
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['vbit_frame'])
                 else:
                     step['vbit_frame'].pack_forget()
-                    step['raster_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['vbit_angle'].set_state("normal")
             if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()

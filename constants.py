@@ -1,5 +1,5 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
-RASTER_DIRECTIONS = ["X", "Y", "Both"]
+RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Both"]
 ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)",
                      "V-Carving (Inscribed)", "Contour"]
 
@@ -37,7 +37,7 @@ DEFAULTS = {
     "step_raster_offset": "0",
     "step_stepdown":     "6.0",
     "step_feed_rate":    "800",
-    "step_raster_dir":   "X",
+    "step_raster_dir":   "Horizontal",
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"

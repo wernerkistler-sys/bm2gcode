@@ -276,9 +276,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
 
     directions = []
-    if raster_dir in ("X", "Both"):
+    if raster_dir in ("Horizontal", "Both"):
         directions.append("X")
-    if raster_dir in ("Y", "Both"):
+    if raster_dir in ("Vertical", "Both"):
         directions.append("Y")
 
     progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
