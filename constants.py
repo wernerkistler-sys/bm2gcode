@@ -23,6 +23,8 @@ DEFAULTS = {
     "width_cm":          "10.0",
     "height_cm":         "10.0",
     "max_depth":         "5.0",
+    "margin_cm":         "0.0",
+    "margin_depth_pct":  "0.0",
     "origin":            "Bottom-Left",
     "surface":           "white",
     # Global machine / G-code settings

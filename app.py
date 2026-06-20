@@ -228,7 +228,13 @@ class GCodeGeneratorApp:
 
         self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"])
         self.max_depth.pack(fill=tk.X, pady=2)
+        self.margin_cm = LabeledEntry(sf, "Stock margin", "cm", DEFAULTS["margin_cm"])
+        self.margin_cm.pack(fill=tk.X, pady=2)
+        self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"])
+        self.margin_depth_pct.pack(fill=tk.X, pady=2)
         self.width_cm.var.trace_add("write", self._on_width_changed)
+        self.margin_cm.var.trace_add("write", lambda *_: self._render())
+        self.margin_depth_pct.var.trace_add("write", lambda *_: self._render())
         self._on_aspect_lock_toggle()   # apply initial locked state
 
         polarity_row = ttk.Frame(sf)
@@ -238,6 +244,7 @@ class GCodeGeneratorApp:
         ttk.Combobox(polarity_row, textvariable=self.surface,
                      values=["white", "black"],
                      state="readonly", width=22).pack(side=tk.RIGHT)
+        self.surface.trace_add("write", lambda *_: self._render())
 
         origin_row = ttk.Frame(sf)
         origin_row.pack(fill=tk.X, pady=(0, 2))
@@ -434,8 +441,8 @@ class GCodeGeneratorApp:
         step['contour_adaptive_var'] = contour_adaptive_var
 
         tsp_frame = ttk.Frame(operation_lf)
+        tsp_frame.pack(fill=tk.X)   # shown initially (Raster Scan is the default)
         step['tsp_frame'] = tsp_frame
-        # (not packed initially — shown on demand by _refresh_layout)
 
         tsp_2opt_var = tk.BooleanVar(
             value=bool(int(DEFAULTS["step_tsp_2opt"])))
@@ -957,7 +964,11 @@ class GCodeGeneratorApp:
         try:
             feed_rate    = float(step['feed_rate'].get())
             threshold_mm = float(step['threshold'].get())
-            width_cm     = float(self.width_cm.get())
+            width_cm      = float(self.width_cm.get())
+            height_cm     = float(self.height_cm.get())
+            margin_cm     = float(self.margin_cm.get())
+            eff_width_cm  = width_cm  + 2.0 * margin_cm
+            eff_height_cm = height_cm + 2.0 * margin_cm
             max_depth    = float(self.max_depth.get())
             if algorithm.startswith("V-Carving"):
                 _profile   = step['profile_var'].get()
@@ -1025,8 +1036,8 @@ class GCodeGeneratorApp:
                         prior_reference = prior_reference,
                         previous_result = _prev_tp.result if _prev_tp is not None else None,
                         max_depth      = max_depth,
-                        width_cm       = width_cm,
-                        height_cm      = float(self.height_cm.get()),
+                        width_cm       = eff_width_cm,
+                        height_cm      = eff_height_cm,
                         origin         = self.origin_var.get(),
                         feed_rate            = feed_rate,
                         threshold_um         = threshold_mm * 1000.0,
@@ -1089,8 +1100,8 @@ class GCodeGeneratorApp:
                         tool             = tool,
                         stepdown_mm      = contour_stepdown,
                         max_depth        = max_depth,
-                        width_cm         = width_cm,
-                        height_cm        = float(self.height_cm.get()),
+                        width_cm         = eff_width_cm,
+                        height_cm        = eff_height_cm,
                         origin           = self.origin_var.get(),
                         feed_rate        = feed_rate,
                         prior_accessible = (_prev_tp.accessible
@@ -1145,8 +1156,8 @@ class GCodeGeneratorApp:
                         step_mm           = step_mm,
                         stepdown_mm       = stepdown,
                         max_depth         = max_depth,
-                        width_cm          = width_cm,
-                        height_cm         = float(self.height_cm.get()),
+                        width_cm          = eff_width_cm,
+                        height_cm         = eff_height_cm,
                         raster_dir        = step['raster_dir_var'].get(),
                         origin            = self.origin_var.get(),
                         work_surface_tol  = work_surface_tol,
@@ -1307,6 +1318,30 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
+    def _pad_image(self, img):
+        """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
+        try:
+            margin_cm = float(self.margin_cm.get())
+        except ValueError:
+            return img
+        if margin_cm <= 0.0:
+            return img
+        try:
+            H, W = img.shape
+            width_cm  = float(self.width_cm.get())
+            height_cm = float(self.height_cm.get())
+            pad_x = max(1, round(margin_cm * W / width_cm))
+            pad_y = max(1, round(margin_cm * H / height_cm))
+            depth_pct = float(self.margin_depth_pct.get()) / 100.0
+            if self.surface.get() == "white":
+                pad_val = np.float32(1.0 - depth_pct)  # white = z=0; deeper cut → darker
+            else:
+                pad_val = np.float32(depth_pct)         # black = z=0; deeper cut → brighter
+        except (ValueError, ZeroDivisionError):
+            return img
+        return np.pad(img, ((pad_y, pad_y), (pad_x, pad_x)),
+                      mode="constant", constant_values=pad_val)
+
     def _get_depth_map(self):
         """Return ``(depth_map, n_grey_levels)``.
 
@@ -1315,7 +1350,7 @@ class GCodeGeneratorApp:
                       current_image is stored as float32 so we use 65536 (16-bit
                       equivalent) as a conservative estimate.
         """
-        img = np.clip(self.current_image, 0.0, 1.0)
+        img = self._pad_image(np.clip(self.current_image, 0.0, 1.0))
         n_grey_levels = self.n_grey_levels
         if self.surface.get() == "white":
             return 1.0 - img, n_grey_levels   # white = z=0, black = deepest cut
@@ -1567,7 +1602,7 @@ class GCodeGeneratorApp:
 
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
-            img   = self.current_image
+            img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
 
@@ -1602,8 +1637,9 @@ class GCodeGeneratorApp:
         if tp is None or not tp.segments:
             return
         try:
-            width_mm  = float(self.width_cm.get())  * 10.0
-            height_mm = float(self.height_cm.get()) * 10.0
+            margin_cm = float(self.margin_cm.get())
+            width_mm  = (float(self.width_cm.get())  + 2.0 * margin_cm) * 10.0
+            height_mm = (float(self.height_cm.get()) + 2.0 * margin_cm) * 10.0
         except ValueError:
             return
         if width_mm == 0 or height_mm == 0:
@@ -1795,8 +1831,9 @@ class GCodeGeneratorApp:
         row = int(np.clip(round(ydata), 0, H - 1))
 
         try:
-            width_mm  = float(self.width_cm.get())  * 10.0
-            height_mm = float(self.height_cm.get()) * 10.0
+            margin_cm = float(self.margin_cm.get())
+            width_mm  = (float(self.width_cm.get())  + 2.0 * margin_cm) * 10.0
+            height_mm = (float(self.height_cm.get()) + 2.0 * margin_cm) * 10.0
             max_depth = float(self.max_depth.get())
         except ValueError:
             self.coord_var.set("")
