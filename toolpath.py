@@ -68,7 +68,9 @@ class ToolPath:
                 continue
 
             # Rapid gap between consecutive segments: retract + traverse + plunge
-            if prev_end is not None and prev_end != points[0]:
+            if prev_end is not None and (
+                    abs(prev_end[0] - points[0][0]) > 1e-4
+                    or abs(prev_end[1] - points[0][1]) > 1e-4):
                 px, py, pz = prev_end
                 nx, ny, nz = points[0]
                 rapid_dist += (abs(z_safe - pz)                              # retract

@@ -29,7 +29,7 @@ DEFAULTS = {
     "surface":           "white",
     # Global machine / G-code settings
     "z_safe":            "5.0",
-    "feed_rapid":        "3000",
+    "feed_rapid":        "1500",
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
     # Per-step defaults (prefix-free; used for every new step tab)
@@ -37,7 +37,8 @@ DEFAULTS = {
     "step_diameter":     "6.0",
     "step_stepover":     "50",
     "step_raster_offset": "0",
-    "step_stepdown":     "6.0",
+    "step_stepdown":              "6.0",
+    "step_raster_final_stepdown": "0.0",
     "step_feed_rate":    "800",
     "step_raster_dir":   "Horizontal",
     "step_threshold":    "0",    # mm; 0 = visit all pixels

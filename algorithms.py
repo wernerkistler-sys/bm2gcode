@@ -220,6 +220,98 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
         0.0)
 
 
+def _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
+    """Return ordered list of cumulative cut-depth ceilings (mm).
+
+    If final_stepdown_mm > 0, roughing stops at max_depth − final_stepdown_mm
+    and a dedicated finishing pass reaches max_depth.
+    stepdown_mm = 0 means one roughing step at full roughing depth (equivalent
+    to stepdown_mm = max_depth_mm).
+    """
+    if stepdown_mm <= 0.0:
+        if final_stepdown_mm <= 0.0:
+            return [max_depth_mm]
+        stepdown_mm = max_depth_mm   # one roughing step + one final pass
+    if final_stepdown_mm > 0.0 and final_stepdown_mm < max_depth_mm:
+        roughable = max_depth_mm - final_stepdown_mm
+        n = max(1, int(np.ceil(roughable / stepdown_mm)))
+        passes = [min((i + 1) * stepdown_mm, roughable) for i in range(n)]
+        passes.append(max_depth_mm)
+    else:
+        n = max(1, int(np.ceil(max_depth_mm / stepdown_mm)))
+        passes = [min((i + 1) * stepdown_mm, max_depth_mm) for i in range(n)]
+    return passes
+
+
+def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
+    """Depth-slice full-depth segments into per-pass segments.
+
+    Parameters
+    ----------
+    segments       : list of [(x, y, z_mm)…] where z_mm is negative (below surface)
+    max_depth_mm   : total cut depth in mm
+    stepdown_mm    : max depth increment per roughing pass (0 = single pass)
+    final_stepdown_mm : depth reserved for a dedicated finishing pass (0 = none)
+
+    Returns
+    -------
+    list of (ceil_mm, is_final_pass, pass_segments)
+      ceil_mm       — this pass's depth ceiling in mm
+      is_final_pass — True for the dedicated finishing pass
+      pass_segments — list of [(x, y, z_mm)…] segments with z clipped to ceiling
+
+    Tracks achieved depth per point; omits already-cut points and breaks segments
+    there (equivalent to V-carving's None-return / raster's remaining-depth check).
+    """
+    if stepdown_mm <= 0.0 and final_stepdown_mm <= 0.0:
+        return [(max_depth_mm, True, list(segments))]
+
+    pass_ceilings = _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm)
+    EPS = 1e-6
+    # Sentinel +1.0 — "above the workpiece surface, pixel not yet visited."
+    # Roughing passes gate on z_target < 0.0 (must actively cut), so the
+    # sentinel is never triggered there.  The final/last pass uses only the
+    # achieved check (no gate), so background pixels (z_target=0 < 1.0−ε)
+    # are included exactly once.  When final_stepdown_mm > 0 every pixel in
+    # the final pass satisfies z_full < z_rough − ε (gap = final_stepdown_mm),
+    # so the full-depth path is traversed without exceptions.  When
+    # final_stepdown_mm = 0 pixels already cut to z_full are not re-traversed
+    # (z_full = z_rough = achieved → skip), avoiding redundant same-depth moves.
+    achieved = [[1.0] * len(seg) for seg in segments]
+
+    result = []
+    for pi, ceil_mm in enumerate(pass_ceilings):
+        is_final = (pi == len(pass_ceilings) - 1)
+        pass_segs = []
+        for si, seg in enumerate(segments):
+            sub = []
+            for j, (x, y, z_full) in enumerate(seg):
+                if is_final:
+                    z_target = z_full
+                    # Final pass: include all pixels not already at this depth.
+                    # Background (z_full=0, achieved=1.0) → 0 < 1.0−ε → included.
+                    include = z_target < achieved[si][j] - EPS
+                else:
+                    z_rough  = min(z_full + final_stepdown_mm, 0.0)
+                    z_target = max(z_rough, -ceil_mm)
+                    # Roughing must actively cut below the surface.  The z_target<0
+                    # gate ensures shallow/background pixels (z_rough=0) are skipped,
+                    # splitting segments so those regions are handled in the final pass.
+                    include  = (z_target < 0.0) and (z_target < achieved[si][j] - EPS)
+
+                if include:
+                    achieved[si][j] = z_target
+                    sub.append((x, y, z_target))
+                else:
+                    if sub:
+                        pass_segs.append(sub)
+                        sub = []
+            if sub:
+                pass_segs.append(sub)
+        result.append((ceil_mm, is_final, pass_segs))
+    return result
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
@@ -230,6 +322,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             prior_reference=None,
                             raster_offset_pct=0.0,
                             use_2opt=False,
+                            final_stepdown_mm=0.0,
                             progress=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
@@ -239,7 +332,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     n_grey_levels     : number of grey levels in source image (e.g. 256)
     tool              : Tool — encapsulates profile, diameter_mm, vbit_angle_deg
     step_mm           : lateral step-over in mm
-    stepdown_mm       : max depth increment per z-pass in mm
+    stepdown_mm       : max depth increment per roughing z-pass in mm
     max_depth         : total maximum cut depth in mm
     width_cm          : physical image width in cm
     height_cm         : physical image height in cm
@@ -265,6 +358,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                         prior_step.result for residual-based gating,
                         prior_step.accessible for geometry-based gating, or
                         None to process the full depth_map.
+    final_stepdown_mm : depth (mm) reserved for a dedicated finishing pass.
+                        Roughing passes stop this far above each pixel's target;
+                        a final pass then cuts to full depth.  0 = no reservation.
     progress          : callable(pct, subtask) — thread-safe progress reporter
 
     Returns
@@ -320,12 +416,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
     progress(35, "Achievable depth surface computed.")
 
-    # ── Stage 3 · Plan depth passes (35–40 %) ─────────────────────
+    # ── Stage 3 · Plan passes (35–40 %) ───────────────────────────
     progress(35, "Planning depth passes…")
-    n_passes    = max(1, int(np.ceil(max_depth / stepdown_mm)))
-    pass_depths = [min((i + 1) * stepdown_mm, max_depth)
-                   for i in range(n_passes)]
-    step_px        = max(1, int(round(step_mm * px_per_mm)))
+    pass_plan       = _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)
+    n_passes        = len(pass_plan)
+    final_norm      = final_stepdown_mm / max_depth
+    step_px         = max(1, int(round(step_mm * px_per_mm)))
     raster_start_px = int(round(raster_offset_pct / 100.0 * step_px)) % step_px
 
     resid_tol_mm = max_depth / (n_grey_levels - 1)
@@ -338,11 +434,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         directions.append("Y")
 
     progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
-                 f"({stepdown_mm:.2f} mm each), "
-                 f"step-over {step_px} px = {step_mm:.2f} mm, "
-                 f"residual tol {resid_tol_mm*1000:.1f} µm.")
+                 f"({stepdown_mm:.2f} mm each"
+                 + (f", final {final_stepdown_mm:.2f} mm" if final_stepdown_mm > 0 else "")
+                 + f"), step-over {step_px} px = {step_mm:.2f} mm, "
+                 + f"residual tol {resid_tol_mm*1000:.1f} µm.")
 
-    # ── Stage 4 · Adaptive multi-pass raster (40–80 %) ────────────
+    # ── Stage 4 · 4-phase raster (40–80 %) ────────────────────────
 
     if work_surface_tol > 0.0:
         from scipy.ndimage import binary_dilation
@@ -355,13 +452,11 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     else:
         prior_mask = None
 
-    all_segments = []  # list of (segment_type, [(x,y,z),...]) for ToolPath
-    achieved_raster    = np.zeros_like(center_depth_contour_raster, dtype=np.float32)
-    tool_pos    = np.array([0.0, 0.0])
-    total_segs  = 0
+    all_segments     = []
+    tool_pos         = np.array([0.0, 0.0])
+    total_segs       = 0
     n_links_inserted = 0
     n_links          = 0
-
     link_threshold_mm = 2.0 * step_mm
 
     def bresenham_pixels(r0, c0, r1, c1):
@@ -388,12 +483,11 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 err += 2 * dc
                 r   += sr
 
-    def geodesic_link_pixels(r0, c0, r1, c1, z_norm_val):
+    def geodesic_link_pixels(r0, c0, r1, c1, ceil_norm, final_norm_val=0.0):
         """Dijkstra minimum-3D-arc-length path from (r0,c0) to (r1,c1).
 
-        Prefers routes that avoid sharp depth edges over the straight
-        Bresenham line, producing a smoother z-profile for terrain links.
-        Closes over center_depth_contour_raster, H, W, px_per_mm_x/y, max_depth.
+        Uses the roughing surface (terrain − final_norm_val, capped at ceil_norm)
+        for arc-length cost, so the path avoids edges in the surface being cut.
         """
         import heapq
         margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
@@ -415,12 +509,14 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 break
             if d > dist.get((r, c), float('inf')):
                 continue
-            z_cur = min(float(center_depth_contour_raster[r, c]), z_norm_val)
+            z_cur = min(max(float(center_depth_contour_raster[r, c])
+                            - final_norm_val, 0.0), ceil_norm)
             for dr, dc in DIRS:
                 nr, nc = r + dr, c + dc
                 if not (rlo <= nr <= rhi and clo <= nc <= chi):
                     continue
-                z_nb = min(float(center_depth_contour_raster[nr, nc]), z_norm_val)
+                z_nb = min(max(float(center_depth_contour_raster[nr, nc])
+                               - final_norm_val, 0.0), ceil_norm)
                 dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
                 dz   = (z_nb - z_cur) * max_depth
                 nd   = d + (dxy2 + dz * dz) ** 0.5
@@ -440,197 +536,156 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         path.reverse()
         return path
 
-    for pass_idx, z_depth_mm in enumerate(pass_depths):
-        z_norm = z_depth_mm / max_depth
+    # ── Phase 1: full-depth reference path (no terrain links) ────
+    progress(40, "Phase 1: generating full-depth reference path…")
+    full_depth_segs = []
+    for direction in directions:
+        if direction == "X":
+            all_line_ids = np.arange(raster_start_px, H, step_px)
+        else:
+            all_line_ids = np.arange(raster_start_px, W, step_px)
 
-        # ── Compute per-pixel remaining depth at this z-level ─────
-        remaining_depth = (np.minimum(center_depth_contour_raster, z_norm)
-                           - achieved_raster).astype(np.float32)
-        if prior_mask is not None:
-            remaining_depth *= prior_mask
-
-        # ── Per direction: find which raster lines need revisiting ─
-        for direction in directions:
-
-            # All raster line indices for this direction
+        for line_idx in all_line_ids:
             if direction == "X":
-                all_line_ids = np.arange(raster_start_px, H, step_px)
+                line_depth = center_depth_contour_raster[line_idx, :]
             else:
-                all_line_ids = np.arange(raster_start_px, W, step_px)
+                line_depth = center_depth_contour_raster[:, line_idx]
 
-            n_lines = len(all_line_ids)
-
-            # 1-D boolean: does this raster line have any pixel whose
-            # remaining depth exceeds the tolerance?
-            line_needs_cut = np.zeros(n_lines, dtype=bool)
-            for li, idx in enumerate(all_line_ids):
+            if prior_mask is not None:
                 if direction == "X":
-                    line_slice = remaining_depth[idx, :]
+                    line_mask = prior_mask[line_idx, :]
                 else:
-                    line_slice = remaining_depth[:, idx]
-                line_needs_cut[li] = (
-                    (pass_idx == 0 and prior_mask is None)
-                    or np.any(line_slice > resid_tol)
-                )
+                    line_mask = prior_mask[:, line_idx]
+                effective = (line_depth * line_mask).astype(np.float32)
+                spans = mask_spans(effective > resid_tol)
+            else:
+                spans = [(0, len(line_depth) - 1)]
 
-            n_active = int(np.sum(line_needs_cut))
-            progress(40 + 40 * pass_idx / n_passes,
-                     f"Pass {pass_idx+1}/{n_passes}, dir={direction} "
-                     f"at z={z_depth_mm:.3f} mm: "
-                     f"{n_active}/{n_lines} raster lines need cutting.")
-
-            if n_active == 0:
-                continue
-
-            # ── Collect all spans across all active raster lines ──
-            all_spans = []
-            for li, idx in enumerate(all_line_ids):
-                if not line_needs_cut[li]:
-                    continue
-                if direction == "X":
-                    line_resid = remaining_depth[idx, :]
-                else:
-                    line_resid = remaining_depth[:, idx]
-                if pass_idx == 0 and prior_mask is None:
-                    # work_surface_tol==0: visit the full line so z=0 regions
-                    # are not skipped.
-                    all_spans.append((idx, 0, len(line_resid) - 1))
-                else:
-                    for s, e in mask_spans(line_resid > resid_tol):
-                        all_spans.append((idx, s, e))
-
-            n_spans = len(all_spans)
-            progress(40 + 40 * pass_idx / n_passes,
-                     f"Pass {pass_idx+1}/{n_passes}, dir={direction}: "
-                     f"{n_spans} span(s) to cut across "
-                     f"{n_active} raster line(s).")
-
-            # ── Path ordering: greedy + optional 2-opt ─────────────
-            def span_endpoints_mm(idx, s, e):
-                """Return (x_s,y_s), (x_e,y_e) for a span in G-code coords."""
-                if direction == "X":
-                    y = (H - 1 - idx) / px_per_mm_y - _oy
-                    return ((s / px_per_mm_x - _ox, y),
-                            (e / px_per_mm_x - _ox, y))
-                else:
-                    x = idx / px_per_mm_x - _ox
-                    return ((x, (H - 1 - s) / px_per_mm_y - _oy),
-                            (x, (H - 1 - e) / px_per_mm_y - _oy))
-
-            # Phase 1 – greedy nearest-endpoint ordering
-            ordered_spans = []
-            cur_pos   = np.array([tool_pos[0], tool_pos[1]])
-            unvisited = list(range(n_spans))
-            while unvisited:
-                best_i    = 0
-                best_rev  = False
-                best_dist = np.inf
-                for ui, si in enumerate(unvisited):
-                    idx, s, e = all_spans[si]
-                    (x_s, y_s), (x_e, y_e) = span_endpoints_mm(idx, s, e)
-                    d_s = np.hypot(x_s - cur_pos[0], y_s - cur_pos[1])
-                    d_e = np.hypot(x_e - cur_pos[0], y_e - cur_pos[1])
-                    if d_s <= d_e:
-                        d, rev = d_s, False
-                    else:
-                        d, rev = d_e, True
-                    if d < best_dist:
-                        best_i, best_rev, best_dist = ui, rev, d
-                si = unvisited.pop(best_i)
-                idx, s, e = all_spans[si]
-                ordered_spans.append((idx, s, e, best_rev))
-                (x_s, y_s), (x_e, y_e) = span_endpoints_mm(idx, s, e)
-                if best_rev:
-                    cur_pos = np.array([x_s, y_s])
-                else:
-                    cur_pos = np.array([x_e, y_e])
-
-            # Phase 2 – optional 2-opt refinement
-            if use_2opt and len(ordered_spans) > 2:
-                ent_xy = []
-                ext_xy = []
-                for idx, s, e, rev in ordered_spans:
-                    (xs, ys), (xe, ye) = span_endpoints_mm(idx, s, e)
-                    ent_xy.append((xe, ye) if rev else (xs, ys))
-                    ext_xy.append((xs, ys) if rev else (xe, ye))
-                origin_2opt = (tool_pos[0], tool_pos[1])
-                order, flips = _two_opt_reorder(ent_xy, ext_xy,
-                                                origin=origin_2opt,
-                                                link_threshold=link_threshold_mm,
-                                                per_rapid_overhead=10.0)
-                ordered_spans = [
-                    (ordered_spans[i][0], ordered_spans[i][1],
-                     ordered_spans[i][2],
-                     ordered_spans[i][3] ^ flips[k])
-                    for k, i in enumerate(order)
-                ]
-
-            # Phase 3 – build segments and terrain links
-            for i, (idx, s, e, rev) in enumerate(ordered_spans):
-                px_range = (range(s, e + 1) if not rev
-                            else range(e, s - 1, -1))
-
+            for s, e in spans:
                 points = []
-                for px in px_range:
-                    row, col = ((idx, px) if direction == "X"
-                                else (px, idx))
-                    target = min(center_depth_contour_raster[row, col], z_norm)
-                    if target > achieved_raster[row, col]:
-                        achieved_raster[row, col] = target
-                    z_mm = achieved_raster[row, col] * max_depth
+                for px in range(s, e + 1):
+                    row, col = (line_idx, px) if direction == "X" else (px, line_idx)
+                    z_mm = float(center_depth_contour_raster[row, col]) * max_depth
                     x_mm = col / px_per_mm_x - _ox
-                    y_mm = (H - 1 - row) / px_per_mm_y - _oy   # flip: pixel rows go down, G-code Y goes up
+                    y_mm = (H - 1 - row) / px_per_mm_y - _oy
                     points.append((x_mm, y_mm, -z_mm))
-
                 if points:
-                    all_segments.append(points)
-                    total_segs += 1
-                    tool_pos = np.array([points[-1][0], points[-1][1]])
+                    full_depth_segs.append(points)
 
-                    # ── Terrain link to next ordered span ──────────
-                    if i + 1 < len(ordered_spans):
-                        idx2, s2, e2, rev2 = ordered_spans[i + 1]
-                        (xs2, ys2), (xe2, ye2) = span_endpoints_mm(idx2, s2, e2)
-                        x_entry = xe2 if rev2 else xs2
-                        y_entry = ye2 if rev2 else ys2
-                        nxt_dist = np.hypot(x_entry - tool_pos[0],
-                                            y_entry - tool_pos[1])
+    progress(55, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s).")
 
-                        if nxt_dist < link_threshold_mm:
-                            x_exit_lnk = tool_pos[0]
-                            y_exit_lnk = tool_pos[1]
-                            c0 = int(round((x_exit_lnk + _ox) * px_per_mm_x))
-                            r0 = int(round((H - 1) - (y_exit_lnk + _oy) * px_per_mm_y))
-                            c1 = int(round((x_entry    + _ox) * px_per_mm_x))
-                            r1 = int(round((H - 1) - (y_entry    + _oy) * px_per_mm_y))
+    # ── Phase 2: depth-slice into per-pass segments ───────────────
+    pass_list = make_multipass(full_depth_segs, max_depth, stepdown_mm,
+                               final_stepdown_mm)
 
-                            link_points = []
-                            for row_l, col_l in geodesic_link_pixels(
-                                    r0, c0, r1, c1, z_norm):
-                                z_link = min(center_depth_contour_raster[row_l, col_l],
-                                             z_norm)
-                                if z_link > achieved_raster[row_l, col_l]:
-                                    achieved_raster[row_l, col_l] = z_link
-                                x_lmm = col_l / px_per_mm_x - _ox
-                                y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy   # flip Y
-                                link_points.append(
-                                    (x_lmm, y_lmm, -z_link * max_depth))
+    # ── Phases 3–4: per-pass ordering + terrain link insertion ────
+    for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
+        if not pass_segs:
+            continue
 
-                            if len(link_points) >= 2:
-                                all_segments.append(link_points)
-                                n_links_inserted += 1
+        pct_base  = 55 + 25 * pi / n_passes
+        ceil_norm = ceil_mm / max_depth
+        progress(pct_base,
+                 f"Pass {pi+1}/{n_passes} at z={ceil_mm:.3f} mm "
+                 f"({'final' if is_final else 'roughing'}): "
+                 f"{len(pass_segs)} segment(s).")
 
-                n_links += 1   # count every potential inter-span gap
+        # Phase 3: greedy nearest-endpoint ordering + optional 2-opt
+        n_segs    = len(pass_segs)
+        unvisited = list(range(n_segs))
+        g_order   = []
+        g_flips   = []
+        cur       = (float(tool_pos[0]), float(tool_pos[1]))
+        while unvisited:
+            best_i, best_rev, best_dist = 0, False, float('inf')
+            for ui, si in enumerate(unvisited):
+                seg = pass_segs[si]
+                xs, ys = seg[0][0],  seg[0][1]
+                xe, ye = seg[-1][0], seg[-1][1]
+                ds = ((xs - cur[0])**2 + (ys - cur[1])**2) ** 0.5
+                de = ((xe - cur[0])**2 + (ye - cur[1])**2) ** 0.5
+                if ds <= de:
+                    d, rev = ds, False
+                else:
+                    d, rev = de, True
+                if d < best_dist:
+                    best_i, best_rev, best_dist = ui, rev, d
+            si = unvisited.pop(best_i)
+            g_order.append(si)
+            g_flips.append(best_rev)
+            seg = pass_segs[si]
+            cur = (seg[0][0], seg[0][1]) if best_rev else (seg[-1][0], seg[-1][1])
 
-                if total_segs % max(1, n_spans // 10) == 0:
-                    pct = 40 + 40 * (pass_idx + (i + 1) / n_spans) / n_passes
-                    progress(pct,
-                             f"Pass {pass_idx+1}/{n_passes}, "
-                             f"dir={direction}: "
-                             f"{i + 1}/{n_spans} spans cut, "
-                             f"{total_segs} segments total…")
+        if use_2opt and n_segs >= 3:
+            ent_xy = []
+            ext_xy = []
+            for si, rev in zip(g_order, g_flips):
+                seg = pass_segs[si]
+                if rev:
+                    ent_xy.append((seg[-1][0], seg[-1][1]))
+                    ext_xy.append((seg[0][0],  seg[0][1]))
+                else:
+                    ent_xy.append((seg[0][0],  seg[0][1]))
+                    ext_xy.append((seg[-1][0], seg[-1][1]))
+            order, flips = _two_opt_reorder(ent_xy, ext_xy,
+                                            origin=(float(tool_pos[0]),
+                                                    float(tool_pos[1])),
+                                            link_threshold=link_threshold_mm,
+                                            per_rapid_overhead=10.0)
+            ordered_segs = [
+                list(reversed(pass_segs[g_order[i]])) if (g_flips[i] ^ flips[k])
+                else pass_segs[g_order[i]]
+                for k, i in enumerate(order)
+            ]
+        else:
+            ordered_segs = [
+                list(reversed(pass_segs[si])) if rev else pass_segs[si]
+                for si, rev in zip(g_order, g_flips)
+            ]
 
-        # remaining_depth is recomputed fresh at the top of each pass
+        # Phase 4: terrain link insertion (respects final_stepdown_mm)
+        for i, seg in enumerate(ordered_segs):
+            all_segments.append(seg)
+            total_segs += 1
+            tool_pos = np.array([seg[-1][0], seg[-1][1]])
+
+            if i + 1 < len(ordered_segs):
+                nxt = ordered_segs[i + 1]
+                x_entry, y_entry = nxt[0][0], nxt[0][1]
+                nxt_dist = np.hypot(x_entry - tool_pos[0],
+                                    y_entry - tool_pos[1])
+
+                if nxt_dist < link_threshold_mm:
+                    x_exit = float(tool_pos[0])
+                    y_exit = float(tool_pos[1])
+                    c0_px = int(round((x_exit  + _ox) * px_per_mm_x))
+                    r0_px = int(round((H - 1) - (y_exit  + _oy) * px_per_mm_y))
+                    c1_px = int(round((x_entry + _ox) * px_per_mm_x))
+                    r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm_y))
+
+                    fn = 0.0 if is_final else final_norm
+                    link_pixels = geodesic_link_pixels(
+                        r0_px, c0_px, r1_px, c1_px, ceil_norm, fn)
+                    # Anchor both ends to the exact adjacent segment tuples so
+                    # that the adjacency check in to_gcode / _render_3d sees
+                    # bitwise-identical values and suppresses false retracts.
+                    link_points = [seg[-1]]
+                    for row_l, col_l in link_pixels[1:-1]:
+                        terrain = float(center_depth_contour_raster[row_l, col_l])
+                        if is_final:
+                            z_link = min(terrain, ceil_norm)
+                        else:
+                            z_link = min(max(terrain - final_norm, 0.0), ceil_norm)
+                        x_lmm = col_l / px_per_mm_x - _ox
+                        y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy
+                        link_points.append((x_lmm, y_lmm, -z_link * max_depth))
+                    link_points.append(nxt[0])
+
+                    if len(link_points) >= 2:
+                        all_segments.append(link_points)
+                        n_links_inserted += 1
+
+                n_links += 1
 
     progress(80, f"Raster complete — {total_segs} cut segments, "
                  f"{n_links_inserted} terrain links across all passes.")
@@ -672,6 +727,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'radius_mm': tool.diameter_mm / 2,
             'step_mm': step_mm,
             'stepdown_mm': stepdown_mm,
+            'final_stepdown_mm': final_stepdown_mm,
             'max_depth': max_depth,
             'width_cm': width_cm,
             'height_cm': height_cm,
@@ -735,7 +791,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior_reference=None, previous_result=None,
                             use_2opt=False,
                             progress=None):
-    """Compute a V-carving toolpath for fine details not reachable by raster.
+    """Compute a V-carving toolpath.
 
     Parameters
     ----------
@@ -1180,58 +1236,17 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     all_segments = []
 
-    if stepdown_mm <= 0.0:
-        def _depth_single(r, c):
-            return -_depth_norm[r, c] * max_depth
-        pass_segs = _build_pass_segments(ordered_branches, _depth_single)
-        all_segments = _two_opt_pass(pass_segs, _pass_origin(all_segments))
-    else:
-        final_norm = final_stepdown_mm / max_depth
-        sd_norm    = stepdown_mm / max_depth
+    # Phase 1: generate full-depth skeleton path
+    def _depth_single(r, c):
+        return -_depth_norm[r, c] * max_depth
+    full_depth_segs = _build_pass_segments(ordered_branches, _depth_single)
+    full_depth_segs = _two_opt_pass(full_depth_segs, _pass_origin(all_segments))
 
-        skel_rows, skel_cols = np.where(skeleton)
-        if len(skel_rows):
-            max_roughable_norm = float(
-                (_depth_norm[skel_rows, skel_cols] - final_norm)
-                .clip(min=0).max()
-            )
-        else:
-            max_roughable_norm = 0.0
-
-        if max_roughable_norm > 0 and sd_norm > 0:
-            n_rough = max(1, int(np.ceil(max_roughable_norm / sd_norm)))
-            pass_ceilings = [
-                min((i + 1) * sd_norm, max_roughable_norm)
-                for i in range(n_rough)
-            ]
-        else:
-            pass_ceilings = []
-
-        prev_ceiling = 0.0
-        for ceiling_norm in pass_ceilings:
-            _pc = prev_ceiling
-            _cn = ceiling_norm
-            _fn = final_norm
-
-            def _depth_rough(r, c, _pc=_pc, _cn=_cn, _fn=_fn):
-                roughing_target = _depth_norm[r, c] - _fn
-                if roughing_target <= _pc:
-                    return None
-                return -min(roughing_target, _cn) * max_depth
-
-            pass_segs = _build_pass_segments(ordered_branches, _depth_rough)
-            all_segments.extend(
-                _two_opt_pass(pass_segs, _pass_origin(all_segments))
-            )
-            prev_ceiling = ceiling_norm
-
-        if final_stepdown_mm > 0.0:
-            def _depth_final(r, c):
-                return -_depth_norm[r, c] * max_depth
-            pass_segs = _build_pass_segments(ordered_branches, _depth_final)
-            all_segments.extend(
-                _two_opt_pass(pass_segs, _pass_origin(all_segments))
-            )
+    # Phases 2–3: depth-slice + per-pass 2-opt reorder
+    for _, _, pass_segs in make_multipass(
+            full_depth_segs, max_depth, stepdown_mm, final_stepdown_mm):
+        pass_segs = _two_opt_pass(pass_segs, _pass_origin(all_segments))
+        all_segments.extend(pass_segs)
 
     progress(90, f"Generated {len(all_segments)} segments across all passes.")
 

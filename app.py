@@ -497,10 +497,15 @@ class GCodeGeneratorApp:
         diam.pack(fill=tk.X, pady=2)
         step['diameter'] = diam
 
-        # ── Raster step-down (shown for Raster Scan only) ─────────────
+        # ── Raster step-down controls (shown for Raster Scan only) ───────
         stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"])
         stepdown.pack(fill=tk.X, pady=2)   # initially shown (default = Raster Scan)
         step['stepdown'] = stepdown
+
+        raster_final_stepdown = LabeledEntry(tool_lf, "Final step-down", "mm",
+                                             DEFAULTS["step_raster_final_stepdown"])
+        raster_final_stepdown.pack(fill=tk.X, pady=2)
+        step['raster_final_stepdown'] = raster_final_stepdown
 
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
         vbit_frame = ttk.Frame(tool_lf)
@@ -545,6 +550,7 @@ class GCodeGeneratorApp:
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
+                step['raster_final_stepdown'].pack_forget()
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2)
@@ -560,6 +566,7 @@ class GCodeGeneratorApp:
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
                 step['stepdown'].pack_forget()
+                step['raster_final_stepdown'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack_forget()
@@ -591,6 +598,8 @@ class GCodeGeneratorApp:
                 else:
                     step['vbit_frame'].pack_forget()
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['raster_final_stepdown'].pack(fill=tk.X, pady=2,
+                                                   after=step['stepdown'])
                 step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['vbit_angle'].set_state("normal")
             if hasattr(self, '_view_menu'):
@@ -993,8 +1002,9 @@ class GCodeGeneratorApp:
                 tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
                 stepover         = float(step['stepover'].get())
                 raster_offset_pct = float(step['raster_offset'].get())
-                stepdown         = float(step['stepdown'].get())
-                use_2opt         = step['tsp_2opt_var'].get()
+                stepdown                  = float(step['stepdown'].get())
+                raster_final_stepdown_mm  = float(step['raster_final_stepdown'].get())
+                use_2opt                  = step['tsp_2opt_var'].get()
         except ValueError:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
@@ -1155,6 +1165,7 @@ class GCodeGeneratorApp:
                         tool              = tool,
                         step_mm           = step_mm,
                         stepdown_mm       = stepdown,
+                        final_stepdown_mm = raster_final_stepdown_mm,
                         max_depth         = max_depth,
                         width_cm          = eff_width_cm,
                         height_cm         = eff_height_cm,
@@ -1393,7 +1404,9 @@ class GCodeGeneratorApp:
         for pts in toolpath.segments:
             if not pts:
                 continue
-            if prev_end is not None and prev_end != pts[0]:
+            if prev_end is not None and (
+                    abs(prev_end[0] - pts[0][0]) > 1e-4
+                    or abs(prev_end[1] - pts[0][1]) > 1e-4):
                 px, py, pz = prev_end
                 nx, ny, nz = pts[0]
                 rapids.append([
@@ -1670,7 +1683,9 @@ class GCodeGeneratorApp:
         for pts in tp.segments:
             if not pts:
                 continue
-            if prev_end is not None and prev_end != pts[0]:
+            if prev_end is not None and (
+                    abs(prev_end[0] - pts[0][0]) > 1e-4
+                    or abs(prev_end[1] - pts[0][1]) > 1e-4):
                 rapid_lines.append([to_px(*prev_end[:2]), to_px(*pts[0][:2])])
             if len(pts) >= 2:
                 cut_lines.append([to_px(x, y) for x, y, _ in pts])
