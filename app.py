@@ -204,6 +204,9 @@ class GCodeGeneratorApp:
                     lambda e: canvas.itemconfig(win_id, width=e.width))
 
         def _mw(event):
+            mpl = getattr(self, 'mpl_canvas', None)
+            if mpl is not None and event.widget is mpl.get_tk_widget():
+                return
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _mw)
 
@@ -1395,7 +1398,6 @@ class GCodeGeneratorApp:
     def _render_3d(self, toolpath, title):
         """Render the depth-map surface and G-code tool path in 3D."""
         from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
-        import matplotlib.colors as mcolors
 
         z_safe = self._settings['z_safe']
         rapids = []
@@ -1430,21 +1432,12 @@ class GCodeGeneratorApp:
         self.fig.patch.set_facecolor("#1e1e1e")
         self.ax.set_facecolor("#1e1e1e")
 
-        depth_map, _ = self._get_depth_map()
-        H, W = depth_map.shape
         try:
             width_cm  = float(self.width_cm.get())
             height_cm = float(self.height_cm.get())
             max_depth = float(self.max_depth.get())
         except ValueError:
             width_cm = height_cm = max_depth = 1.0
-
-        # Subsample depth map for surface mesh (max 80×80 for performance)
-        step = max(1, max(H, W) // 80)
-        zs   = depth_map[::step, ::step] * max_depth   # mm
-        xs   = np.linspace(0, width_cm  * 10, zs.shape[1])  # mm
-        ys   = np.linspace(0, height_cm * 10, zs.shape[0])  # mm
-        Xm, Ym = np.meshgrid(xs, ys)
 
         # Apply 3D pan offset
         ox, oy, oz = self._3d_pan_offset
@@ -1478,8 +1471,12 @@ class GCodeGeneratorApp:
         self.ax.grid(False)
         self.ax.set_title(title, color='white', fontsize=10, pad=10)
 
-        W_mm = width_cm  * 10
-        H_mm = height_cm * 10
+        try:
+            margin_cm = float(self.margin_cm.get())
+        except ValueError:
+            margin_cm = 0.0
+        W_mm = (width_cm  + 2.0 * margin_cm) * 10
+        H_mm = (height_cm + 2.0 * margin_cm) * 10
         try:
             origin = self.origin_var.get()
         except Exception:
@@ -1493,7 +1490,7 @@ class GCodeGeneratorApp:
         cx   = W_mm / 2 - _ox
         cy   = H_mm / 2 - _oy
         cz   = -max_depth / 2
-        half = max(width_cm * 10, height_cm * 10, max_depth) / 2 * self._3d_zoom
+        half = max(W_mm, H_mm, max_depth) / 2 * self._3d_zoom
         self.ax.set_xlim(cx - half + ox, cx + half + ox)
         self.ax.set_ylim(cy - half + oy, cy + half + oy)
         self.ax.set_zlim(cz - half + oz, cz + half + oz)
