@@ -87,6 +87,18 @@ class GCodeGeneratorApp:
                               command=self.root.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
+        compute_menu = tk.Menu(menubar, tearoff=0)
+        compute_menu.add_command(
+            label="Compute Current Step",
+            accelerator="F5",
+            command=lambda: self._compute_step(
+                self.steps[self._steps_nb.index("current")]))
+        compute_menu.add_command(
+            label="Compute All Steps",
+            accelerator="F6",
+            command=self._compute_all_steps)
+        menubar.add_cascade(label="Compute", menu=compute_menu)
+
         self._view_menu = tk.Menu(menubar, tearoff=0)
 
         _display_hotkeys = [
@@ -128,6 +140,9 @@ class GCodeGeneratorApp:
         self.root.bind("<Control-s>", lambda e: self._save_project())
         self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self.root.quit())
+        self.root.bind("<F5>", lambda _: self._compute_step(
+            self.steps[self._steps_nb.index("current")]))
+        self.root.bind("<F6>", lambda _: self._compute_all_steps())
 
         def _make_mode_handler(mode):
             def _handler(e):
@@ -236,6 +251,8 @@ class GCodeGeneratorApp:
         self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"])
         self.margin_depth_pct.pack(fill=tk.X, pady=2)
         self.width_cm.var.trace_add("write", self._on_width_changed)
+        self.height_cm.var.trace_add("write", lambda *_: self._render())
+        self.max_depth.var.trace_add("write", lambda *_: self._render())
         self.margin_cm.var.trace_add("write", lambda *_: self._render())
         self.margin_depth_pct.var.trace_add("write", lambda *_: self._render())
         self._on_aspect_lock_toggle()   # apply initial locked state
@@ -759,6 +776,8 @@ class GCodeGeneratorApp:
 
     def _on_width_changed(self, *_):
         self._recalc_height()
+        if not self._aspect_lock_var.get():
+            self._render()
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -967,64 +986,181 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
     # ------------------------------------------------------------------ #
+    def _gather_step_params(self, step):
+        """Read and validate all parameters for one step.
+
+        Returns a dict of ready-to-use values. Raises ValueError on bad input.
+        Must be called on the main thread so that tkinter variable reads are safe.
+        """
+        idx       = self.steps.index(step)
+        algorithm = step['algorithm_var'].get()
+        feed_rate    = float(step['feed_rate'].get())
+        threshold_mm = float(step['threshold'].get())
+        width_cm      = float(self.width_cm.get())
+        height_cm     = float(self.height_cm.get())
+        margin_cm     = float(self.margin_cm.get())
+        max_depth    = float(self.max_depth.get())
+        eff_width_cm  = width_cm  + 2.0 * margin_cm
+        eff_height_cm = height_cm + 2.0 * margin_cm
+        origin       = self.origin_var.get()
+
+        params = {
+            'idx':           idx,
+            'algorithm':     algorithm,
+            'feed_rate':     feed_rate,
+            'threshold_mm':  threshold_mm,
+            'eff_width_cm':  eff_width_cm,
+            'eff_height_cm': eff_height_cm,
+            'max_depth':     max_depth,
+            'origin':        origin,
+        }
+
+        if algorithm.startswith("V-Carving"):
+            _profile    = step['profile_var'].get()
+            _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
+            tool        = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            params.update({
+                'tool':                     tool,
+                'min_feature_width_mm':     float(step['min_fw'].get()),
+                'max_feature_width_mm':     float(step['max_fw'].get()),
+                'vcarve_stepdown_mm':       float(step['vcarve_stepdown'].get()),
+                'vcarve_final_stepdown_mm': float(step['vcarve_final_stepdown'].get()),
+                'use_2opt':                 step['tsp_2opt_var'].get(),
+                'skeleton_mode':            ("voronoi"    if algorithm == "V-Carving (Voronoi)"
+                                             else "inscribed" if algorithm == "V-Carving (Inscribed)"
+                                             else "medial_axis"),
+                'gating_mode':              step['gating_mode_var'].get(),
+            })
+        elif algorithm == "Contour":
+            _profile    = step['profile_var'].get()
+            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
+            tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            params.update({
+                'tool':             tool,
+                'contour_stepdown': float(step['contour_stepdown'].get()),
+                'contour_adaptive': step['contour_adaptive_var'].get(),
+            })
+        else:  # Raster
+            _profile    = step['profile_var'].get()
+            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
+            tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            stepover = float(step['stepover'].get())
+            params.update({
+                'tool':                     tool,
+                'step_mm':                  tool.diameter_mm * stepover / 100.0,
+                'raster_offset_pct':        float(step['raster_offset'].get()),
+                'raster_stepdown_mm':       float(step['stepdown'].get()),
+                'raster_final_stepdown_mm': float(step['raster_final_stepdown'].get()),
+                'use_2opt':                 step['tsp_2opt_var'].get(),
+                'raster_dir':               step['raster_dir_var'].get(),
+                'gating_mode':              step['gating_mode_var'].get(),
+                'work_surface_tol':         threshold_mm / max_depth if max_depth else 0.0,
+            })
+
+        return params
+
+    def _compute_step_work(self, params, progress_fn, prev_tp):
+        """Synchronous algorithm computation — call from a background thread.
+
+        Returns a toolpath result. Raises ProgressDialog.Cancelled or any
+        algorithm exception on failure.
+        """
+        algorithm    = params['algorithm']
+        depth_map, n_grey_levels = self._get_depth_map()
+
+        if algorithm.startswith("V-Carving"):
+            gating_mode = params['gating_mode']
+            if gating_mode == "Residual from prior step":
+                prior_reference = prev_tp.result    if prev_tp is not None else None
+            elif gating_mode == "Inaccessible by prior tool":
+                prior_reference = prev_tp.accessible if prev_tp is not None else None
+            else:
+                prior_reference = None
+            return compute_vcarve_toolpath(
+                depth_map            = depth_map,
+                n_grey_levels        = n_grey_levels,
+                tool                 = params['tool'],
+                prior_reference      = prior_reference,
+                previous_result      = prev_tp.result if prev_tp is not None else None,
+                max_depth            = params['max_depth'],
+                width_cm             = params['eff_width_cm'],
+                height_cm            = params['eff_height_cm'],
+                origin               = params['origin'],
+                feed_rate            = params['feed_rate'],
+                threshold_um         = params['threshold_mm'] * 1000.0,
+                min_feature_width_mm = params['min_feature_width_mm'],
+                max_feature_width_mm = params['max_feature_width_mm'],
+                stepdown_mm          = params['vcarve_stepdown_mm'],
+                final_stepdown_mm    = params['vcarve_final_stepdown_mm'],
+                skeleton_mode        = params['skeleton_mode'],
+                use_2opt             = params['use_2opt'],
+                progress             = progress_fn,
+            )
+        elif algorithm == "Contour":
+            return compute_contour_toolpath(
+                depth_map        = depth_map,
+                n_grey_levels    = n_grey_levels,
+                tool             = params['tool'],
+                stepdown_mm      = params['contour_stepdown'],
+                max_depth        = params['max_depth'],
+                width_cm         = params['eff_width_cm'],
+                height_cm        = params['eff_height_cm'],
+                origin           = params['origin'],
+                feed_rate        = params['feed_rate'],
+                prior_accessible = prev_tp.accessible if prev_tp is not None else None,
+                previous_result  = prev_tp.result     if prev_tp is not None else None,
+                progress         = progress_fn,
+                adaptive_levels  = params['contour_adaptive'],
+            )
+        else:  # Raster
+            gating_mode = params['gating_mode']
+            if gating_mode == "Residual from prior step":
+                prior_reference = prev_tp.result    if prev_tp is not None else None
+            elif gating_mode == "Inaccessible by prior tool":
+                prior_reference = prev_tp.accessible if prev_tp is not None else None
+            else:
+                prior_reference = None
+            return compute_raster_toolpath(
+                depth_map         = depth_map,
+                n_grey_levels     = n_grey_levels,
+                tool              = params['tool'],
+                step_mm           = params['step_mm'],
+                stepdown_mm       = params['raster_stepdown_mm'],
+                final_stepdown_mm = params['raster_final_stepdown_mm'],
+                max_depth         = params['max_depth'],
+                width_cm          = params['eff_width_cm'],
+                height_cm         = params['eff_height_cm'],
+                raster_dir        = params['raster_dir'],
+                origin            = params['origin'],
+                work_surface_tol  = params['work_surface_tol'],
+                previous_result   = prev_tp.result if prev_tp is not None else None,
+                prior_reference   = prior_reference,
+                raster_offset_pct = params['raster_offset_pct'],
+                feed_rate         = params['feed_rate'],
+                use_2opt          = params['use_2opt'],
+                progress          = progress_fn,
+            )
+
     def _compute_step(self, step):
         if self.current_image is None:
             messagebox.showinfo("No image", "Please open an image first.")
             return
-        idx       = self.steps.index(step)
-        algorithm = step['algorithm_var'].get()
+
+        idx = self.steps.index(step)
         try:
-            feed_rate    = float(step['feed_rate'].get())
-            threshold_mm = float(step['threshold'].get())
-            width_cm      = float(self.width_cm.get())
-            height_cm     = float(self.height_cm.get())
-            margin_cm     = float(self.margin_cm.get())
-            eff_width_cm  = width_cm  + 2.0 * margin_cm
-            eff_height_cm = height_cm + 2.0 * margin_cm
-            max_depth    = float(self.max_depth.get())
-            if algorithm.startswith("V-Carving"):
-                _profile   = step['profile_var'].get()
-                _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
-                tool       = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-                min_feature_width_mm     = float(step['min_fw'].get())
-                max_feature_width_mm     = float(step['max_fw'].get())
-                vcarve_stepdown_mm       = float(step['vcarve_stepdown'].get())
-                vcarve_final_stepdown_mm = float(step['vcarve_final_stepdown'].get())
-                use_2opt                 = step['tsp_2opt_var'].get()
-            elif algorithm == "Contour":
-                _profile    = step['profile_var'].get()
-                _vbit_angle = (float(step['vbit_angle'].get())
-                               if _profile == "V-Bit" else 0.0)
-                tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-                contour_stepdown  = float(step['contour_stepdown'].get())
-                contour_adaptive  = step['contour_adaptive_var'].get()
-            else:
-                _profile   = step['profile_var'].get()
-                _vbit_angle = (float(step['vbit_angle'].get())
-                               if _profile == "V-Bit" else 0.0)
-                tool             = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-                stepover         = float(step['stepover'].get())
-                raster_offset_pct = float(step['raster_offset'].get())
-                stepdown                  = float(step['stepdown'].get())
-                raster_final_stepdown_mm  = float(step['raster_final_stepdown'].get())
-                use_2opt                  = step['tsp_2opt_var'].get()
+            params = self._gather_step_params(step)
         except ValueError:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
             return
 
-        # ── Derive prior step and gating reference ──────────────────────────
-        _prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
+        # ── Prior-step checks (all before the dialog opens) ─────────────────
+        prev_tp   = self.toolpaths[idx - 1] if idx > 0 else None
+        algorithm = params['algorithm']
 
         if algorithm != "Contour":
-            gating_mode = step['gating_mode_var'].get()
-            if gating_mode == "Residual from prior step":
-                prior_reference = _prev_tp.result if _prev_tp is not None else None
-            elif gating_mode == "Inaccessible by prior tool":
-                prior_reference = _prev_tp.accessible if _prev_tp is not None else None
-            else:
-                prior_reference = None
-            if gating_mode != "Full depth map" and idx > 0 and _prev_tp is None:
+            gating_mode = params['gating_mode']
+            if gating_mode != "Full depth map" and idx > 0 and prev_tp is None:
                 surf_name = ("accessible surface"
                              if gating_mode == "Inaccessible by prior tool"
                              else "result surface")
@@ -1034,69 +1170,8 @@ class GCodeGeneratorApp:
                         f"Without its {surf_name} this step will process the "
                         f"full depth map.\n\nContinue anyway?"):
                     return
-
-        dlg = ProgressDialog(self.root,
-                             title=f"Computing Step {idx + 1} Tool Path")
-
-        if algorithm.startswith("V-Carving"):
-            def _worker():
-                try:
-                    depth_map, n_grey_levels = self._get_depth_map()
-                    result = compute_vcarve_toolpath(
-                        depth_map       = depth_map,
-                        n_grey_levels   = n_grey_levels,
-                        tool            = tool,
-                        prior_reference = prior_reference,
-                        previous_result = _prev_tp.result if _prev_tp is not None else None,
-                        max_depth      = max_depth,
-                        width_cm       = eff_width_cm,
-                        height_cm      = eff_height_cm,
-                        origin         = self.origin_var.get(),
-                        feed_rate            = feed_rate,
-                        threshold_um         = threshold_mm * 1000.0,
-                        min_feature_width_mm = min_feature_width_mm,
-                        max_feature_width_mm = max_feature_width_mm,
-                        stepdown_mm          = vcarve_stepdown_mm,
-                        final_stepdown_mm    = vcarve_final_stepdown_mm,
-                        skeleton_mode        = ("voronoi"    if algorithm == "V-Carving (Voronoi)"
-                                                else "inscribed" if algorithm == "V-Carving (Inscribed)"
-                                                else "medial_axis"),
-                        use_2opt             = use_2opt,
-                        progress             = dlg.report,
-                    )
-                except ProgressDialog.Cancelled:
-                    self.root.after(0, lambda: dlg.close("Cancelled."))
-                    return
-                except Exception as exc:
-                    self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
-                    self.root.after(0, lambda e=exc: messagebox.showerror(
-                        "Computation error", str(e)))
-                    return
-
-                def _done():
-                    self.toolpaths[idx] = result
-                    result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(
-                        feed_rate=feed_rate,
-                        feed_rapid=self._settings['feed_rapid'],
-                        z_safe=self._settings['z_safe'],
-                    )
-                    dlg.close("Completed.")
-                    step['info_var'].set(
-                        f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-                        f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                        f" @ {feed_rate:.0f} mm/min")
-                    self.display_mode_var.set(DISPLAY_STEP_3D)
-                    self.display_step_var.set(idx + 1)
-                    self._on_display_mode_changed()
-
-                self.root.after(0, _done)
-
-            threading.Thread(target=_worker, daemon=True).start()
-
-        elif algorithm == "Contour":
-            # ── Contour (waterline) ─────────────────────────────────────
-            if idx > 0 and _prev_tp is None:
+        else:
+            if idx > 0 and prev_tp is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
                         f"Step {idx} has not been computed yet.\n\n"
@@ -1104,25 +1179,78 @@ class GCodeGeneratorApp:
                         "depth map as unfinished.\n\nContinue anyway?"):
                     return
 
-            def _worker():
+        feed_rate = params['feed_rate']
+        dlg = ProgressDialog(self.root,
+                             title=f"Computing Step {idx + 1} Tool Path")
+
+        def _worker():
+            try:
+                result = self._compute_step_work(params, dlg.report, prev_tp)
+            except ProgressDialog.Cancelled:
+                self.root.after(0, lambda: dlg.close("Cancelled."))
+                return
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
+                self.root.after(0, lambda e=exc: messagebox.showerror(
+                    "Computation error", str(e)))
+                return
+
+            def _done():
+                self.toolpaths[idx] = result
+                result.metadata['feed_rate'] = feed_rate
+                stats = result.get_stats(
+                    feed_rate  = feed_rate,
+                    feed_rapid = self._settings['feed_rapid'],
+                    z_safe     = self._settings['z_safe'],
+                )
+                dlg.close("Completed.")
+                step['info_var'].set(
+                    f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+                    f"Est. time: {_fmt_time(stats['est_minutes'])}"
+                    f" @ {feed_rate:.0f} mm/min")
+                self.display_mode_var.set(DISPLAY_STEP_3D)
+                self.display_step_var.set(idx + 1)
+                self._on_display_mode_changed()
+
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _compute_all_steps(self):
+        if self.current_image is None:
+            messagebox.showinfo("No image", "Please open an image first.")
+            return
+        if not self.steps:
+            return
+
+        # Validate every step upfront so the dialog never opens on bad input.
+        all_params = []
+        for step in self.steps:
+            try:
+                all_params.append(self._gather_step_params(step))
+            except ValueError:
+                idx = self.steps.index(step)
+                messagebox.showerror("Invalid input",
+                                     f"Please check the settings for Step {idx + 1}.")
+                return
+
+        n   = len(self.steps)
+        dlg = ProgressDialog(self.root, title="Computing All Step Tool Paths")
+
+        def _worker():
+            def step_progress(step_i):
+                def fn(pct, msg=""):
+                    scaled = step_i * 100.0 / n + pct / n
+                    dlg.report(scaled, f"Step {step_i + 1}/{n}: {msg}" if msg else "")
+                return fn
+
+            for i, (step, params) in enumerate(zip(self.steps, all_params)):
+                idx     = params['idx']
+                prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
                 try:
-                    depth_map, n_grey_levels = self._get_depth_map()
-                    result = compute_contour_toolpath(
-                        depth_map        = depth_map,
-                        n_grey_levels    = n_grey_levels,
-                        tool             = tool,
-                        stepdown_mm      = contour_stepdown,
-                        max_depth        = max_depth,
-                        width_cm         = eff_width_cm,
-                        height_cm        = eff_height_cm,
-                        origin           = self.origin_var.get(),
-                        feed_rate        = feed_rate,
-                        prior_accessible = (_prev_tp.accessible
-                                            if _prev_tp is not None else None),
-                        previous_result  = _prev_tp.result if _prev_tp is not None else None,
-                        progress         = dlg.report,
-                        adaptive_levels  = contour_adaptive,
-                    )
+                    dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
+                    result = self._compute_step_work(
+                        params, step_progress(i), prev_tp)
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
@@ -1132,85 +1260,32 @@ class GCodeGeneratorApp:
                         "Computation error", str(e)))
                     return
 
-                def _done():
-                    self.toolpaths[idx] = result
-                    result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(
-                        feed_rate=feed_rate,
-                        feed_rapid=self._settings['feed_rapid'],
-                        z_safe=self._settings['z_safe'],
+                # Store immediately so the next step's prev_tp is up to date.
+                self.toolpaths[idx]          = result
+                result.metadata['feed_rate'] = params['feed_rate']
+
+                feed_rate = params['feed_rate']
+                def _update_ui(idx=idx, s=step, r=result, fr=feed_rate):
+                    stats = r.get_stats(
+                        feed_rate  = fr,
+                        feed_rapid = self._settings['feed_rapid'],
+                        z_safe     = self._settings['z_safe'],
                     )
-                    dlg.close("Completed.")
-                    step['info_var'].set(
+                    s['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
                         f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                        f" @ {feed_rate:.0f} mm/min")
-                    self.display_mode_var.set(DISPLAY_STEP_3D)
-                    self.display_step_var.set(idx + 1)
-                    self._on_display_mode_changed()
+                        f" @ {fr:.0f} mm/min")
+                self.root.after(0, _update_ui)
 
-                self.root.after(0, _done)
+            def _all_done():
+                dlg.close("All steps completed.")
+                self.display_mode_var.set(DISPLAY_STEP_3D)
+                self.display_step_var.set(len(self.steps))
+                self._on_display_mode_changed()
 
-            threading.Thread(target=_worker, daemon=True).start()
+            self.root.after(0, _all_done)
 
-        else:
-            # ── Raster scan ─────────────────────────────────────────────
-            work_surface_tol = threshold_mm / max_depth if max_depth else 0.0
-
-            step_mm = tool.diameter_mm * stepover / 100.0
-
-            def _worker():
-                try:
-                    depth_map, n_grey_levels = self._get_depth_map()
-                    result = compute_raster_toolpath(
-                        depth_map         = depth_map,
-                        n_grey_levels     = n_grey_levels,
-                        tool              = tool,
-                        step_mm           = step_mm,
-                        stepdown_mm       = stepdown,
-                        final_stepdown_mm = raster_final_stepdown_mm,
-                        max_depth         = max_depth,
-                        width_cm          = eff_width_cm,
-                        height_cm         = eff_height_cm,
-                        raster_dir        = step['raster_dir_var'].get(),
-                        origin            = self.origin_var.get(),
-                        work_surface_tol  = work_surface_tol,
-                        previous_result   = _prev_tp.result if _prev_tp is not None else None,
-                        prior_reference   = prior_reference,
-                        raster_offset_pct = raster_offset_pct,
-                        feed_rate         = feed_rate,
-                        use_2opt          = use_2opt,
-                        progress          = dlg.report,
-                    )
-                except ProgressDialog.Cancelled:
-                    self.root.after(0, lambda: dlg.close("Cancelled."))
-                    return
-                except Exception as exc:
-                    self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
-                    self.root.after(0, lambda e=exc: messagebox.showerror(
-                        "Computation error", str(e)))
-                    return
-
-                def _done():
-                    self.toolpaths[idx] = result
-                    result.metadata['feed_rate'] = feed_rate
-                    stats = result.get_stats(
-                        feed_rate=feed_rate,
-                        feed_rapid=self._settings['feed_rapid'],
-                        z_safe=self._settings['z_safe'],
-                    )
-                    dlg.close("Completed.")
-                    step['info_var'].set(
-                        f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-                        f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                        f" @ {feed_rate:.0f} mm/min")
-                    self.display_mode_var.set(DISPLAY_STEP_3D)
-                    self.display_step_var.set(idx + 1)
-                    self._on_display_mode_changed()
-
-                self.root.after(0, _done)
-
-            threading.Thread(target=_worker, daemon=True).start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _build_steps_info(self):
         info = []

@@ -35,12 +35,12 @@ DEFAULTS = {
     # Per-step defaults (prefix-free; used for every new step tab)
     "step_profile":      "End Mill",
     "step_diameter":     "6.0",
-    "step_stepover":     "50",
+    "step_stepover":     "66",
     "step_raster_offset": "0",
     "step_stepdown":              "6.0",
     "step_raster_final_stepdown": "0.0",
     "step_feed_rate":    "800",
-    "step_raster_dir":   "Horizontal",
+    "step_raster_dir":   "Vertical",
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"
@@ -51,7 +51,7 @@ DEFAULTS = {
     "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
     # Contour-specific defaults
-    "step_contour_stepdown":      "1.0", # Z increment between contour levels (mm)
+    "step_contour_stepdown":      "0.2", # Z increment between contour levels (mm)
     "step_contour_adaptive":      "0",   # 0 = fixed levels, 1 = adaptive CDF levels
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
