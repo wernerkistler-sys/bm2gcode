@@ -371,7 +371,7 @@ class GCodeGeneratorApp:
         dst['profile_var'].set(src['profile_var'].get())
         for key in ('diameter', 'stepover', 'stepdown', 'vbit_angle',
                     'vcarve_stepdown', 'vcarve_final_stepdown',
-                    'contour_stepdown', 'feed_rate', 'threshold',
+                    'contour_stepdown', 'contour_lateral_tol', 'feed_rate', 'threshold',
                     'min_fw', 'max_fw'):
             dst[key].set(src[key].get())
             if dst[key].auto_var is not None and src[key].auto_var is not None:
@@ -459,6 +459,11 @@ class GCodeGeneratorApp:
         ttk.Checkbutton(contour_frame, text="Adaptive levels (CDF)",
                         variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
         step['contour_adaptive_var'] = contour_adaptive_var
+
+        contour_lateral_tol = LabeledEntry(contour_frame, "Lateral tolerance", "mm",
+                                           DEFAULTS["step_contour_lateral_tol"])
+        contour_lateral_tol.pack(fill=tk.X, pady=2)
+        step['contour_lateral_tol'] = contour_lateral_tol
 
         tsp_frame = ttk.Frame(operation_lf)
         tsp_frame.pack(fill=tk.X)   # shown initially (Raster Scan is the default)
@@ -590,7 +595,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack_forget()
-                step['tsp_frame'].pack_forget()
+                step['tsp_frame'].pack(fill=tk.X)
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -689,6 +694,7 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
+        step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
 
@@ -833,6 +839,7 @@ class GCodeGeneratorApp:
             'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
             'contour_stepdown':     step['contour_stepdown'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
+            'contour_lateral_tol':    step['contour_lateral_tol'].get(),
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
             'threshold':            step['threshold'].get(),
@@ -855,6 +862,7 @@ class GCodeGeneratorApp:
         step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
         step['contour_stepdown'].set(d.get('contour_stepdown', DEFAULTS['step_contour_stepdown']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
+        step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
         step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
@@ -1037,8 +1045,10 @@ class GCodeGeneratorApp:
             tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
             params.update({
                 'tool':             tool,
-                'contour_stepdown': float(step['contour_stepdown'].get()),
-                'contour_adaptive': step['contour_adaptive_var'].get(),
+                'contour_stepdown':  float(step['contour_stepdown'].get()),
+                'contour_adaptive':  step['contour_adaptive_var'].get(),
+                'contour_lateral_tol': float(step['contour_lateral_tol'].get()),
+                'use_2opt':          step['tsp_2opt_var'].get(),
             })
         else:  # Raster
             _profile    = step['profile_var'].get()
@@ -1111,6 +1121,10 @@ class GCodeGeneratorApp:
                 previous_result  = prev_tp.result     if prev_tp is not None else None,
                 progress         = progress_fn,
                 adaptive_levels  = params['contour_adaptive'],
+                lateral_tol_mm   = params['contour_lateral_tol'],
+                z_safe           = self._settings['z_safe'],
+                feed_rapid       = self._settings['feed_rapid'],
+                use_2opt         = params['use_2opt'],
             )
         else:  # Raster
             gating_mode = params['gating_mode']

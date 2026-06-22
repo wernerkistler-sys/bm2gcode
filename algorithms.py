@@ -1293,6 +1293,142 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     return toolpath
 
 
+def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
+                          px_per_mm=1.0, feed_rate=800.0, feed_rapid=3000.0,
+                          z_safe=5.0, max_depth=1.0):
+    """Remove contour points at shallower z-levels that lie within lateral_tol_px
+    of the nearest deeper (effective) contour — i.e. they are laterally
+    redundant because the deeper pass will remove the same material.
+
+    Processes deepest-to-shallowest.  The "effective next" reference for z_i is
+    the nearest deeper level that was not itself fully pruned.  Because we
+    always compare z_i *directly* against effective_next (never transitively),
+    the lateral error is bounded to lateral_tol_px regardless of how many levels
+    are skipped between z_i and effective_next.
+
+    A pruned run is restored if its arc length is below the retract+plunge
+    breakeven: feed_rate × 2 × (z_safe + z_level_mm) / feed_rapid.  The z_safe
+    term accounts for travel from the surface to safe height; z_level_mm adds
+    the depth of the current cut, since both contribute to retract travel.
+    This threshold grows with depth, making deep-level splits harder to justify.
+
+    Returns a dict with the same keys as all_z_contours but with redundant
+    segments replaced by shorter open polylines (or removed entirely).
+    """
+    from scipy.ndimage import distance_transform_edt
+    from skimage.draw import line as draw_line
+
+    def _rasterize(contours):
+        img = np.zeros((H, W), dtype=bool)
+        for c in contours:
+            rows = np.round(c[:, 0]).astype(int).clip(0, H - 1)
+            cols = np.round(c[:, 1]).astype(int).clip(0, W - 1)
+            img[rows, cols] = True
+            for k in range(len(rows) - 1):
+                rr, cc = draw_line(int(rows[k]), int(cols[k]),
+                                   int(rows[k + 1]), int(cols[k + 1]))
+                img[np.clip(rr, 0, H - 1), np.clip(cc, 0, W - 1)] = True
+        return img
+
+    def _split_runs(c, keep_mask, min_pts=3, min_prune_arc_px=0.0):
+        n = len(c)
+        is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
+
+        # Pass 1: restore pruned runs whose pixel-space arc length is below the
+        # retract+plunge breakeven threshold.  Splitting there would cost more
+        # in Z-travel overhead than the redundant cutting saves.
+        mask = keep_mask.copy()
+        if min_prune_arc_px > 0.0 and mask.any() and not mask.all():
+            if is_closed:
+                start = next((i for i in range(n)
+                              if mask[i] and not mask[(i - 1) % n]), 0)
+                seq = [(start + i) % n for i in range(n)]
+            else:
+                seq = list(range(n))
+            i = 0
+            while i < len(seq):
+                if not mask[seq[i]]:
+                    run_idx = []
+                    while i < len(seq) and not mask[seq[i]]:
+                        run_idx.append(seq[i])
+                        i += 1
+                    pts = c[run_idx]
+                    arc = (float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+                           if len(pts) > 1 else 0.0)
+                    if arc < min_prune_arc_px:
+                        for ri in run_idx:
+                            mask[ri] = True
+                else:
+                    i += 1
+
+        if not mask.any():
+            return []
+        if mask.all():
+            return [c]
+
+        # Pass 2: split on the (possibly restored) mask.
+        if is_closed:
+            start = next((i for i in range(n)
+                          if mask[i] and not mask[(i - 1) % n]), 0)
+            indices = [(start + i) % n for i in range(n)]
+        else:
+            indices = list(range(n))
+        segments = []
+        run = []
+        for idx in indices:
+            if mask[idx]:
+                run.append(c[idx])
+            else:
+                if len(run) >= min_pts:
+                    segments.append(np.array(run))
+                run = []
+        if len(run) >= min_pts:
+            segments.append(np.array(run))
+        return segments
+
+    pruned = {}
+    effective_next_img = None
+
+    for z_norm in reversed(z_levels):
+        contours = all_z_contours.get(z_norm, [])
+        if effective_next_img is None:
+            # Deepest level — always kept
+            pruned[z_norm] = contours
+            if contours:
+                effective_next_img = _rasterize(contours)
+            continue
+
+        if not contours:
+            pruned[z_norm] = []
+            continue
+
+        # Retract+plunge breakeven arc length for this depth level (in pixels).
+        z_level_mm = z_norm * max_depth
+        min_prune_arc_px = (feed_rate * 2.0 * (z_safe + z_level_mm)
+                            / feed_rapid * px_per_mm)
+
+        dt = distance_transform_edt(~effective_next_img)
+
+        kept = []
+        for c in contours:
+            rows = np.round(c[:, 0]).astype(int).clip(0, H - 1)
+            cols = np.round(c[:, 1]).astype(int).clip(0, W - 1)
+            keep_mask = dt[rows, cols] >= lateral_tol_px
+            kept.extend(_split_runs(c, keep_mask,
+                                    min_prune_arc_px=min_prune_arc_px))
+
+        pruned[z_norm] = kept
+        if kept:
+            # Union with existing image so deeper coverage is never lost.
+            # A shallower contour point is redundant if it falls within tol of
+            # *any* committed cut at this level or deeper, not just the nearest
+            # partially-pruned level's remaining segments.
+            effective_next_img = effective_next_img | _rasterize(kept)
+        # else: fully pruned — effective_next_img unchanged, propagates upward
+
+    return pruned
+
+
 def compute_contour_toolpath(
     depth_map, n_grey_levels,
     tool, stepdown_mm, max_depth,
@@ -1303,6 +1439,10 @@ def compute_contour_toolpath(
     previous_result=None,
     progress=None,
     adaptive_levels=False,
+    lateral_tol_mm=0.0,
+    z_safe=5.0,
+    feed_rapid=3000.0,
+    use_2opt=False,
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -1349,6 +1489,16 @@ def compute_contour_toolpath(
         of this step.  None treats the prior removal as zero.
     progress : callable(pct, message)
         Thread-safe progress reporter.
+    lateral_tol_mm : float
+        Lateral tolerance in mm for redundancy pruning.  Contour segments whose
+        every point lies within this distance of the next deeper (effective)
+        contour are considered redundant and omitted.  0.0 disables pruning.
+    z_safe : float
+        Safe Z height above the workpiece surface in mm.  Used with
+        feed_rapid to compute the retract+plunge breakeven arc length per
+        level (splits shorter than this are not worth the overhead).
+    feed_rapid : float
+        Rapid traverse rate in mm/min used for retract+plunge cost estimate.
 
     Returns
     -------
@@ -1438,17 +1588,36 @@ def compute_contour_toolpath(
     # a flat step and the tool cuts air above the neighbouring deeper region.
     _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
 
+    # ── Stage 4a · Extract raw contours for every Z-level ─────────────────
+    progress(40, "Extracting contours for all Z-levels…")
+    all_z_contours = {}
+    for z_norm in z_levels:
+        raw = find_contours(center_depth_contour, max(z_norm - _contour_eps, 0.0))
+        all_z_contours[z_norm] = [c for c in raw if len(c) >= 3]
+
+    # ── Stage 4b · Prune laterally-redundant segments ─────────────────────
+    if lateral_tol_mm > 0.0:
+        progress(50, f"Pruning redundant segments (lateral tol={lateral_tol_mm:.3f} mm)…")
+        lateral_tol_px = lateral_tol_mm * px_per_mm
+        all_z_contours = _prune_contours(
+            all_z_contours, z_levels, lateral_tol_px, H, W,
+            px_per_mm=px_per_mm,
+            feed_rate=feed_rate,
+            feed_rapid=feed_rapid,
+            z_safe=z_safe,
+            max_depth=max_depth)
+
+    # ── Stage 4c · Greedy nearest-neighbour ordering per Z-level ──────────
     all_segments = []
     current_pos  = np.array([0.0, 0.0])
 
     n_levels = len(z_levels)
     for pass_idx, z_norm in enumerate(z_levels):
-        progress(40 + 40 * pass_idx // n_levels,
-                 f"Extracting contours at Z = {-z_norm * max_depth:.3f} mm…")
+        progress(55 + 25 * pass_idx // n_levels,
+                 f"Ordering contours at Z = {-z_norm * max_depth:.3f} mm…")
         z_mm = -z_norm * max_depth
 
-        raw_contours = find_contours(center_depth_contour, max(z_norm - _contour_eps, 0.0))
-        contours     = [c for c in raw_contours if len(c) >= 3]
+        contours = all_z_contours.get(z_norm, [])
         if not contours:
             continue
 
@@ -1456,6 +1625,10 @@ def compute_contour_toolpath(
         # For closed contours any rotation of the loop is valid, so we sample
         # candidate start points; for open contours only the two endpoints are
         # considered (flip=True covers the other end).
+        # Segments are collected into level_segs so that optional 2-opt can
+        # reorder them before they are committed to all_segments.
+        level_cur = current_pos.copy()
+        level_segs = []
         remaining = contours[:]
         while remaining:
             best_idx  = 0
@@ -1473,7 +1646,7 @@ def compute_contour_toolpath(
                         row0, col0 = orient[j]
                         x0 = col0 / px_per_mm_x - _ox
                         y0 = (H - 1 - row0) / px_per_mm_y - _oy
-                        d  = (x0 - current_pos[0])**2 + (y0 - current_pos[1])**2
+                        d  = (x0 - level_cur[0])**2 + (y0 - level_cur[1])**2
                         if d < best_dist:
                             best_dist = d
                             best_idx  = i
@@ -1497,10 +1670,35 @@ def compute_contour_toolpath(
             if len(points) < 2:
                 continue
 
-            all_segments.append(points)
+            level_segs.append(points)
             last = points[-1]
-            current_pos[0] = last[0]
-            current_pos[1] = last[1]
+            level_cur[0] = last[0]
+            level_cur[1] = last[1]
+
+        if not level_segs:
+            continue
+
+        # Optional 2-opt reorder within this Z-level.  Preserves
+        # shallow-before-deep ordering across levels while reducing rapids
+        # within each level.  per_rapid_overhead = 2 × z_safe reflects the
+        # actual retract + plunge distance at this safe height.
+        if use_2opt and len(level_segs) >= 3:
+            ent_xy = [(s[0][0],  s[0][1])  for s in level_segs]
+            ext_xy = [(s[-1][0], s[-1][1]) for s in level_segs]
+            order, flips = _two_opt_reorder(
+                ent_xy, ext_xy,
+                origin=(float(current_pos[0]), float(current_pos[1])),
+                link_threshold=rdp_tol,
+                per_rapid_overhead=2.0 * z_safe)
+            level_segs = [
+                list(reversed(level_segs[i])) if flips[k] else level_segs[i]
+                for k, i in enumerate(order)
+            ]
+
+        all_segments.extend(level_segs)
+        last = level_segs[-1][-1]
+        current_pos[0] = last[0]
+        current_pos[1] = last[1]
 
     progress(80, f"Contour segments built ({len(all_segments)} segments).")
 
@@ -1529,6 +1727,8 @@ def compute_contour_toolpath(
             'radius_mm':       tool.diameter_mm / 2,
             'stepdown_mm':     stepdown_mm,
             'adaptive_levels': adaptive_levels,
+            'use_2opt':        use_2opt,
+            'lateral_tol_mm':    lateral_tol_mm,
             'n_passes':        len(z_levels),
             'width_cm':        width_cm,
             'height_cm':       height_cm,
