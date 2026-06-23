@@ -590,7 +590,6 @@ class GCodeGeneratorApp:
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
-                step['stepdown'].pack_forget()
                 step['raster_final_stepdown'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
@@ -599,10 +598,14 @@ class GCodeGeneratorApp:
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
+                if alg_changed:
+                    step['stepdown'].set(step['contour_stepdown'].get())
                 if profile == "V-Bit":
                     step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['vbit_frame'])
                 else:
                     step['vbit_frame'].pack_forget()
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
@@ -1043,12 +1046,19 @@ class GCodeGeneratorApp:
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
             tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            _sd  = float(step['contour_stepdown'].get())
+            _msd = float(step['stepdown'].get())
+            if _msd <= 0 or _sd <= 0:
+                _win = 0
+            else:
+                _win = max(1, int(round(_msd / _sd)))
             params.update({
-                'tool':             tool,
-                'contour_stepdown':  float(step['contour_stepdown'].get()),
-                'contour_adaptive':  step['contour_adaptive_var'].get(),
+                'tool':                tool,
+                'contour_stepdown':    _sd,
+                'contour_adaptive':    step['contour_adaptive_var'].get(),
                 'contour_lateral_tol': float(step['contour_lateral_tol'].get()),
-                'use_2opt':          step['tsp_2opt_var'].get(),
+                'use_2opt':            step['tsp_2opt_var'].get(),
+                'cross_level_window':  _win,
             })
         else:  # Raster
             _profile    = step['profile_var'].get()
@@ -1122,9 +1132,10 @@ class GCodeGeneratorApp:
                 progress         = progress_fn,
                 adaptive_levels  = params['contour_adaptive'],
                 lateral_tol_mm   = params['contour_lateral_tol'],
-                z_safe           = self._settings['z_safe'],
-                feed_rapid       = self._settings['feed_rapid'],
-                use_2opt         = params['use_2opt'],
+                z_safe             = self._settings['z_safe'],
+                feed_rapid         = self._settings['feed_rapid'],
+                use_2opt           = params['use_2opt'],
+                cross_level_window = params['cross_level_window'],
             )
         else:  # Raster
             gating_mode = params['gating_mode']

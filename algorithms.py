@@ -4,7 +4,8 @@ from toolpath import ToolPath
 
 
 def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
-                     link_threshold=0.0, per_rapid_overhead=0.0):
+                     link_threshold=0.0, per_rapid_overhead=0.0,
+                     seg_z=None, z_jump_weight=0.0):
     """Return (order, flipped) permutation that minimises rapid travel cost.
 
     seg_entries[i], seg_exits[i]: (x, y) G-code mm for the i-th segment's
@@ -16,6 +17,10 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
         link_threshold, representing the retract + plunge distance overhead
         (typically 2 × z_safe).  Without this the optimiser may break several
         cheap stitches to save a few mm of traverse.
+    seg_z: optional list of z-values (mm, negative) for each segment.  When
+        provided, z_jump_weight * |Δz| is added to every transition cost,
+        discouraging large depth jumps across z-levels.
+    z_jump_weight: cost per mm of z-jump (applies regardless of link_threshold).
 
     Returns parallel lists — order (indices into the original lists) and
     flipped (bool: whether to reverse that segment's traversal direction).
@@ -29,20 +34,31 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
     order   = list(range(n))
     flipped = [False] * n
 
-    def edge_cost(a, b):
+    use_z = seg_z is not None and z_jump_weight > 0.0
+    ent_z = list(seg_z) if use_z else None
+    ext_z = list(seg_z) if use_z else None
+    origin_z = 0.0
+
+    def edge_cost(a, b, za=0.0, zb=0.0):
         d = ((a[0] - b[0])**2 + (a[1] - b[1])**2) ** 0.5
-        return 0.0 if d < link_threshold else per_rapid_overhead + d
+        z_cost = z_jump_weight * abs(za - zb) if use_z else 0.0
+        return z_cost if d < link_threshold else per_rapid_overhead + d + z_cost
 
     for _ in range(max_passes):
         improved = False
         for i in range(-1, n - 2):
             prev_ext = origin if i == -1 else ext[i]
+            pz = (origin_z if i == -1 else ext_z[i]) if use_z else 0.0
             for j in range(i + 2, n):
-                old = edge_cost(prev_ext, ent[i + 1])
-                new = edge_cost(prev_ext, ext[j])
+                old = edge_cost(prev_ext, ent[i + 1], pz, ent_z[i + 1] if use_z else 0.0)
+                new = edge_cost(prev_ext, ext[j],     pz, ext_z[j]     if use_z else 0.0)
                 if j + 1 < n:
-                    old += edge_cost(ext[j],     ent[j + 1])
-                    new += edge_cost(ent[i + 1], ent[j + 1])
+                    old += edge_cost(ext[j],     ent[j + 1],
+                                     ext_z[j]     if use_z else 0.0,
+                                     ent_z[j + 1] if use_z else 0.0)
+                    new += edge_cost(ent[i + 1], ent[j + 1],
+                                     ent_z[i + 1] if use_z else 0.0,
+                                     ent_z[j + 1] if use_z else 0.0)
                 if new < old - 1e-9:
                     lo, hi = i + 1, j + 1
                     block_e = ent[lo:hi]
@@ -51,11 +67,95 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
                     ext[lo:hi]     = list(reversed(block_e))
                     order[lo:hi]   = list(reversed(order[lo:hi]))
                     flipped[lo:hi] = [not f for f in reversed(flipped[lo:hi])]
+                    if use_z:
+                        block_z = ent_z[lo:hi]
+                        ent_z[lo:hi] = list(reversed(block_z))
+                        ext_z[lo:hi] = list(reversed(block_z))
                     improved = True
         if not improved:
             break
 
     return order, flipped
+
+
+def _bresenham_pixels(r0, c0, r1, c1):
+    """Yield (row, col) pixels along the line (r0,c0)→(r1,c1)."""
+    dr, dc = abs(r1 - r0), abs(c1 - c0)
+    sr, sc = (1 if r1 >= r0 else -1), (1 if c1 >= c0 else -1)
+    r, c = r0, c0
+    if dc >= dr:
+        err = 2 * dr - dc
+        for _ in range(dc + 1):
+            yield r, c
+            if err > 0:
+                r   += sr
+                err -= 2 * dc
+            err += 2 * dr
+            c   += sc
+    else:
+        err = 2 * dc - dr
+        for _ in range(dr + 1):
+            yield r, c
+            if err > 0:
+                c   += sc
+                err -= 2 * dr
+            err += 2 * dc
+            r   += sr
+
+
+def _geodesic_link(r0, c0, r1, c1, ceil_norm,
+                   center_depth_map, H, W, px_per_mm_x, px_per_mm_y, max_depth,
+                   final_norm_val=0.0):
+    """Dijkstra minimum-3D-arc-length path from (r0,c0) to (r1,c1).
+
+    Uses the roughing surface (terrain − final_norm_val, capped at ceil_norm)
+    for arc-length cost, so the path avoids edges in the surface being cut.
+    """
+    import heapq
+    margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
+    rlo = max(0, min(r0, r1) - margin)
+    rhi = min(H - 1, max(r0, r1) + margin)
+    clo = max(0, min(c0, c1) - margin)
+    chi = min(W - 1, max(c0, c1) + margin)
+
+    DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    dist = {}
+    prev = {}
+    dist[(r0, c0)] = 0.0
+    heap = [(0.0, r0, c0)]
+
+    while heap:
+        d, r, c = heapq.heappop(heap)
+        if (r, c) == (r1, c1):
+            break
+        if d > dist.get((r, c), float('inf')):
+            continue
+        z_cur = min(max(float(center_depth_map[r, c]) - final_norm_val, 0.0), ceil_norm)
+        for dr, dc in DIRS:
+            nr, nc = r + dr, c + dc
+            if not (rlo <= nr <= rhi and clo <= nc <= chi):
+                continue
+            z_nb = min(max(float(center_depth_map[nr, nc]) - final_norm_val, 0.0),
+                       ceil_norm)
+            dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
+            dz   = (z_nb - z_cur) * max_depth
+            nd   = d + (dxy2 + dz * dz) ** 0.5
+            if nd < dist.get((nr, nc), float('inf')):
+                dist[(nr, nc)] = nd
+                prev[(nr, nc)] = (r, c)
+                heapq.heappush(heap, (nd, nr, nc))
+
+    if (r1, c1) not in prev and (r0, c0) != (r1, c1):
+        return list(_bresenham_pixels(r0, c0, r1, c1))
+
+    path, cur = [], (r1, c1)
+    while cur != (r0, c0):
+        path.append(cur)
+        cur = prev[cur]
+    path.append((r0, c0))
+    path.reverse()
+    return path
 
 
 def mask_spans(mask_1d):
@@ -459,83 +559,6 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     n_links          = 0
     link_threshold_mm = 2.0 * step_mm
 
-    def bresenham_pixels(r0, c0, r1, c1):
-        """Yield (row, col) pixels along the line (r0,c0)→(r1,c1)."""
-        dr, dc = abs(r1 - r0), abs(c1 - c0)
-        sr, sc = (1 if r1 >= r0 else -1), (1 if c1 >= c0 else -1)
-        r, c = r0, c0
-        if dc >= dr:
-            err = 2 * dr - dc
-            for _ in range(dc + 1):
-                yield r, c
-                if err > 0:
-                    r   += sr
-                    err -= 2 * dc
-                err += 2 * dr
-                c   += sc
-        else:
-            err = 2 * dc - dr
-            for _ in range(dr + 1):
-                yield r, c
-                if err > 0:
-                    c   += sc
-                    err -= 2 * dr
-                err += 2 * dc
-                r   += sr
-
-    def geodesic_link_pixels(r0, c0, r1, c1, ceil_norm, final_norm_val=0.0):
-        """Dijkstra minimum-3D-arc-length path from (r0,c0) to (r1,c1).
-
-        Uses the roughing surface (terrain − final_norm_val, capped at ceil_norm)
-        for arc-length cost, so the path avoids edges in the surface being cut.
-        """
-        import heapq
-        margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
-        rlo = max(0, min(r0, r1) - margin)
-        rhi = min(H - 1, max(r0, r1) + margin)
-        clo = max(0, min(c0, c1) - margin)
-        chi = min(W - 1, max(c0, c1) + margin)
-
-        DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
-                (-1, -1), (-1, 1), (1, -1), (1, 1)]
-        dist = {}
-        prev = {}
-        dist[(r0, c0)] = 0.0
-        heap = [(0.0, r0, c0)]
-
-        while heap:
-            d, r, c = heapq.heappop(heap)
-            if (r, c) == (r1, c1):
-                break
-            if d > dist.get((r, c), float('inf')):
-                continue
-            z_cur = min(max(float(center_depth_contour_raster[r, c])
-                            - final_norm_val, 0.0), ceil_norm)
-            for dr, dc in DIRS:
-                nr, nc = r + dr, c + dc
-                if not (rlo <= nr <= rhi and clo <= nc <= chi):
-                    continue
-                z_nb = min(max(float(center_depth_contour_raster[nr, nc])
-                               - final_norm_val, 0.0), ceil_norm)
-                dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
-                dz   = (z_nb - z_cur) * max_depth
-                nd   = d + (dxy2 + dz * dz) ** 0.5
-                if nd < dist.get((nr, nc), float('inf')):
-                    dist[(nr, nc)] = nd
-                    prev[(nr, nc)] = (r, c)
-                    heapq.heappush(heap, (nd, nr, nc))
-
-        if (r1, c1) not in prev and (r0, c0) != (r1, c1):
-            return list(bresenham_pixels(r0, c0, r1, c1))
-
-        path, cur = [], (r1, c1)
-        while cur != (r0, c0):
-            path.append(cur)
-            cur = prev[cur]
-        path.append((r0, c0))
-        path.reverse()
-        return path
-
     # ── Phase 1: full-depth reference path (no terrain links) ────
     progress(40, "Phase 1: generating full-depth reference path…")
     full_depth_segs = []
@@ -664,8 +687,10 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                     r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm_y))
 
                     fn = 0.0 if is_final else final_norm
-                    link_pixels = geodesic_link_pixels(
-                        r0_px, c0_px, r1_px, c1_px, ceil_norm, fn)
+                    link_pixels = _geodesic_link(
+                        r0_px, c0_px, r1_px, c1_px, ceil_norm,
+                        center_depth_contour_raster, H, W,
+                        px_per_mm_x, px_per_mm_y, max_depth, fn)
                     # Anchor both ends to the exact adjacent segment tuples so
                     # that the adjacency check in to_gcode / _render_3d sees
                     # bitwise-identical values and suppresses false retracts.
@@ -1443,6 +1468,7 @@ def compute_contour_toolpath(
     z_safe=5.0,
     feed_rapid=3000.0,
     use_2opt=False,
+    cross_level_window=1,
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -1608,8 +1634,11 @@ def compute_contour_toolpath(
             max_depth=max_depth)
 
     # ── Stage 4c · Greedy nearest-neighbour ordering per Z-level ──────────
-    all_segments = []
-    current_pos  = np.array([0.0, 0.0])
+    all_segments      = []
+    level_segs_dict   = {}
+    current_pos       = np.array([0.0, 0.0])
+    initial_pos       = current_pos.copy()
+    link_threshold_mm = tool.diameter_mm
 
     n_levels = len(z_levels)
     for pass_idx, z_norm in enumerate(z_levels):
@@ -1688,19 +1717,92 @@ def compute_contour_toolpath(
             order, flips = _two_opt_reorder(
                 ent_xy, ext_xy,
                 origin=(float(current_pos[0]), float(current_pos[1])),
-                link_threshold=rdp_tol,
+                link_threshold=link_threshold_mm,
                 per_rapid_overhead=2.0 * z_safe)
             level_segs = [
                 list(reversed(level_segs[i])) if flips[k] else level_segs[i]
                 for k, i in enumerate(order)
             ]
 
-        all_segments.extend(level_segs)
+        level_segs_dict[z_norm] = level_segs
         last = level_segs[-1][-1]
         current_pos[0] = last[0]
         current_pos[1] = last[1]
 
-    progress(80, f"Contour segments built ({len(all_segments)} segments).")
+    progress(80, f"Contour segments built ({sum(len(v) for v in level_segs_dict.values())} segments).")
+
+    # ── Stage 4b · Cross-level assembly + terrain links ───────────────────
+    # Build all_segments from level_segs_dict using non-overlapping windows of
+    # cross_level_window adjacent z-levels.  Within each window (when >1 level)
+    # a second 2-opt pass mixes contours across levels guided by a z-jump
+    # penalty, reducing rapids that straddle level boundaries.
+    z_jump_weight_mm = stepdown_mm * 1.5
+    win_size     = cross_level_window if cross_level_window > 0 else len(z_levels)
+    assemble_pos = initial_pos.copy()
+
+    for win_start in range(0, len(z_levels), win_size):
+        win_levels = z_levels[win_start : win_start + win_size]
+        win_segs   = [seg for z in win_levels for seg in level_segs_dict.get(z, [])]
+        if not win_segs:
+            continue
+        if use_2opt and win_size > 1 and len(win_segs) >= 3:
+            win_z  = [s[0][2] for s in win_segs]
+            ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
+            ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
+            order, flips = _two_opt_reorder(
+                ent_xy, ext_xy,
+                origin=(float(assemble_pos[0]), float(assemble_pos[1])),
+                link_threshold=link_threshold_mm,
+                per_rapid_overhead=2.0 * z_safe,
+                seg_z=win_z,
+                z_jump_weight=z_jump_weight_mm)
+            win_segs = [
+                list(reversed(win_segs[i])) if flips[k] else win_segs[i]
+                for k, i in enumerate(order)
+            ]
+        all_segments.extend(win_segs)
+        last = win_segs[-1][-1]
+        assemble_pos[0] = last[0]
+        assemble_pos[1] = last[1]
+
+    # Terrain-link insertion: walk all_segments once and splice geodesic links
+    # wherever consecutive segments are within link_threshold_mm of each other.
+    # Done as a separate stage so cross-window boundaries are also covered.
+    cut_segs    = all_segments
+    all_segments = []
+    n_links      = 0
+    for i, seg in enumerate(cut_segs):
+        all_segments.append(seg)
+        if i + 1 < len(cut_segs):
+            nxt      = cut_segs[i + 1]
+            nxt_dist = ((nxt[0][0] - seg[-1][0])**2 +
+                        (nxt[0][1] - seg[-1][1])**2) ** 0.5
+            if nxt_dist < link_threshold_mm:
+                ceil_norm = max(-seg[-1][2], -nxt[0][2]) / max_depth
+                x_exit,  y_exit  = float(seg[-1][0]),  float(seg[-1][1])
+                x_entry, y_entry = float(nxt[0][0]),   float(nxt[0][1])
+                c0_px = int(round((x_exit  + _ox) * px_per_mm_x))
+                r0_px = int(round((H - 1)  - (y_exit  + _oy) * px_per_mm_y))
+                c1_px = int(round((x_entry + _ox) * px_per_mm_x))
+                r1_px = int(round((H - 1)  - (y_entry + _oy) * px_per_mm_y))
+                link_pixels = _geodesic_link(
+                    r0_px, c0_px, r1_px, c1_px, ceil_norm,
+                    center_depth_contour, H, W,
+                    px_per_mm_x, px_per_mm_y, max_depth)
+                link_points = [seg[-1]]
+                for row_l, col_l in link_pixels[1:-1]:
+                    z_link = min(float(center_depth_contour[row_l, col_l]),
+                                 ceil_norm)
+                    x_lmm = col_l / px_per_mm_x - _ox
+                    y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy
+                    link_points.append((x_lmm, y_lmm, -z_link * max_depth))
+                link_points.append(nxt[0])
+                if len(link_points) >= 2:
+                    all_segments.append(link_points)
+                    n_links += 1
+
+    progress(80, f"Assembly complete — {len(cut_segs)} cut segments, "
+                 f"{n_links} terrain links.")
 
     # ── Stage 5 · Simulate result (80–90 %) ───────────────────────────────
     progress(80, "Simulating tool-swept removal surface…")
@@ -1727,8 +1829,9 @@ def compute_contour_toolpath(
             'radius_mm':       tool.diameter_mm / 2,
             'stepdown_mm':     stepdown_mm,
             'adaptive_levels': adaptive_levels,
-            'use_2opt':        use_2opt,
-            'lateral_tol_mm':    lateral_tol_mm,
+            'use_2opt':           use_2opt,
+            'cross_level_window': cross_level_window,
+            'lateral_tol_mm':     lateral_tol_mm,
             'n_passes':        len(z_levels),
             'width_cm':        width_cm,
             'height_cm':       height_cm,
