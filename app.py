@@ -1855,8 +1855,10 @@ class GCodeGeneratorApp:
                                         self._3d_pan_offset.copy())
         else:
             if event.button == 2 and event.inaxes is self.ax:
-                self._pan_origin = (event.xdata, event.ydata,
-                                    self.ax.get_xlim(), self.ax.get_ylim())
+                bbox = self.ax.bbox
+                self._pan_origin = (event.x, event.y,
+                                    self.ax.get_xlim(), self.ax.get_ylim(),
+                                    bbox.width, bbox.height)
             elif event.button == 1 and event.dblclick:
                 self._reset_zoom_and_render()
 
@@ -1918,11 +1920,13 @@ class GCodeGeneratorApp:
                 return
             if event.xdata is None or event.ydata is None:
                 return
-            ox, oy, xlim0, ylim0 = self._pan_origin
-            dx = ox - event.xdata
-            dy = oy - event.ydata
-            new_xlim = (xlim0[0] + dx, xlim0[1] + dx)
-            new_ylim = (ylim0[0] + dy, ylim0[1] + dy)
+            ox, oy, xlim0, ylim0, bw, bh = self._pan_origin
+            # Use pixel-space delta against frozen original limits to avoid
+            # the feedback loop where draw_idle() changes event.xdata/ydata.
+            dx = (event.x - ox) / bw * (xlim0[1] - xlim0[0])
+            dy = (event.y - oy) / bh * (ylim0[1] - ylim0[0])
+            new_xlim = (xlim0[0] - dx, xlim0[1] - dx)
+            new_ylim = (ylim0[0] - dy, ylim0[1] - dy)
             self.ax.set_xlim(new_xlim)
             self.ax.set_ylim(new_ylim)
             self._view_xlim = new_xlim
