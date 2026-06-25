@@ -949,7 +949,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         # eps = sqrt(2)/2 removes all single-pixel staircase steps (worst case: 45° line)
         # while preserving corners whose deviation from a straight chord is >> 1 px.
         rdp_eps = np.sqrt(2.0) / 2.0
-        raw_contours = _find_contours(uncut_depth_filtered, threshold_norm)
+        raw_contours = _find_contours(uncut_depth_filtered, threshold_norm * (1.0 - 1e-6))
         pts_list = []
         for c in raw_contours:
             if len(c) < 4:
@@ -964,7 +964,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         boundary_pts = np.vstack(pts_list) if pts_list else np.empty((0, 2))
 
         if len(boundary_pts) < 4:
-            skeleton = np.zeros_like(mask_vcarve, dtype=bool)
+            skeleton   = np.zeros_like(mask_vcarve, dtype=bool)
+            radius_map = np.zeros((H, W), dtype=np.float32)
         else:
             vor = _Voronoi(boundary_pts)
 
