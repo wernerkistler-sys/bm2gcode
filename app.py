@@ -729,7 +729,7 @@ class GCodeGeneratorApp:
 
         self.placeholder = ttk.Label(
             parent,
-            text="Open a PNG image via File → Open Image…",
+            text="Open an image via File → Open Image…",
             font=("Helvetica", 13),
             foreground="#888888",
         )
@@ -791,8 +791,13 @@ class GCodeGeneratorApp:
 
     def open_image(self):
         path = filedialog.askopenfilename(
-            title="Select a PNG image",
-            filetypes=[("PNG files", "*.png"), ("All files", "*.*")]
+            title="Open Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp"),
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg *.jpeg"),
+                ("All files", "*.*"),
+            ]
         )
         if not path:
             return
