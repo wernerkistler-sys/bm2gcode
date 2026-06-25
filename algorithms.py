@@ -1739,13 +1739,16 @@ def compute_contour_toolpath(
     z_jump_weight_mm = stepdown_mm * 1.5
     win_size     = cross_level_window if cross_level_window > 0 else len(z_levels)
     assemble_pos = initial_pos.copy()
+    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
 
-    for win_start in range(0, len(z_levels), win_size):
+    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
         win_levels = z_levels[win_start : win_start + win_size]
         win_segs   = [seg for z in win_levels for seg in level_segs_dict.get(z, [])]
         if not win_segs:
             continue
         if use_2opt and win_size > 1 and len(win_segs) >= 3:
+            progress(80, f"Cross-level 2-opt: window {win_idx + 1}/{n_windows} "
+                         f"({len(win_segs)} segments)…")
             win_z  = [s[0][2] for s in win_segs]
             ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
             ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
