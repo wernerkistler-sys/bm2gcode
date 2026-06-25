@@ -876,22 +876,22 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    # ── Stage 1 · Unaccessible-depth mask (0–10 %) ────────────────
-    progress(0, "Computing unaccessible-depth mask…")
+    # ── Stage 1 · V-carving mask (0–10 %) ────────────────
+    progress(0, "Computing V-carving mask…")
     if prior_reference is None:
-        unaccessible = depth_map.copy()
+        uncut_depth = depth_map.copy()
     else:
-        unaccessible = np.clip(depth_map - prior_reference, 0.0, 1.0)
+        uncut_depth = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
     threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
 
-    unaccessible_filtered, mask_vcarve = compute_vcarve_mask(
-        unaccessible, threshold_norm, min_feature_width_mm, px_per_mm,
+    uncut_depth_filtered, mask_vcarve = compute_vcarve_mask(
+        uncut_depth, threshold_norm, min_feature_width_mm, px_per_mm,
         max_feature_width_mm,
     )
 
-    if not np.any(mask_vcarve):
-        progress(100, "No fine-detail regions found — nothing to V-carve.")
+    if not np.any(mask_vcarve) or np.all(mask_vcarve):
+        progress(100, "No V-carving mask found — nothing to V-carve.")
         return ToolPath(
             segments=[],
             result=(previous_result.copy() if previous_result is not None
@@ -902,7 +902,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                       'max_depth': max_depth}
         )
 
-    progress(10, f"Fine-detail mask: {np.count_nonzero(mask_vcarve)} pixels.")
+    progress(10, f"V-carving mask: {np.count_nonzero(mask_vcarve)} pixels.")
 
     # ── Stage 2a · Build tool kernel (10–20 %) ────────────────────
     progress(10, "Building tool geometry kernel…")
@@ -949,7 +949,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         # eps = sqrt(2)/2 removes all single-pixel staircase steps (worst case: 45° line)
         # while preserving corners whose deviation from a straight chord is >> 1 px.
         rdp_eps = np.sqrt(2.0) / 2.0
-        raw_contours = _find_contours(unaccessible_filtered, threshold_norm)
+        raw_contours = _find_contours(uncut_depth_filtered, threshold_norm)
         pts_list = []
         for c in raw_contours:
             if len(c) < 4:
