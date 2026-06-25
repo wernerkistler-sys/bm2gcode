@@ -857,9 +857,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     """
     from scipy.ndimage import grey_erosion, distance_transform_edt, label
 
-    _alg_name = ('V-Carving (Voronoi)'   if skeleton_mode == 'voronoi'
-                 else 'V-Carving (Inscribed)' if skeleton_mode == 'inscribed'
-                 else 'V-Carving')
+    _alg_name = ('V-Carving (Sub-pixel)'    if skeleton_mode == 'voronoi'
+                 else 'V-Carving (Feature Width)' if skeleton_mode == 'inscribed'
+                 else 'V-Carving (Depth Map)')
 
     H, W = depth_map.shape
 

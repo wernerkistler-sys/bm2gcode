@@ -1037,8 +1037,8 @@ class GCodeGeneratorApp:
                 'vcarve_stepdown_mm':       float(step['vcarve_stepdown'].get()),
                 'vcarve_final_stepdown_mm': float(step['vcarve_final_stepdown'].get()),
                 'use_2opt':                 step['tsp_2opt_var'].get(),
-                'skeleton_mode':            ("voronoi"    if algorithm == "V-Carving (Voronoi)"
-                                             else "inscribed" if algorithm == "V-Carving (Inscribed)"
+                'skeleton_mode':            ("voronoi"    if algorithm == "V-Carving (Sub-pixel)"
+                                             else "inscribed" if algorithm == "V-Carving (Feature Width)"
                                              else "medial_axis"),
                 'gating_mode':              step['gating_mode_var'].get(),
             })

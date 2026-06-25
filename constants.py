@@ -1,7 +1,9 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
 RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Both"]
-ALGORITHMS        = ["Raster Scan", "V-Carving", "V-Carving (Voronoi)",
-                     "V-Carving (Inscribed)", "Contour"]
+ALGORITHMS        = ["Raster Scan", "Contour",
+                     "V-Carving (Depth Map)",
+                     "V-Carving (Sub-pixel)",
+                     "V-Carving (Feature Width)"]
 
 DEFAULT_PREAMBLE = (
     "G21         ; units = mm\n"
@@ -43,7 +45,7 @@ DEFAULTS = {
     "step_raster_dir":   "Vertical",
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
-    "step_algorithm":    "Raster Scan",  # "Raster Scan" | "V-Carving"
+    "step_algorithm":    "Raster Scan",  # see ALGORITHMS list
     "step_gating_mode": "Residual from prior step",  # initial default; overridden per-algorithm by _refresh_layout
     "step_vbit_angle":   "60",           # included angle in degrees
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
