@@ -46,7 +46,7 @@ DEFAULTS = {
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # see ALGORITHMS list
-    "step_gating_mode": "Residual from prior step",  # initial default; overridden per-algorithm by _refresh_layout
+    "step_gating_mode": "Full depth map",  # initial default; overridden per-algorithm by _refresh_layout
     "step_vbit_angle":   "60",           # included angle in degrees
     "step_min_fw":       "0.0",          # min feature width for V-carve mask (mm)
     "step_max_fw":       "0.0",          # max feature width for V-carve mask (mm)

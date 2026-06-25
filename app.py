@@ -572,7 +572,9 @@ class GCodeGeneratorApp:
 
             if alg.startswith("V-Carving"):
                 if alg_changed:
-                    step['gating_mode_var'].set("Inaccessible by prior tool")
+                    step['gating_mode_var'].set(
+                        "Full depth map" if self.steps[0] is step
+                        else "Inaccessible by prior tool")
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
@@ -599,8 +601,6 @@ class GCodeGeneratorApp:
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
-                if alg_changed:
-                    step['stepdown'].set(step['contour_stepdown'].get())
                 if profile == "V-Bit":
                     step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['vbit_frame'])
@@ -611,7 +611,9 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
                 if alg_changed:
-                    step['gating_mode_var'].set("Residual from prior step")
+                    step['gating_mode_var'].set(
+                        "Full depth map" if self.steps[0] is step
+                        else "Residual from prior step")
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
