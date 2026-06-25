@@ -466,7 +466,6 @@ class GCodeGeneratorApp:
         step['contour_lateral_tol'] = contour_lateral_tol
 
         tsp_frame = ttk.Frame(operation_lf)
-        tsp_frame.pack(fill=tk.X)   # shown initially (Raster Scan is the default)
         step['tsp_frame'] = tsp_frame
 
         tsp_2opt_var = tk.BooleanVar(
@@ -478,6 +477,8 @@ class GCodeGeneratorApp:
         gating_frame = ttk.Frame(operation_lf)
         gating_frame.pack(fill=tk.X)
         step['gating_frame'] = gating_frame
+
+        tsp_frame.pack(fill=tk.X)   # always last; packed after gating_frame
 
         region_row = ttk.Frame(gating_frame)
         region_row.pack(fill=tk.X, pady=(0, 4))
@@ -581,7 +582,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack(fill=tk.X, pady=2)
                 step['max_fw'].pack(fill=tk.X, pady=2)
                 step['gating_frame'].pack(fill=tk.X)
-                step['tsp_frame'].pack(fill=tk.X)
+                step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -616,7 +617,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack(fill=tk.X)
-                step['tsp_frame'].pack(fill=tk.X)
+                step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
