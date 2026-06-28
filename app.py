@@ -2,17 +2,32 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
 import os
+import matplotlib.colors as mcolors
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import threading
 
+# Diverging colormap that is dark at zero (like "hot") and bright at both extremes.
+# Negative half: black → blue → cyan → white  (cold mirror of hot)
+# Positive half: black → red → yellow → white  (standard hot)
+_cold_cmap = mcolors.LinearSegmentedColormap.from_list(
+    '_cold', [(0, 0, 0), (0, 0, 1), (0, 1, 1), (1, 1, 1)])
+_DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
+    'diff_hot',
+    np.vstack([
+        _cold_cmap(np.linspace(1, 0, 128)),   # white/cyan → black  (most-negative → zero)
+        plt.cm.hot(np.linspace(0, 1, 128)),    # black → yellow/white (zero → most-positive)
+    ])
+)
+
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
+    DISPLAY_DIFF_RES_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
@@ -107,7 +122,8 @@ class GCodeGeneratorApp:
             (DISPLAY_STEP_RESULT,       "3"),
             (DISPLAY_STEP_RES,          "4"),
             (DISPLAY_STEP_UNACCESSIBLE, "5"),
-            (DISPLAY_PROC_MASK,         "6"),
+            (DISPLAY_DIFF_RES_UNCUT,    "6"),
+            (DISPLAY_PROC_MASK,         "7"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -369,8 +385,8 @@ class GCodeGeneratorApp:
         """Copy all user-editable settings from src step dict to dst step dict."""
         dst['algorithm_var'].set(src['algorithm_var'].get())
         dst['profile_var'].set(src['profile_var'].get())
-        for key in ('diameter', 'stepover', 'stepdown', 'vbit_angle',
-                    'vcarve_stepdown', 'vcarve_final_stepdown',
+        for key in ('diameter', 'stepover', 'raster_offset', 'stepdown', 'raster_final_stepdown',
+                    'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'contour_stepdown', 'contour_lateral_tol', 'feed_rate', 'threshold',
                     'min_fw', 'max_fw'):
             dst[key].set(src[key].get())
@@ -378,6 +394,7 @@ class GCodeGeneratorApp:
                 dst[key].auto_var.set(src[key].auto_var.get())
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
+        dst['tsp_2opt_var'].set(src['tsp_2opt_var'].get())
         dst['gating_mode_var'].set(src['gating_mode_var'].get())
 
     def _remove_step(self, step):
@@ -488,7 +505,9 @@ class GCodeGeneratorApp:
         gating_cb = ttk.Combobox(region_row, textvariable=gating_var,
                                  values=["Full depth map",
                                          "Residual from prior step",
-                                         "Inaccessible by prior tool"],
+                                         "Inaccessible by prior tool",
+                                         "Reachable residual",
+                                         "Reachable inaccessible"],
                                  state="readonly", width=22)
         gating_cb.pack(side=tk.RIGHT)
         step['gating_cb'] = gating_cb
@@ -844,6 +863,7 @@ class GCodeGeneratorApp:
             'stepover':             step['stepover'].get(),
             'raster_offset':        step['raster_offset'].get(),
             'stepdown':             step['stepdown'].get(),
+            'raster_final_stepdown': step['raster_final_stepdown'].get(),
             'raster_dir':           step['raster_dir_var'].get(),
             'vbit_angle':           step['vbit_angle'].get(),
             'vcarve_stepdown':      step['vcarve_stepdown'].get(),
@@ -867,6 +887,7 @@ class GCodeGeneratorApp:
         step['stepover'].set(d.get('stepover', DEFAULTS['step_stepover']))
         step['raster_offset'].set(d.get('raster_offset', DEFAULTS['step_raster_offset']))
         step['stepdown'].set(d.get('stepdown', DEFAULTS['step_stepdown']))
+        step['raster_final_stepdown'].set(d.get('raster_final_stepdown', DEFAULTS['step_raster_final_stepdown']))
         step['raster_dir_var'].set(d.get('raster_dir', DEFAULTS['step_raster_dir']))
         step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
         step['vcarve_stepdown'].set(d.get('vcarve_stepdown', DEFAULTS['step_vcarve_stepdown']))
@@ -885,8 +906,8 @@ class GCodeGeneratorApp:
     def _save_project(self):
         path = filedialog.asksaveasfilename(
             title="Save Project",
-            defaultextension=".bm2",
-            filetypes=[("BM2GCODE project", "*.bm2"), ("All files", "*.*")],
+            defaultextension=".prj",
+            filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
         )
         if not path:
             return
@@ -894,12 +915,14 @@ class GCodeGeneratorApp:
             'version': 1,
             'image_path': self.image_path,
             'global': {
-                'width_cm':     self.width_cm.get(),
-                'height_cm':    self.height_cm.get(),
-                'max_depth':    self.max_depth.get(),
-                'surface':      self.surface.get(),
-                'origin':       self.origin_var.get(),
-                'aspect_locked': self._aspect_lock_var.get(),
+                'width_cm':        self.width_cm.get(),
+                'height_cm':       self.height_cm.get(),
+                'max_depth':       self.max_depth.get(),
+                'margin_cm':       self.margin_cm.get(),
+                'margin_depth_pct': self.margin_depth_pct.get(),
+                'surface':         self.surface.get(),
+                'origin':          self.origin_var.get(),
+                'aspect_locked':   self._aspect_lock_var.get(),
             },
             'machine': {
                 'z_safe':     self._settings['z_safe'],
@@ -919,7 +942,7 @@ class GCodeGeneratorApp:
     def _load_project(self):
         path = filedialog.askopenfilename(
             title="Open Project",
-            filetypes=[("BM2GCODE project", "*.bm2"), ("All files", "*.*")],
+            filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
         )
         if not path:
             return
@@ -940,6 +963,8 @@ class GCodeGeneratorApp:
         self.width_cm.set(g.get('width_cm', DEFAULTS['width_cm']))
         self.height_cm.set(g.get('height_cm', DEFAULTS['height_cm']))
         self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
+        self.margin_cm.set(g.get('margin_cm', DEFAULTS['margin_cm']))
+        self.margin_depth_pct.set(g.get('margin_depth_pct', DEFAULTS['margin_depth_pct']))
         self.surface.set(g.get('surface', DEFAULTS['surface']))
         self.origin_var.set(g.get('origin', DEFAULTS['origin']))
 
@@ -1099,17 +1124,27 @@ class GCodeGeneratorApp:
         if algorithm.startswith("V-Carving"):
             gating_mode = params['gating_mode']
             if gating_mode == "Residual from prior step":
-                prior_reference = prev_tp.result    if prev_tp is not None else None
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = False
             elif gating_mode == "Inaccessible by prior tool":
-                prior_reference = prev_tp.accessible if prev_tp is not None else None
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = False
+            elif gating_mode == "Reachable residual":
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = True
+            elif gating_mode == "Reachable inaccessible":
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = True
             else:
-                prior_reference = None
+                prior_reference       = None
+                subtract_unaccessible = False
             return compute_vcarve_toolpath(
-                depth_map            = depth_map,
-                n_grey_levels        = n_grey_levels,
-                tool                 = params['tool'],
-                prior_reference      = prior_reference,
-                previous_result      = prev_tp.result if prev_tp is not None else None,
+                depth_map             = depth_map,
+                n_grey_levels         = n_grey_levels,
+                tool                  = params['tool'],
+                prior_reference       = prior_reference,
+                subtract_unaccessible = subtract_unaccessible,
+                previous_result       = prev_tp.result if prev_tp is not None else None,
                 max_depth            = params['max_depth'],
                 width_cm             = params['eff_width_cm'],
                 height_cm            = params['eff_height_cm'],
@@ -1148,26 +1183,36 @@ class GCodeGeneratorApp:
         else:  # Raster
             gating_mode = params['gating_mode']
             if gating_mode == "Residual from prior step":
-                prior_reference = prev_tp.result    if prev_tp is not None else None
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = False
             elif gating_mode == "Inaccessible by prior tool":
-                prior_reference = prev_tp.accessible if prev_tp is not None else None
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = False
+            elif gating_mode == "Reachable residual":
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = True
+            elif gating_mode == "Reachable inaccessible":
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = True
             else:
-                prior_reference = None
+                prior_reference       = None
+                subtract_unaccessible = False
             return compute_raster_toolpath(
-                depth_map         = depth_map,
-                n_grey_levels     = n_grey_levels,
-                tool              = params['tool'],
-                step_mm           = params['step_mm'],
-                stepdown_mm       = params['raster_stepdown_mm'],
-                final_stepdown_mm = params['raster_final_stepdown_mm'],
-                max_depth         = params['max_depth'],
-                width_cm          = params['eff_width_cm'],
-                height_cm         = params['eff_height_cm'],
-                raster_dir        = params['raster_dir'],
-                origin            = params['origin'],
-                work_surface_tol  = params['work_surface_tol'],
-                previous_result   = prev_tp.result if prev_tp is not None else None,
-                prior_reference   = prior_reference,
+                depth_map             = depth_map,
+                n_grey_levels         = n_grey_levels,
+                tool                  = params['tool'],
+                step_mm               = params['step_mm'],
+                stepdown_mm           = params['raster_stepdown_mm'],
+                final_stepdown_mm     = params['raster_final_stepdown_mm'],
+                max_depth             = params['max_depth'],
+                width_cm              = params['eff_width_cm'],
+                height_cm             = params['eff_height_cm'],
+                raster_dir            = params['raster_dir'],
+                origin                = params['origin'],
+                work_surface_tol      = params['work_surface_tol'],
+                previous_result       = prev_tp.result if prev_tp is not None else None,
+                prior_reference       = prior_reference,
+                subtract_unaccessible = subtract_unaccessible,
                 raster_offset_pct = params['raster_offset_pct'],
                 feed_rate         = params['feed_rate'],
                 use_2opt          = params['use_2opt'],
@@ -1195,7 +1240,8 @@ class GCodeGeneratorApp:
             gating_mode = params['gating_mode']
             if gating_mode != "Full depth map" and idx > 0 and prev_tp is None:
                 surf_name = ("accessible surface"
-                             if gating_mode == "Inaccessible by prior tool"
+                             if gating_mode in ("Inaccessible by prior tool",
+                                                "Reachable inaccessible")
                              else "result surface")
                 if not messagebox.askyesno(
                         "Previous step not computed",
@@ -1413,11 +1459,16 @@ class GCodeGeneratorApp:
         has_step       = 0 <= idx < len(self.steps)
         has_accessible = self._accessible_for_step(idx) is not None
         step_computed  = (0 <= idx < len(self.toolpaths) and self.toolpaths[idx] is not None)
+        has_prev_result = (idx > 0
+                           and idx - 1 < len(self.toolpaths)
+                           and self.toolpaths[idx - 1] is not None
+                           and self.toolpaths[idx - 1].result is not None)
         available_modes = [
             m for m in DISPLAY_MODES
             if not (m == DISPLAY_PROC_MASK  and not has_step)
             and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
+            and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
         ]
         for m in DISPLAY_MODES:
             state = "normal" if m in available_modes else "disabled"
@@ -1638,6 +1689,8 @@ class GCodeGeneratorApp:
             self.fig.patch.set_facecolor("#2b2b2b")
             self.ax.set_facecolor("#2b2b2b")
 
+        vmin, vmax = 0.0, 1.0
+
         if mode == DISPLAY_STEP_RES:
             tp = (self.toolpaths[step_idx]
                   if 0 <= step_idx < len(self.toolpaths) else None)
@@ -1695,6 +1748,28 @@ class GCodeGeneratorApp:
                     )
                     ref = (np.clip(depth_map - prior_result, 0.0, 1.0)
                            if prior_result is not None else depth_map.copy())
+                elif gating_mode == "Reachable residual":
+                    prior_result = (
+                        self.toolpaths[prior_idx].result
+                        if (0 <= prior_idx < len(self.toolpaths)
+                            and self.toolpaths[prior_idx] is not None
+                            and self.toolpaths[prior_idx].result is not None)
+                        else None
+                    )
+                    ref = (np.clip(accessible - prior_result, 0.0, 1.0)
+                           if (prior_result is not None and accessible is not None)
+                           else depth_map.copy())
+                elif gating_mode == "Reachable inaccessible":
+                    prior_acc = (
+                        self.toolpaths[prior_idx].accessible
+                        if (0 <= prior_idx < len(self.toolpaths)
+                            and self.toolpaths[prior_idx] is not None
+                            and self.toolpaths[prior_idx].accessible is not None)
+                        else None
+                    )
+                    ref = (np.clip(accessible - prior_acc, 0.0, 1.0)
+                           if (prior_acc is not None and accessible is not None)
+                           else depth_map.copy())
                 else:  # "Full depth map"
                     ref = depth_map.copy()
 
@@ -1718,8 +1793,26 @@ class GCodeGeneratorApp:
                 cmap = "Greens"
                 title = f"Processing Mask (Step {step_idx + 1})"
 
+        elif mode == DISPLAY_DIFF_RES_UNCUT:
+            prev_idx   = step_idx - 1
+            accessible = self._accessible_for_step(step_idx)
+            prev_tp    = (self.toolpaths[prev_idx]
+                          if 0 <= prev_idx < len(self.toolpaths) else None)
+            if (accessible is not None and prev_tp is not None
+                    and prev_tp.result is not None):
+                # (depth_map − prev_tp.result) − (depth_map − accessible) = accessible − prev_tp.result
+                # positive → current tool can access material the prior step left behind
+                # negative → current tool also cannot reach that region
+                img   = (accessible - prev_tp.result).astype(np.float32)
+                cmap  = _DIFF_CMAP
+                vmin, vmax = -1.0, 1.0
+                title = f"Prev Residual − Unaccessible (Step {step_idx + 1})"
+            else:
+                mode = DISPLAY_ORIGINAL
+
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-                        DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
+                        DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
+                        DISPLAY_DIFF_RES_UNCUT):
             img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
@@ -1731,7 +1824,7 @@ class GCodeGeneratorApp:
         self.ax.cla()
         self.ax.set_visible(True)
         self.ax.imshow(img, interpolation="none", aspect="equal",
-                       cmap=cmap, vmin=0, vmax=1)
+                       cmap=cmap, vmin=vmin, vmax=vmax)
         self._overlay_toolpath_2d(img, step_idx)
         self.ax.axis("off")
         if title:
@@ -1981,6 +2074,9 @@ class GCodeGeneratorApp:
         if mode == DISPLAY_PROC_MASK:
             val = float(img[row, col])
             z_str = f"Z: {'1' if val > 0.5 else '0'}"
+        elif mode == DISPLAY_DIFF_RES_UNCUT:
+            val = float(img[row, col])
+            z_str = f"ΔZ: {val * max_depth:+.2f} mm"
         else:
             if mode == DISPLAY_ORIGINAL:
                 depth_map, _ = self._get_depth_map()

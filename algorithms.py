@@ -420,6 +420,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             work_surface_tol=None,
                             previous_result=None,
                             prior_reference=None,
+                            subtract_unaccessible=False,
                             raster_offset_pct=0.0,
                             use_2opt=False,
                             final_stepdown_mm=0.0,
@@ -543,8 +544,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     if work_surface_tol > 0.0:
         from scipy.ndimage import binary_dilation
+        if subtract_unaccessible and prior_reference is not None:
+            _gate = np.clip(accessible_raster - prior_reference, 0.0, 1.0)
+        else:
+            _gate = residual
         prior_mask = binary_dilation(
-                         residual >= work_surface_tol,
+                         _gate >= work_surface_tol,
                          structure=footprint_raster,
                      ).astype(np.float32)
         progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
@@ -814,6 +819,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
                             skeleton_mode="medial_axis",
                             prior_reference=None, previous_result=None,
+                            subtract_unaccessible=False,
                             use_2opt=False,
                             progress=None):
     """Compute a V-carving toolpath.
@@ -855,7 +861,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     -------
     ToolPath
     """
-    from scipy.ndimage import grey_erosion, distance_transform_edt, label
+    from scipy.ndimage import grey_erosion, grey_dilation, distance_transform_edt, label
 
     _alg_name = ('V-Carving (Sub-pixel)'    if skeleton_mode == 'voronoi'
                  else 'V-Carving (Feature Width)' if skeleton_mode == 'inscribed'
@@ -876,10 +882,37 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    # ── Stage 1 · V-carving mask (0–10 %) ────────────────
-    progress(0, "Computing V-carving mask…")
+    # ── Stage 2a · Build tool kernel (0–10 %) ────────────────────
+    progress(0, "Building tool geometry kernel…")
+    if tool.profile == "Ball" and tool.diameter_mm <= 0.0:
+        raise ValueError("Ball profile requires a positive tool diameter.")
+    kernel_vcarve, footprint_vcarve = _build_kernel(tool, px_per_mm, max_depth)
+    ksize = kernel_vcarve.shape[0]
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
+
+    # ── Stage 2b · Achievable depth surface (10–35 %) ────────────
+    progress(10, "Computing achievable depth surface (morphological opening)…")
+    center_depth_contour_vcarve = grey_erosion(
+        depth_map.astype(np.float64),
+        footprint=footprint_vcarve,
+        structure=-kernel_vcarve.astype(np.float64),
+    ).astype(np.float32)
+    center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
+
+    accessible_vcarve = grey_dilation(
+        center_depth_contour_vcarve.astype(np.float64),
+        footprint=footprint_vcarve,
+        structure=-kernel_vcarve.astype(np.float64),
+    ).astype(np.float32)
+    accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
+    progress(35, "Achievable depth surface computed.")
+
+    # ── Stage 1 · V-carving mask (35–45 %) ────────────────
+    progress(35, "Computing V-carving mask…")
     if prior_reference is None:
         uncut_depth = depth_map.copy()
+    elif subtract_unaccessible:
+        uncut_depth = np.clip(accessible_vcarve - prior_reference, 0.0, 1.0)
     else:
         uncut_depth = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
@@ -896,33 +929,16 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             segments=[],
             result=(previous_result.copy() if previous_result is not None
                     else np.zeros_like(depth_map, dtype=np.float32)),
+            accessible=accessible_vcarve,
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': tool.vbit_angle_deg,
                       'threshold_um': threshold_um,
                       'max_depth': max_depth}
         )
 
-    progress(10, f"V-carving mask: {np.count_nonzero(mask_vcarve)} pixels.")
+    progress(45, f"V-carving mask: {np.count_nonzero(mask_vcarve)} pixels.")
 
-    # ── Stage 2a · Build tool kernel (10–20 %) ────────────────────
-    progress(10, "Building tool geometry kernel…")
-    if tool.profile == "Ball" and tool.diameter_mm <= 0.0:
-        raise ValueError("Ball profile requires a positive tool diameter.")
-    kernel_vcarve, footprint_vcarve = _build_kernel(tool, px_per_mm, max_depth)
-    ksize = kernel_vcarve.shape[0]
-    progress(20, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
-
-    # ── Stage 2b · Tool-centre depth limit (20–40 %) ─────────────
-    progress(20, "Computing tool-centre depth limit (morphological erosion)…")
-    center_depth_contour_vcarve = grey_erosion(
-        depth_map.astype(np.float64),
-        footprint=footprint_vcarve,
-        structure=-kernel_vcarve.astype(np.float64),
-    ).astype(np.float32)
-    center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
-    progress(40, "Tool-centre depth limit computed.")
-
-    # ── Stage 3 · Medial axis (40–60 %) ───────────────────────────
+    # ── Stage 3 · Medial axis (45–60 %) ───────────────────────────
     if skeleton_mode in ('voronoi', 'inscribed'):
         progress(45, "Computing Voronoi skeleton…")
         from scipy.spatial import Voronoi as _Voronoi
@@ -1298,7 +1314,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         result=np.maximum(
             previous_result if previous_result is not None else 0.0,
             vcarve_result).astype(np.float32),
-        accessible=None,
+        accessible=accessible_vcarve,
         metadata={
             'algorithm':       _alg_name,
             'skeleton_mode':   skeleton_mode,
