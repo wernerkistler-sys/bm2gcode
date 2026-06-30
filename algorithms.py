@@ -471,19 +471,34 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     from scipy.ndimage import grey_erosion, grey_dilation
 
 
-    H, W = depth_map.shape
-
     if work_surface_tol is None:
         work_surface_tol = 0.0
+
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
+    H, W = depth_map.shape
+    px_per_mm_x = W / (width_cm  * 10.0)
+    px_per_mm_y = H / (height_cm * 10.0)
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        if prior_reference is not None:
+            prior_reference = _zoom(prior_reference, (zy, zx), order=1).astype(np.float32)
+        if previous_result is not None:
+            previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
+
     residual = (np.clip(depth_map - prior_reference, 0.0, 1.0)
                 if prior_reference is not None else depth_map)
 
-    px_per_mm_x = W / (width_cm  * 10.0)
-    px_per_mm_y = H / (height_cm * 10.0)
-    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0   # isotropic approx
-
-    W_mm = (W - 1) / px_per_mm_x
-    H_mm = (H - 1) / px_per_mm_y
+    W_mm = (W - 1) / px_per_mm
+    H_mm = (H - 1) / px_per_mm
     _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
            "Top-Left":    0,       "Top-Right":    W_mm,
            "Center":      W_mm/2}.get(origin, 0)
@@ -594,8 +609,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 for px in range(s, e + 1):
                     row, col = (line_idx, px) if direction == "X" else (px, line_idx)
                     z_mm = float(center_depth_contour_raster[row, col]) * max_depth
-                    x_mm = col / px_per_mm_x - _ox
-                    y_mm = (H - 1 - row) / px_per_mm_y - _oy
+                    x_mm = col / px_per_mm - _ox
+                    y_mm = (H - 1 - row) / px_per_mm - _oy
                     points.append((x_mm, y_mm, -z_mm))
                 if points:
                     full_depth_segs.append(points)
@@ -686,16 +701,16 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 if nxt_dist < link_threshold_mm:
                     x_exit = float(tool_pos[0])
                     y_exit = float(tool_pos[1])
-                    c0_px = int(round((x_exit  + _ox) * px_per_mm_x))
-                    r0_px = int(round((H - 1) - (y_exit  + _oy) * px_per_mm_y))
-                    c1_px = int(round((x_entry + _ox) * px_per_mm_x))
-                    r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm_y))
+                    c0_px = int(round((x_exit  + _ox) * px_per_mm))
+                    r0_px = int(round((H - 1) - (y_exit  + _oy) * px_per_mm))
+                    c1_px = int(round((x_entry + _ox) * px_per_mm))
+                    r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm))
 
                     fn = 0.0 if is_final else final_norm
                     link_pixels = _geodesic_link(
                         r0_px, c0_px, r1_px, c1_px, ceil_norm,
                         center_depth_contour_raster, H, W,
-                        px_per_mm_x, px_per_mm_y, max_depth, fn)
+                        px_per_mm, px_per_mm, max_depth, fn)
                     # Anchor both ends to the exact adjacent segment tuples so
                     # that the adjacency check in to_gcode / _render_3d sees
                     # bitwise-identical values and suppresses false retracts.
@@ -706,8 +721,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             z_link = min(terrain, ceil_norm)
                         else:
                             z_link = min(max(terrain - final_norm, 0.0), ceil_norm)
-                        x_lmm = col_l / px_per_mm_x - _ox
-                        y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy
+                        x_lmm = col_l / px_per_mm - _ox
+                        y_lmm = (H - 1 - row_l) / px_per_mm - _oy
                         link_points.append((x_lmm, y_lmm, -z_link * max_depth))
                     link_points.append(nxt[0])
 
@@ -723,8 +738,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     # ── Stage 6 · Simplify, simulate result, create ToolPath (88–100 %) ─────
     progress(80, "Simplifying tool path…")
     rdp_tol = max(
-        1.0 / px_per_mm_x,
-        1.0 / px_per_mm_y,
+        1.0 / px_per_mm,
         max_depth / (n_grey_levels - 1),
     )
     simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
@@ -732,7 +746,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     progress(88, "Simulating tool-swept removal surface…")
     material_removed_raster = simulate_toolpath_result(
         ToolPath(segments=simplified),
-        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_raster, footprint_raster,
     )
     raster_result = np.minimum(
@@ -867,14 +881,28 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                  else 'V-Carving (Feature Width)' if skeleton_mode == 'inscribed'
                  else 'V-Carving (Depth Map)')
 
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
-
     px_per_mm_x = W / (width_cm  * 10.0)
     px_per_mm_y = H / (height_cm * 10.0)
-    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        if prior_reference is not None:
+            prior_reference = _zoom(prior_reference, (zy, zx), order=1).astype(np.float32)
+        if previous_result is not None:
+            previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
 
-    W_mm = (W - 1) / px_per_mm_x
-    H_mm = (H - 1) / px_per_mm_y
+    W_mm = (W - 1) / px_per_mm
+    H_mm = (H - 1) / px_per_mm
     _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
            "Top-Left":    0,       "Top-Right":    W_mm,
            "Center":      W_mm/2}.get(origin, 0)
@@ -1182,7 +1210,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(75, f"Path ordering: {n_branches} branch(es).")
 
     # Greedy nearest-endpoint TSP ordering of branches.
-    vcarve_link_mm  = 2.0 / min(px_per_mm_x, px_per_mm_y)
+    vcarve_link_mm  = 2.0 / px_per_mm
     ordered_branches = []
     tool_pos         = np.array([0.0, 0.0])
     remaining        = list(range(n_branches))
@@ -1195,10 +1223,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             path = branches[i]
             sr, sc = path[0]
             er, ec = path[-1]
-            x_s = sc / px_per_mm_x - _ox
-            y_s = (H - 1 - sr) / px_per_mm_y - _oy
-            x_e = ec / px_per_mm_x - _ox
-            y_e = (H - 1 - er) / px_per_mm_y - _oy
+            x_s = sc / px_per_mm - _ox
+            y_s = (H - 1 - sr) / px_per_mm - _oy
+            x_e = ec / px_per_mm - _ox
+            y_e = (H - 1 - er) / px_per_mm - _oy
             d_s = float(np.hypot(x_s - tool_pos[0], y_s - tool_pos[1]))
             d_e = float(np.hypot(x_e - tool_pos[0], y_e - tool_pos[1]))
             if d_s <= d_e:
@@ -1215,8 +1243,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         ordered_branches.append(path)
 
         er, ec = path[-1]
-        tool_pos[0] = ec / px_per_mm_x - _ox
-        tool_pos[1] = (H - 1 - er) / px_per_mm_y - _oy
+        tool_pos[0] = ec / px_per_mm - _ox
+        tool_pos[1] = (H - 1 - er) / px_per_mm - _oy
 
     progress(80, f"Ordered {len(ordered_branches)} branches.")
 
@@ -1239,8 +1267,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                         segs.append(sub)
                         sub = []
                     continue
-                x = c / px_per_mm_x - _ox
-                y = (H - 1 - r) / px_per_mm_y - _oy
+                x = c / px_per_mm - _ox
+                y = (H - 1 - r) / px_per_mm - _oy
                 sub.append((x, y, z))
             if sub:
                 if segs:
@@ -1295,8 +1323,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     # ── Stage 6 · Simplify, simulate result, Simplify and assemble ToolPath (90–100 %) ───────
     progress(90, "Simplifying tool path (RDP)…")
     rdp_tol = max(
-        1.0 / px_per_mm_x,
-        1.0 / px_per_mm_y,
+        1.0 / px_per_mm,
         max_depth / (n_grey_levels - 1),
     )
     simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
@@ -1304,7 +1331,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(93, "Simulating tool-swept removal surface…")
     vcarve_result = simulate_toolpath_result(
         ToolPath(segments=simplified),
-        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_vcarve, footprint_vcarve,
     )
 
@@ -1551,14 +1578,26 @@ def compute_contour_toolpath(
     from scipy.ndimage import grey_erosion, grey_dilation
     from skimage.measure import find_contours
 
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
-
     px_per_mm_x = W / (width_cm  * 10.0)
     px_per_mm_y = H / (height_cm * 10.0)
-    px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        if previous_result is not None:
+            previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
 
-    W_mm = (W - 1) / px_per_mm_x
-    H_mm = (H - 1) / px_per_mm_y
+    W_mm = (W - 1) / px_per_mm
+    H_mm = (H - 1) / px_per_mm
     _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
            "Top-Left":    0,       "Top-Right":    W_mm,
            "Center":      W_mm / 2}.get(origin, 0)
@@ -1620,8 +1659,7 @@ def compute_contour_toolpath(
                      f"({stepdown_mm:.2f} mm each).")
 
     # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
-    rdp_tol = max(1.0 / px_per_mm_x,
-                  1.0 / px_per_mm_y,
+    rdp_tol = max(1.0 / px_per_mm,
                   max_depth / (n_grey_levels - 1))
 
     # Half a grey-level step in normalised units.  Subtracting this from the
@@ -1690,8 +1728,8 @@ def compute_contour_toolpath(
                     orient = c[::-1] if flip else c
                     for j in rot_cands:
                         row0, col0 = orient[j]
-                        x0 = col0 / px_per_mm_x - _ox
-                        y0 = (H - 1 - row0) / px_per_mm_y - _oy
+                        x0 = col0 / px_per_mm - _ox
+                        y0 = (H - 1 - row0) / px_per_mm - _oy
                         d  = (x0 - level_cur[0])**2 + (y0 - level_cur[1])**2
                         if d < best_dist:
                             best_dist = d
@@ -1708,8 +1746,8 @@ def compute_contour_toolpath(
             if is_closed:
                 c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
 
-            points = [(col / px_per_mm_x - _ox,
-                       (H - 1 - row) / px_per_mm_y - _oy,
+            points = [(col / px_per_mm - _ox,
+                       (H - 1 - row) / px_per_mm - _oy,
                        z_mm)
                       for row, col in c_chosen]
             points = simplify_line(points, rdp_tol)
@@ -1801,20 +1839,20 @@ def compute_contour_toolpath(
                 ceil_norm = max(-seg[-1][2], -nxt[0][2]) / max_depth
                 x_exit,  y_exit  = float(seg[-1][0]),  float(seg[-1][1])
                 x_entry, y_entry = float(nxt[0][0]),   float(nxt[0][1])
-                c0_px = int(round((x_exit  + _ox) * px_per_mm_x))
-                r0_px = int(round((H - 1)  - (y_exit  + _oy) * px_per_mm_y))
-                c1_px = int(round((x_entry + _ox) * px_per_mm_x))
-                r1_px = int(round((H - 1)  - (y_entry + _oy) * px_per_mm_y))
+                c0_px = int(round((x_exit  + _ox) * px_per_mm))
+                r0_px = int(round((H - 1)  - (y_exit  + _oy) * px_per_mm))
+                c1_px = int(round((x_entry + _ox) * px_per_mm))
+                r1_px = int(round((H - 1)  - (y_entry + _oy) * px_per_mm))
                 link_pixels = _geodesic_link(
                     r0_px, c0_px, r1_px, c1_px, ceil_norm,
                     center_depth_contour, H, W,
-                    px_per_mm_x, px_per_mm_y, max_depth)
+                    px_per_mm, px_per_mm, max_depth)
                 link_points = [seg[-1]]
                 for row_l, col_l in link_pixels[1:-1]:
                     z_link = min(float(center_depth_contour[row_l, col_l]),
                                  ceil_norm)
-                    x_lmm = col_l / px_per_mm_x - _ox
-                    y_lmm = (H - 1 - row_l) / px_per_mm_y - _oy
+                    x_lmm = col_l / px_per_mm - _ox
+                    y_lmm = (H - 1 - row_l) / px_per_mm - _oy
                     link_points.append((x_lmm, y_lmm, -z_link * max_depth))
                 link_points.append(nxt[0])
                 if len(link_points) >= 2:
@@ -1828,7 +1866,7 @@ def compute_contour_toolpath(
     progress(80, "Simulating tool-swept removal surface…")
     material_removed = simulate_toolpath_result(
         ToolPath(segments=all_segments),
-        (H, W), px_per_mm_x, px_per_mm_y, _ox, _oy,
+        (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_contour, footprint_contour,
     )
     result = np.maximum(
