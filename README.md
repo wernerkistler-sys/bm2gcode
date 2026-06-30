@@ -114,7 +114,7 @@ The **Process Region** selector is the adaptive gating mechanism. It defines whi
 | Reachable residual | Intersection of "this tool can reach here" AND "the prior step left residual here." |
 | Reachable inaccessible | Intersection of "this tool can reach here" AND "the prior tool could not reach here." |
 
-Use the **Processing Mask** view (hotkey 7) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
+Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
 
 **Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth) exceeds this value, skipping areas that deviate from the reference by less than this amount.
 
@@ -187,11 +187,12 @@ All visualization modes show data for the currently active step. Cut moves and r
 |---|---|---|
 | Original | 1 | The source image, with stock margin if configured. |
 | Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
-| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. |
-| Step Residual | 4 | Material that this step failed to remove: pixels where the target depth was not reached. |
-| Step Unaccessible | 5 | Material that the current tool profile cannot remove, regardless of strategy. |
-| Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Useful for identifying residuals from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". |
-| Processing Mask | 7 | Binary mask of which regions will be cut in this step, based on the Process Region setting. |
+| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. Requires toolpath to be computed.|
+| Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
+| Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Prev Unaccessible − Unaccessible | 7 | Difference between the prior step's inaccessible material and the current tool's inaccessible material. Positive (warm) values indicate regions the current tool can reach that the prior tool could not; negative (cool) values indicate the current tool is more restricted than its predecessor; cf. the "Reachable inaccessible" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Processing Mask | 8 | Binary mask of which regions will be cut in this step, based on the Process Region setting. Live update when Z-threshold is changed.|
 
 **Canvas navigation:**
 - All modes: scroll to zoom, middle-click drag to pan, double-click to reset.

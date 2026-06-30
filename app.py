@@ -27,7 +27,7 @@ from constants import (
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
-    DISPLAY_DIFF_RES_UNCUT,
+    DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
@@ -122,8 +122,9 @@ class GCodeGeneratorApp:
             (DISPLAY_STEP_RESULT,       "3"),
             (DISPLAY_STEP_RES,          "4"),
             (DISPLAY_STEP_UNACCESSIBLE, "5"),
-            (DISPLAY_DIFF_RES_UNCUT,    "6"),
-            (DISPLAY_PROC_MASK,         "7"),
+            (DISPLAY_DIFF_RES_UNCUT,     "6"),
+            (DISPLAY_DIFF_UNCUT_UNCUT,  "7"),
+            (DISPLAY_PROC_MASK,         "8"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -1469,6 +1470,13 @@ class GCodeGeneratorApp:
             and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
+            and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
+                has_accessible
+                and idx > 0
+                and idx - 1 < len(self.toolpaths)
+                and self.toolpaths[idx - 1] is not None
+                and self.toolpaths[idx - 1].accessible is not None
+            ))
         ]
         for m in DISPLAY_MODES:
             state = "normal" if m in available_modes else "disabled"
@@ -1810,9 +1818,26 @@ class GCodeGeneratorApp:
             else:
                 mode = DISPLAY_ORIGINAL
 
+        elif mode == DISPLAY_DIFF_UNCUT_UNCUT:
+            prev_idx   = step_idx - 1
+            accessible = self._accessible_for_step(step_idx)
+            prev_tp    = (self.toolpaths[prev_idx]
+                          if 0 <= prev_idx < len(self.toolpaths) else None)
+            if (accessible is not None and prev_tp is not None
+                    and prev_tp.accessible is not None):
+                # accessible − prev_tp.accessible:
+                # positive → current tool can access material the prior tool couldn't
+                # negative → current tool is more restricted than the prior tool
+                img   = (accessible - prev_tp.accessible).astype(np.float32)
+                cmap  = _DIFF_CMAP
+                vmin, vmax = -1.0, 1.0
+                title = f"Prev Unaccessible − Unaccessible (Step {step_idx + 1})"
+            else:
+                mode = DISPLAY_ORIGINAL
+
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
-                        DISPLAY_DIFF_RES_UNCUT):
+                        DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
             img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
@@ -2074,7 +2099,7 @@ class GCodeGeneratorApp:
         if mode == DISPLAY_PROC_MASK:
             val = float(img[row, col])
             z_str = f"Z: {'1' if val > 0.5 else '0'}"
-        elif mode == DISPLAY_DIFF_RES_UNCUT:
+        elif mode in (DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
             val = float(img[row, col])
             z_str = f"ΔZ: {val * max_depth:+.2f} mm"
         else:
