@@ -37,33 +37,6 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
 from tool import Tool
 
 
-def _snap_step_mm(step_mm, span_px, px_per_mm, max_tweak=0.10):
-    """Adjust step_mm to minimise leftover pixels at the far image boundary.
-
-    Searches candidate line counts near round(span_px / step_px) and picks
-    the one leaving the fewest uncovered pixels, subject to:
-      • no overshoot  — floor division guarantees n * step_px <= span_px
-      • adjustment within max_tweak of the original step_mm
-
-    Returns step_mm unchanged when no better candidate is found within the
-    tolerance.
-    """
-    step_px_orig = max(1, int(round(step_mm * px_per_mm)))
-    n0 = max(1, round(span_px / step_px_orig))
-    best_mm   = step_mm
-    best_miss = span_px + 1
-    for n in range(max(1, n0 - 1), n0 + 3):
-        step_px = span_px // n          # floor: n * step_px <= span_px always
-        if step_px < 1:
-            continue
-        snapped = step_px / px_per_mm
-        if abs(snapped - step_mm) / step_mm > max_tweak:
-            continue
-        miss = span_px - n * step_px
-        if miss < best_miss:
-            best_mm, best_miss = snapped, miss
-    return best_mm
-
 
 class GCodeGeneratorApp:
 
@@ -1231,11 +1204,6 @@ class GCodeGeneratorApp:
                             H / (params['eff_height_cm'] * 10.0))
             rdir      = params['raster_dir']
             step_mm   = params['step_mm']
-            if rdir == "Horizontal":
-                step_mm = _snap_step_mm(step_mm, H - 1, px_per_mm)
-            elif rdir == "Vertical":
-                step_mm = _snap_step_mm(step_mm, W - 1, px_per_mm)
-            # "Both": two spans, one step_mm — no unique snap; leave unchanged.
             return compute_raster_toolpath(
                 depth_map             = depth_map,
                 n_grey_levels         = n_grey_levels,

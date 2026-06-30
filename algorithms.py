@@ -537,8 +537,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     pass_plan       = _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)
     n_passes        = len(pass_plan)
     final_norm      = final_stepdown_mm / max_depth
-    step_px         = max(1, int(round(step_mm * px_per_mm)))
-    raster_start_px = int(round(raster_offset_pct / 100.0 * step_px)) % step_px
+    step_px = max(1, int(round(step_mm * px_per_mm)))   # for progress display only
 
     resid_tol_mm = max_depth / (n_grey_levels - 1)
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
@@ -584,9 +583,18 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     full_depth_segs = []
     for direction in directions:
         if direction == "X":
-            all_line_ids = np.arange(raster_start_px, H, step_px)
+            boundary_px = H - 1
         else:
-            all_line_ids = np.arange(raster_start_px, W, step_px)
+            boundary_px = W - 1
+        span_mm     = boundary_px / px_per_mm
+        n           = max(1, round(span_mm / step_mm))
+        adj_step_mm = span_mm / n
+        raster_start_mm = (raster_offset_pct / 100.0) * adj_step_mm
+        line_positions_mm = [raster_start_mm + i * adj_step_mm
+                             for i in range(n + 1)
+                             if raster_start_mm + i * adj_step_mm <= span_mm + 1e-9]
+        all_line_ids = [min(int(round(m * px_per_mm)), boundary_px)
+                        for m in line_positions_mm]
 
         for line_idx in all_line_ids:
             if direction == "X":
