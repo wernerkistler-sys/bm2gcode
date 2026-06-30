@@ -1,10 +1,10 @@
 # bm2gcode
 
-bm2gcode converts a grayscale bitmap image into CNC G-code for relief carving. Each pixel's brightness maps to a cut depth: by default, white pixels are left at the surface and black pixels are carved to the maximum depth. The mapping can be inverted via the **Z=0 colour** setting.
+bm2gcode converts a depth map, represented by a grayscale bitmap image, into CNC G-code for relief carving. 
 
-The central idea is a **multi-step workflow**. You define as many cutting steps as needed, each with its own algorithm and tool. Each step can be configured to process only what prior steps left behind — residual material the previous tool could not reach deep enough, or regions the previous tool geometry could not access at all. This makes it straightforward to combine strategies: for example, a large ball-nose mill for a fast rough pass, followed by a V-bit that targets only the fine detail the ball-nose could not reach, without any manual mask editing.
+The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces and then a V-bit to cut fine details that the ball bit could not reach.
 
-Supported algorithms: **Raster Scan**, **Contour** (waterline), and **V-Carving** (three variants). Supported tool profiles: **Ball**, **End Mill**, **V-Bit**.
+A set of visualization modes supports strategy planning. In addition to the 3D toolpath preview, available views include the simulated surface after each step, the material not removed by a step, regions inaccessible to the tool geometry, and a binary processing mask showing which areas the current gating configuration will cut. These views, together with the estimated machining time for each step, allow users to optimize the cutting strategy for a particular depth map.
 
 ![bm2gcode screenshot](docs/screenshot.png)
 
@@ -29,7 +29,7 @@ python bm2gcode.py
 2. Set **Physical Image Size** — enter the real-world dimensions and maximum cut depth.
 3. Configure one or more **steps** — choose algorithm, tool, and region targeting for each.
 4. **Compute → Compute All Steps** (F6) — generate toolpaths.
-5. Use the **View** menu (hotkeys 1–7) to inspect the 3D path, residual depth, processing mask, etc.
+5. Use the **View** menu (hotkeys 1–7) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 6. **File → Export Toolpath** — save a `.nc` G-code file for your CNC machine.
 
 Save your work at any time with **File → Save Project** (Ctrl+S); reload it later with **File → Open Project** (Ctrl+Shift+O). Project files store all parameters and the path to the source image.
@@ -65,19 +65,19 @@ Each cutting step appears as a numbered tab. Use the **Add Step After** and **Re
 
 ##### Step / Operation / Raster Scan
 
-Sweeps the cutter in parallel lines across the material. Suitable for roughing passes and general relief carving.
+Sweeps the cutter in parallel lines across the material. 
 
 | Parameter | Description |
 |---|---|
 | Step-over | Lateral spacing between scan lines, as a percentage of tool diameter. |
 | Line offset | Shifts alternate scan lines by this percentage, so that the in-between lines can be cut in a separate step with a different setting. |
-| Scan direction | Horizontal, Vertical, or Both (bidirectional). |
+| Scan direction | Horizontal, Vertical, or Both. |
 
 ---
 
 ##### Step / Operation / Contour
 
-Traces the depth map as a stack of iso-depth contours, like topographic lines on a map. Well suited to smooth relief surfaces and profiles where surface finish matters.
+Traces the depth map as a stack of iso-depth contours, like topographic lines on a map. 
 
 | Parameter | Description |
 |---|---|
@@ -135,14 +135,14 @@ Use the **Processing Mask** view (hotkey 7) and the **Prev Residual − Unaccess
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
 | Feed rate | Cutting feed rate in mm/min. |
 
-**Step-down controls (Raster Scan):**
+**Step-down controls (Raster Scan and V-Carving):**
 
 | Parameter | Description |
 |---|---|
 | Max step-down | Maximum depth per roughing pass (mm). If the required depth exceeds this, multiple passes are generated automatically. |
 | Final step-down | Depth of a separate finishing pass (mm). 0 means no finishing pass; the last roughing pass goes directly to full depth. |
 
-**Step-down controls (V-Carving):** same semantics as the Raster Scan controls, applied to V-carving passes.
+
 
 ---
 
@@ -190,7 +190,7 @@ All visualization modes show data for the currently active step. Cut moves and r
 | Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. |
 | Step Residual | 4 | Material that this step failed to remove: pixels where the target depth was not reached. |
 | Step Unaccessible | 5 | Material that the current tool profile cannot remove, regardless of strategy. |
-| Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Useful for verifying "Reachable residual" and "Reachable inaccessible" gating before computing. |
+| Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Useful for identifying residuals from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". |
 | Processing Mask | 7 | Binary mask of which regions will be cut in this step, based on the Process Region setting. |
 
 **Canvas navigation:**
