@@ -360,47 +360,53 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
       is_final_pass — True for the dedicated finishing pass
       pass_segments — list of [(x, y, z_mm)…] segments with z clipped to ceiling
 
-    Tracks achieved depth per point; omits already-cut points and breaks segments
-    there (equivalent to V-carving's None-return / raster's remaining-depth check).
+    A point's depth after roughing to ceiling ceil_mm is
+    max(min(z_full + final_stepdown_mm, 0.0), -ceil_mm), i.e. the full depth
+    (minus the reserve left for the finishing pass) clipped to what this pass
+    is allowed to remove. A roughing point is kept only if that pass's target
+    is deeper than the previous roughing pass's target — otherwise the tool
+    would repeat a move at a depth it has already cut, so a raster/contour
+    line is only split once some points have nothing left to cut while others
+    still do.
+
+    If final_stepdown_mm > 0, roughing skips points whose full depth is
+    within the reserve (nothing to rough there), and the dedicated finishing
+    pass covers every point of the line, including those skipped points, at
+    its true full depth. If final_stepdown_mm == 0, there is no finishing
+    pass, so the first roughing pass covers every point of the line instead,
+    including points whose full depth is 0 (no cut needed).
     """
     if stepdown_mm <= 0.0 and final_stepdown_mm <= 0.0:
         return [(max_depth_mm, True, list(segments))]
 
     pass_ceilings = _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm)
     EPS = 1e-6
-    # Sentinel +1.0 — "above the workpiece surface, pixel not yet visited."
-    # Roughing passes gate on z_target < 0.0 (must actively cut), so the
-    # sentinel is never triggered there.  The final/last pass uses only the
-    # achieved check (no gate), so background pixels (z_target=0 < 1.0−ε)
-    # are included exactly once.  When final_stepdown_mm > 0 every pixel in
-    # the final pass satisfies z_full < z_rough − ε (gap = final_stepdown_mm),
-    # so the full-depth path is traversed without exceptions.  When
-    # final_stepdown_mm = 0 pixels already cut to z_full are not re-traversed
-    # (z_full = z_rough = achieved → skip), avoiding redundant same-depth moves.
-    achieved = [[1.0] * len(seg) for seg in segments]
+    n_passes = len(pass_ceilings)
+    has_dedicated_final = final_stepdown_mm > 0.0
+
+    def rough_target(z_full, ceil_mm):
+        return max(min(z_full + final_stepdown_mm, 0.0), -ceil_mm)
 
     result = []
     for pi, ceil_mm in enumerate(pass_ceilings):
-        is_final = (pi == len(pass_ceilings) - 1)
+        is_final = (pi == n_passes - 1)
+        is_dedicated_final = is_final and has_dedicated_final
         pass_segs = []
-        for si, seg in enumerate(segments):
+        for seg in segments:
             sub = []
-            for j, (x, y, z_full) in enumerate(seg):
-                if is_final:
+            for x, y, z_full in seg:
+                if is_dedicated_final:
                     z_target = z_full
-                    # Final pass: include all pixels not already at this depth.
-                    # Background (z_full=0, achieved=1.0) → 0 < 1.0−ε → included.
-                    include = z_target < achieved[si][j] - EPS
+                    keep = True
                 else:
-                    z_rough  = min(z_full + final_stepdown_mm, 0.0)
-                    z_target = max(z_rough, -ceil_mm)
-                    # Roughing must actively cut below the surface.  The z_target<0
-                    # gate ensures shallow/background pixels (z_rough=0) are skipped,
-                    # splitting segments so those regions are handled in the final pass.
-                    include  = (z_target < 0.0) and (z_target < achieved[si][j] - EPS)
+                    z_target = rough_target(z_full, ceil_mm)
+                    if pi == 0:
+                        keep = True if not has_dedicated_final else (z_target < -EPS)
+                    else:
+                        prev_target = rough_target(z_full, pass_ceilings[pi - 1])
+                        keep = z_target < prev_target - EPS
 
-                if include:
-                    achieved[si][j] = z_target
+                if keep:
                     sub.append((x, y, z_target))
                 else:
                     if sub:
