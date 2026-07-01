@@ -1283,8 +1283,9 @@ class GCodeGeneratorApp:
                     f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
                     f"Est. time: {_fmt_time(stats['est_minutes'])}"
                     f" @ {feed_rate:.0f} mm/min")
-                self.display_mode_var.set(DISPLAY_STEP_3D)
                 self.display_step_var.set(idx + 1)
+                if not self.show_cut_moves_var.get():
+                    self.show_cut_moves_var.set(True)
                 self._on_display_mode_changed()
 
             self.root.after(0, _done)
@@ -1354,8 +1355,9 @@ class GCodeGeneratorApp:
 
             def _all_done():
                 dlg.close("All steps completed.")
-                self.display_mode_var.set(DISPLAY_STEP_3D)
                 self.display_step_var.set(len(self.steps))
+                if not self.show_cut_moves_var.get():
+                    self.show_cut_moves_var.set(True)
                 self._on_display_mode_changed()
 
             self.root.after(0, _all_done)
