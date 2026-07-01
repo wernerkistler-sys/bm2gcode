@@ -583,19 +583,12 @@ class GCodeGeneratorApp:
         # ── Wire up algorithm / profile toggle ────────────────────────
         _VCARVE_PROFILES  = ["V-Bit", "Ball"]
         _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
-        _prev_alg = [algorithm_var.get()]
 
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
-            alg_changed = (alg != _prev_alg[0])
-            _prev_alg[0] = alg
 
             if alg.startswith("V-Carving"):
-                if alg_changed:
-                    step['gating_mode_var'].set(
-                        "Full depth map" if self.steps[0] is step
-                        else "Inaccessible by prior tool")
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
@@ -631,10 +624,6 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
-                if alg_changed:
-                    step['gating_mode_var'].set(
-                        "Full depth map" if self.steps[0] is step
-                        else "Residual from prior step")
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
