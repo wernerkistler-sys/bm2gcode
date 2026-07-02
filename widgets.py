@@ -172,17 +172,24 @@ class ProgressDialog(tk.Toplevel):
 class LabeledEntry(ttk.Frame):
     """Single-row widget: label on the left, unit tag + entry on the right.
 
+    The entry is a ttk.Spinbox, so the value can be nudged with the up/down
+    arrows or the mouse wheel (while hovering over it) in addition to typing.
+    ``minval``/``maxval`` bound the value and ``increment`` sets the step size
+    for both the arrows and the wheel.
+
     If auto_label is given, a checkbutton with that text is inserted between
     the unit tag and the label.  When checked, the entry is disabled;
     unchecking re-enables it.  The BooleanVar is exposed as ``auto_var``.
     Layout: [label ← spacer → [☐ auto_label] [unit] [entry]]
     """
 
-    def __init__(self, parent, label, unit, default, width=8, auto_label=None, **kw):
+    def __init__(self, parent, label, unit, default, width=8, auto_label=None,
+                 minval=0.0, maxval=100000.0, increment=1.0, **kw):
         super().__init__(parent, **kw)
         ttk.Label(self, text=label).pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
-        self.entry = ttk.Entry(self, textvariable=self.var, width=width)
+        self.entry = ttk.Spinbox(self, textvariable=self.var, width=width,
+                                 from_=minval, to=maxval, increment=increment)
         self.entry.pack(side=tk.RIGHT)
         ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
         self.auto_var = None
@@ -191,6 +198,25 @@ class LabeledEntry(ttk.Frame):
             self.auto_var.trace_add("write", self._on_auto_toggle)
             ttk.Checkbutton(self, text=auto_label,
                             variable=self.auto_var).pack(side=tk.RIGHT, padx=(0, 4))
+
+        # The ttk.Spinbox class bindings already handle the mouse wheel, but
+        # they don't stop the event, so it would also bubble up to whatever
+        # scrollable container the spinbox lives in (e.g. a scrolling
+        # sidebar), scrolling the view underneath the pointer at the same
+        # time as nudging the value. Re-dispatch as the same <<Increment>>/
+        # <<Decrement>> virtual events the arrows use, then swallow it.
+        self.entry.bind("<MouseWheel>", self._on_mousewheel)
+        self.entry.bind("<Button-4>", self._on_mousewheel)
+        self.entry.bind("<Button-5>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        if "disabled" in self.entry.state():
+            return None
+        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            self.entry.event_generate("<<Decrement>>")
+        else:
+            self.entry.event_generate("<<Increment>>")
+        return "break"
 
     def _on_auto_toggle(self, *_):
         if self.auto_var and self.auto_var.get():
@@ -248,15 +274,18 @@ class SettingsDialog(tk.Toplevel):
         mf.pack(fill=tk.X, pady=(0, 8))
 
         self._z_safe = LabeledEntry(mf, "Safe height (z_safe)", "mm",
-                                    str(settings.get('z_safe', 5.0)))
+                                    str(settings.get('z_safe', 5.0)),
+                                    minval=0.0, maxval=200.0, increment=0.5)
         self._z_safe.pack(fill=tk.X, pady=2)
 
         self._feed_rapid = LabeledEntry(mf, "Rapid feed (time estimate only)", "mm/min",
-                                        str(settings.get('feed_rapid', 3000.0)))
+                                        str(settings.get('feed_rapid', 3000.0)),
+                                        minval=1.0, maxval=30000.0, increment=100.0)
         self._feed_rapid.pack(fill=tk.X, pady=2)
 
         self._accel = LabeledEntry(mf, "Max acceleration (time estimate only)", "mm/s²",
-                                   str(settings.get('accel_mm_s2', 300.0)))
+                                   str(settings.get('accel_mm_s2', 300.0)),
+                                   minval=1.0, maxval=10000.0, increment=10.0)
         self._accel.pack(fill=tk.X, pady=2)
 
         # ── G-code preamble ───────────────────────────────────────────

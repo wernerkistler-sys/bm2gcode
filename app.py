@@ -251,8 +251,10 @@ class GCodeGeneratorApp:
         # ── 1. Physical Image Size ─────────────────────────────────────
         sf = SectionFrame(p, "Physical Image Size")
         sf.pack(fill=tk.X, pady=(0, 8))
-        self.width_cm    = LabeledEntry(sf, "Width",         "cm", DEFAULTS["width_cm"])
-        self.height_cm   = LabeledEntry(sf, "Height",        "cm", DEFAULTS["height_cm"])
+        self.width_cm    = LabeledEntry(sf, "Width",         "cm", DEFAULTS["width_cm"],
+                                        minval=0.1, maxval=2000.0, increment=0.1)
+        self.height_cm   = LabeledEntry(sf, "Height",        "cm", DEFAULTS["height_cm"],
+                                        minval=0.1, maxval=2000.0, increment=0.1)
         self.width_cm.pack(fill=tk.X, pady=2)
         self.height_cm.pack(fill=tk.X, pady=2)
 
@@ -263,11 +265,14 @@ class GCodeGeneratorApp:
                         command=self._on_aspect_lock_toggle
                         ).pack(side=tk.RIGHT, padx=(0, 4))
 
-        self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"])
+        self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"],
+                                      minval=0.01, maxval=200.0, increment=0.1)
         self.max_depth.pack(fill=tk.X, pady=2)
-        self.margin_cm = LabeledEntry(sf, "Stock margin", "cm", DEFAULTS["margin_cm"])
+        self.margin_cm = LabeledEntry(sf, "Stock margin", "cm", DEFAULTS["margin_cm"],
+                                      minval=0.0, maxval=500.0, increment=0.1)
         self.margin_cm.pack(fill=tk.X, pady=2)
-        self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"])
+        self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"],
+                                             minval=0.0, maxval=100.0, increment=1.0)
         self.margin_depth_pct.pack(fill=tk.X, pady=2)
         self.width_cm.var.trace_add("write", self._on_width_changed)
         self.height_cm.var.trace_add("write", lambda *_: self._render())
@@ -447,11 +452,13 @@ class GCodeGeneratorApp:
         raster_frame.pack(fill=tk.X, after=alg_row)   # initially shown
         step['raster_frame'] = raster_frame
 
-        stepover = LabeledEntry(raster_frame, "Step-over", "%", DEFAULTS["step_stepover"])
+        stepover = LabeledEntry(raster_frame, "Step-over", "%", DEFAULTS["step_stepover"],
+                                minval=1.0, maxval=100.0, increment=1.0)
         stepover.pack(fill=tk.X, pady=2)
         step['stepover'] = stepover
 
-        raster_offset = LabeledEntry(raster_frame, "Line offset", "%", DEFAULTS["step_raster_offset"])
+        raster_offset = LabeledEntry(raster_frame, "Line offset", "%", DEFAULTS["step_raster_offset"],
+                                     minval=0.0, maxval=99.0, increment=1.0)
         raster_offset.pack(fill=tk.X, pady=2)
         step['raster_offset'] = raster_offset
 
@@ -470,7 +477,8 @@ class GCodeGeneratorApp:
         # (not packed initially — shown on demand by _refresh_layout)
 
         contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
-                                        DEFAULTS["step_contour_stepdown"])
+                                        DEFAULTS["step_contour_stepdown"],
+                                        minval=0.01, maxval=50.0, increment=0.05)
         contour_stepdown.pack(fill=tk.X, pady=2)
         step['contour_stepdown'] = contour_stepdown
 
@@ -481,7 +489,8 @@ class GCodeGeneratorApp:
         step['contour_adaptive_var'] = contour_adaptive_var
 
         contour_lateral_tol = LabeledEntry(contour_frame, "Lateral tolerance", "mm",
-                                           DEFAULTS["step_contour_lateral_tol"])
+                                           DEFAULTS["step_contour_lateral_tol"],
+                                           minval=0.0, maxval=50.0, increment=0.05)
         contour_lateral_tol.pack(fill=tk.X, pady=2)
         step['contour_lateral_tol'] = contour_lateral_tol
 
@@ -515,14 +524,16 @@ class GCodeGeneratorApp:
         gating_cb.pack(side=tk.RIGHT)
         step['gating_cb'] = gating_cb
 
-        threshold = LabeledEntry(gating_frame, "Z-threshold", "mm", DEFAULTS["step_threshold"])
+        threshold = LabeledEntry(gating_frame, "Z-threshold", "mm", DEFAULTS["step_threshold"],
+                                 minval=0.0, maxval=200.0, increment=0.1)
         threshold.pack(fill=tk.X, pady=2)
         step['threshold'] = threshold
 
-        min_fw = LabeledEntry(gating_frame, "Min feature width", "mm", DEFAULTS["step_min_fw"])
+        min_fw = LabeledEntry(gating_frame, "Min feature width", "mm", DEFAULTS["step_min_fw"],
+                              minval=0.0, maxval=200.0, increment=0.1)
         step['min_fw'] = min_fw
         max_fw = LabeledEntry(gating_frame, "Max feature width", "mm", DEFAULTS["step_max_fw"],
-                              auto_label="Auto")
+                              auto_label="Auto", minval=0.0, maxval=200.0, increment=0.1)
         step['max_fw'] = max_fw
         # min_fw/max_fw packed/unpacked by _refresh_layout below
 
@@ -541,17 +552,20 @@ class GCodeGeneratorApp:
         profile_cb.pack(side=tk.RIGHT)
         step['profile_cb'] = profile_cb
 
-        diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"])
+        diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"],
+                            minval=0.01, maxval=200.0, increment=0.1)
         diam.pack(fill=tk.X, pady=2)
         step['diameter'] = diam
 
         # ── Raster step-down controls (shown for Raster Scan only) ───────
-        stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"])
+        stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"],
+                                minval=0.01, maxval=50.0, increment=0.1)
         stepdown.pack(fill=tk.X, pady=2)   # initially shown (default = Raster Scan)
         step['stepdown'] = stepdown
 
         raster_final_stepdown = LabeledEntry(tool_lf, "Final step-down", "mm",
-                                             DEFAULTS["step_raster_final_stepdown"])
+                                             DEFAULTS["step_raster_final_stepdown"],
+                                             minval=0.0, maxval=50.0, increment=0.1)
         raster_final_stepdown.pack(fill=tk.X, pady=2)
         step['raster_final_stepdown'] = raster_final_stepdown
 
@@ -560,7 +574,8 @@ class GCodeGeneratorApp:
         step['vbit_frame'] = vbit_frame
         # (not packed initially — shown on demand)
 
-        vbit_angle = LabeledEntry(vbit_frame, "V-bit angle", "°", DEFAULTS["step_vbit_angle"])
+        vbit_angle = LabeledEntry(vbit_frame, "V-bit angle", "°", DEFAULTS["step_vbit_angle"],
+                                  minval=1.0, maxval=179.0, increment=1.0)
         vbit_angle.pack(fill=tk.X, pady=2)
         step['vbit_angle'] = vbit_angle
 
@@ -569,15 +584,18 @@ class GCodeGeneratorApp:
         step['vcarve_frame'] = vcarve_frame
         # (not packed initially — shown on demand by _refresh_layout)
 
-        vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"])
+        vcarve_stepdown = LabeledEntry(vcarve_frame, "Max step-down", "mm", DEFAULTS["step_vcarve_stepdown"],
+                                       minval=0.0, maxval=50.0, increment=0.1)
         vcarve_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_stepdown'] = vcarve_stepdown
 
-        vcarve_final_stepdown = LabeledEntry(vcarve_frame, "Final step-down", "mm", DEFAULTS["step_vcarve_final_stepdown"])
+        vcarve_final_stepdown = LabeledEntry(vcarve_frame, "Final step-down", "mm", DEFAULTS["step_vcarve_final_stepdown"],
+                                             minval=0.0, maxval=50.0, increment=0.1)
         vcarve_final_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_final_stepdown'] = vcarve_final_stepdown
 
-        feed = LabeledEntry(tool_lf, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"])
+        feed = LabeledEntry(tool_lf, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"],
+                            minval=1.0, maxval=30000.0, increment=50.0)
         feed.pack(fill=tk.X, pady=2)
         step['feed_rate'] = feed
 
