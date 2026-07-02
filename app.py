@@ -47,10 +47,11 @@ class GCodeGeneratorApp:
         self.root.minsize(900, 560)
 
         self._settings = {
-            'z_safe':     float(DEFAULTS['z_safe']),
-            'feed_rapid': float(DEFAULTS['feed_rapid']),
-            'preamble':   DEFAULTS['preamble'],
-            'postamble':  DEFAULTS['postamble'],
+            'z_safe':      float(DEFAULTS['z_safe']),
+            'feed_rapid':  float(DEFAULTS['feed_rapid']),
+            'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
+            'preamble':    DEFAULTS['preamble'],
+            'postamble':   DEFAULTS['postamble'],
         }
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
@@ -924,10 +925,11 @@ class GCodeGeneratorApp:
                 'aspect_locked':   self._aspect_lock_var.get(),
             },
             'machine': {
-                'z_safe':     self._settings['z_safe'],
-                'feed_rapid': self._settings['feed_rapid'],
-                'preamble':   self._settings['preamble'],
-                'postamble':  self._settings['postamble'],
+                'z_safe':      self._settings['z_safe'],
+                'feed_rapid':  self._settings['feed_rapid'],
+                'accel_mm_s2': self._settings['accel_mm_s2'],
+                'preamble':    self._settings['preamble'],
+                'postamble':   self._settings['postamble'],
             },
             'steps': [self._step_to_dict(s) for s in self.steps],
         }
@@ -969,10 +971,11 @@ class GCodeGeneratorApp:
 
         # ── Machine settings ──────────────────────────────────────────
         m = project.get('machine', {})
-        self._settings['z_safe']     = m.get('z_safe',     self._settings['z_safe'])
-        self._settings['feed_rapid'] = m.get('feed_rapid', self._settings['feed_rapid'])
-        self._settings['preamble']   = m.get('preamble',   self._settings['preamble'])
-        self._settings['postamble']  = m.get('postamble',  self._settings['postamble'])
+        self._settings['z_safe']      = m.get('z_safe',      self._settings['z_safe'])
+        self._settings['feed_rapid']  = m.get('feed_rapid',  self._settings['feed_rapid'])
+        self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
+        self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
+        self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
 
         # ── Steps ─────────────────────────────────────────────────────
         step_dicts = project.get('steps', [])
@@ -1294,9 +1297,10 @@ class GCodeGeneratorApp:
                 self.toolpaths[idx] = result
                 result.metadata['feed_rate'] = feed_rate
                 stats = result.get_stats(
-                    feed_rate  = feed_rate,
-                    feed_rapid = self._settings['feed_rapid'],
-                    z_safe     = self._settings['z_safe'],
+                    feed_rate   = feed_rate,
+                    feed_rapid  = self._settings['feed_rapid'],
+                    z_safe      = self._settings['z_safe'],
+                    accel_mm_s2 = self._settings['accel_mm_s2'],
                 )
                 dlg.close("Completed.")
                 step['info_var'].set(
@@ -1363,9 +1367,10 @@ class GCodeGeneratorApp:
                 feed_rate = params['feed_rate']
                 def _update_ui(idx=idx, s=step, r=result, fr=feed_rate):
                     stats = r.get_stats(
-                        feed_rate  = fr,
-                        feed_rapid = self._settings['feed_rapid'],
-                        z_safe     = self._settings['z_safe'],
+                        feed_rate   = fr,
+                        feed_rapid  = self._settings['feed_rapid'],
+                        z_safe      = self._settings['z_safe'],
+                        accel_mm_s2 = self._settings['accel_mm_s2'],
                     )
                     s['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -1414,12 +1419,13 @@ class GCodeGeneratorApp:
         if not indices:
             return
 
-        z_safe     = self._settings['z_safe']
-        feed_rapid = self._settings['feed_rapid']
-        preamble   = (self._settings['preamble']
+        z_safe      = self._settings['z_safe']
+        feed_rapid  = self._settings['feed_rapid']
+        accel_mm_s2 = self._settings['accel_mm_s2']
+        preamble    = (self._settings['preamble']
                       or DEFAULT_PREAMBLE.format(z_safe=z_safe))
-        postamble  = (self._settings['postamble']
-                      or DEFAULT_POSTAMBLE.format(z_safe=z_safe))
+        postamble   = (self._settings['postamble']
+                       or DEFAULT_POSTAMBLE.format(z_safe=z_safe))
 
         # Warn if the selected steps use different tools — tool changes are not
         # supported in a single G-code file.
@@ -1448,7 +1454,7 @@ class GCodeGeneratorApp:
             for idx in indices:
                 tp = self.toolpaths[idx]
                 feed_rate = tp.metadata.get('feed_rate', 800.0)
-                bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe))
+                bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe, accel_mm_s2))
 
             gcode = preamble + "\n\n" + "\n\n".join(bodies) + "\n\n" + postamble
             with open(path, "w", encoding="utf-8") as f:

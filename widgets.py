@@ -255,6 +255,10 @@ class SettingsDialog(tk.Toplevel):
                                         str(settings.get('feed_rapid', 3000.0)))
         self._feed_rapid.pack(fill=tk.X, pady=2)
 
+        self._accel = LabeledEntry(mf, "Max acceleration (time estimate only)", "mm/s²",
+                                   str(settings.get('accel_mm_s2', 300.0)))
+        self._accel.pack(fill=tk.X, pady=2)
+
         # ── G-code preamble ───────────────────────────────────────────
         pre_sf = SectionFrame(outer, "G-code Preamble")
         pre_sf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -333,11 +337,13 @@ class SettingsDialog(tk.Toplevel):
 
     def _confirm(self):
         try:
-            z_safe     = float(self._z_safe.get())
-            feed_rapid = float(self._feed_rapid.get())
+            z_safe      = float(self._z_safe.get())
+            feed_rapid  = float(self._feed_rapid.get())
+            accel_mm_s2 = float(self._accel.get())
         except ValueError:
             messagebox.showerror("Invalid input",
-                                 "Safe height and rapid feed must be numbers.",
+                                 "Safe height, rapid feed and max acceleration "
+                                 "must be numbers.",
                                  parent=self)
             return
 
@@ -351,10 +357,11 @@ class SettingsDialog(tk.Toplevel):
         if postamble == self._default_postamble():
             postamble = ''
 
-        self._settings['z_safe']     = z_safe
-        self._settings['feed_rapid'] = feed_rapid
-        self._settings['preamble']   = preamble
-        self._settings['postamble']  = postamble
+        self._settings['z_safe']      = z_safe
+        self._settings['feed_rapid']  = feed_rapid
+        self._settings['accel_mm_s2'] = accel_mm_s2
+        self._settings['preamble']    = preamble
+        self._settings['postamble']   = postamble
         self.grab_release()
         self.destroy()
 

@@ -57,11 +57,38 @@ class ToolPath:
             return np.empty((0, 3), dtype=np.float64)
         return np.array(pts_out, dtype=np.float64)
 
-    def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
-        """Compute statistics from the path segments."""
+    def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
+                  accel_mm_s2=300.0):
+        """Compute statistics from the path segments.
+
+        ``est_minutes`` models a trapezoidal (or triangular, for motions too
+        short to reach cruise speed) velocity profile bounded by
+        *accel_mm_s2*, and carries velocity through a corner only in
+        proportion to how straight it is — full speed when collinear, down
+        to a full stop for a ~90 deg-or-sharper turn. A plain
+        distance/feed_rate estimate implicitly assumes infinite
+        acceleration and can undershoot real run time by 2x or more on
+        paths with many short, zig-zagging motions (dense raster/V-carve
+        scans), since the tool never actually reaches the commanded feed
+        rate on them.
+        """
         cut_dist = rapid_dist = 0.0
         motion_count = 0
         prev_end = None
+
+        # (length_mm, cruise_mm_s, unit_dir) per straight motion, in path
+        # order, used below for the acceleration-aware time estimate.
+        motions = []
+
+        feed_rate_s  = max(feed_rate,  1.0) / 60.0
+        feed_rapid_s = max(feed_rapid, 1.0) / 60.0
+
+        def add_motion(p0, p1, vmax):
+            dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+            length = (dx*dx + dy*dy + dz*dz) ** 0.5
+            if length < 1e-9:
+                return
+            motions.append((length, vmax, (dx/length, dy/length, dz/length)))
 
         for points in self.segments:
             if not points:
@@ -73,9 +100,15 @@ class ToolPath:
                     or abs(prev_end[1] - points[0][1]) > 1e-4):
                 px, py, pz = prev_end
                 nx, ny, nz = points[0]
+                retract  = (px, py, z_safe)
+                traverse = (nx, ny, z_safe)
+                plunge   = (nx, ny, nz)
                 rapid_dist += (abs(z_safe - pz)                              # retract
                                + ((nx-px)**2 + (ny-py)**2) ** 0.5           # traverse
                                + abs(z_safe - nz))                           # plunge
+                add_motion(prev_end, retract,  feed_rapid_s)
+                add_motion(retract,  traverse, feed_rapid_s)
+                add_motion(traverse, plunge,   feed_rapid_s)
                 motion_count += 3
 
             if len(points) >= 2:
@@ -84,20 +117,46 @@ class ToolPath:
                     x0, y0, z0 = points[i]
                     x1, y1, z1 = points[i + 1]
                     cut_dist += ((x1-x0)**2 + (y1-y0)**2 + (z1-z0)**2) ** 0.5
+                    add_motion(points[i], points[i + 1], feed_rate_s)
 
             prev_end = points[-1]
 
-        est_minutes = cut_dist / max(feed_rate, 1.0) + \
-                      rapid_dist / max(feed_rapid, 1.0)
+        # Junction (corner) velocities: the machine starts and ends the
+        # whole path at rest, so junction_v[0] and junction_v[-1] stay 0.
+        n = len(motions)
+        junction_v = [0.0] * (n + 1)
+        for i in range(1, n):
+            _, vmax_prev, dir_prev = motions[i - 1]
+            _, vmax_next, dir_next = motions[i]
+            cos_theta = (dir_prev[0]*dir_next[0] + dir_prev[1]*dir_next[1]
+                         + dir_prev[2]*dir_next[2])
+            junction_v[i] = max(0.0, cos_theta) * min(vmax_prev, vmax_next)
+
+        accel = max(accel_mm_s2, 1e-6)
+        time_sec = 0.0
+        for i, (length, vmax, _) in enumerate(motions):
+            v_enter = min(junction_v[i],     vmax)
+            v_exit  = min(junction_v[i + 1], vmax)
+            d_acc = (vmax*vmax - v_enter*v_enter) / (2.0 * accel)
+            d_dec = (vmax*vmax - v_exit *v_exit)  / (2.0 * accel)
+            if d_acc + d_dec <= length:
+                d_cruise = length - d_acc - d_dec
+                time_sec += (((vmax - v_enter) + (vmax - v_exit)) / accel
+                             + d_cruise / vmax)
+            else:
+                vp = (accel*length + 0.5*(v_enter*v_enter + v_exit*v_exit)) ** 0.5
+                vp = min(vp, vmax)
+                time_sec += (max(0.0, vp - v_enter) + max(0.0, vp - v_exit)) / accel
 
         return {
             'motion_count': motion_count,
             'cut_distance_mm': cut_dist,
             'rapid_distance_mm': rapid_dist,
-            'est_minutes': est_minutes
+            'est_minutes': time_sec / 60.0,
         }
 
-    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0):
+    def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
+                 accel_mm_s2=300.0):
         """Generate G-code string for the motion segments.
 
         The output is self-contained: it starts with a move to z_safe and ends
@@ -138,7 +197,7 @@ class ToolPath:
                         f"{meta['refining_threshold_um']:.0f} µm "
                         f"(spans from prior residual only)")
 
-        stats = self.get_stats(feed_rate, feed_rapid, z_safe)
+        stats = self.get_stats(feed_rate, feed_rapid, z_safe, accel_mm_s2)
 
         lines += [
             f"; Total motion lines: {stats['motion_count']}",

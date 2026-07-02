@@ -32,6 +32,7 @@ DEFAULTS = {
     # Global machine / G-code settings
     "z_safe":            "5.0",
     "feed_rapid":        "1500",
+    "accel_mm_s2":       "300",
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
     # Per-step defaults (prefix-free; used for every new step tab)
