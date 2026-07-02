@@ -210,13 +210,13 @@ class GCodeGeneratorApp:
 
         # ── Right column: image canvas ────────────────────────────────
         right = ttk.Frame(pane)
-        pane.add(right, minsize=420)
+        pane.add(right, minsize=420, stretch="always")
         self._build_right_panel(right)
 
         # ── Sidebar ────────────────────────────────────────────────────
         sidebar_outer = ttk.Frame(pane, width=275)
         sidebar_outer.pack_propagate(False)
-        pane.add(sidebar_outer, minsize=240)
+        pane.add(sidebar_outer, minsize=240, stretch="never")
         self._build_scrollable_sidebar(sidebar_outer)
 
     # ------------------------------------------------------------------ #
