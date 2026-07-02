@@ -902,9 +902,17 @@ class GCodeGeneratorApp:
         )
         if not path:
             return
+        image_path_rel = None
+        if self.image_path:
+            try:
+                image_path_rel = os.path.relpath(
+                    self.image_path, os.path.dirname(os.path.abspath(path)))
+            except ValueError:
+                image_path_rel = None  # e.g. different drive on Windows
         project = {
             'version': 1,
             'image_path': self.image_path,
+            'image_path_rel': image_path_rel,
             'global': {
                 'width_cm':        self.width_cm.get(),
                 'height_cm':       self.height_cm.get(),
@@ -982,13 +990,24 @@ class GCodeGeneratorApp:
             self._apply_step_dict(step, d)
 
         # ── Image ─────────────────────────────────────────────────────
-        saved_image_path = project.get('image_path')
-        if saved_image_path:
-            if os.path.isfile(saved_image_path):
+        saved_image_path     = project.get('image_path')
+        saved_image_path_rel = project.get('image_path_rel')
+
+        resolved_image_path = None
+        if saved_image_path_rel:
+            candidate = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(path)), saved_image_path_rel))
+            if os.path.isfile(candidate):
+                resolved_image_path = candidate
+        if resolved_image_path is None and saved_image_path and os.path.isfile(saved_image_path):
+            resolved_image_path = saved_image_path
+
+        if saved_image_path or saved_image_path_rel:
+            if resolved_image_path:
                 try:
-                    raw = mpimg.imread(saved_image_path)
+                    raw = mpimg.imread(resolved_image_path)
                     self.current_image = self._to_grayscale(raw)
-                    self.image_path    = saved_image_path
+                    self.image_path    = resolved_image_path
                     h, w = self.current_image.shape
                     if self._aspect_lock_var.get():
                         self._image_aspect = w / h
@@ -1004,7 +1023,7 @@ class GCodeGeneratorApp:
                     self.n_grey_levels = levels
                     self._render()
                     self.status_var.set(
-                        f"Project loaded: {path}  |  Image: {saved_image_path}")
+                        f"Project loaded: {path}  |  Image: {resolved_image_path}")
                     return
                 except Exception as exc:
                     messagebox.showwarning(
@@ -1013,7 +1032,8 @@ class GCodeGeneratorApp:
             else:
                 messagebox.showwarning(
                     "Image Not Found",
-                    f"Project loaded, but the saved image was not found:\n{saved_image_path}\n\n"
+                    "Project loaded, but the saved image was not found:\n"
+                    f"{saved_image_path or saved_image_path_rel}\n\n"
                     "Use File → Open Image… to load an image manually.")
 
         self.status_var.set(f"Project loaded: {path}")
