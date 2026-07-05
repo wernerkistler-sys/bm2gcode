@@ -737,9 +737,29 @@ class GCodeGeneratorApp:
     #  Right panel: image canvas
     # ------------------------------------------------------------------ #
     def _build_right_panel(self, parent):
+        scale_bar = ttk.Frame(parent)
+        scale_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 6))
+        self._build_toolpath_scale(scale_bar)
+
         canvas_frame = ttk.Frame(parent)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._build_image_canvas(canvas_frame)
+
+    def _build_toolpath_scale(self, parent):
+        """Horizontal scale to preview how far the tool has progressed along the toolpath."""
+        self.toolpath_scale_var = tk.DoubleVar(value=100.0)
+
+        ttk.Label(parent, text="Toolpath progress:").pack(side=tk.LEFT, padx=(0, 6))
+        self.toolpath_scale_label = ttk.Label(parent, text="100%", width=5, anchor=tk.E)
+        self.toolpath_scale_label.pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Scale(parent, from_=0, to=100, orient=tk.HORIZONTAL,
+                  variable=self.toolpath_scale_var,
+                  command=self._on_toolpath_scale_changed
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _on_toolpath_scale_changed(self, _value=None):
+        self.toolpath_scale_label.config(text=f"{round(self.toolpath_scale_var.get())}%")
+        self._render()
 
     def _build_image_canvas(self, parent):
         self.fig, self.ax = plt.subplots(figsize=(7, 5), tight_layout=True)
@@ -1328,6 +1348,8 @@ class GCodeGeneratorApp:
                 self.display_step_var.set(idx + 1)
                 if not self.show_cut_moves_var.get():
                     self.show_cut_moves_var.set(True)
+                self.toolpath_scale_var.set(100.0)
+                self.toolpath_scale_label.config(text="100%")
                 self._on_display_mode_changed()
 
             self.root.after(0, _done)
@@ -1401,6 +1423,8 @@ class GCodeGeneratorApp:
                 self.display_step_var.set(len(self.steps))
                 if not self.show_cut_moves_var.get():
                     self.show_cut_moves_var.set(True)
+                self.toolpath_scale_var.set(100.0)
+                self.toolpath_scale_label.config(text="100%")
                 self._on_display_mode_changed()
 
             self.root.after(0, _all_done)
@@ -1600,6 +1624,35 @@ class GCodeGeneratorApp:
                 return tp.accessible
         return None
 
+    def _toolpath_progress_segments(self, tp):
+        """Return tp.segments truncated to the leading x% of path points.
+
+        x is the position of the toolpath-progress scale below the canvas, letting
+        the user scrub through how far the tool has travelled along the path.
+        """
+        segments = tp.segments
+        pct = max(0.0, min(1.0, self.toolpath_scale_var.get() / 100.0))
+        if pct >= 1.0:
+            return segments
+        total_points = sum(len(pts) for pts in segments)
+        if total_points == 0:
+            return segments
+        n_keep   = int(round(total_points * pct))
+        truncated = []
+        count = 0
+        for pts in segments:
+            if count >= n_keep:
+                break
+            remaining = n_keep - count
+            if len(pts) <= remaining:
+                truncated.append(pts)
+                count += len(pts)
+            else:
+                truncated.append(pts[:remaining])
+                count = n_keep
+                break
+        return truncated
+
     # ------------------------------------------------------------------ #
     #  3D rendering
     # ------------------------------------------------------------------ #
@@ -1611,7 +1664,7 @@ class GCodeGeneratorApp:
         rapids = []
         cuts   = []
         prev_end = None
-        for pts in toolpath.segments:
+        for pts in self._toolpath_progress_segments(toolpath):
             if not pts:
                 continue
             if prev_end is not None and (
@@ -1944,7 +1997,7 @@ class GCodeGeneratorApp:
         rapid_lines = []
         prev_end    = None
 
-        for pts in tp.segments:
+        for pts in self._toolpath_progress_segments(tp):
             if not pts:
                 continue
             if prev_end is not None and (
