@@ -152,12 +152,15 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 
 | Item | Shortcut | Description |
 |---|---|---|
-| Open Image | Ctrl+O | Load a grayscale bitmap. |
+| New Project | Ctrl+N | Discard the current steps and parameters and restart from default values. |
 | Open Project | Ctrl+Shift+O | Reload a previously saved `.prj` file, restoring all parameters and step configuration. |
 | Save Project | Ctrl+S | Save all current parameters and step configuration to a `.prj` file. |
+| Open Image | Ctrl+O | Load a grayscale bitmap. |
 | Export Toolpath | — | Export G-code for selected computed steps to a `.nc` file. |
 | Settings | — | Configure machine parameters (see below). |
 | Exit | Ctrl+Q | Quit the application. |
+
+New Project, Open Project, and Exit all check for unsaved changes first: if the current project differs from what was last saved (or loaded), you're prompted to save, discard, or cancel before continuing.
 
 **Settings dialog:**
 

@@ -78,6 +78,11 @@ class GCodeGeneratorApp:
         self._build_menu()
         self._build_layout()
 
+        # Baseline snapshot of the default, "empty" project — lets us detect
+        # changes even if the user never opens or saves a project file.
+        self._saved_snapshot = self._snapshot_key()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
+
     # ------------------------------------------------------------------ #
     #  Menu
     # ------------------------------------------------------------------ #
@@ -89,19 +94,28 @@ class GCodeGeneratorApp:
 
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
-                              command=self.open_image)
+        # ── Project ─────────────────────────────────────────────────
+        file_menu.add_command(label="New Project",   accelerator="Ctrl+N",
+                              command=self._new_project)
         file_menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
                               command=self._load_project)
         file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
                               command=self._save_project)
+        file_menu.add_separator()
+        # ── Image ───────────────────────────────────────────────────
+        file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
+                              command=self.open_image)
+        file_menu.add_separator()
+        # ── Toolpath ────────────────────────────────────────────────
         file_menu.add_command(label="Export Toolpath…",
                               command=self._export_toolpaths)
         file_menu.add_separator()
+        # ── Settings ────────────────────────────────────────────────
         file_menu.add_command(label="Settings…",     command=self._open_settings)
         file_menu.add_separator()
+        # ── Exit ────────────────────────────────────────────────────
         file_menu.add_command(label="Exit",          accelerator="Ctrl+Q",
-                              command=self.root.quit)
+                              command=self._on_exit)
         menubar.add_cascade(label="File", menu=file_menu)
 
         compute_menu = tk.Menu(menubar, tearoff=0)
@@ -155,10 +169,11 @@ class GCodeGeneratorApp:
         menubar.add_cascade(label="View", menu=self._view_menu)
 
         self.root.config(menu=menubar)
+        self.root.bind("<Control-n>", lambda e: self._new_project())
         self.root.bind("<Control-o>", lambda e: self.open_image())
         self.root.bind("<Control-s>", lambda e: self._save_project())
         self.root.bind("<Control-O>", lambda e: self._load_project())
-        self.root.bind("<Control-q>", lambda e: self.root.quit())
+        self.root.bind("<Control-q>", lambda e: self._on_exit())
         self.root.bind("<F5>", lambda _: self._compute_step(
             self.steps[self._steps_nb.index("current")]))
         self.root.bind("<F6>", lambda _: self._compute_all_steps())
@@ -933,25 +948,10 @@ class GCodeGeneratorApp:
         step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
         step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
 
-    def _save_project(self):
-        path = filedialog.asksaveasfilename(
-            title="Save Project",
-            defaultextension=".prj",
-            filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        image_path_rel = None
-        if self.image_path:
-            try:
-                image_path_rel = os.path.relpath(
-                    self.image_path, os.path.dirname(os.path.abspath(path)))
-            except ValueError:
-                image_path_rel = None  # e.g. different drive on Windows
-        project = {
-            'version': 1,
+    def _project_snapshot(self):
+        """Return a JSON-able dict describing all persistable project state."""
+        return {
             'image_path': self.image_path,
-            'image_path_rel': image_path_rel,
             'global': {
                 'width_cm':        self.width_cm.get(),
                 'height_cm':       self.height_cm.get(),
@@ -971,12 +971,114 @@ class GCodeGeneratorApp:
             },
             'steps': [self._step_to_dict(s) for s in self.steps],
         }
+
+    def _snapshot_key(self):
+        return json.dumps(self._project_snapshot(), sort_keys=True)
+
+    def _is_dirty(self):
+        return self._snapshot_key() != self._saved_snapshot
+
+    def _confirm_discard(self, verb):
+        """If there are unsaved changes, ask the user how to proceed.
+
+        Returns True if it's OK to continue with `verb` (changes were saved
+        or the user chose to discard them), False if the action should be
+        cancelled.
+        """
+        if not self._is_dirty():
+            return True
+        response = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            f"The current project has unsaved changes.\nSave changes before {verb}?")
+        if response is None:
+            return False
+        if response:
+            return self._save_project()
+        return True
+
+    def _on_exit(self):
+        if self._confirm_discard("exiting"):
+            self.root.destroy()
+
+    def _new_project(self):
+        if not self._confirm_discard("starting a new project"):
+            return
+
+        self._aspect_lock_var.set(True)
+        self.width_cm.set(DEFAULTS['width_cm'])
+        self.height_cm.set(DEFAULTS['height_cm'])
+        self.max_depth.set(DEFAULTS['max_depth'])
+        self.margin_cm.set(DEFAULTS['margin_cm'])
+        self.margin_depth_pct.set(DEFAULTS['margin_depth_pct'])
+        self.surface.set(DEFAULTS['surface'])
+        self.origin_var.set(DEFAULTS['origin'])
+
+        self._settings['z_safe']      = float(DEFAULTS['z_safe'])
+        self._settings['feed_rapid']  = float(DEFAULTS['feed_rapid'])
+        self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
+        self._settings['preamble']    = DEFAULTS['preamble']
+        self._settings['postamble']   = DEFAULTS['postamble']
+
+        while len(self.steps) > 1:
+            self._remove_step(self.steps[-1])
+        self._apply_step_dict(self.steps[0], {})
+
+        self.current_image = None
+        self.image_path     = None
+        self._image_aspect  = None
+        self.n_grey_levels  = 256
+        self.toolpaths      = [None]
+        self.steps[0]['info_var'].set("Step 1: not computed")
+
+        self.display_mode_var.set(DISPLAY_ORIGINAL)
+        self._reset_zoom()
+
+        if getattr(self.ax, 'name', '') == '3d':
+            self.fig.clear()
+            self.ax = self.fig.add_subplot(111)
+            self.fig.patch.set_facecolor("#2b2b2b")
+            self.ax.set_facecolor("#2b2b2b")
+        self.ax.clear()
+        self.ax.set_visible(False)
+        self.mpl_canvas.draw()
+        self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        self.status_var.set("New project")
+        self._saved_snapshot = self._snapshot_key()
+
+    def _save_project(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Project",
+            defaultextension=".prj",
+            filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
+        )
+        if not path:
+            return False
+        image_path_rel = None
+        if self.image_path:
+            try:
+                image_path_rel = os.path.relpath(
+                    self.image_path, os.path.dirname(os.path.abspath(path)))
+            except ValueError:
+                image_path_rel = None  # e.g. different drive on Windows
+        snapshot = self._project_snapshot()
+        project = {
+            'version': 1,
+            'image_path': snapshot['image_path'],
+            'image_path_rel': image_path_rel,
+            'global': snapshot['global'],
+            'machine': snapshot['machine'],
+            'steps': snapshot['steps'],
+        }
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(project, f, indent=2)
             self.status_var.set(f"Project saved: {path}")
+            self._saved_snapshot = json.dumps(snapshot, sort_keys=True)
+            return True
         except Exception as exc:
             messagebox.showerror("Save Error", f"Could not save project:\n{exc}")
+            return False
 
     def _load_project(self):
         path = filedialog.askopenfilename(
@@ -994,6 +1096,9 @@ class GCodeGeneratorApp:
 
         if project.get('version', 1) != 1:
             messagebox.showerror("Load Error", "Unsupported project file version.")
+            return
+
+        if not self._confirm_discard("opening another project"):
             return
 
         # ── Global image-size parameters ──────────────────────────────
@@ -1065,6 +1170,7 @@ class GCodeGeneratorApp:
                     self._render()
                     self.status_var.set(
                         f"Project loaded: {path}  |  Image: {resolved_image_path}")
+                    self._saved_snapshot = self._snapshot_key()
                     return
                 except Exception as exc:
                     messagebox.showwarning(
@@ -1078,6 +1184,7 @@ class GCodeGeneratorApp:
                     "Use File → Open Image… to load an image manually.")
 
         self.status_var.set(f"Project loaded: {path}")
+        self._saved_snapshot = self._snapshot_key()
 
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
