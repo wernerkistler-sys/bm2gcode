@@ -1716,8 +1716,9 @@ class GCodeGeneratorApp:
     def _accessible_for_step(self, idx):
         """Return the achievable depth surface (morphological opening) for step *idx*, or None.
 
-        For a raster/contour step: returns that step's own opening array.
-        For a V-carve step (accessible=None): falls back to the prior step's opening.
+        If step *idx* has its own accessible array, returns that. Otherwise
+        (currently only a V-carve step with an empty skeleton/no moves generated)
+        falls back to the prior step's opening.
         """
         if 0 <= idx < len(self.toolpaths):
             tp = self.toolpaths[idx]
