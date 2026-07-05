@@ -229,6 +229,8 @@ This section describes how each algorithm works internally — the pipeline stag
 - *V-Bit*: cone slope — `r / (tan(half-angle) × max_depth)`
 - *End Mill*: zero inside the radius, infinity outside
 
+**Accessibility caching.** The grey-erosion/grey-dilation pair above is the most expensive part of computing a step, and it depends only on the tool geometry, Max cut depth, and the work area's physical dimensions — not on step-down, threshold, gating mode, or any other per-step parameter. bm2gcode keeps a cache of these accessibility maps keyed by that combination, so recomputing a step after tweaking an unrelated parameter, or computing a later step with the same tool, reuses the previously computed result instead of rerunning the erosion/dilation. The cache is cleared whenever the source image or project changes.
+
 **Result map.** After each step is computed, a float32 *result map* records how deep the material has been cut at every pixel. This is passed to the next step as the prior reference, enabling the Residual and Reachable gating modes.
 
 ---
