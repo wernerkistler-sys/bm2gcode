@@ -430,7 +430,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             raster_offset_pct=0.0,
                             use_2opt=False,
                             final_stepdown_mm=0.0,
-                            progress=None):
+                            progress=None,
+                            erosion_cache=None,
+                            erosion_cache_key=None):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
     Parameters
@@ -469,6 +471,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                         Roughing passes stop this far above each pixel's target;
                         a final pass then cuts to full depth.  0 = no reservation.
     progress          : callable(pct, subtask) — thread-safe progress reporter
+    erosion_cache     : optional dict used to memoise the grey-erosion/grey-dilation
+                        achievable-depth surface (keyed by erosion_cache_key), so a
+                        subsequent call with the same tool and physical scale can skip
+                        recomputing it.  None disables caching.
+    erosion_cache_key : hashable key identifying the (tool, px_per_mm, max_depth)
+                        combination for erosion_cache lookups.
 
     Returns
     -------
@@ -519,24 +527,31 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2 · Compute achievable depth surface (10–35 %) ─────────────
-    progress(10, "Computing achievable depth surface (morphological opening)…")
-    structure = -kernel_raster.astype(np.float64)
+    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
+    if cached is not None and cached[0].shape == depth_map.shape:
+        center_depth_contour_raster, accessible_raster = cached
+        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
+    else:
+        progress(10, "Computing achievable depth surface (morphological opening)…")
+        structure = -kernel_raster.astype(np.float64)
 
-    # Max depth the tool can reach when centred at each pixel (erosion).
-    # Used internally as per-pixel depth targets during toolpath planning.
-    center_depth_contour_raster = grey_erosion(depth_map.astype(np.float64),
-                              footprint=footprint_raster,
-                              structure=structure).astype(np.float32)
-    center_depth_contour_raster = np.clip(center_depth_contour_raster, 0.0, 1.0)
+        # Max depth the tool can reach when centred at each pixel (erosion).
+        # Used internally as per-pixel depth targets during toolpath planning.
+        center_depth_contour_raster = grey_erosion(depth_map.astype(np.float64),
+                                  footprint=footprint_raster,
+                                  structure=structure).astype(np.float32)
+        center_depth_contour_raster = np.clip(center_depth_contour_raster, 0.0, 1.0)
 
-    # Dilation of the erosion gives the true achievable depth at each material
-    # point: the tool can carve (x,y) while centred at an offset position.
-    # Erosion followed by dilation = morphological opening.
-    accessible_raster = grey_dilation(center_depth_contour_raster.astype(np.float64),
-                               footprint=footprint_raster,
-                               structure=structure).astype(np.float32)
-    accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
-    progress(35, "Achievable depth surface computed.")
+        # Dilation of the erosion gives the true achievable depth at each material
+        # point: the tool can carve (x,y) while centred at an offset position.
+        # Erosion followed by dilation = morphological opening.
+        accessible_raster = grey_dilation(center_depth_contour_raster.astype(np.float64),
+                                   footprint=footprint_raster,
+                                   structure=structure).astype(np.float32)
+        accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
+        progress(35, "Achievable depth surface computed.")
+        if erosion_cache is not None:
+            erosion_cache[erosion_cache_key] = (center_depth_contour_raster, accessible_raster)
 
     # ── Stage 3 · Plan passes (35–40 %) ───────────────────────────
     progress(35, "Planning depth passes…")
@@ -849,7 +864,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior_reference=None, previous_result=None,
                             subtract_unaccessible=False,
                             use_2opt=False,
-                            progress=None):
+                            progress=None,
+                            erosion_cache=None,
+                            erosion_cache_key=None):
     """Compute a V-carving toolpath.
 
     Parameters
@@ -877,6 +894,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior_step.result for residual-based gating
                             (material not yet removed).  None treats the full
                             depth_map as the region to V-carve.
+    erosion_cache         : optional dict used to memoise the grey-erosion/grey-dilation
+                            achievable-depth surface (keyed by erosion_cache_key), so a
+                            subsequent call with the same tool and physical scale can
+                            skip recomputing it.  None disables caching.
+    erosion_cache_key     : hashable key identifying the (tool, px_per_mm, max_depth)
+                            combination for erosion_cache lookups.
     previous_result       : optional 2-D float32 [0,1] cumulative result from a
                             prior step (i.e. ToolPath.result).  Combined with the
                             V-carve's own removal surface to produce the cumulative
@@ -933,21 +956,28 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2b · Achievable depth surface (10–35 %) ────────────
-    progress(10, "Computing achievable depth surface (morphological opening)…")
-    center_depth_contour_vcarve = grey_erosion(
-        depth_map.astype(np.float64),
-        footprint=footprint_vcarve,
-        structure=-kernel_vcarve.astype(np.float64),
-    ).astype(np.float32)
-    center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
+    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
+    if cached is not None and cached[0].shape == depth_map.shape:
+        center_depth_contour_vcarve, accessible_vcarve = cached
+        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
+    else:
+        progress(10, "Computing achievable depth surface (morphological opening)…")
+        center_depth_contour_vcarve = grey_erosion(
+            depth_map.astype(np.float64),
+            footprint=footprint_vcarve,
+            structure=-kernel_vcarve.astype(np.float64),
+        ).astype(np.float32)
+        center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
 
-    accessible_vcarve = grey_dilation(
-        center_depth_contour_vcarve.astype(np.float64),
-        footprint=footprint_vcarve,
-        structure=-kernel_vcarve.astype(np.float64),
-    ).astype(np.float32)
-    accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
-    progress(35, "Achievable depth surface computed.")
+        accessible_vcarve = grey_dilation(
+            center_depth_contour_vcarve.astype(np.float64),
+            footprint=footprint_vcarve,
+            structure=-kernel_vcarve.astype(np.float64),
+        ).astype(np.float32)
+        accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
+        progress(35, "Achievable depth surface computed.")
+        if erosion_cache is not None:
+            erosion_cache[erosion_cache_key] = (center_depth_contour_vcarve, accessible_vcarve)
 
     # ── Stage 1 · V-carving mask (35–45 %) ────────────────
     progress(35, "Computing V-carving mask…")
@@ -1527,6 +1557,8 @@ def compute_contour_toolpath(
     feed_rapid=3000.0,
     use_2opt=False,
     cross_level_window=1,
+    erosion_cache=None,
+    erosion_cache_key=None,
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -1583,6 +1615,13 @@ def compute_contour_toolpath(
         level (splits shorter than this are not worth the overhead).
     feed_rapid : float
         Rapid traverse rate in mm/min used for retract+plunge cost estimate.
+    erosion_cache : dict, optional
+        Used to memoise the grey-erosion/grey-dilation achievable-depth surface
+        (keyed by erosion_cache_key), so a subsequent call with the same tool
+        and physical scale can skip recomputing it.  None disables caching.
+    erosion_cache_key : hashable, optional
+        Key identifying the (tool, px_per_mm, max_depth) combination for
+        erosion_cache lookups.
 
     Returns
     -------
@@ -1626,24 +1665,31 @@ def compute_contour_toolpath(
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
     # ── Stage 2 · Compute achievable depth surface (10–35 %) ──────────────
-    progress(10, "Computing achievable depth surface (morphological opening)…")
-    structure = -kernel_contour.astype(np.float64)
+    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
+    if cached is not None and cached[0].shape == depth_map.shape:
+        center_depth_contour, accessible_contour = cached
+        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
+    else:
+        progress(10, "Computing achievable depth surface (morphological opening)…")
+        structure = -kernel_contour.astype(np.float64)
 
-    # Max depth the tool can reach when centred at each pixel (erosion).
-    # Used for contour extraction and adaptive level planning.
-    center_depth_contour = grey_erosion(depth_map.astype(np.float64),
-                              footprint=footprint_contour,
-                              structure=structure).astype(np.float32)
-    center_depth_contour = np.clip(center_depth_contour, 0.0, 1.0)
+        # Max depth the tool can reach when centred at each pixel (erosion).
+        # Used for contour extraction and adaptive level planning.
+        center_depth_contour = grey_erosion(depth_map.astype(np.float64),
+                                  footprint=footprint_contour,
+                                  structure=structure).astype(np.float32)
+        center_depth_contour = np.clip(center_depth_contour, 0.0, 1.0)
 
-    # Dilation of the erosion gives the true achievable depth at each material
-    # point: the tool can carve (x,y) while centred at an offset position.
-    # Erosion followed by dilation = morphological opening.
-    accessible_contour = grey_dilation(center_depth_contour.astype(np.float64),
-                                       footprint=footprint_contour,
-                                       structure=structure).astype(np.float32)
-    accessible_contour = np.clip(accessible_contour, 0.0, 1.0)
-    progress(35, "Achievable depth surface computed.")
+        # Dilation of the erosion gives the true achievable depth at each material
+        # point: the tool can carve (x,y) while centred at an offset position.
+        # Erosion followed by dilation = morphological opening.
+        accessible_contour = grey_dilation(center_depth_contour.astype(np.float64),
+                                           footprint=footprint_contour,
+                                           structure=structure).astype(np.float32)
+        accessible_contour = np.clip(accessible_contour, 0.0, 1.0)
+        progress(35, "Achievable depth surface computed.")
+        if erosion_cache is not None:
+            erosion_cache[erosion_cache_key] = (center_depth_contour, accessible_contour)
 
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")

@@ -59,6 +59,7 @@ class GCodeGeneratorApp:
         self.image_path      = None
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
+        self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
 
         # Zoom / pan state (2D)
         self._pan_origin     = None
@@ -883,6 +884,7 @@ class GCodeGeneratorApp:
 
         # Reset any previously computed tool paths
         self.toolpaths = [None] * len(self.steps)
+        self._erosion_cache.clear()
         for i, s in enumerate(self.steps):
             s['info_var'].set(f"Step {i + 1}: not computed")
         self.display_mode_var.set(DISPLAY_ORIGINAL)
@@ -1028,6 +1030,7 @@ class GCodeGeneratorApp:
         self._image_aspect  = None
         self.n_grey_levels  = 256
         self.toolpaths      = [None]
+        self._erosion_cache.clear()
         self.steps[0]['info_var'].set("Step 1: not computed")
 
         self.display_mode_var.set(DISPLAY_ORIGINAL)
@@ -1159,6 +1162,7 @@ class GCodeGeneratorApp:
                         self._image_aspect = w / h
                         self._recalc_height()
                     self.toolpaths = [None] * len(self.steps)
+                    self._erosion_cache.clear()
                     for i, s in enumerate(self.steps):
                         s['info_var'].set(f"Step {i + 1}: not computed")
                     self.display_mode_var.set(DISPLAY_ORIGINAL)
@@ -1280,6 +1284,10 @@ class GCodeGeneratorApp:
         algorithm    = params['algorithm']
         depth_map, n_grey_levels = self._get_depth_map()
 
+        tool = params['tool']
+        erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
+                             params['max_depth'], params['eff_width_cm'], params['eff_height_cm'])
+
         if algorithm.startswith("V-Carving"):
             gating_mode = params['gating_mode']
             if gating_mode == "Residual from prior step":
@@ -1317,6 +1325,8 @@ class GCodeGeneratorApp:
                 skeleton_mode        = params['skeleton_mode'],
                 use_2opt             = params['use_2opt'],
                 progress             = progress_fn,
+                erosion_cache        = self._erosion_cache,
+                erosion_cache_key    = erosion_cache_key,
             )
         elif algorithm == "Contour":
             return compute_contour_toolpath(
@@ -1338,6 +1348,8 @@ class GCodeGeneratorApp:
                 feed_rapid         = self._settings['feed_rapid'],
                 use_2opt           = params['use_2opt'],
                 cross_level_window = params['cross_level_window'],
+                erosion_cache      = self._erosion_cache,
+                erosion_cache_key  = erosion_cache_key,
             )
         else:  # Raster
             gating_mode = params['gating_mode']
@@ -1381,6 +1393,8 @@ class GCodeGeneratorApp:
                 feed_rate         = params['feed_rate'],
                 use_2opt          = params['use_2opt'],
                 progress          = progress_fn,
+                erosion_cache     = self._erosion_cache,
+                erosion_cache_key = erosion_cache_key,
             )
 
     def _compute_step(self, step):
