@@ -4,6 +4,7 @@ import queue
 import re
 
 from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
+import stl_mesh
 
 
 class ProgressDialog(tk.Toplevel):
@@ -509,5 +510,232 @@ class ExportToolpathDialog(tk.Toplevel):
 
     def _cancel(self):
         self.selected_indices = None
+        self.grab_release()
+        self.destroy()
+
+
+class ImportSTLDialog(tk.Toplevel):
+    """Modal dialog for configuring an STL import: rasterization resolution,
+    orientation (a quarter-turn rotation around each of the X/Y/Z axes,
+    applied to the mesh before rasterization), and whether to auto-populate
+    bm2gcode's physical-size fields from the mesh's bounding box.
+
+    *triangles*/*xy_bounds*/*z_bounds* describe the mesh at rotation
+    (0, 0, 0). Rotation-dependent values (aspect ratio, physical-size
+    preview) are recomputed live via ``stl_mesh.rotate_bounds`` as the
+    rotation dropdowns change, so they never drift from what actually gets
+    applied on Import.
+
+    After ``wait_window()`` returns, read:
+    - ``self.confirmed``                        -- bool
+    - ``self.width_px``, ``self.height_px``      -- int
+    - ``self.rot_x``, ``self.rot_y``, ``self.rot_z`` -- int, one of 0/90/180/270
+    - ``self.populate_physical``                 -- bool
+    """
+
+    _ROT_VALUES = ["0", "90", "180", "270"]
+
+    def __init__(self, parent, triangles, xy_bounds, z_bounds):
+        super().__init__(parent)
+        self.title("Import STL")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self.confirmed = False
+        self._triangles  = triangles
+        self._xy_bounds  = xy_bounds
+        self._z_bounds   = z_bounds
+        self._updating   = False
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ── Orientation ──────────────────────────────────────────────
+        rot_sf = SectionFrame(outer, "Orientation")
+        rot_sf.pack(fill=tk.X, pady=(0, 8))
+
+        self.rot_x_var = tk.StringVar(value="0")
+        self.rot_y_var = tk.StringVar(value="0")
+        self.rot_z_var = tk.StringVar(value="0")
+        for label, var in (("Rotate around X axis", self.rot_x_var),
+                           ("Rotate around Y axis", self.rot_y_var),
+                           ("Rotate around Z axis", self.rot_z_var)):
+            row = ttk.Frame(rot_sf)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=20, anchor=tk.W).pack(side=tk.LEFT)
+            ttk.Combobox(row, textvariable=var, values=self._ROT_VALUES,
+                        state="readonly", width=6).pack(side=tk.RIGHT)
+
+        self.rot_x_var.trace_add("write", self._on_rotation_changed)
+        self.rot_y_var.trace_add("write", self._on_rotation_changed)
+        self.rot_z_var.trace_add("write", self._on_rotation_changed)
+
+        # ── Output Resolution ───────────────────────────────────────
+        res_sf = SectionFrame(outer, "Output Resolution")
+        res_sf.pack(fill=tk.X, pady=(0, 8))
+
+        default_w, default_h = self._default_dims()
+        self.width_var  = tk.StringVar(value=str(default_w))
+        self.height_var = tk.StringVar(value=str(default_h))
+        self.keep_aspect_var = tk.BooleanVar(value=True)
+
+        row_w = ttk.Frame(res_sf)
+        row_w.pack(fill=tk.X, pady=2)
+        ttk.Label(row_w, text="Width", width=8, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Spinbox(row_w, from_=2, to=9999, textvariable=self.width_var,
+                    width=8).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row_w, text="px", foreground="#666666").pack(side=tk.LEFT)
+
+        row_h = ttk.Frame(res_sf)
+        row_h.pack(fill=tk.X, pady=2)
+        ttk.Label(row_h, text="Height", width=8, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Spinbox(row_h, from_=2, to=9999, textvariable=self.height_var,
+                    width=8).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row_h, text="px", foreground="#666666").pack(side=tk.LEFT)
+
+        ttk.Checkbutton(res_sf, text="Keep aspect ratio",
+                        variable=self.keep_aspect_var).pack(anchor=tk.W, pady=2)
+
+        self.width_var.trace_add("write", self._on_width_changed)
+        self.height_var.trace_add("write", self._on_height_changed)
+
+        # ── Physical Size ────────────────────────────────────────────
+        phys_sf = SectionFrame(outer, "Physical Size")
+        phys_sf.pack(fill=tk.X, pady=(0, 8))
+
+        self.populate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(phys_sf,
+                        text="Set width/height/max depth from mesh bounding box",
+                        variable=self.populate_var).pack(anchor=tk.W)
+
+        self._preview_var = tk.StringVar()
+        ttk.Label(phys_sf, textvariable=self._preview_var,
+                  foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+
+        # ── Buttons ──────────────────────────────────────────────────
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Import", command=self._on_import).pack(
+            side=tk.RIGHT, padx=(0, 6))
+
+        self._update_preview()
+
+        # Centre on parent
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+        self.wait_window()
+
+    # ------------------------------------------------------------------ #
+    def _current_rotation(self):
+        try:
+            return (int(self.rot_x_var.get()), int(self.rot_y_var.get()),
+                    int(self.rot_z_var.get()))
+        except (tk.TclError, ValueError):
+            return (0, 0, 0)
+
+    def _rotated_bounds(self):
+        rot_x, rot_y, rot_z = self._current_rotation()
+        return stl_mesh.rotate_bounds(self._xy_bounds, self._z_bounds,
+                                      rot_x, rot_y, rot_z)
+
+    def _default_dims(self):
+        (x_min, x_max, y_min, y_max), _ = self._rotated_bounds()
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        if y_range < 1e-12:
+            return 1024, 1024
+        ar = x_range / y_range
+        if ar >= 1.0:
+            return 1024, max(2, round(1024 / ar))
+        return max(2, round(1024 * ar)), 1024
+
+    def _update_preview(self):
+        (x_min, x_max, y_min, y_max), (z_min, z_max) = self._rotated_bounds()
+        width_cm, height_cm, max_depth_mm = stl_mesh.physical_size_from_bounds(
+            x_max - x_min, y_max - y_min, z_max - z_min)
+        self._preview_var.set(
+            f"→ {width_cm:.2f} cm × {height_cm:.2f} cm × {max_depth_mm:.2f} mm")
+
+    def _on_rotation_changed(self, *_):
+        self._update_preview()
+        if self.keep_aspect_var.get():
+            try:
+                w = int(self.width_var.get())
+            except (tk.TclError, ValueError):
+                return
+            (x_min, x_max, y_min, y_max), _ = self._rotated_bounds()
+            x_range = x_max - x_min
+            y_range = y_max - y_min
+            if x_range < 1e-12:
+                return
+            self._updating = True
+            try:
+                self.height_var.set(str(max(2, round(w * y_range / x_range))))
+            finally:
+                self._updating = False
+
+    def _on_width_changed(self, *_):
+        if self._updating or not self.keep_aspect_var.get():
+            return
+        try:
+            w = int(self.width_var.get())
+        except (tk.TclError, ValueError):
+            return
+        (x_min, x_max, y_min, y_max), _ = self._rotated_bounds()
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        if x_range < 1e-12:
+            return
+        self._updating = True
+        try:
+            self.height_var.set(str(max(2, round(w * y_range / x_range))))
+        finally:
+            self._updating = False
+
+    def _on_height_changed(self, *_):
+        if self._updating or not self.keep_aspect_var.get():
+            return
+        try:
+            h = int(self.height_var.get())
+        except (tk.TclError, ValueError):
+            return
+        (x_min, x_max, y_min, y_max), _ = self._rotated_bounds()
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        if y_range < 1e-12:
+            return
+        self._updating = True
+        try:
+            self.width_var.set(str(max(2, round(h * x_range / y_range))))
+        finally:
+            self._updating = False
+
+    def _on_import(self):
+        try:
+            width_px  = int(self.width_var.get())
+            height_px = int(self.height_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid Input",
+                                 "Width and height must be integers.", parent=self)
+            return
+        if width_px < 2 or height_px < 2:
+            messagebox.showerror("Invalid Input",
+                                 "Width and height must each be at least 2.",
+                                 parent=self)
+            return
+        self.width_px, self.height_px = width_px, height_px
+        self.rot_x, self.rot_y, self.rot_z = self._current_rotation()
+        self.populate_physical = self.populate_var.get()
+        self.confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.confirmed = False
         self.grab_release()
         self.destroy()

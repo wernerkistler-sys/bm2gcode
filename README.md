@@ -25,14 +25,14 @@ python bm2gcode.py
 
 ## Quick Start
 
-1. **File → Open Image** (Ctrl+O) — load a grayscale image (PNG, JPG, BMP, TIFF, WEBP, …).
-2. Set **Physical Image Size** — enter the real-world dimensions and maximum cut depth.
+1. **File → Open Image** (Ctrl+O) — load a grayscale image (PNG, JPG, BMP, TIFF, WEBP, …). Alternatively, **File → Import STL…** (Ctrl+I) converts a 3D mesh into a depth map directly (see below).
+2. Set **Physical Image Size** — enter the real-world dimensions and maximum cut depth. (Skip this if you used Import STL and let it populate these fields from the mesh.)
 3. Configure one or more **steps** — choose algorithm, tool, and region targeting for each.
 4. **Compute → Compute All Steps** (F6) — generate toolpaths.
 5. Use the **View** menu (hotkeys 1–7) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 6. **File → Export Toolpath** — save a `.nc` G-code file for your CNC machine.
 
-Save your work at any time with **File → Save Project** (Ctrl+S); reload it later with **File → Open Project** (Ctrl+Shift+O). Project files store all parameters and the path to the source image.
+Save your work at any time with **File → Save Project** (Ctrl+S); reload it later with **File → Open Project** (Ctrl+Shift+O). Project files store all parameters and a path back to the source image or STL file (re-rasterized with the same settings on reload).
 
 ---
 
@@ -156,11 +156,24 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 | Open Project | Ctrl+Shift+O | Reload a previously saved `.prj` file, restoring all parameters and step configuration. |
 | Save Project | Ctrl+S | Save all current parameters and step configuration to a `.prj` file. |
 | Open Image | Ctrl+O | Load a grayscale bitmap. |
+| Import STL | Ctrl+I | Convert a 3D mesh (STL) into a depth map (see below). |
 | Export Toolpath | — | Export G-code for selected computed steps to a `.nc` file. |
 | Settings | — | Configure machine parameters (see below). |
 | Exit | Ctrl+Q | Quit the application. |
 
 New Project, Open Project, and Exit all check for unsaved changes first: if the current project differs from what was last saved (or loaded), you're prompted to save, discard, or cancel before continuing.
+
+**Import STL dialog:**
+
+Reads a binary or ASCII STL file and rasterizes it into a grayscale depth map — a top-down view where each pixel's brightness is the mesh's height at that point (white = highest point, black = lowest, matching the default Z=0 colour setting). The result becomes the current image, exactly as if it had been loaded with Open Image.
+
+| Parameter | Description |
+|---|---|
+| Rotate around X / Y / Z axis | Rotates the mesh by 0°, 90°, 180°, or 270° around each axis before rasterizing, applied in X → Y → Z order. A 90°/270° rotation around X or Y turns a *side* of the mesh into the top-down view, so a side profile can become the depth map, not just the mesh's native top or bottom face. |
+| Width / Height (px) | Resolution of the rasterized depth map. "Keep aspect ratio" ties the two together to match the (rotated) mesh's own proportions. |
+| Set width/height/max depth from mesh bounding box | When checked, populates the Physical Image Size fields (Width, Height, Max cut depth) from the rotated mesh's bounding box, assumed to be in millimeters — the common STL convention. A live preview shows the resulting physical size as the rotation changes. |
+
+**File → Save Project** after an STL import stores the STL file's path together with the chosen resolution and rotation, instead of a bitmap reference. Reopening the project re-parses the STL and re-rasterizes the depth map with the same settings, so the result is reproduced exactly. If the STL file has since been moved or deleted, the project still loads with all other settings intact, and a warning explains that Import STL must be run again manually.
 
 **Settings dialog:**
 

@@ -31,10 +31,11 @@ from constants import (
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
-                     SettingsDialog, ExportToolpathDialog, _fmt_time)
+                     SettingsDialog, ExportToolpathDialog, ImportSTLDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
+import stl_mesh
 
 
 
@@ -57,6 +58,7 @@ class GCodeGeneratorApp:
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
         self.n_grey_levels   = 256
         self.image_path      = None
+        self.stl_source      = None   # dict describing an STL-derived current_image, or None
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
@@ -106,6 +108,8 @@ class GCodeGeneratorApp:
         # ── Image ───────────────────────────────────────────────────
         file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
                               command=self.open_image)
+        file_menu.add_command(label="Import STL…",  accelerator="Ctrl+I",
+                              command=self.import_stl)
         file_menu.add_separator()
         # ── Toolpath ────────────────────────────────────────────────
         file_menu.add_command(label="Export Toolpath…",
@@ -172,6 +176,7 @@ class GCodeGeneratorApp:
         self.root.config(menu=menubar)
         self.root.bind("<Control-n>", lambda e: self._new_project())
         self.root.bind("<Control-o>", lambda e: self.open_image())
+        self.root.bind("<Control-i>", lambda e: self.import_stl())
         self.root.bind("<Control-s>", lambda e: self._save_project())
         self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self._on_exit())
@@ -872,6 +877,7 @@ class GCodeGeneratorApp:
             raw = mpimg.imread(path)
             self.current_image = self._to_grayscale(raw)
             self.image_path    = path
+            self.stl_source    = None
         except Exception as exc:
             messagebox.showerror("Error", f"Could not load image:\n{exc}")
             return
@@ -894,6 +900,87 @@ class GCodeGeneratorApp:
         levels = int(np.round((self.current_image.max() - self.current_image.min()) * 255)) + 1
         self.n_grey_levels = levels
         self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
+        self._render()
+
+    def import_stl(self):
+        path = filedialog.askopenfilename(
+            title="Import STL",
+            filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            triangles = stl_mesh.load_stl(path)
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
+            return
+
+        xy_bounds = stl_mesh.mesh_xy_bounds(triangles)
+        z_bounds  = stl_mesh.mesh_z_bounds(triangles)
+        dlg = ImportSTLDialog(self.root, triangles, xy_bounds, z_bounds)
+        if not dlg.confirmed:
+            return
+
+        try:
+            rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            raw     = stl_mesh.generate_heightmap(rotated, dlg.width_px, dlg.height_px)
+            image   = stl_mesh.normalize_and_orient(raw)
+        except Exception as exc:
+            messagebox.showerror("Import Error", str(exc))
+            return
+
+        self._finish_stl_import(image, path, triangles, dlg, xy_bounds, z_bounds)
+
+    def _finish_stl_import(self, image, path, triangles, dlg, xy_bounds, z_bounds):
+        self.current_image = image
+        self.image_path     = None   # STL isn't reloadable via mpimg.imread
+        self.stl_source     = {
+            'path':      path,
+            'width_px':  dlg.width_px,
+            'height_px': dlg.height_px,
+            'rot_x':     dlg.rot_x,
+            'rot_y':     dlg.rot_y,
+            'rot_z':     dlg.rot_z,
+        }
+
+        h, w = self.current_image.shape
+        if dlg.populate_physical:
+            rotated_xy, rotated_z = stl_mesh.rotate_bounds(
+                xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            x_min, x_max, y_min, y_max = rotated_xy
+            z_min, z_max = rotated_z
+            width_cm, height_cm, max_depth_mm = stl_mesh.physical_size_from_bounds(
+                x_max - x_min, y_max - y_min, z_max - z_min)
+
+            x_range, y_range = x_max - x_min, y_max - y_min
+            mesh_aspect  = x_range / y_range if y_range > 1e-12 else 1.0
+            pixel_aspect = dlg.width_px / dlg.height_px
+            matches = mesh_aspect > 1e-12 and abs(pixel_aspect / mesh_aspect - 1.0) < 0.01
+            self._aspect_lock_var.set(matches)
+            self._on_aspect_lock_toggle()
+
+            self.width_cm.set(f"{width_cm:.4f}")
+            self.height_cm.set(f"{height_cm:.4f}")
+            self.max_depth.set(f"{max_depth_mm:.4f}")
+        else:
+            if self._aspect_lock_var.get():
+                self._image_aspect = w / h
+                self._recalc_height()
+
+        # Reset any previously computed tool paths
+        self.toolpaths = [None] * len(self.steps)
+        self._erosion_cache.clear()
+        for i, s in enumerate(self.steps):
+            s['info_var'].set(f"Step {i + 1}: not computed")
+        self.display_mode_var.set(DISPLAY_ORIGINAL)
+        self._reset_zoom()
+
+        self.placeholder.place_forget()
+        self.n_grey_levels = 65536   # continuous STL-derived data, not 8-bit-quantized
+        self.status_var.set(
+            f"Imported STL: {os.path.basename(path)}  |  {w} x {h} px  |  "
+            f"{len(triangles)} triangles")
         self._render()
 
     def _open_settings(self):
@@ -954,6 +1041,7 @@ class GCodeGeneratorApp:
         """Return a JSON-able dict describing all persistable project state."""
         return {
             'image_path': self.image_path,
+            'stl_source': self.stl_source,
             'global': {
                 'width_cm':        self.width_cm.get(),
                 'height_cm':       self.height_cm.get(),
@@ -1027,6 +1115,7 @@ class GCodeGeneratorApp:
 
         self.current_image = None
         self.image_path     = None
+        self.stl_source     = None
         self._image_aspect  = None
         self.n_grey_levels  = 256
         self.toolpaths      = [None]
@@ -1064,11 +1153,20 @@ class GCodeGeneratorApp:
                     self.image_path, os.path.dirname(os.path.abspath(path)))
             except ValueError:
                 image_path_rel = None  # e.g. different drive on Windows
+        stl_source = None
+        if self.stl_source:
+            stl_source = dict(self.stl_source)
+            try:
+                stl_source['path_rel'] = os.path.relpath(
+                    self.stl_source['path'], os.path.dirname(os.path.abspath(path)))
+            except ValueError:
+                stl_source['path_rel'] = None  # e.g. different drive on Windows
         snapshot = self._project_snapshot()
         project = {
             'version': 1,
             'image_path': snapshot['image_path'],
             'image_path_rel': image_path_rel,
+            'stl_source': stl_source,
             'global': snapshot['global'],
             'machine': snapshot['machine'],
             'steps': snapshot['steps'],
@@ -1141,6 +1239,7 @@ class GCodeGeneratorApp:
         # ── Image ─────────────────────────────────────────────────────
         saved_image_path     = project.get('image_path')
         saved_image_path_rel = project.get('image_path_rel')
+        saved_stl_source     = project.get('stl_source')
 
         resolved_image_path = None
         if saved_image_path_rel:
@@ -1157,6 +1256,7 @@ class GCodeGeneratorApp:
                     raw = mpimg.imread(resolved_image_path)
                     self.current_image = self._to_grayscale(raw)
                     self.image_path    = resolved_image_path
+                    self.stl_source    = None
                     h, w = self.current_image.shape
                     if self._aspect_lock_var.get():
                         self._image_aspect = w / h
@@ -1186,6 +1286,63 @@ class GCodeGeneratorApp:
                     "Project loaded, but the saved image was not found:\n"
                     f"{saved_image_path or saved_image_path_rel}\n\n"
                     "Use File → Open Image… to load an image manually.")
+
+        elif saved_stl_source:
+            stl_path     = saved_stl_source.get('path')
+            stl_path_rel = saved_stl_source.get('path_rel')
+
+            resolved_stl_path = None
+            if stl_path_rel:
+                candidate = os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(path)), stl_path_rel))
+                if os.path.isfile(candidate):
+                    resolved_stl_path = candidate
+            if resolved_stl_path is None and stl_path and os.path.isfile(stl_path):
+                resolved_stl_path = stl_path
+
+            if resolved_stl_path:
+                try:
+                    rot_x, rot_y, rot_z = (saved_stl_source.get('rot_x', 0),
+                                           saved_stl_source.get('rot_y', 0),
+                                           saved_stl_source.get('rot_z', 0))
+                    width_px  = saved_stl_source['width_px']
+                    height_px = saved_stl_source['height_px']
+                    triangles = stl_mesh.load_stl(resolved_stl_path)
+                    rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
+                    raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
+                    self.current_image = stl_mesh.normalize_and_orient(raw)
+                    self.image_path = None
+                    self.stl_source = {
+                        'path': resolved_stl_path, 'width_px': width_px, 'height_px': height_px,
+                        'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z,
+                    }
+                    h, w = self.current_image.shape
+                    if self._aspect_lock_var.get():
+                        self._image_aspect = w / h
+                        self._recalc_height()
+                    self.toolpaths = [None] * len(self.steps)
+                    self._erosion_cache.clear()
+                    for i, s in enumerate(self.steps):
+                        s['info_var'].set(f"Step {i + 1}: not computed")
+                    self.display_mode_var.set(DISPLAY_ORIGINAL)
+                    self._reset_zoom()
+                    self.placeholder.place_forget()
+                    self.n_grey_levels = 65536   # continuous STL-derived data
+                    self._render()
+                    self.status_var.set(
+                        f"Project loaded: {path}  |  STL: {resolved_stl_path}")
+                    self._saved_snapshot = self._snapshot_key()
+                    return
+                except Exception as exc:
+                    messagebox.showwarning(
+                        "STL Load Warning",
+                        f"Project loaded but the STL file could not be re-rasterized:\n{exc}")
+            else:
+                messagebox.showwarning(
+                    "STL Not Found",
+                    "Project loaded, but the saved STL file was not found:\n"
+                    f"{stl_path or stl_path_rel}\n\n"
+                    "Use File → Import STL… to load it manually.")
 
         self.status_var.set(f"Project loaded: {path}")
         self._saved_snapshot = self._snapshot_key()
