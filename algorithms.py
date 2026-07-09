@@ -1408,7 +1408,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
 def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
                           px_per_mm=1.0, feed_rate=800.0, feed_rapid=3000.0,
-                          z_safe=5.0, max_depth=1.0):
+                          z_safe=5.0, max_depth=1.0, max_step_down_mm=None):
     """Remove contour points at shallower z-levels that lie within lateral_tol_px
     of the nearest deeper (effective) contour — i.e. they are laterally
     redundant because the deeper pass will remove the same material.
@@ -1418,6 +1418,17 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
     always compare z_i *directly* against effective_next (never transitively),
     the lateral error is bounded to lateral_tol_px regardless of how many levels
     are skipped between z_i and effective_next.
+
+    If max_step_down_mm is given, a point is pruned only if it is *both*
+    laterally within lateral_tol_px of its nearest committed pixel *and* that
+    same nearest pixel's recorded depth is within max_step_down_mm of the
+    current level's depth. Otherwise it is kept even though laterally
+    redundant, since relying on that deeper cut would require the tool to
+    plunge more than one stepdown in a single move. A depth gap exactly equal
+    to max_step_down_mm is treated as a legal single-pass stepdown and remains
+    prunable. Note this only prevents pruning from *creating* an oversized
+    gap — in adaptive-levels mode the programmed levels themselves can already
+    be spaced further apart than max_step_down_mm in sparse regions.
 
     A pruned run is restored if its arc length is below the retract+plunge
     breakeven: feed_rate × 2 × (z_safe + z_level_mm) / feed_rapid.  The z_safe
@@ -1431,7 +1442,7 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
     from scipy.ndimage import distance_transform_edt
     from skimage.draw import line as draw_line
 
-    def _rasterize(contours):
+    def _rasterize(contours, depth_img=None, depth_mm=0.0):
         img = np.zeros((H, W), dtype=bool)
         for c in contours:
             rows = np.round(c[:, 0]).astype(int).clip(0, H - 1)
@@ -1441,6 +1452,8 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
                 rr, cc = draw_line(int(rows[k]), int(cols[k]),
                                    int(rows[k + 1]), int(cols[k + 1]))
                 img[np.clip(rr, 0, H - 1), np.clip(cc, 0, W - 1)] = True
+        if depth_img is not None:
+            depth_img[img] = depth_mm
         return img
 
     def _split_runs(c, keep_mask, min_pts=3, min_prune_arc_px=0.0):
@@ -1501,14 +1514,17 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
 
     pruned = {}
     effective_next_img = None
+    effective_next_depth = None
 
     for z_norm in reversed(z_levels):
         contours = all_z_contours.get(z_norm, [])
+        z_level_mm = z_norm * max_depth
         if effective_next_img is None:
             # Deepest level — always kept
             pruned[z_norm] = contours
             if contours:
-                effective_next_img = _rasterize(contours)
+                effective_next_depth = np.full((H, W), np.inf, dtype=np.float32)
+                effective_next_img = _rasterize(contours, effective_next_depth, z_level_mm)
             continue
 
         if not contours:
@@ -1516,17 +1532,21 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
             continue
 
         # Retract+plunge breakeven arc length for this depth level (in pixels).
-        z_level_mm = z_norm * max_depth
         min_prune_arc_px = (feed_rate * 2.0 * (z_safe + z_level_mm)
                             / feed_rapid * px_per_mm)
 
-        dt = distance_transform_edt(~effective_next_img)
+        dt, nearest_idx = distance_transform_edt(~effective_next_img, return_indices=True)
 
         kept = []
         for c in contours:
             rows = np.round(c[:, 0]).astype(int).clip(0, H - 1)
             cols = np.round(c[:, 1]).astype(int).clip(0, W - 1)
             keep_mask = dt[rows, cols] >= lateral_tol_px
+            if max_step_down_mm is not None:
+                near_depth_mm = effective_next_depth[nearest_idx[0][rows, cols],
+                                                      nearest_idx[1][rows, cols]]
+                depth_gap_mm = near_depth_mm - z_level_mm
+                keep_mask = keep_mask | (depth_gap_mm > max_step_down_mm + 1e-6)
             kept.extend(_split_runs(c, keep_mask,
                                     min_prune_arc_px=min_prune_arc_px))
 
@@ -1536,7 +1556,7 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
             # A shallower contour point is redundant if it falls within tol of
             # *any* committed cut at this level or deeper, not just the nearest
             # partially-pruned level's remaining segments.
-            effective_next_img = effective_next_img | _rasterize(kept)
+            effective_next_img = effective_next_img | _rasterize(kept, effective_next_depth, z_level_mm)
         # else: fully pruned — effective_next_img unchanged, propagates upward
 
     return pruned
@@ -1556,7 +1576,7 @@ def compute_contour_toolpath(
     z_safe=5.0,
     feed_rapid=3000.0,
     use_2opt=False,
-    cross_level_window=1,
+    max_step_down_mm=None,
     erosion_cache=None,
     erosion_cache_key=None,
 ):
@@ -1609,6 +1629,15 @@ def compute_contour_toolpath(
         Lateral tolerance in mm for redundancy pruning.  Contour segments whose
         every point lies within this distance of the next deeper (effective)
         contour are considered redundant and omitted.  0.0 disables pruning.
+    max_step_down_mm : float or None
+        Maximum Z increment, in mm, that redundancy pruning is allowed to
+        create between one retained cut and the next, and the window (in
+        z-levels) that cross-level 2-opt is allowed to mix contours across.
+        Both are derived from this single value: the pruning bound is used
+        directly (see _prune_contours), and the mixing window is
+        round(max_step_down_mm / stepdown_mm) levels.  None or <= 0 means
+        unconstrained — pruning may collapse any number of redundant levels
+        and 2-opt may mix across the full level range.
     z_safe : float
         Safe Z height above the workpiece surface in mm.  Used with
         feed_rapid to compute the retract+plunge breakeven arc length per
@@ -1630,6 +1659,11 @@ def compute_contour_toolpath(
     import math
     from scipy.ndimage import grey_erosion, grey_dilation
     from skimage.measure import find_contours
+
+    # None/<=0 both mean "unconstrained" — normalise once, used for both the
+    # pruning depth bound and the cross-level 2-opt mixing window below.
+    _msd = max_step_down_mm if (max_step_down_mm is not None
+                                 and max_step_down_mm > 0) else None
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
@@ -1746,7 +1780,8 @@ def compute_contour_toolpath(
             feed_rate=feed_rate,
             feed_rapid=feed_rapid,
             z_safe=z_safe,
-            max_depth=max_depth)
+            max_depth=max_depth,
+            max_step_down_mm=_msd)
 
     # ── Stage 4c · Greedy nearest-neighbour ordering per Z-level ──────────
     all_segments      = []
@@ -1848,11 +1883,13 @@ def compute_contour_toolpath(
 
     # ── Stage 4b · Cross-level assembly + terrain links ───────────────────
     # Build all_segments from level_segs_dict using non-overlapping windows of
-    # cross_level_window adjacent z-levels.  Within each window (when >1 level)
-    # a second 2-opt pass mixes contours across levels guided by a z-jump
+    # adjacent z-levels, sized so mixing within a window never exceeds
+    # max_step_down_mm of Z travel.  Within each window (when >1 level) a
+    # second 2-opt pass mixes contours across levels guided by a z-jump
     # penalty, reducing rapids that straddle level boundaries.
     z_jump_weight_mm = stepdown_mm * 1.5
-    win_size     = cross_level_window if cross_level_window > 0 else len(z_levels)
+    win_size     = (max(1, round(_msd / stepdown_mm))
+                     if _msd and stepdown_mm > 0 else len(z_levels))
     assemble_pos = initial_pos.copy()
     n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
 
@@ -1948,7 +1985,7 @@ def compute_contour_toolpath(
             'stepdown_mm':     stepdown_mm,
             'adaptive_levels': adaptive_levels,
             'use_2opt':           use_2opt,
-            'cross_level_window': cross_level_window,
+            'max_step_down_mm':   _msd,
             'lateral_tol_mm':     lateral_tol_mm,
             'n_passes':        len(z_levels),
             'width_cm':        width_cm,

@@ -1399,19 +1399,13 @@ class GCodeGeneratorApp:
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
             tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
-            _sd  = float(step['contour_stepdown'].get())
-            _msd = float(step['stepdown'].get())
-            if _msd <= 0 or _sd <= 0:
-                _win = 0
-            else:
-                _win = max(1, int(round(_msd / _sd)))
             params.update({
                 'tool':                tool,
-                'contour_stepdown':    _sd,
+                'contour_stepdown':    float(step['contour_stepdown'].get()),
                 'contour_adaptive':    step['contour_adaptive_var'].get(),
                 'contour_lateral_tol': float(step['contour_lateral_tol'].get()),
                 'use_2opt':            step['tsp_2opt_var'].get(),
-                'cross_level_window':  _win,
+                'contour_max_step_down': float(step['stepdown'].get()),
             })
         else:  # Raster
             _profile    = step['profile_var'].get()
@@ -1504,7 +1498,7 @@ class GCodeGeneratorApp:
                 z_safe             = self._settings['z_safe'],
                 feed_rapid         = self._settings['feed_rapid'],
                 use_2opt           = params['use_2opt'],
-                cross_level_window = params['cross_level_window'],
+                max_step_down_mm   = params['contour_max_step_down'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
             )
