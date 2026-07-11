@@ -213,7 +213,7 @@ class ToolPath:
         lines.append(f"G0 Z{z_safe:.3f}  ; move to safe height")
         at_safe = True
 
-        prev_end = None   # (x, y) of the last emitted endpoint
+        prev_end = None   # (x, y, z) of the last emitted endpoint
 
         for points in self.segments:
             if not points:
@@ -232,11 +232,13 @@ class ToolPath:
                 lines.append(f"G0 X{x0:.3f} Y{y0:.3f}  ; rapid to span start")
                 lines.append(f"G1 Z{z0:.3f} F{feed_rate}  ; plunge")
                 at_safe = False
+            elif abs(prev_end[2] - z0) > 1e-4:
+                lines.append(f"G1 Z{z0:.3f} F{feed_rate}")
 
             for x, y, z in points[1:]:
                 lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
 
-            prev_end = (points[-1][0], points[-1][1])
+            prev_end = points[-1]
 
         if not at_safe:
             lines.append(f"G0 Z{z_safe:.3f}  ; retract")

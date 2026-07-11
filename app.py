@@ -1951,6 +1951,8 @@ class GCodeGeneratorApp:
                     (nx, ny, z_safe),    # traverse at safe height
                     (nx, ny, nz),        # plunge
                 ])
+            elif prev_end is not None and abs(prev_end[2] - pts[0][2]) > 1e-4:
+                cuts.append([prev_end, pts[0]])  # vertical G1 move, no XY change
             cuts.append(pts)
             prev_end = pts[-1]
 
