@@ -418,6 +418,153 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     return result
 
 
+def _order_free_raster_pass(pass_segs, origin, use_2opt, link_threshold_mm):
+    """Greedy nearest-endpoint ordering with optional 2-opt refinement,
+    for a raster pass with no forced cut direction — segments may be
+    visited, and individually reversed, in whichever order minimises
+    travel.
+    """
+    n_segs    = len(pass_segs)
+    unvisited = list(range(n_segs))
+    g_order   = []
+    g_flips   = []
+    cur       = origin
+    while unvisited:
+        best_i, best_rev, best_dist = 0, False, float('inf')
+        for ui, si in enumerate(unvisited):
+            seg = pass_segs[si]
+            xs, ys = seg[0][0],  seg[0][1]
+            xe, ye = seg[-1][0], seg[-1][1]
+            ds = ((xs - cur[0])**2 + (ys - cur[1])**2) ** 0.5
+            de = ((xe - cur[0])**2 + (ye - cur[1])**2) ** 0.5
+            if ds <= de:
+                d, rev = ds, False
+            else:
+                d, rev = de, True
+            if d < best_dist:
+                best_i, best_rev, best_dist = ui, rev, d
+        si = unvisited.pop(best_i)
+        g_order.append(si)
+        g_flips.append(best_rev)
+        seg = pass_segs[si]
+        cur = (seg[0][0], seg[0][1]) if best_rev else (seg[-1][0], seg[-1][1])
+
+    if use_2opt and n_segs >= 3:
+        ent_xy = []
+        ext_xy = []
+        for si, rev in zip(g_order, g_flips):
+            seg = pass_segs[si]
+            if rev:
+                ent_xy.append((seg[-1][0], seg[-1][1]))
+                ext_xy.append((seg[0][0],  seg[0][1]))
+            else:
+                ent_xy.append((seg[0][0],  seg[0][1]))
+                ext_xy.append((seg[-1][0], seg[-1][1]))
+        order, flips = _two_opt_reorder(ent_xy, ext_xy,
+                                        origin=origin,
+                                        link_threshold=link_threshold_mm,
+                                        per_rapid_overhead=10.0)
+        return [
+            list(reversed(pass_segs[g_order[i]])) if (g_flips[i] ^ flips[k])
+            else pass_segs[g_order[i]]
+            for k, i in enumerate(order)
+        ]
+    return [
+        list(reversed(pass_segs[si])) if rev else pass_segs[si]
+        for si, rev in zip(g_order, g_flips)
+    ]
+
+
+def _order_locked_raster_pass(pass_segs, direction, cur):
+    """Order one depth-pass's segments for a locked Climb/Conventional
+    direction, keeping consecutive cuts on the same or an adjacent raster
+    line so the "uncut material on a fixed side" guarantee holds between
+    segments, not just within one.
+
+    pass_segs : list of [(x, y, z_mm)...], each already oriented for
+                ascending line index ("mode A" — set by Phase 1's
+                FORCE_REVERSE).
+    direction : "X" (horizontal lines, grouped by their constant Y) or "Y"
+                (vertical lines, grouped by their constant X).
+    cur       : (x, y) starting tool position.
+
+    Mode A visits lines in ascending line-index order using each segment's
+    stored orientation. Mode B visits in descending order using each
+    segment reversed. Reversing progression and per-segment travel
+    together preserves which side carries uncut material, so mode B is
+    equally valid — just the mirror image of mode A. Ascending line index
+    is descending Y for horizontal lines but ascending X for vertical
+    ones, so grouping keys on a direction-adjusted coordinate (-y or +x)
+    makes "ascending key order" mean mode A either way.
+
+    At each step the candidate pool is the current line's remaining
+    segments plus the immediately next line's (in the active mode's
+    direction) — never a line further away — so consecutive cuts always
+    stay adjacent. A candidate from the next line becomes the new current
+    line. When both are empty, the pointer advances; if it walks off the
+    end of the map while segments remain elsewhere, direction flips (mode
+    A <-> B) and the sweep resumes from that same end, oscillating until
+    nothing is left.
+    """
+    def coord(seg):
+        return -seg[0][1] if direction == "X" else seg[0][0]
+
+    groups = {}
+    for i, seg in enumerate(pass_segs):
+        groups.setdefault(coord(seg), []).append(i)
+    keys = sorted(groups)
+    key_index = {k: idx for idx, k in enumerate(keys)}
+    remaining = {k: set(v) for k, v in groups.items()}
+    remaining_count = len(pass_segs)
+
+    def orient(i, mode):
+        seg = pass_segs[i]
+        return seg if mode == 'A' else list(reversed(seg))
+
+    def nearest(cands, mode, pos):
+        best_i, best_d = None, float('inf')
+        for i in cands:
+            x, y = orient(i, mode)[0][:2]
+            d = (x - pos[0])**2 + (y - pos[1])**2
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i
+
+    # Choose the nearer of the two sweep endpoints as the starting mode.
+    cand_a = nearest(remaining[keys[0]], 'A', cur)
+    cand_b = nearest(remaining[keys[-1]], 'B', cur)
+    xa, ya = orient(cand_a, 'A')[0][:2]
+    xb, yb = orient(cand_b, 'B')[0][:2]
+    da = (xa - cur[0])**2 + (ya - cur[1])**2
+    db = (xb - cur[0])**2 + (yb - cur[1])**2
+    mode, ptr = ('A', 0) if da <= db else ('B', len(keys) - 1)
+
+    ordered = []
+    while remaining_count > 0:
+        step = 1 if mode == 'A' else -1
+        nptr = ptr + step
+        cands = list(remaining.get(keys[ptr], ())) if 0 <= ptr < len(keys) else []
+        if 0 <= nptr < len(keys):
+            cands += list(remaining[keys[nptr]])
+        if cands:
+            bi = nearest(cands, mode, cur)
+            seg = orient(bi, mode)
+            ordered.append(seg)
+            key = coord(pass_segs[bi])
+            remaining[key].discard(bi)
+            remaining_count -= 1
+            cur = seg[-1][:2]
+            ptr = key_index[key]
+        else:
+            ptr = nptr
+            if not (0 <= ptr < len(keys)):
+                if remaining_count == 0:
+                    break
+                mode = 'B' if mode == 'A' else 'A'
+                ptr = len(keys) - 1 if mode == 'B' else 0
+    return ordered
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
@@ -429,6 +576,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             subtract_unaccessible=False,
                             raster_offset_pct=0.0,
                             use_2opt=False,
+                            cut_direction="Either",
                             final_stepdown_mm=0.0,
                             progress=None,
                             erosion_cache=None,
@@ -445,10 +593,17 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     max_depth         : total maximum cut depth in mm
     width_cm          : physical image width in cm
     height_cm         : physical image height in cm
-    raster_dir        : "X" | "Y" | "Both"
+    raster_dir        : "Horizontal" | "Vertical"
     raster_offset_pct : percentage [0, 100) to shift raster lines relative to the
                         step-over distance; e.g. 50 shifts every line by half a step,
                         useful when combining with a previous raster step at 0%.
+    cut_direction     : "Either" | "Climb" | "Conventional" — for a clockwise
+                        spindle, forces every scan line to travel in the
+                        direction that keeps uncut material on the tool's
+                        right (Climb) or left (Conventional). "Either"
+                        preserves the default behaviour: no forced direction,
+                        and the ordering pass below is free to reverse
+                        segments for shorter travel.
     origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate         : cutting feed rate in mm/min
     work_surface_tol  : threshold (normalised [0,1]) applied to the residual
@@ -563,11 +718,16 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     resid_tol_mm = max_depth / (n_grey_levels - 1)
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
 
-    directions = []
-    if raster_dir in ("Horizontal", "Both"):
-        directions.append("X")
-    if raster_dir in ("Vertical", "Both"):
-        directions.append("Y")
+    direction = "X" if raster_dir == "Horizontal" else "Y"
+
+    # Forces every scan line onto a single fixed travel direction (climb
+    # keeps uncut material on the right of travel, conventional on the
+    # left, for a clockwise spindle). "Either" leaves the default pixel-scan
+    # order untouched and lets the ordering pass below reverse segments
+    # freely for shorter travel.
+    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
+                      "Conventional": {"X": True,  "Y": False}}
+    lock_direction = cut_direction in FORCE_REVERSE
 
     progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
                  f"({stepdown_mm:.2f} mm each"
@@ -602,47 +762,45 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     # ── Phase 1: full-depth reference path (no terrain links) ────
     progress(40, "Phase 1: generating full-depth reference path…")
     full_depth_segs = []
-    for direction in directions:
+    boundary_px = H - 1 if direction == "X" else W - 1
+    span_mm     = boundary_px / px_per_mm
+    n           = max(1, round(span_mm / step_mm))
+    adj_step_mm = span_mm / n
+    raster_start_mm = (raster_offset_pct / 100.0) * adj_step_mm
+    line_positions_mm = [raster_start_mm + i * adj_step_mm
+                         for i in range(n + 1)
+                         if raster_start_mm + i * adj_step_mm <= span_mm + 1e-9]
+    all_line_ids = [min(int(round(m * px_per_mm)), boundary_px)
+                    for m in line_positions_mm]
+
+    for line_idx in all_line_ids:
         if direction == "X":
-            boundary_px = H - 1
+            line_depth = center_depth_contour_raster[line_idx, :]
         else:
-            boundary_px = W - 1
-        span_mm     = boundary_px / px_per_mm
-        n           = max(1, round(span_mm / step_mm))
-        adj_step_mm = span_mm / n
-        raster_start_mm = (raster_offset_pct / 100.0) * adj_step_mm
-        line_positions_mm = [raster_start_mm + i * adj_step_mm
-                             for i in range(n + 1)
-                             if raster_start_mm + i * adj_step_mm <= span_mm + 1e-9]
-        all_line_ids = [min(int(round(m * px_per_mm)), boundary_px)
-                        for m in line_positions_mm]
+            line_depth = center_depth_contour_raster[:, line_idx]
 
-        for line_idx in all_line_ids:
+        if prior_mask is not None:
             if direction == "X":
-                line_depth = center_depth_contour_raster[line_idx, :]
+                line_mask = prior_mask[line_idx, :]
             else:
-                line_depth = center_depth_contour_raster[:, line_idx]
+                line_mask = prior_mask[:, line_idx]
+            effective = (line_depth * line_mask).astype(np.float32)
+            spans = mask_spans(effective > resid_tol)
+        else:
+            spans = [(0, len(line_depth) - 1)]
 
-            if prior_mask is not None:
-                if direction == "X":
-                    line_mask = prior_mask[line_idx, :]
-                else:
-                    line_mask = prior_mask[:, line_idx]
-                effective = (line_depth * line_mask).astype(np.float32)
-                spans = mask_spans(effective > resid_tol)
-            else:
-                spans = [(0, len(line_depth) - 1)]
-
-            for s, e in spans:
-                points = []
-                for px in range(s, e + 1):
-                    row, col = (line_idx, px) if direction == "X" else (px, line_idx)
-                    z_mm = float(center_depth_contour_raster[row, col]) * max_depth
-                    x_mm = col / px_per_mm - _ox
-                    y_mm = (H - 1 - row) / px_per_mm - _oy
-                    points.append((x_mm, y_mm, -z_mm))
-                if points:
-                    full_depth_segs.append(points)
+        for s, e in spans:
+            points = []
+            for px in range(s, e + 1):
+                row, col = (line_idx, px) if direction == "X" else (px, line_idx)
+                z_mm = float(center_depth_contour_raster[row, col]) * max_depth
+                x_mm = col / px_per_mm - _ox
+                y_mm = (H - 1 - row) / px_per_mm - _oy
+                points.append((x_mm, y_mm, -z_mm))
+            if points:
+                if lock_direction and FORCE_REVERSE[cut_direction][direction]:
+                    points = list(reversed(points))
+                full_depth_segs.append(points)
 
     progress(55, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s).")
 
@@ -662,58 +820,13 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                  f"({'final' if is_final else 'roughing'}): "
                  f"{len(pass_segs)} segment(s).")
 
-        # Phase 3: greedy nearest-endpoint ordering + optional 2-opt
-        n_segs    = len(pass_segs)
-        unvisited = list(range(n_segs))
-        g_order   = []
-        g_flips   = []
-        cur       = (float(tool_pos[0]), float(tool_pos[1]))
-        while unvisited:
-            best_i, best_rev, best_dist = 0, False, float('inf')
-            for ui, si in enumerate(unvisited):
-                seg = pass_segs[si]
-                xs, ys = seg[0][0],  seg[0][1]
-                xe, ye = seg[-1][0], seg[-1][1]
-                ds = ((xs - cur[0])**2 + (ys - cur[1])**2) ** 0.5
-                de = ((xe - cur[0])**2 + (ye - cur[1])**2) ** 0.5
-                if ds <= de:
-                    d, rev = ds, False
-                else:
-                    d, rev = de, True
-                if d < best_dist:
-                    best_i, best_rev, best_dist = ui, rev, d
-            si = unvisited.pop(best_i)
-            g_order.append(si)
-            g_flips.append(best_rev)
-            seg = pass_segs[si]
-            cur = (seg[0][0], seg[0][1]) if best_rev else (seg[-1][0], seg[-1][1])
-
-        if use_2opt and n_segs >= 3:
-            ent_xy = []
-            ext_xy = []
-            for si, rev in zip(g_order, g_flips):
-                seg = pass_segs[si]
-                if rev:
-                    ent_xy.append((seg[-1][0], seg[-1][1]))
-                    ext_xy.append((seg[0][0],  seg[0][1]))
-                else:
-                    ent_xy.append((seg[0][0],  seg[0][1]))
-                    ext_xy.append((seg[-1][0], seg[-1][1]))
-            order, flips = _two_opt_reorder(ent_xy, ext_xy,
-                                            origin=(float(tool_pos[0]),
-                                                    float(tool_pos[1])),
-                                            link_threshold=link_threshold_mm,
-                                            per_rapid_overhead=10.0)
-            ordered_segs = [
-                list(reversed(pass_segs[g_order[i]])) if (g_flips[i] ^ flips[k])
-                else pass_segs[g_order[i]]
-                for k, i in enumerate(order)
-            ]
+        # Phase 3: per-pass ordering (locked direction vs. free)
+        cur = (float(tool_pos[0]), float(tool_pos[1]))
+        if lock_direction:
+            ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
         else:
-            ordered_segs = [
-                list(reversed(pass_segs[si])) if rev else pass_segs[si]
-                for si, rev in zip(g_order, g_flips)
-            ]
+            ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
+                                                    link_threshold_mm)
 
         # Phase 4: terrain link insertion (respects final_stepdown_mm)
         for i, seg in enumerate(ordered_segs):
@@ -1576,6 +1689,7 @@ def compute_contour_toolpath(
     z_safe=5.0,
     feed_rapid=3000.0,
     use_2opt=False,
+    cut_direction="Either",
     max_step_down_mm=None,
     erosion_cache=None,
     erosion_cache_key=None,
@@ -1644,6 +1758,12 @@ def compute_contour_toolpath(
         level (splits shorter than this are not worth the overhead).
     feed_rapid : float
         Rapid traverse rate in mm/min used for retract+plunge cost estimate.
+    cut_direction : "Either" | "Climb" | "Conventional"
+        For a clockwise spindle, forces every contour to travel in the
+        direction that keeps uncut material on the tool's right (Climb) or
+        left (Conventional). "Either" preserves the default behaviour: no
+        forced direction, and the ordering/2-opt passes below are free to
+        reverse contours for shorter travel.
     erosion_cache : dict, optional
         Used to memoise the grey-erosion/grey-dilation achievable-depth surface
         (keyed by erosion_cache_key), so a subsequent call with the same tool
@@ -1765,10 +1885,19 @@ def compute_contour_toolpath(
 
     # ── Stage 4a · Extract raw contours for every Z-level ─────────────────
     progress(40, "Extracting contours for all Z-levels…")
+    # find_contours keeps uncut material consistently on the right of the
+    # direction of travel (see compute_raster_toolpath's cut_direction docs
+    # for the clockwise-spindle convention), so a single global reversal
+    # rule suffices — no per-contour inside/outside analysis needed.
+    reverse_contours = (cut_direction == "Conventional")
+    lock_direction    = cut_direction in ("Climb", "Conventional")
     all_z_contours = {}
     for z_norm in z_levels:
         raw = find_contours(center_depth_contour, max(z_norm - _contour_eps, 0.0))
-        all_z_contours[z_norm] = [c for c in raw if len(c) >= 3]
+        kept = [c for c in raw if len(c) >= 3]
+        if reverse_contours:
+            kept = [c[::-1] for c in kept]
+        all_z_contours[z_norm] = kept
 
     # ── Stage 4b · Prune laterally-redundant segments ─────────────────────
     if lateral_tol_mm > 0.0:
@@ -1819,7 +1948,8 @@ def compute_contour_toolpath(
                 n         = len(c)
                 is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
                 rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
-                for flip in (False, True):
+                flip_cands = (False,) if lock_direction else (False, True)
+                for flip in flip_cands:
                     orient = c[::-1] if flip else c
                     for j in rot_cands:
                         row0, col0 = orient[j]
@@ -1861,7 +1991,7 @@ def compute_contour_toolpath(
         # shallow-before-deep ordering across levels while reducing rapids
         # within each level.  per_rapid_overhead = 2 × z_safe reflects the
         # actual retract + plunge distance at this safe height.
-        if use_2opt and len(level_segs) >= 3:
+        if use_2opt and len(level_segs) >= 3 and not lock_direction:
             ent_xy = [(s[0][0],  s[0][1])  for s in level_segs]
             ext_xy = [(s[-1][0], s[-1][1]) for s in level_segs]
             order, flips = _two_opt_reorder(
@@ -1898,7 +2028,7 @@ def compute_contour_toolpath(
         win_segs   = [seg for z in win_levels for seg in level_segs_dict.get(z, [])]
         if not win_segs:
             continue
-        if use_2opt and win_size > 1 and len(win_segs) >= 3:
+        if use_2opt and win_size > 1 and len(win_segs) >= 3 and not lock_direction:
             progress(80, f"Cross-level 2-opt: window {win_idx + 1}/{n_windows} "
                          f"({len(win_segs)} segments)…")
             win_z  = [s[0][2] for s in win_segs]
