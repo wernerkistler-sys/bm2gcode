@@ -1912,39 +1912,55 @@ def compute_contour_toolpath(
             max_depth=max_depth,
             max_step_down_mm=_msd)
 
-    # ── Stage 4c · Greedy nearest-neighbour ordering per Z-level ──────────
+    # ── Stage 4c · Ordering — greedy per max_step_down window, optional 2-opt
+    # A contour's climb/conventional correctness comes entirely from
+    # find_contours' own per-contour orientation guarantee (see the
+    # cut_direction docs above), independent of visiting order or Z-level —
+    # unlike raster, where correctness depends on visiting adjacent lines in
+    # sequence. So the greedy step may freely draw candidates from anywhere
+    # in the max_step_down_mm window regardless of lock state; only 2-opt
+    # (which reverses segments/blocks) needs to stay gated by
+    # not lock_direction.
     all_segments      = []
-    level_segs_dict   = {}
     current_pos       = np.array([0.0, 0.0])
-    initial_pos       = current_pos.copy()
     link_threshold_mm = tool.diameter_mm
+    z_jump_weight_mm  = stepdown_mm * 1.5
+    win_size     = (max(1, round(_msd / stepdown_mm))
+                     if _msd and stepdown_mm > 0 else len(z_levels))
+    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
 
-    n_levels = len(z_levels)
-    for pass_idx, z_norm in enumerate(z_levels):
-        progress(55 + 25 * pass_idx // n_levels,
-                 f"Ordering contours at Z = {-z_norm * max_depth:.3f} mm…")
-        z_mm = -z_norm * max_depth
-
-        contours = all_z_contours.get(z_norm, [])
-        if not contours:
+    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
+        win_levels = z_levels[win_start : win_start + win_size]
+        remaining  = [(c, -z_norm * max_depth)
+                      for z_norm in win_levels
+                      for c in all_z_contours.get(z_norm, [])]
+        if not remaining:
             continue
+        progress(55 + 25 * win_idx // n_windows,
+                 f"Ordering window {win_idx + 1}/{n_windows} "
+                 f"({len(remaining)} contour(s))…")
 
-        # Greedy nearest-neighbour ordering across contours at this Z-level.
-        # For closed contours any rotation of the loop is valid, so we sample
-        # candidate start points; for open contours only the two endpoints are
-        # considered (flip=True covers the other end).
-        # Segments are collected into level_segs so that optional 2-opt can
+        # Shallowest Z in this window: once a candidate requires a real rapid
+        # anyway (d >= link_threshold_mm), prefer whichever is closest to
+        # this depth, so forced long jumps still trend top-to-bottom instead
+        # of landing at an arbitrary depth. Short hops stay pure-XY.
+        win_z_top = -win_levels[0] * max_depth
+
+        # Greedy nearest-neighbour ordering across every contour in the
+        # window. For closed contours any rotation of the loop is valid, so
+        # we sample candidate start points; for open contours only the two
+        # endpoints are considered (flip=True covers the other end).
+        # Segments are collected into win_segs so that optional 2-opt can
         # reorder them before they are committed to all_segments.
-        level_cur = current_pos.copy()
-        level_segs = []
-        remaining = contours[:]
+        win_cur  = current_pos.copy()
+        win_segs = []
         while remaining:
             best_idx  = 0
             best_flip = False
             best_rot  = 0
-            best_dist = float('inf')
+            best_cost = float('inf')
 
-            for i, c in enumerate(remaining):
+            for i, (c, z_mm) in enumerate(remaining):
                 n         = len(c)
                 is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
                 rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
@@ -1955,14 +1971,17 @@ def compute_contour_toolpath(
                         row0, col0 = orient[j]
                         x0 = col0 / px_per_mm - _ox
                         y0 = (H - 1 - row0) / px_per_mm - _oy
-                        d  = (x0 - level_cur[0])**2 + (y0 - level_cur[1])**2
-                        if d < best_dist:
-                            best_dist = d
+                        dx, dy = x0 - win_cur[0], y0 - win_cur[1]
+                        d = (dx * dx + dy * dy) ** 0.5
+                        cost = d if d < link_threshold_mm else (
+                            d + z_jump_weight_mm * (win_z_top - z_mm))
+                        if cost < best_cost:
+                            best_cost = cost
                             best_idx  = i
                             best_flip = flip
                             best_rot  = j
 
-            c_chosen  = remaining.pop(best_idx)
+            c_chosen, z_mm = remaining.pop(best_idx)
             is_closed = np.linalg.norm(c_chosen[0] - c_chosen[-1]) < 1.5
             if best_flip:
                 c_chosen = c_chosen[::-1]
@@ -1975,68 +1994,28 @@ def compute_contour_toolpath(
                        (H - 1 - row) / px_per_mm - _oy,
                        z_mm)
                       for row, col in c_chosen]
-            points = simplify_line(points, rdp_tol)
             if len(points) < 2:
                 continue
 
-            level_segs.append(points)
+            win_segs.append(points)
             last = points[-1]
-            level_cur[0] = last[0]
-            level_cur[1] = last[1]
+            win_cur[0] = last[0]
+            win_cur[1] = last[1]
 
-        if not level_segs:
-            continue
-
-        # Optional 2-opt reorder within this Z-level.  Preserves
-        # shallow-before-deep ordering across levels while reducing rapids
-        # within each level.  per_rapid_overhead = 2 × z_safe reflects the
-        # actual retract + plunge distance at this safe height.
-        if use_2opt and len(level_segs) >= 3 and not lock_direction:
-            ent_xy = [(s[0][0],  s[0][1])  for s in level_segs]
-            ext_xy = [(s[-1][0], s[-1][1]) for s in level_segs]
-            order, flips = _two_opt_reorder(
-                ent_xy, ext_xy,
-                origin=(float(current_pos[0]), float(current_pos[1])),
-                link_threshold=link_threshold_mm,
-                per_rapid_overhead=2.0 * z_safe)
-            level_segs = [
-                list(reversed(level_segs[i])) if flips[k] else level_segs[i]
-                for k, i in enumerate(order)
-            ]
-
-        level_segs_dict[z_norm] = level_segs
-        last = level_segs[-1][-1]
-        current_pos[0] = last[0]
-        current_pos[1] = last[1]
-
-    progress(80, f"Contour segments built ({sum(len(v) for v in level_segs_dict.values())} segments).")
-
-    # ── Stage 4b · Cross-level assembly + terrain links ───────────────────
-    # Build all_segments from level_segs_dict using non-overlapping windows of
-    # adjacent z-levels, sized so mixing within a window never exceeds
-    # max_step_down_mm of Z travel.  Within each window (when >1 level) a
-    # second 2-opt pass mixes contours across levels guided by a z-jump
-    # penalty, reducing rapids that straddle level boundaries.
-    z_jump_weight_mm = stepdown_mm * 1.5
-    win_size     = (max(1, round(_msd / stepdown_mm))
-                     if _msd and stepdown_mm > 0 else len(z_levels))
-    assemble_pos = initial_pos.copy()
-    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
-
-    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
-        win_levels = z_levels[win_start : win_start + win_size]
-        win_segs   = [seg for z in win_levels for seg in level_segs_dict.get(z, [])]
         if not win_segs:
             continue
-        if use_2opt and win_size > 1 and len(win_segs) >= 3 and not lock_direction:
-            progress(80, f"Cross-level 2-opt: window {win_idx + 1}/{n_windows} "
-                         f"({len(win_segs)} segments)…")
+
+        # Optional 2-opt reorder across the whole window, guided by a
+        # z-jump penalty to discourage rapids that straddle levels more
+        # than necessary. Skipped when locked, since its block-reversal
+        # move would undo the forced direction.
+        if use_2opt and len(win_segs) >= 3 and not lock_direction:
             win_z  = [s[0][2] for s in win_segs]
             ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
             ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
             order, flips = _two_opt_reorder(
                 ent_xy, ext_xy,
-                origin=(float(assemble_pos[0]), float(assemble_pos[1])),
+                origin=(float(current_pos[0]), float(current_pos[1])),
                 link_threshold=link_threshold_mm,
                 per_rapid_overhead=2.0 * z_safe,
                 seg_z=win_z,
@@ -2045,14 +2024,18 @@ def compute_contour_toolpath(
                 list(reversed(win_segs[i])) if flips[k] else win_segs[i]
                 for k, i in enumerate(order)
             ]
+
         all_segments.extend(win_segs)
         last = win_segs[-1][-1]
-        assemble_pos[0] = last[0]
-        assemble_pos[1] = last[1]
+        current_pos[0] = last[0]
+        current_pos[1] = last[1]
 
-    # Terrain-link insertion: walk all_segments once and splice geodesic links
-    # wherever consecutive segments are within link_threshold_mm of each other.
-    # Done as a separate stage so cross-window boundaries are also covered.
+    progress(80, f"Ordering complete ({len(all_segments)} segments).")
+
+    # ── Stage 4d · Terrain-link insertion ──────────────────────────────────
+    # Walk all_segments once and splice geodesic links wherever consecutive
+    # segments are within link_threshold_mm of each other. Done as a separate
+    # stage so cross-window boundaries are also covered.
     cut_segs    = all_segments
     all_segments = []
     n_links      = 0
@@ -2088,6 +2071,14 @@ def compute_contour_toolpath(
 
     progress(80, f"Assembly complete — {len(cut_segs)} cut segments, "
                  f"{n_links} terrain links.")
+
+    # RDP-simplify every segment — cut contours and terrain links alike —
+    # now that ordering is finalised. Simplification never moves a segment's
+    # first/last point (see simplify_line), so deferring it to here rather
+    # than per-contour during ordering has no effect on entry-point choice,
+    # 2-opt, or terrain-link endpoints; it just needs to happen somewhere
+    # after every segment (including links, built above) exists.
+    all_segments = [simplify_line(pts, rdp_tol) for pts in all_segments]
 
     # ── Stage 5 · Simulate result (80–90 %) ───────────────────────────────
     progress(80, "Simulating tool-swept removal surface…")

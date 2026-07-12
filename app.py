@@ -23,7 +23,7 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 )
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, ALGORITHMS, DEFAULTS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
@@ -492,6 +492,16 @@ class GCodeGeneratorApp:
                      values=RASTER_DIRECTIONS, state="readonly", width=22
                      ).pack(side=tk.RIGHT)
 
+        cut_dir_row = ttk.Frame(operation_lf)
+        cut_dir_row.pack(fill=tk.X, pady=2, after=raster_frame)   # initially shown (default = Raster Scan)
+        step['cut_dir_row'] = cut_dir_row
+        ttk.Label(cut_dir_row, text="Cut direction:").pack(side=tk.LEFT)
+        cut_dir_var = tk.StringVar(value=DEFAULTS["step_cut_direction"])
+        step['cut_dir_var'] = cut_dir_var
+        ttk.Combobox(cut_dir_row, textvariable=cut_dir_var,
+                     values=CUT_DIRECTIONS, state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
+
         # ── Contour-only op controls (hidden unless Contour algorithm) ──
         contour_frame = ttk.Frame(operation_lf)
         step['contour_frame'] = contour_frame
@@ -520,9 +530,11 @@ class GCodeGeneratorApp:
 
         tsp_2opt_var = tk.BooleanVar(
             value=bool(int(DEFAULTS["step_tsp_2opt"])))
-        ttk.Checkbutton(tsp_frame, text="Optimize path order (2-opt)",
-                        variable=tsp_2opt_var).pack(anchor=tk.W, pady=2)
+        tsp_2opt_cb = ttk.Checkbutton(tsp_frame, text="Optimize path order (2-opt)",
+                                      variable=tsp_2opt_var)
+        tsp_2opt_cb.pack(anchor=tk.W, pady=2)
         step['tsp_2opt_var'] = tsp_2opt_var
+        step['tsp_2opt_cb'] = tsp_2opt_cb
 
         gating_frame = ttk.Frame(operation_lf)
         gating_frame.pack(fill=tk.X)
@@ -633,6 +645,7 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
                 step['raster_final_stepdown'].pack_forget()
+                step['cut_dir_row'].pack_forget()
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2)
@@ -662,6 +675,7 @@ class GCodeGeneratorApp:
                     step['vbit_frame'].pack_forget()
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['contour_frame'])
                 step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
@@ -682,12 +696,18 @@ class GCodeGeneratorApp:
                 step['raster_final_stepdown'].pack(fill=tk.X, pady=2,
                                                    after=step['stepdown'])
                 step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
+
+            locked = not alg.startswith("V-Carving") and step['cut_dir_var'].get() != "Either"
+            step['tsp_2opt_cb'].config(state="disabled" if locked else "normal")
+
             if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()
 
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
+        cut_dir_var.trace_add("write", _refresh_layout)
 
         def _on_mask_param_changed(*_):
             if not hasattr(self, '_view_menu'):
@@ -742,6 +762,7 @@ class GCodeGeneratorApp:
         step['feed_rate'].set(DEFAULTS["step_feed_rate"])
         step['threshold'].set(DEFAULTS["step_threshold"])
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
+        step['cut_dir_var'].set(DEFAULTS["step_cut_direction"])
         step['vbit_angle'].set(DEFAULTS["step_vbit_angle"])
         step['min_fw'].set(DEFAULTS["step_min_fw"])
         step['max_fw'].auto_var.set(False)
@@ -999,6 +1020,7 @@ class GCodeGeneratorApp:
             'stepdown':             step['stepdown'].get(),
             'raster_final_stepdown': step['raster_final_stepdown'].get(),
             'raster_dir':           step['raster_dir_var'].get(),
+            'cut_direction':        step['cut_dir_var'].get(),
             'vbit_angle':           step['vbit_angle'].get(),
             'vcarve_stepdown':      step['vcarve_stepdown'].get(),
             'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
@@ -1023,6 +1045,7 @@ class GCodeGeneratorApp:
         step['stepdown'].set(d.get('stepdown', DEFAULTS['step_stepdown']))
         step['raster_final_stepdown'].set(d.get('raster_final_stepdown', DEFAULTS['step_raster_final_stepdown']))
         step['raster_dir_var'].set(d.get('raster_dir', DEFAULTS['step_raster_dir']))
+        step['cut_dir_var'].set(d.get('cut_direction', DEFAULTS['step_cut_direction']))
         step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
         step['vcarve_stepdown'].set(d.get('vcarve_stepdown', DEFAULTS['step_vcarve_stepdown']))
         step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
@@ -1406,6 +1429,7 @@ class GCodeGeneratorApp:
                 'contour_lateral_tol': float(step['contour_lateral_tol'].get()),
                 'use_2opt':            step['tsp_2opt_var'].get(),
                 'contour_max_step_down': float(step['stepdown'].get()),
+                'cut_direction':       step['cut_dir_var'].get(),
             })
         else:  # Raster
             _profile    = step['profile_var'].get()
@@ -1420,6 +1444,7 @@ class GCodeGeneratorApp:
                 'raster_final_stepdown_mm': float(step['raster_final_stepdown'].get()),
                 'use_2opt':                 step['tsp_2opt_var'].get(),
                 'raster_dir':               step['raster_dir_var'].get(),
+                'cut_direction':            step['cut_dir_var'].get(),
                 'gating_mode':              step['gating_mode_var'].get(),
                 'work_surface_tol':         threshold_mm / max_depth if max_depth else 0.0,
             })
@@ -1498,6 +1523,7 @@ class GCodeGeneratorApp:
                 z_safe             = self._settings['z_safe'],
                 feed_rapid         = self._settings['feed_rapid'],
                 use_2opt           = params['use_2opt'],
+                cut_direction      = params['cut_direction'],
                 max_step_down_mm   = params['contour_max_step_down'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
@@ -1543,6 +1569,7 @@ class GCodeGeneratorApp:
                 raster_offset_pct = params['raster_offset_pct'],
                 feed_rate         = params['feed_rate'],
                 use_2opt          = params['use_2opt'],
+                cut_direction     = params['cut_direction'],
                 progress          = progress_fn,
                 erosion_cache     = self._erosion_cache,
                 erosion_cache_key = erosion_cache_key,

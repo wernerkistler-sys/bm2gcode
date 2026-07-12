@@ -71,7 +71,8 @@ Sweeps the cutter in parallel lines across the material.
 |---|---|
 | Step-over | Lateral spacing between scan lines, as a percentage of tool diameter. |
 | Line offset | Shifts alternate scan lines by this percentage, so that the in-between lines can be cut in a separate step with a different setting. |
-| Scan direction | Horizontal, Vertical, or Both. |
+| Scan direction | Horizontal or Vertical. |
+| Cut direction | Climb or Conventional forces every scan line to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained, so path ordering is free to reverse segments for shorter travel. |
 
 ---
 
@@ -84,6 +85,7 @@ Traces the depth map as a stack of iso-depth contours, like topographic lines on
 | Step-down | Vertical distance between contour levels (mm). |
 | Adaptive levels (CDF) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. |
 | Lateral tolerance | Discards contour segments that lie within this distance (mm) of an adjacent deeper-level contour, removing redundant passes over areas already covered. |
+| Cut direction | Climb or Conventional forces every contour to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained, so path ordering is free to reverse segments for shorter travel. |
 
 ---
 
@@ -122,7 +124,7 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 
 ##### Step / Operation / Path Optimization
 
-**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments.
+**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments. Greyed out and has no effect when **Cut direction** is set to Climb or Conventional, since a locked direction cannot be reordered — see [Climb / conventional cut direction](#climb--conventional-cut-direction).
 
 ---
 
@@ -142,7 +144,17 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 | Max step-down | Maximum depth per roughing pass (mm). If the required depth exceeds this, multiple passes are generated automatically. |
 | Final step-down | Depth of a separate finishing pass (mm). 0 means no finishing pass; the last roughing pass goes directly to full depth. |
 
+V-Carving has its own independent pair of fields with the same labels and
+meaning — changing Raster Scan's Max/Final step-down has no effect on a
+V-Carving step, and vice versa.
 
+Contour also shows a **Max step-down** field here, but with a different
+meaning: it bounds how many redundant levels lateral pruning may collapse
+and the window (in Z-levels) that contour ordering and 2-opt are allowed
+to mix contours across — see
+[Contour lateral pruning](#contour-lateral-pruning). Contour's actual
+Z-level spacing is the separate **Step-down** field under
+[Step / Operation / Contour](#step--operation--contour).
 
 ---
 
@@ -253,9 +265,9 @@ This section describes how each algorithm works internally — the pipeline stag
 1. **Kernel construction** — Tool geometry is discretised into a depth-offset kernel and a boolean footprint disk.
 2. **Accessibility map** — Grey-erosion → grey-dilation (morphological opening) yields the reachable depth at each material point.
 3. **Pass planning** — Max step-down and Final step-down define an ordered sequence of depth ceilings (e.g. 0.5 mm → 1.0 mm → 1.5 mm → 1.8 mm (final)).
-4. **Scan line extraction** — For each raster line at the step-over interval, contiguous spans of the gated work region are extracted by edge-detection on the binary mask. Each span becomes a full-depth segment.
+4. **Scan line extraction** — For each raster line at the step-over interval, contiguous spans of the gated work region are extracted by edge-detection on the binary mask. Each span becomes a full-depth segment. If Cut direction is Climb or Conventional, spans are reversed as needed so every line travels the same physical direction (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
 5. **Depth-slicing (multi-pass)** — Full-depth segments are split into per-pass sub-segments. Roughing passes skip pixels already at target depth or shallower than the final step-down reserve. The final pass covers all remaining pixels. Segments are broken wherever the gate changes.
-6. **Path ordering** — Greedy nearest-endpoint ordering, optionally refined by 2-opt TSP (see [2-opt TSP path reordering](#2-opt-tsp-path-reordering)).
+6. **Path ordering** — Greedy nearest-endpoint ordering, optionally refined by 2-opt TSP (see [2-opt TSP path reordering](#2-opt-tsp-path-reordering)). A locked Cut direction instead uses a line-adjacency-preserving oscillating sweep (see [Climb / conventional cut direction](#climb--conventional-cut-direction)); 2-opt is skipped in that case.
 7. **Terrain linking** — Short gaps between segments are bridged by a geodesic path along the roughing surface rather than a full retract (see [Geodesic terrain linking](#geodesic-terrain-linking)). Longer gaps use retract → rapid → plunge.
 8. **Simplification** — Ramer-Douglas-Peucker reduces point count to within pixel resolution (see [Ramer-Douglas-Peucker simplification](#ramer-douglas-peucker-simplification)).
 9. **Result simulation** — The toolpath is resampled at sub-pixel spacing and swept through a grey-dilation to compute the material state (result map) for subsequent steps.
@@ -268,12 +280,11 @@ This section describes how each algorithm works internally — the pipeline stag
 2. **Level planning** — Two modes:
    - *Uniform*: Z-levels at equal step-down intervals.
    - *Adaptive (CDF)*: Z-levels placed at quantile boundaries of the depth-map pixel distribution. This concentrates levels where many pixels share the same depth value ("plateaus"), so contour lines align with flat areas rather than spanning empty gray ranges.
-3. **Contour extraction** — `skimage.find_contours` traces iso-depth curves at each Z-level on the accessibility map.
+3. **Contour extraction** — `skimage.find_contours` traces iso-depth curves at each Z-level on the accessibility map. If Cut direction is Climb or Conventional, every contour is reversed (or not) by a single global rule applied at this stage (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
 4. **Lateral pruning (optional)** — For each level, the distance transform to all committed deeper-level cuts is computed. Contour segments closer than the Lateral tolerance are discarded. Short pruned runs are restored if the retract/plunge overhead would cost more machine time than the cut saves.
-5. **Per-level ordering** — Greedy nearest-neighbour with support for closed-contour rotation; optional 2-opt within each level.
-6. **Cross-level assembly** — Optional 2-opt across adjacent levels, with a Z-jump penalty proportional to Max step-down. This reduces depth-change rapids between levels while discouraging jumps that exceed the step-down budget.
-7. **Terrain linking** — Same geodesic approach as Raster for short inter-segment gaps.
-8. **Simplification + result simulation** — Same as Raster (steps 8–9).
+5. **Ordering** — Contours are grouped into non-overlapping windows of adjacent Z-levels sized so no window spans more than Max step-down of Z travel, then greedy nearest-neighbour ordering runs across every contour in the window at once — not just one Z-level — with support for closed-contour rotation. Because a contour's climb/conventional correctness comes entirely from its own orientation (set in step 3), not from visiting order, a locked Cut direction still gets this full cross-window freedom; it only disables reversal (flip) and the optional 2-opt refinement pass, since 2-opt's block-reversal move would undo the forced direction — see [Climb / conventional cut direction](#climb--conventional-cut-direction). When the nearest candidate is a genuine rapid rather than a short hop, the greedy step prefers whichever candidate is closest to the window's shallowest level, so forced long jumps still trend top-to-bottom instead of landing at an arbitrary depth. 2-opt, when it runs, applies a Z-jump penalty proportional to Max step-down across the same window.
+6. **Terrain linking** — Same geodesic approach as Raster for short inter-segment gaps.
+7. **Simplification + result simulation** — Same as Raster (steps 8–9).
 
 ---
 
@@ -303,6 +314,20 @@ All three V-Carving variants share stages 1–2 and 4–8; they differ in how th
 #### 2-opt TSP path reordering
 
 Iteratively tests whether reversing a contiguous block of segments reduces total travel cost. The cost function accounts for whether a gap qualifies for terrain-linking (feed-rate cost only) or requires a retract + rapid + plunge (fixed overhead + distance). A configurable Z-jump penalty discourages large depth changes for cross-level reordering in Contour.
+
+#### Climb / conventional cut direction
+
+With a clockwise spindle (`M3`, the default G-code preamble, editable under File → Settings), a cut keeps uncut material on the tool's right for climb milling and on its left for conventional milling. Raster and Contour each apply this as a single, cheap, upfront reversal rule rather than analysing each segment's surrounding geometry:
+
+- **Raster**: horizontal scan lines default to left→right and vertical lines to bottom→top. Climb keeps horizontal lines as extracted and reverses vertical lines; Conventional does the opposite.
+- **Contour**: `skimage.find_contours` always keeps higher-valued pixels on a fixed side of the direction it returns a contour in, regardless of whether that contour encloses a peak or a valley, open or closed. Climb keeps every contour as extracted; Conventional reverses all of them.
+
+Once a direction is locked, reversal is off the table everywhere, but how much freedom ordering keeps differs between the two algorithms — it depends on whether correctness is a property of one segment alone or of the visiting sequence:
+
+- **Raster**: correctness depends on visiting order, not just each segment's own direction — a segment cut out of turn could put a still-uncut line's material on the wrong side even though its own travel direction is correct. So consecutive cuts are restricted to the current raster line or the immediately next one in the active sweep direction, and a line can never be visited out of turn. Depth-slicing for multi-pass roughing can fragment a line into several short segments, leaving some unvisited when a greedy jump favours a closer line further along; when the sweep reaches one edge of the map with segments still unvisited elsewhere, both the sweep direction and each newly-visited segment's travel direction flip together and it resumes from that same edge, oscillating back and forth until nothing is left. Reversing progression and per-segment travel together preserves which side carries uncut material, so every line-to-line transition stays climb/conventional-correct; 2-opt is skipped, since its block-reversal move would undo the forced direction.
+- **Contour**: correctness comes entirely from each contour's own fixed orientation (set in the single global reversal rule above), not from visiting order, so locking direction doesn't need to restrict which contour is visited next or from which Z-level — the greedy step still draws candidates from the whole max_step_down window, same as when unlocked. It only removes the flip option (a closed contour can still start at any point along itself, just never reversed) and skips 2-opt, since its block-reversal move would undo the forced direction.
+
+This trades some travel-time optimisation for a mechanically consistent cut.
 
 #### Ramer-Douglas-Peucker simplification
 

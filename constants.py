@@ -1,5 +1,6 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
-RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Both"]
+RASTER_DIRECTIONS = ["Horizontal", "Vertical"]
+CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
 ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
@@ -44,6 +45,7 @@ DEFAULTS = {
     "step_raster_final_stepdown": "0.0",
     "step_feed_rate":    "800",
     "step_raster_dir":   "Vertical",
+    "step_cut_direction": "Either",
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # see ALGORITHMS list
