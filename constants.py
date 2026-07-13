@@ -1,5 +1,6 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
-RASTER_DIRECTIONS = ["Horizontal", "Vertical"]
+RASTER_DIRECTIONS = ["Horizontal", "Vertical",
+                     "Spiral (Outside-In)", "Spiral (Inside-Out)"]
 CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
 ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",

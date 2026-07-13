@@ -565,6 +565,204 @@ def _order_locked_raster_pass(pass_segs, direction, cur):
     return ordered
 
 
+def _grid_line_ids(boundary_px, px_per_mm, step_mm, raster_offset_pct):
+    """Evenly spaced grid-line pixel indices spanning [0, boundary_px],
+    step-adjusted to fit exactly (no partial leftover line) and shifted by
+    raster_offset_pct of the adjusted step.
+
+    Shared by Horizontal/Vertical raster lines (one axis) and both axes of
+    the Spiral grid.
+
+    Returns
+    -------
+    (line_ids, adj_step_mm) — line_ids is a list of pixel indices in
+    [0, boundary_px]; adj_step_mm is the step size after rounding to fit.
+    """
+    span_mm = boundary_px / px_per_mm
+    n = max(1, round(span_mm / step_mm))
+    adj_step_mm = span_mm / n
+    start_mm = (raster_offset_pct / 100.0) * adj_step_mm
+    positions_mm = [start_mm + i * adj_step_mm
+                    for i in range(n + 1)
+                    if start_mm + i * adj_step_mm <= span_mm + 1e-9]
+    line_ids = [min(int(round(m * px_per_mm)), boundary_px) for m in positions_mm]
+    return line_ids, adj_step_mm
+
+
+def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
+                  center_depth_contour_raster, prior_mask, resid_tol,
+                  px_per_mm, H, _ox, _oy, max_depth):
+    """Build zero or more point-list segments along one raster line (or a
+    sub-range of a line, for spiral legs), gated by prior_mask/mask_spans.
+
+    direction : "X" (fixed row, points vary across columns lo_idx..hi_idx)
+                or "Y" (fixed column, points vary across rows lo_idx..hi_idx)
+    fixed_idx : the constant row (direction="X") or column (direction="Y")
+                pixel index for this line/leg.
+    lo_idx, hi_idx : inclusive pixel-index bounds along the varying axis;
+                     always lo_idx <= hi_idx — use `reverse` for travel
+                     direction, never swapped bounds.
+    reverse   : if True, each resulting segment's points are reversed so
+                the segment travels from hi_idx toward lo_idx instead of
+                lo_idx toward hi_idx.
+
+    Returns
+    -------
+    list of point-lists — [[(x_mm, y_mm, -z_mm), ...], ...] — normally one
+    element, or several when prior_mask/mask_spans splits the range into
+    disjoint active sub-spans.
+    """
+    if direction == "X":
+        line_depth = center_depth_contour_raster[fixed_idx, lo_idx:hi_idx + 1]
+    else:
+        line_depth = center_depth_contour_raster[lo_idx:hi_idx + 1, fixed_idx]
+
+    if prior_mask is not None:
+        if direction == "X":
+            line_mask = prior_mask[fixed_idx, lo_idx:hi_idx + 1]
+        else:
+            line_mask = prior_mask[lo_idx:hi_idx + 1, fixed_idx]
+        effective = (line_depth * line_mask).astype(np.float32)
+        spans = mask_spans(effective > resid_tol)
+    else:
+        spans = [(0, len(line_depth) - 1)]
+
+    segs = []
+    for s, e in spans:                       # s, e are LOCAL indices, 0-based within lo_idx..hi_idx
+        points = []
+        for local_px in range(s, e + 1):
+            px = lo_idx + local_px
+            row, col = (fixed_idx, px) if direction == "X" else (px, fixed_idx)
+            z_mm = float(center_depth_contour_raster[row, col]) * max_depth
+            x_mm = col / px_per_mm - _ox
+            y_mm = (H - 1 - row) / px_per_mm - _oy
+            points.append((x_mm, y_mm, -z_mm))
+        if points:
+            if reverse:
+                points = list(reversed(points))
+            segs.append(points)
+    if reverse:
+        # mask_spans always returns spans in ascending pixel-index order;
+        # when the line travels hi_idx -> lo_idx, the span nearer hi_idx
+        # is reached first, so the span LIST order must flip too, not
+        # just each span's own point order.
+        segs = list(reversed(segs))
+    return segs
+
+
+def _spiral_index_pairs_cw(ny, nx):
+    """(row_idx, col_idx) ARRAY-position pairs in outside-in clockwise
+    order: top row L→R, right col T→B, bottom row R→L, left col B→T,
+    each ring shrinking inward. Standard 'spiral matrix' traversal,
+    operating on grid-LINE counts (ny, nx), not raw image pixel counts.
+    """
+    top, bottom, left, right = 0, ny - 1, 0, nx - 1
+    order = []
+    while top <= bottom and left <= right:
+        order += [(top, c) for c in range(left, right + 1)]
+        top += 1
+        order += [(r, right) for r in range(top, bottom + 1)]
+        right -= 1
+        if top <= bottom:
+            order += [(bottom, c) for c in range(right, left - 1, -1)]
+            bottom -= 1
+        if left <= right:
+            order += [(r, left) for r in range(bottom, top - 1, -1)]
+            left += 1
+    return order
+
+
+def _spiral_index_pairs_ccw(ny, nx):
+    """Mirror of _spiral_index_pairs_cw: left col T→B, bottom row L→R,
+    right col B→T, top row R→L, each ring shrinking inward.
+    """
+    top, bottom, left, right = 0, ny - 1, 0, nx - 1
+    order = []
+    while top <= bottom and left <= right:
+        order += [(r, left) for r in range(top, bottom + 1)]
+        left += 1
+        order += [(bottom, c) for c in range(left, right + 1)]
+        bottom -= 1
+        if left <= right:
+            order += [(r, right) for r in range(bottom, top - 1, -1)]
+            right -= 1
+        if top <= bottom:
+            order += [(top, c) for c in range(right, left - 1, -1)]
+            top += 1
+    return order
+
+
+def _rle_into_legs(pts):
+    """Run-length-encode a sequence of axis-aligned adjacent grid points
+    (real pixel coordinates, as produced by _spiral_index_pairs_cw/ccw
+    applied to row_ids/col_ids) into maximal straight legs.
+
+    Two consecutive points always share either their row or their column
+    (never both, except when the whole spiral is a single point). This
+    automatically absorbs the "ring shrinks to 1 pixel wide" edge case
+    into whichever neighbouring run the corner pixel belongs to, with no
+    special-casing needed.
+
+    Returns
+    -------
+    list of (direction, fixed_idx, start_idx, end_idx) — direction is "X"
+    (fixed row, varying column) or "Y" (fixed column, varying row),
+    matching compute_raster_toolpath's existing direction convention.
+    start_idx/end_idx are actual pixel indices and may be given in either
+    order: start_idx > end_idx means the leg travels toward a *decreasing*
+    pixel index.
+    """
+    n = len(pts)
+    if n == 1:
+        r, c = pts[0]
+        return [("X", r, c, c)]
+    legs = []
+    i = 0
+    while i < n - 1:
+        r0, c0 = pts[i]
+        r1, c1 = pts[i + 1]
+        if r1 == r0:
+            k = i + 1
+            while k + 1 < n and pts[k + 1][0] == r0:
+                k += 1
+            legs.append(("X", r0, c0, pts[k][1]))
+        else:
+            k = i + 1
+            while k + 1 < n and pts[k + 1][1] == c0:
+                k += 1
+            legs.append(("Y", c0, r0, pts[k][0]))
+        i = k
+    return legs
+
+
+def _spiral_legs(row_ids, col_ids, sense):
+    """Perimeter-tracing spiral traversal of a (row_ids × col_ids) grid,
+    outside-in, in the given rotational `sense` ("CW" or "CCW"). Handles
+    ny==1, nx==1, ny==nx==1, and non-square ny/nx transparently — see
+    _rle_into_legs.
+    """
+    ny, nx = len(row_ids), len(col_ids)
+    index_order = (_spiral_index_pairs_cw(ny, nx) if sense == "CW"
+                   else _spiral_index_pairs_ccw(ny, nx))
+    pts = [(row_ids[r], col_ids[c]) for r, c in index_order]
+    return _rle_into_legs(pts)
+
+
+def _is_contiguous_chain(segs, tol_mm=1e-6):
+    """True if segs (in list order) form one unbroken chain: each
+    segment's last point is within tol_mm of the next segment's first
+    point (in XY). Used to detect whether a pass's segments are still a
+    single continuous path (e.g. an unfragmented spiral coil), in which
+    case there is no travel to optimise and reordering only risks harm.
+    """
+    for i in range(len(segs) - 1):
+        x0, y0 = segs[i][-1][0], segs[i][-1][1]
+        x1, y1 = segs[i + 1][0][0], segs[i + 1][0][1]
+        if (x1 - x0) ** 2 + (y1 - y0) ** 2 > tol_mm * tol_mm:
+            return False
+    return True
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_cm, height_cm, raster_dir,
@@ -593,7 +791,17 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     max_depth         : total maximum cut depth in mm
     width_cm          : physical image width in cm
     height_cm         : physical image height in cm
-    raster_dir        : "Horizontal" | "Vertical"
+    raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
+                        "Spiral (Inside-Out)" — Horizontal/Vertical scan in
+                        parallel lines; the Spiral patterns trace the depth
+                        map's perimeter inward in concentric rectangular
+                        rings (Outside-In) or the reverse, starting near the
+                        center (Inside-Out), without lifting the tool.
+                        Always starts at the top-left corner and uses
+                        independent row/column step-overs, so non-square
+                        depth maps are fully covered on both axes. See
+                        cut_direction for how Climb/Conventional map onto
+                        the spiral's clockwise/counter-clockwise sense.
     raster_offset_pct : percentage [0, 100) to shift raster lines relative to the
                         step-over distance; e.g. 50 shifts every line by half a step,
                         useful when combining with a previous raster step at 0%.
@@ -718,15 +926,23 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     resid_tol_mm = max_depth / (n_grey_levels - 1)
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
 
-    direction = "X" if raster_dir == "Horizontal" else "Y"
+    IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
+    direction = None if IS_SPIRAL else ("X" if raster_dir == "Horizontal" else "Y")
 
-    # Forces every scan line onto a single fixed travel direction (climb
+    # Forces every scan line/leg onto a single fixed travel direction (climb
     # keeps uncut material on the right of travel, conventional on the
     # left, for a clockwise spindle). "Either" leaves the default pixel-scan
     # order untouched and lets the ordering pass below reverse segments
-    # freely for shorter travel.
+    # freely for shorter travel. For Horizontal/Vertical this flips each
+    # line's own point order (FORCE_REVERSE); for Spiral it instead selects
+    # which rotational sense (CW/CCW) the whole spiral is generated in,
+    # which achieves the same "uncut material on a fixed side" guarantee
+    # for every leg without needing a per-leg reversal (see
+    # SPIRAL_OUTSIDE_IN_SENSE and _spiral_legs() in Phase 1 below;
+    # Inside-Out is a whole-path reversal on top of that).
     FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
                       "Conventional": {"X": True,  "Y": False}}
+    SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
     lock_direction = cut_direction in FORCE_REVERSE
 
     progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
@@ -762,45 +978,36 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     # ── Phase 1: full-depth reference path (no terrain links) ────
     progress(40, "Phase 1: generating full-depth reference path…")
     full_depth_segs = []
-    boundary_px = H - 1 if direction == "X" else W - 1
-    span_mm     = boundary_px / px_per_mm
-    n           = max(1, round(span_mm / step_mm))
-    adj_step_mm = span_mm / n
-    raster_start_mm = (raster_offset_pct / 100.0) * adj_step_mm
-    line_positions_mm = [raster_start_mm + i * adj_step_mm
-                         for i in range(n + 1)
-                         if raster_start_mm + i * adj_step_mm <= span_mm + 1e-9]
-    all_line_ids = [min(int(round(m * px_per_mm)), boundary_px)
-                    for m in line_positions_mm]
 
-    for line_idx in all_line_ids:
-        if direction == "X":
-            line_depth = center_depth_contour_raster[line_idx, :]
-        else:
-            line_depth = center_depth_contour_raster[:, line_idx]
+    if IS_SPIRAL:
+        row_ids, adj_step_y_mm = _grid_line_ids(H - 1, px_per_mm, step_mm, raster_offset_pct)
+        col_ids, adj_step_x_mm = _grid_line_ids(W - 1, px_per_mm, step_mm, raster_offset_pct)
+        sense = SPIRAL_OUTSIDE_IN_SENSE[cut_direction]
+        legs = _spiral_legs(row_ids, col_ids, sense)
+        if raster_dir == "Spiral (Inside-Out)":
+            # Inside-Out is the point-reversal of Outside-In generated in
+            # the sense that yields the same Climb/Conventional label:
+            # reversing a path both reverses leg order and flips the
+            # perceived rotational sense, so this reuses
+            # SPIRAL_OUTSIDE_IN_SENSE instead of needing a second table.
+            legs = [(axis, fixed, e, s) for axis, fixed, s, e in reversed(legs)]
 
-        if prior_mask is not None:
-            if direction == "X":
-                line_mask = prior_mask[line_idx, :]
-            else:
-                line_mask = prior_mask[:, line_idx]
-            effective = (line_depth * line_mask).astype(np.float32)
-            spans = mask_spans(effective > resid_tol)
-        else:
-            spans = [(0, len(line_depth) - 1)]
-
-        for s, e in spans:
-            points = []
-            for px in range(s, e + 1):
-                row, col = (line_idx, px) if direction == "X" else (px, line_idx)
-                z_mm = float(center_depth_contour_raster[row, col]) * max_depth
-                x_mm = col / px_per_mm - _ox
-                y_mm = (H - 1 - row) / px_per_mm - _oy
-                points.append((x_mm, y_mm, -z_mm))
-            if points:
-                if lock_direction and FORCE_REVERSE[cut_direction][direction]:
-                    points = list(reversed(points))
-                full_depth_segs.append(points)
+        for axis, fixed_idx, start_idx, end_idx in legs:
+            lo, hi = (start_idx, end_idx) if start_idx <= end_idx else (end_idx, start_idx)
+            full_depth_segs.extend(
+                _line_points(axis, fixed_idx, lo, hi, start_idx > end_idx,
+                             center_depth_contour_raster, prior_mask, resid_tol,
+                             px_per_mm, H, _ox, _oy, max_depth))
+    else:
+        spacing_boundary_px = H - 1 if direction == "X" else W - 1   # axis lines are spaced along
+        line_span_px        = W - 1 if direction == "X" else H - 1   # each line's own full length
+        all_line_ids, adj_step_mm = _grid_line_ids(spacing_boundary_px, px_per_mm, step_mm, raster_offset_pct)
+        for line_idx in all_line_ids:
+            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
+            full_depth_segs.extend(
+                _line_points(direction, line_idx, 0, line_span_px, reverse,
+                             center_depth_contour_raster, prior_mask, resid_tol,
+                             px_per_mm, H, _ox, _oy, max_depth))
 
     progress(55, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s).")
 
@@ -822,8 +1029,41 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
         # Phase 3: per-pass ordering (locked direction vs. free)
         cur = (float(tool_pos[0]), float(tool_pos[1]))
-        if lock_direction:
+        if lock_direction and IS_SPIRAL:
+            # Phase 1 already emits one continuous, correctly-sensed
+            # perimeter walk (see SPIRAL_OUTSIDE_IN_SENSE above);
+            # reordering would break that. _order_locked_raster_pass's
+            # single-coordinate grouping assumes one axis-aligned line
+            # family and doesn't generalize to a spiral's alternating
+            # row/column legs, so pass make_multipass's output straight
+            # through unreordered. Phase 4 below still bridges any gaps a
+            # masked/gated refining pass introduces, same as it already
+            # does for Horizontal/Vertical.
+            ordered_segs = pass_segs
+        elif lock_direction:
             ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
+        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
+            # This pass is still one genuinely unbroken coil (the common
+            # case: full-depth single pass, or a multi-pass/masked pass
+            # that happened not to fragment) — skip reordering. This is
+            # never a loss (an already-contiguous chain has zero
+            # inter-segment travel to optimise) and avoids a real bug:
+            # _order_free_raster_pass's greedy walk starts from the
+            # tool's world origin (0,0), which can coincide exactly with
+            # a NON-initial vertex of the spiral depending on the G-code
+            # origin setting (e.g. Bottom-Left origin puts (0,0) on the
+            # ring-0/ring-1 boundary corner). That exact-zero-distance tie
+            # makes greedy pick the wrong leg first and chain backwards
+            # through more zero-distance ties, closing each ring into a
+            # rectangle linked to the next by a diagonal jump instead of
+            # a spiral. When make_multipass or mask-based gating DOES
+            # fragment a pass into disconnected pieces, this check is
+            # False and we fall through to genuine nearest-neighbour
+            # reordering below, same as any other pattern — there is no
+            # single correct order left to preserve in that case, so
+            # travel-optimizing among the fragments is the right thing
+            # to do.
+            ordered_segs = pass_segs
         else:
             ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
                                                     link_threshold_mm)
@@ -840,7 +1080,11 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 nxt_dist = np.hypot(x_entry - tool_pos[0],
                                     y_entry - tool_pos[1])
 
-                if nxt_dist < link_threshold_mm:
+                # Consecutive Spiral legs share their corner pixel exactly
+                # (nxt_dist == 0.0); skip link insertion when segments are
+                # already contiguous to avoid a spurious zero-length link
+                # between every leg.
+                if 1e-6 < nxt_dist < link_threshold_mm:
                     x_exit = float(tool_pos[0])
                     y_exit = float(tool_pos[1])
                     c0_px = int(round((x_exit  + _ox) * px_per_mm))
