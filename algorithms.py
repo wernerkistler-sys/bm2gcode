@@ -765,7 +765,7 @@ def _is_contiguous_chain(segs, tol_mm=1e-6):
 
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
-                            width_cm, height_cm, raster_dir,
+                            width_mm, height_mm, raster_dir,
                             origin="Bottom-Left",
                             feed_rate=800.0,
                             work_surface_tol=None,
@@ -789,8 +789,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     step_mm           : lateral step-over in mm
     stepdown_mm       : max depth increment per roughing z-pass in mm
     max_depth         : total maximum cut depth in mm
-    width_cm          : physical image width in cm
-    height_cm         : physical image height in cm
+    width_mm          : physical image width in mm
+    height_mm         : physical image height in mm
     raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
                         "Spiral (Inside-Out)" — Horizontal/Vertical scan in
                         parallel lines; the Spiral patterns trace the depth
@@ -853,8 +853,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
-    px_per_mm_x = W / (width_cm  * 10.0)
-    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
     if px_per_mm_x != px_per_mm_y:
         from scipy.ndimage import zoom as _zoom
         target = max(px_per_mm_x, px_per_mm_y)
@@ -1159,8 +1159,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'stepdown_mm': stepdown_mm,
             'final_stepdown_mm': final_stepdown_mm,
             'max_depth': max_depth,
-            'width_cm': width_cm,
-            'height_cm': height_cm,
+            'width_mm': width_mm,
+            'height_mm': height_mm,
             'n_passes': n_passes,
             'rdp_tolerance': rdp_tol,
             'link_threshold_mm': link_threshold_mm,
@@ -1210,10 +1210,10 @@ def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
 
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             tool, max_depth,
-                            width_cm, height_cm,
+                            width_mm, height_mm,
                             origin="Bottom-Left",
                             feed_rate=800.0,
-                            threshold_um=0.0,
+                            threshold_mm=0.0,
                             min_feature_width_mm=0.0,
                             max_feature_width_mm=0.0,
                             stepdown_mm=0.0, final_stepdown_mm=0.0,
@@ -1232,11 +1232,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     n_grey_levels         : number of grey levels (for RDP tolerance)
     tool                  : Tool — encapsulates profile, diameter_mm, vbit_angle_deg
     max_depth             : total max cut depth in mm (physical scale)
-    width_cm              : physical image width in cm
-    height_cm             : physical image height in cm
+    width_mm              : physical image width in mm
+    height_mm             : physical image height in mm
     origin                : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate             : cutting feed rate in mm/min
-    threshold_um          : minimum fine-detail depth in µm; regions shallower
+    threshold_mm          : minimum fine-detail depth in mm; regions shallower
                             than this are skipped
     min_feature_width_mm  : features narrower than this (mm) are skipped
     stepdown_mm           : max depth increment per z-pass in mm; 0 = single pass
@@ -1277,8 +1277,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
-    px_per_mm_x = W / (width_cm  * 10.0)
-    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
     if px_per_mm_x != px_per_mm_y:
         from scipy.ndimage import zoom as _zoom
         target = max(px_per_mm_x, px_per_mm_y)
@@ -1345,7 +1345,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         uncut_depth = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
-    threshold_norm = (threshold_um / 1000.0) / max_depth if max_depth else 0.0
+    threshold_norm = threshold_mm / max_depth if max_depth else 0.0
 
     uncut_depth_filtered, mask_vcarve = compute_vcarve_mask(
         uncut_depth, threshold_norm, min_feature_width_mm, px_per_mm,
@@ -1361,7 +1361,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             accessible=accessible_vcarve,
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': tool.vbit_angle_deg,
-                      'threshold_um': threshold_um,
+                      'threshold_mm': threshold_mm,
                       'max_depth': max_depth}
         )
 
@@ -1502,7 +1502,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                     else np.zeros_like(depth_map, dtype=np.float32)),
             metadata={'algorithm': _alg_name,
                       'vbit_angle_deg': tool.vbit_angle_deg,
-                      'threshold_um': threshold_um,
+                      'threshold_mm': threshold_mm,
                       'max_depth': max_depth}
         )
 
@@ -1749,12 +1749,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'profile':         tool.profile,
             'vbit_angle_deg':  tool.vbit_angle_deg,
             'min_feature_width_mm':  min_feature_width_mm,
-            'threshold_um':          threshold_um,
+            'threshold_mm':          threshold_mm,
             'stepdown_mm':           stepdown_mm,
             'final_stepdown_mm':     final_stepdown_mm,
             'max_depth':       max_depth,
-            'width_cm':        width_cm,
-            'height_cm':       height_cm,
+            'width_mm':        width_mm,
+            'height_mm':       height_mm,
             'n_branches':      n_branches,
             'rdp_tolerance':   rdp_tol,
         }
@@ -1922,7 +1922,7 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
 def compute_contour_toolpath(
     depth_map, n_grey_levels,
     tool, stepdown_mm, max_depth,
-    width_cm, height_cm,
+    width_mm, height_mm,
     origin="Bottom-Left",
     feed_rate=800.0,
     prior_accessible=None,
@@ -1967,8 +1967,8 @@ def compute_contour_toolpath(
         discrete grey-level transitions.
     max_depth : float
         Total maximum cut depth in mm.
-    width_cm, height_cm : float
-        Physical dimensions of the work area in cm.
+    width_mm, height_mm : float
+        Physical dimensions of the work area in mm.
     origin : str
         G-code origin convention ("Bottom-Left", "Top-Left", etc.).
     feed_rate : float
@@ -2031,8 +2031,8 @@ def compute_contour_toolpath(
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
-    px_per_mm_x = W / (width_cm  * 10.0)
-    px_per_mm_y = H / (height_cm * 10.0)
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
     if px_per_mm_x != px_per_mm_y:
         from scipy.ndimage import zoom as _zoom
         target = max(px_per_mm_x, px_per_mm_y)
@@ -2353,8 +2353,8 @@ def compute_contour_toolpath(
             'max_step_down_mm':   _msd,
             'lateral_tol_mm':     lateral_tol_mm,
             'n_passes':        len(z_levels),
-            'width_cm':        width_cm,
-            'height_cm':       height_cm,
+            'width_mm':        width_mm,
+            'height_mm':       height_mm,
             'rdp_tolerance':   rdp_tol,
         }
     )

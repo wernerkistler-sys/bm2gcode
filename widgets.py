@@ -656,10 +656,10 @@ class ImportSTLDialog(tk.Toplevel):
 
     def _update_preview(self):
         (x_min, x_max, y_min, y_max), (z_min, z_max) = self._rotated_bounds()
-        width_cm, height_cm, max_depth_mm = stl_mesh.physical_size_from_bounds(
+        width_mm, height_mm, max_depth_mm = stl_mesh.physical_size_from_bounds(
             x_max - x_min, y_max - y_min, z_max - z_min)
         self._preview_var.set(
-            f"→ {width_cm:.2f} cm × {height_cm:.2f} cm × {max_depth_mm:.2f} mm")
+            f"→ {width_mm:.2f} mm × {height_mm:.2f} mm × {max_depth_mm:.2f} mm")
 
     def _on_rotation_changed(self, *_):
         self._update_preview()

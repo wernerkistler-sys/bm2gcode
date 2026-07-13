@@ -208,6 +208,6 @@ def normalize_and_orient(raw_heightmap):
 
 def physical_size_from_bounds(x_range, y_range, z_range):
     """Convert mesh-space ranges (assumed millimeters) into bm2gcode's
-    physical-size fields: (width_cm, height_cm, max_depth_mm).
+    physical-size fields: (width_mm, height_mm, max_depth_mm).
     """
-    return x_range / 10.0, y_range / 10.0, z_range
+    return x_range, y_range, z_range

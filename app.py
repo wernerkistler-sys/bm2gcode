@@ -272,16 +272,16 @@ class GCodeGeneratorApp:
         # ── 1. Physical Image Size ─────────────────────────────────────
         sf = SectionFrame(p, "Physical Image Size")
         sf.pack(fill=tk.X, pady=(0, 8))
-        self.width_cm    = LabeledEntry(sf, "Width",         "cm", DEFAULTS["width_cm"],
-                                        minval=0.1, maxval=2000.0, increment=0.1)
-        self.height_cm   = LabeledEntry(sf, "Height",        "cm", DEFAULTS["height_cm"],
-                                        minval=0.1, maxval=2000.0, increment=0.1)
-        self.width_cm.pack(fill=tk.X, pady=2)
-        self.height_cm.pack(fill=tk.X, pady=2)
+        self.width_mm    = LabeledEntry(sf, "Width",         "mm", DEFAULTS["width_mm"],
+                                        minval=1.0, maxval=20000.0, increment=1.0)
+        self.height_mm   = LabeledEntry(sf, "Height",        "mm", DEFAULTS["height_mm"],
+                                        minval=1.0, maxval=20000.0, increment=1.0)
+        self.width_mm.pack(fill=tk.X, pady=2)
+        self.height_mm.pack(fill=tk.X, pady=2)
 
         self._aspect_lock_var = tk.BooleanVar(value=True)
         self._image_aspect    = None   # pixel W/H of the loaded image
-        ttk.Checkbutton(self.height_cm, text="Lock",
+        ttk.Checkbutton(self.height_mm, text="Lock",
                         variable=self._aspect_lock_var,
                         command=self._on_aspect_lock_toggle
                         ).pack(side=tk.RIGHT, padx=(0, 4))
@@ -289,16 +289,16 @@ class GCodeGeneratorApp:
         self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"],
                                       minval=0.01, maxval=200.0, increment=0.1)
         self.max_depth.pack(fill=tk.X, pady=2)
-        self.margin_cm = LabeledEntry(sf, "Stock margin", "cm", DEFAULTS["margin_cm"],
-                                      minval=0.0, maxval=500.0, increment=0.1)
-        self.margin_cm.pack(fill=tk.X, pady=2)
+        self.margin_mm = LabeledEntry(sf, "Stock margin", "mm", DEFAULTS["margin_mm"],
+                                      minval=0.0, maxval=5000.0, increment=1.0)
+        self.margin_mm.pack(fill=tk.X, pady=2)
         self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"],
                                              minval=0.0, maxval=100.0, increment=1.0)
         self.margin_depth_pct.pack(fill=tk.X, pady=2)
-        self.width_cm.var.trace_add("write", self._on_width_changed)
-        self.height_cm.var.trace_add("write", lambda *_: self._render())
+        self.width_mm.var.trace_add("write", self._on_width_changed)
+        self.height_mm.var.trace_add("write", lambda *_: self._render())
         self.max_depth.var.trace_add("write", lambda *_: self._render())
-        self.margin_cm.var.trace_add("write", lambda *_: self._render())
+        self.margin_mm.var.trace_add("write", lambda *_: self._render())
         self.margin_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
         self._on_aspect_lock_toggle()   # apply initial locked state
 
@@ -862,18 +862,18 @@ class GCodeGeneratorApp:
             if self.current_image is not None:
                 h, w = self.current_image.shape
                 self._image_aspect = w / h
-            self.height_cm.set_state("disabled")
+            self.height_mm.set_state("disabled")
             self._recalc_height()
         else:
             self._image_aspect = None
-            self.height_cm.set_state("normal")
+            self.height_mm.set_state("normal")
 
     def _recalc_height(self):
         if not self._aspect_lock_var.get() or self._image_aspect is None:
             return
         try:
-            w = float(self.width_cm.get())
-            self.height_cm.set(f"{w / self._image_aspect:.4f}")
+            w = float(self.width_mm.get())
+            self.height_mm.set(f"{w / self._image_aspect:.4f}")
         except (ValueError, ZeroDivisionError):
             pass
 
@@ -977,7 +977,7 @@ class GCodeGeneratorApp:
                 xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
             x_min, x_max, y_min, y_max = rotated_xy
             z_min, z_max = rotated_z
-            width_cm, height_cm, max_depth_mm = stl_mesh.physical_size_from_bounds(
+            width_mm, height_mm, max_depth_mm = stl_mesh.physical_size_from_bounds(
                 x_max - x_min, y_max - y_min, z_max - z_min)
 
             x_range, y_range = x_max - x_min, y_max - y_min
@@ -987,8 +987,8 @@ class GCodeGeneratorApp:
             self._aspect_lock_var.set(matches)
             self._on_aspect_lock_toggle()
 
-            self.width_cm.set(f"{width_cm:.4f}")
-            self.height_cm.set(f"{height_cm:.4f}")
+            self.width_mm.set(f"{width_mm:.4f}")
+            self.height_mm.set(f"{height_mm:.4f}")
             self.max_depth.set(f"{max_depth_mm:.4f}")
         else:
             if self._aspect_lock_var.get():
@@ -1072,10 +1072,10 @@ class GCodeGeneratorApp:
             'image_path': self.image_path,
             'stl_source': self.stl_source,
             'global': {
-                'width_cm':        self.width_cm.get(),
-                'height_cm':       self.height_cm.get(),
+                'width_mm':        self.width_mm.get(),
+                'height_mm':       self.height_mm.get(),
                 'max_depth':       self.max_depth.get(),
-                'margin_cm':       self.margin_cm.get(),
+                'margin_mm':       self.margin_mm.get(),
                 'margin_depth_pct': self.margin_depth_pct.get(),
                 'surface':         self.surface.get(),
                 'origin':          self.origin_var.get(),
@@ -1124,10 +1124,10 @@ class GCodeGeneratorApp:
             return
 
         self._aspect_lock_var.set(True)
-        self.width_cm.set(DEFAULTS['width_cm'])
-        self.height_cm.set(DEFAULTS['height_cm'])
+        self.width_mm.set(DEFAULTS['width_mm'])
+        self.height_mm.set(DEFAULTS['height_mm'])
         self.max_depth.set(DEFAULTS['max_depth'])
-        self.margin_cm.set(DEFAULTS['margin_cm'])
+        self.margin_mm.set(DEFAULTS['margin_mm'])
         self.margin_depth_pct.set(DEFAULTS['margin_depth_pct'])
         self.surface.set(DEFAULTS['surface'])
         self.origin_var.set(DEFAULTS['origin'])
@@ -1234,10 +1234,10 @@ class GCodeGeneratorApp:
         # ── Global image-size parameters ──────────────────────────────
         g = project.get('global', {})
         self._aspect_lock_var.set(bool(g.get('aspect_locked', True)))
-        self.width_cm.set(g.get('width_cm', DEFAULTS['width_cm']))
-        self.height_cm.set(g.get('height_cm', DEFAULTS['height_cm']))
+        self.width_mm.set(g.get('width_mm', DEFAULTS['width_mm']))
+        self.height_mm.set(g.get('height_mm', DEFAULTS['height_mm']))
         self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
-        self.margin_cm.set(g.get('margin_cm', DEFAULTS['margin_cm']))
+        self.margin_mm.set(g.get('margin_mm', DEFAULTS['margin_mm']))
         self.margin_depth_pct.set(g.get('margin_depth_pct', DEFAULTS['margin_depth_pct']))
         self.surface.set(g.get('surface', DEFAULTS['surface']))
         self.origin_var.set(g.get('origin', DEFAULTS['origin']))
@@ -1389,12 +1389,12 @@ class GCodeGeneratorApp:
         algorithm = step['algorithm_var'].get()
         feed_rate    = float(step['feed_rate'].get())
         threshold_mm = float(step['threshold'].get())
-        width_cm      = float(self.width_cm.get())
-        height_cm     = float(self.height_cm.get())
-        margin_cm     = float(self.margin_cm.get())
+        width_mm      = float(self.width_mm.get())
+        height_mm     = float(self.height_mm.get())
+        margin_mm     = float(self.margin_mm.get())
         max_depth    = float(self.max_depth.get())
-        eff_width_cm  = width_cm  + 2.0 * margin_cm
-        eff_height_cm = height_cm + 2.0 * margin_cm
+        eff_width_mm  = width_mm  + 2.0 * margin_mm
+        eff_height_mm = height_mm + 2.0 * margin_mm
         origin       = self.origin_var.get()
 
         params = {
@@ -1402,8 +1402,8 @@ class GCodeGeneratorApp:
             'algorithm':     algorithm,
             'feed_rate':     feed_rate,
             'threshold_mm':  threshold_mm,
-            'eff_width_cm':  eff_width_cm,
-            'eff_height_cm': eff_height_cm,
+            'eff_width_mm':  eff_width_mm,
+            'eff_height_mm': eff_height_mm,
             'max_depth':     max_depth,
             'origin':        origin,
         }
@@ -1468,7 +1468,7 @@ class GCodeGeneratorApp:
 
         tool = params['tool']
         erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
-                             params['max_depth'], params['eff_width_cm'], params['eff_height_cm'])
+                             params['max_depth'], params['eff_width_mm'], params['eff_height_mm'])
 
         if algorithm.startswith("V-Carving"):
             gating_mode = params['gating_mode']
@@ -1495,11 +1495,11 @@ class GCodeGeneratorApp:
                 subtract_unaccessible = subtract_unaccessible,
                 previous_result       = prev_tp.result if prev_tp is not None else None,
                 max_depth            = params['max_depth'],
-                width_cm             = params['eff_width_cm'],
-                height_cm            = params['eff_height_cm'],
+                width_mm             = params['eff_width_mm'],
+                height_mm            = params['eff_height_mm'],
                 origin               = params['origin'],
                 feed_rate            = params['feed_rate'],
-                threshold_um         = params['threshold_mm'] * 1000.0,
+                threshold_mm         = params['threshold_mm'],
                 min_feature_width_mm = params['min_feature_width_mm'],
                 max_feature_width_mm = params['max_feature_width_mm'],
                 stepdown_mm          = params['vcarve_stepdown_mm'],
@@ -1517,8 +1517,8 @@ class GCodeGeneratorApp:
                 tool             = params['tool'],
                 stepdown_mm      = params['contour_stepdown'],
                 max_depth        = params['max_depth'],
-                width_cm         = params['eff_width_cm'],
-                height_cm        = params['eff_height_cm'],
+                width_mm         = params['eff_width_mm'],
+                height_mm        = params['eff_height_mm'],
                 origin           = params['origin'],
                 feed_rate        = params['feed_rate'],
                 prior_accessible = prev_tp.accessible if prev_tp is not None else None,
@@ -1552,8 +1552,8 @@ class GCodeGeneratorApp:
                 prior_reference       = None
                 subtract_unaccessible = False
             H, W      = depth_map.shape
-            px_per_mm = max(W / (params['eff_width_cm']  * 10.0),
-                            H / (params['eff_height_cm'] * 10.0))
+            px_per_mm = max(W / params['eff_width_mm'],
+                            H / params['eff_height_mm'])
             rdir      = params['raster_dir']
             step_mm   = params['step_mm']
             return compute_raster_toolpath(
@@ -1564,8 +1564,8 @@ class GCodeGeneratorApp:
                 stepdown_mm           = params['raster_stepdown_mm'],
                 final_stepdown_mm     = params['raster_final_stepdown_mm'],
                 max_depth             = params['max_depth'],
-                width_cm              = params['eff_width_cm'],
-                height_cm             = params['eff_height_cm'],
+                width_mm              = params['eff_width_mm'],
+                height_mm             = params['eff_height_mm'],
                 raster_dir            = params['raster_dir'],
                 origin                = params['origin'],
                 work_surface_tol      = params['work_surface_tol'],
@@ -1872,17 +1872,17 @@ class GCodeGeneratorApp:
     def _pad_image(self, img):
         """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
         try:
-            margin_cm = float(self.margin_cm.get())
+            margin_mm = float(self.margin_mm.get())
         except ValueError:
             return img
-        if margin_cm <= 0.0:
+        if margin_mm <= 0.0:
             return img
         try:
             H, W = img.shape
-            width_cm  = float(self.width_cm.get())
-            height_cm = float(self.height_cm.get())
-            pad_x = max(1, round(margin_cm * W / width_cm))
-            pad_y = max(1, round(margin_cm * H / height_cm))
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+            pad_x = max(1, round(margin_mm * W / width_mm))
+            pad_y = max(1, round(margin_mm * H / height_mm))
             depth_pct = float(self.margin_depth_pct.get()) / 100.0
             if self.surface.get() == "white":
                 pad_val = np.float32(1.0 - depth_pct)  # white = z=0; deeper cut → darker
@@ -2002,11 +2002,11 @@ class GCodeGeneratorApp:
         self.ax.set_facecolor("#1e1e1e")
 
         try:
-            width_cm  = float(self.width_cm.get())
-            height_cm = float(self.height_cm.get())
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
             max_depth = float(self.max_depth.get())
         except ValueError:
-            width_cm = height_cm = max_depth = 1.0
+            width_mm = height_mm = max_depth = 1.0
 
         # Apply 3D pan offset
         ox, oy, oz = self._3d_pan_offset
@@ -2041,11 +2041,11 @@ class GCodeGeneratorApp:
         self.ax.set_title(title, color='white', fontsize=10, pad=10)
 
         try:
-            margin_cm = float(self.margin_cm.get())
+            margin_mm = float(self.margin_mm.get())
         except ValueError:
-            margin_cm = 0.0
-        W_mm = (width_cm  + 2.0 * margin_cm) * 10
-        H_mm = (height_cm + 2.0 * margin_cm) * 10
+            margin_mm = 0.0
+        W_mm = width_mm  + 2.0 * margin_mm
+        H_mm = height_mm + 2.0 * margin_mm
         try:
             origin = self.origin_var.get()
         except Exception:
@@ -2192,8 +2192,8 @@ class GCodeGeneratorApp:
                     pass
                 try:
                     H, W = ref.shape
-                    px_per_mm_x = W / (float(self.width_cm.get())  * 10.0)
-                    px_per_mm_y = H / (float(self.height_cm.get()) * 10.0)
+                    px_per_mm_x = W / float(self.width_mm.get())
+                    px_per_mm_y = H / float(self.height_mm.get())
                     px_per_mm   = (px_per_mm_x + px_per_mm_y) / 2.0
                 except (ValueError, ZeroDivisionError):
                     px_per_mm = 1.0
@@ -2275,9 +2275,9 @@ class GCodeGeneratorApp:
         if tp is None or not tp.segments:
             return
         try:
-            margin_cm = float(self.margin_cm.get())
-            width_mm  = (float(self.width_cm.get())  + 2.0 * margin_cm) * 10.0
-            height_mm = (float(self.height_cm.get()) + 2.0 * margin_cm) * 10.0
+            margin_mm = float(self.margin_mm.get())
+            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
+            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
         except ValueError:
             return
         if width_mm == 0 or height_mm == 0:
@@ -2418,8 +2418,8 @@ class GCodeGeneratorApp:
                 # (-sin(a), cos(a), 0); rotating the naive (-dx, dy) vector
                 # by (a + 90°) gives the azimuth-correct world offset.
                 try:
-                    w_mm = float(self.width_cm.get())  * 10
-                    h_mm = float(self.height_cm.get()) * 10
+                    w_mm = float(self.width_mm.get())
+                    h_mm = float(self.height_mm.get())
                 except ValueError:
                     w_mm = h_mm = 100.0
                 canvas_w = self.mpl_canvas.get_tk_widget().winfo_width()
@@ -2475,9 +2475,9 @@ class GCodeGeneratorApp:
         row = int(np.clip(round(ydata), 0, H - 1))
 
         try:
-            margin_cm = float(self.margin_cm.get())
-            width_mm  = (float(self.width_cm.get())  + 2.0 * margin_cm) * 10.0
-            height_mm = (float(self.height_cm.get()) + 2.0 * margin_cm) * 10.0
+            margin_mm = float(self.margin_mm.get())
+            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
+            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
             max_depth = float(self.max_depth.get())
         except ValueError:
             self.coord_var.set("")

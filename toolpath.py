@@ -182,8 +182,8 @@ class ToolPath:
             f"Step-down: {meta.get('stepdown', 0):.3f} mm",
             f"; Max depth: {meta.get('max_depth', 0):.3f} mm   "
             f"Passes: {meta.get('n_passes', 0)}",
-            f"; Work area: {meta.get('width_cm', 0):.1f} cm × "
-            f"{meta.get('height_cm', 0):.1f} cm",
+            f"; Work area: {meta.get('width_mm', 0):.1f} mm × "
+            f"{meta.get('height_mm', 0):.1f} mm",
         ]
 
         if 'rdp_tolerance' in meta:

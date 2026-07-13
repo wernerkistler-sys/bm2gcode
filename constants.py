@@ -24,10 +24,10 @@ DEFAULT_POSTAMBLE = (
 )
 
 DEFAULTS = {
-    "width_cm":          "10.0",
-    "height_cm":         "10.0",
+    "width_mm":          "100.0",
+    "height_mm":         "100.0",
     "max_depth":         "5.0",
-    "margin_cm":         "0.0",
+    "margin_mm":         "0.0",
     "margin_depth_pct":  "0.0",
     "origin":            "Bottom-Left",
     "surface":           "white",
