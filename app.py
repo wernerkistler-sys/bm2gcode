@@ -299,7 +299,7 @@ class GCodeGeneratorApp:
         self.height_cm.var.trace_add("write", lambda *_: self._render())
         self.max_depth.var.trace_add("write", lambda *_: self._render())
         self.margin_cm.var.trace_add("write", lambda *_: self._render())
-        self.margin_depth_pct.var.trace_add("write", lambda *_: self._render())
+        self.margin_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
         self._on_aspect_lock_toggle()   # apply initial locked state
 
         polarity_row = ttk.Frame(sf)
@@ -309,7 +309,7 @@ class GCodeGeneratorApp:
         ttk.Combobox(polarity_row, textvariable=self.surface,
                      values=["white", "black"],
                      state="readonly", width=22).pack(side=tk.RIGHT)
-        self.surface.trace_add("write", lambda *_: self._render())
+        self.surface.trace_add("write", self._on_depth_map_content_changed)
 
         origin_row = ttk.Frame(sf)
         origin_row.pack(fill=tk.X, pady=(0, 2))
@@ -881,6 +881,12 @@ class GCodeGeneratorApp:
         self._recalc_height()
         if not self._aspect_lock_var.get():
             self._render()
+
+    def _on_depth_map_content_changed(self, *_):
+        """z=0 colour / margin depth change the *content* of depth_map without
+        changing the erosion cache key, so any cached entry is now stale."""
+        self._erosion_cache.clear()
+        self._render()
 
     def open_image(self):
         path = filedialog.askopenfilename(
