@@ -37,14 +37,6 @@ DEFAULTS = {
     "accel_mm_s2":       "300",
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
-    # Optional G-code dress-ups (see dressup.py) — all opt-in, disabled by default
-    "ramp_in_enabled":     "0",
-    "ramp_angle_deg":      "30.0",
-    "ramp_max_length_mm":  "15.0",
-    "backoff_enabled":     "0",
-    "backoff_distance_mm": "0.5",
-    "arc_rapids_enabled":  "0",
-    "arc_radius_mm":       "3.0",
     # Per-step defaults (prefix-free; used for every new step tab)
     "step_profile":      "End Mill",
     "step_diameter":     "6.0",
@@ -71,6 +63,14 @@ DEFAULTS = {
     "step_contour_lateral_tol":   "0.0", # lateral tolerance for redundancy pruning (mm); 0 = disabled
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
+    # Per-step G-code dress-ups (see dressup.py) — all opt-in, disabled by default
+    "step_ramp_in_enabled":     "0",
+    "step_ramp_angle_deg":      "30.0",
+    "step_ramp_max_length_mm":  "15.0",
+    "step_backoff_enabled":     "0",
+    "step_backoff_distance_mm": "0.5",
+    "step_arc_rapids_enabled":  "0",
+    "step_arc_radius_mm":       "3.0",
 }
 
 DISPLAY_ORIGINAL    = "Original"

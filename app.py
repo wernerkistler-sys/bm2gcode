@@ -31,7 +31,8 @@ from constants import (
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
-                     SettingsDialog, ExportToolpathDialog, ImportSTLDialog, _fmt_time)
+                     SettingsDialog, DressUpDialog, ExportToolpathDialog,
+                     ImportSTLDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
@@ -54,13 +55,6 @@ class GCodeGeneratorApp:
             'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
             'preamble':    DEFAULTS['preamble'],
             'postamble':   DEFAULTS['postamble'],
-            'ramp_in_enabled':     bool(int(DEFAULTS['ramp_in_enabled'])),
-            'ramp_angle_deg':      float(DEFAULTS['ramp_angle_deg']),
-            'ramp_max_length_mm':  float(DEFAULTS['ramp_max_length_mm']),
-            'backoff_enabled':     bool(int(DEFAULTS['backoff_enabled'])),
-            'backoff_distance_mm': float(DEFAULTS['backoff_distance_mm']),
-            'arc_rapids_enabled':  bool(int(DEFAULTS['arc_rapids_enabled'])),
-            'arc_radius_mm':       float(DEFAULTS['arc_radius_mm']),
         }
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
@@ -393,8 +387,8 @@ class GCodeGeneratorApp:
         ttk.Button(bf, text="Compute",
                    command=lambda s=step: self._compute_step(s)
                    ).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
-        ttk.Button(bf, text="Export…",
-                   command=lambda s=step: self._export_from_step(s)
+        ttk.Button(bf, text="Dress-up…",
+                   command=lambda s=step: self._open_dressup(s)
                    ).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
         ttk.Button(bf, text="Add Step After",
                    command=self._add_step
@@ -435,6 +429,10 @@ class GCodeGeneratorApp:
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
         dst['tsp_2opt_var'].set(src['tsp_2opt_var'].get())
         dst['gating_mode_var'].set(src['gating_mode_var'].get())
+        for key in ('ramp_in_enabled', 'ramp_angle_deg', 'ramp_max_length_mm',
+                    'backoff_enabled', 'backoff_distance_mm',
+                    'arc_rapids_enabled', 'arc_radius_mm'):
+            dst[f'{key}_var'].set(src[f'{key}_var'].get())
 
     def _remove_step(self, step):
         """Remove a step tab and its associated data."""
@@ -462,6 +460,23 @@ class GCodeGeneratorApp:
     def _build_step_widgets(self, frame, step):
         """Populate a step tab with all tool-parameter widgets.
         Widget references are stored in the step dict. Values from DEFAULTS."""
+
+        # ── Tool path dress-up (no visible widgets; edited via the
+        #    "Dress-up" button/dialog) ──────────────────────────────────
+        step['ramp_in_enabled_var']     = tk.BooleanVar(
+            value=bool(int(DEFAULTS['step_ramp_in_enabled'])))
+        step['ramp_angle_deg_var']      = tk.DoubleVar(
+            value=float(DEFAULTS['step_ramp_angle_deg']))
+        step['ramp_max_length_mm_var']  = tk.DoubleVar(
+            value=float(DEFAULTS['step_ramp_max_length_mm']))
+        step['backoff_enabled_var']     = tk.BooleanVar(
+            value=bool(int(DEFAULTS['step_backoff_enabled'])))
+        step['backoff_distance_mm_var'] = tk.DoubleVar(
+            value=float(DEFAULTS['step_backoff_distance_mm']))
+        step['arc_rapids_enabled_var']  = tk.BooleanVar(
+            value=bool(int(DEFAULTS['step_arc_rapids_enabled'])))
+        step['arc_radius_mm_var']       = tk.DoubleVar(
+            value=float(DEFAULTS['step_arc_radius_mm']))
 
         # ── Operation group ────────────────────────────────────────────
         operation_lf = ttk.LabelFrame(frame, text="Operation", padding=4)
@@ -1036,15 +1051,36 @@ class GCodeGeneratorApp:
         if dlg.confirmed:
             self._refresh_stats_and_view()
 
+    def _open_dressup(self, step):
+        idx = self.steps.index(step)
+        settings = {
+            'ramp_in_enabled':     step['ramp_in_enabled_var'].get(),
+            'ramp_angle_deg':      step['ramp_angle_deg_var'].get(),
+            'ramp_max_length_mm':  step['ramp_max_length_mm_var'].get(),
+            'backoff_enabled':     step['backoff_enabled_var'].get(),
+            'backoff_distance_mm': step['backoff_distance_mm_var'].get(),
+            'arc_rapids_enabled':  step['arc_rapids_enabled_var'].get(),
+            'arc_radius_mm':       step['arc_radius_mm_var'].get(),
+        }
+        dlg = DressUpDialog(self.root, settings, self._settings['z_safe'],
+                            title=f"Tool Path Dress-Up — Step {idx + 1}")
+        if dlg.confirmed:
+            step['ramp_in_enabled_var'].set(settings['ramp_in_enabled'])
+            step['ramp_angle_deg_var'].set(settings['ramp_angle_deg'])
+            step['ramp_max_length_mm_var'].set(settings['ramp_max_length_mm'])
+            step['backoff_enabled_var'].set(settings['backoff_enabled'])
+            step['backoff_distance_mm_var'].set(settings['backoff_distance_mm'])
+            step['arc_rapids_enabled_var'].set(settings['arc_rapids_enabled'])
+            step['arc_radius_mm_var'].set(settings['arc_radius_mm'])
+            self._refresh_stats_and_view()
+
     def _refresh_stats_and_view(self):
         """Re-derive the displayed stats (motion count / est. time) and
-        refresh the 3D preview for every already-computed step, using the
-        current dress-up settings. Ramp-in/back-off/arc-rounding only affect
-        G-code emission/rendering, not the underlying toolpath geometry, so
-        this refresh is cheap and doesn't require recomputing any step."""
-        ramp    = self._ramp_settings()
-        backoff = self._backoff_settings()
-        arc     = self._arc_settings()
+        refresh the 3D preview for every already-computed step, using each
+        step's own dress-up settings. Ramp-in/back-off/arc-rounding only
+        affect G-code emission/rendering, not the underlying toolpath
+        geometry, so this refresh is cheap and doesn't require recomputing
+        any step."""
         for idx, (step, tp) in enumerate(zip(self.steps, self.toolpaths)):
             if tp is None:
                 continue
@@ -1054,9 +1090,9 @@ class GCodeGeneratorApp:
                 feed_rapid  = self._settings['feed_rapid'],
                 z_safe      = self._settings['z_safe'],
                 accel_mm_s2 = self._settings['accel_mm_s2'],
-                ramp        = ramp,
-                backoff     = backoff,
-                arc         = arc,
+                ramp        = self._ramp_settings(step),
+                backoff     = self._backoff_settings(step),
+                arc         = self._arc_settings(step),
             )
             step['info_var'].set(
                 f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -1064,18 +1100,18 @@ class GCodeGeneratorApp:
                 f" @ {feed_rate:.0f} mm/min")
         self._on_display_mode_changed()
 
-    def _ramp_settings(self):
-        return RampSettings(enabled=self._settings['ramp_in_enabled'],
-                             angle_deg=self._settings['ramp_angle_deg'],
-                             max_length_mm=self._settings['ramp_max_length_mm'])
+    def _ramp_settings(self, step):
+        return RampSettings(enabled=step['ramp_in_enabled_var'].get(),
+                             angle_deg=step['ramp_angle_deg_var'].get(),
+                             max_length_mm=step['ramp_max_length_mm_var'].get())
 
-    def _backoff_settings(self):
-        return BackoffSettings(enabled=self._settings['backoff_enabled'],
-                                distance_mm=self._settings['backoff_distance_mm'])
+    def _backoff_settings(self, step):
+        return BackoffSettings(enabled=step['backoff_enabled_var'].get(),
+                                distance_mm=step['backoff_distance_mm_var'].get())
 
-    def _arc_settings(self):
-        return ArcSettings(enabled=self._settings['arc_rapids_enabled'],
-                            radius_mm=self._settings['arc_radius_mm'])
+    def _arc_settings(self, step):
+        return ArcSettings(enabled=step['arc_rapids_enabled_var'].get(),
+                            radius_mm=step['arc_radius_mm_var'].get())
 
     # ------------------------------------------------------------------ #
     #  Project save / load
@@ -1105,6 +1141,13 @@ class GCodeGeneratorApp:
             'max_fw':               step['max_fw'].get(),
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
             'gating_mode':          step['gating_mode_var'].get(),
+            'ramp_in_enabled':      step['ramp_in_enabled_var'].get(),
+            'ramp_angle_deg':       step['ramp_angle_deg_var'].get(),
+            'ramp_max_length_mm':   step['ramp_max_length_mm_var'].get(),
+            'backoff_enabled':      step['backoff_enabled_var'].get(),
+            'backoff_distance_mm':  step['backoff_distance_mm_var'].get(),
+            'arc_rapids_enabled':   step['arc_rapids_enabled_var'].get(),
+            'arc_radius_mm':        step['arc_radius_mm_var'].get(),
         }
 
     def _apply_step_dict(self, step, d):
@@ -1131,6 +1174,20 @@ class GCodeGeneratorApp:
         step['max_fw'].auto_var.set(bool(d.get('max_fw_auto', False)))
         step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
         step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
+        step['ramp_in_enabled_var'].set(bool(d.get(
+            'ramp_in_enabled', bool(int(DEFAULTS['step_ramp_in_enabled'])))))
+        step['ramp_angle_deg_var'].set(d.get(
+            'ramp_angle_deg', DEFAULTS['step_ramp_angle_deg']))
+        step['ramp_max_length_mm_var'].set(d.get(
+            'ramp_max_length_mm', DEFAULTS['step_ramp_max_length_mm']))
+        step['backoff_enabled_var'].set(bool(d.get(
+            'backoff_enabled', bool(int(DEFAULTS['step_backoff_enabled'])))))
+        step['backoff_distance_mm_var'].set(d.get(
+            'backoff_distance_mm', DEFAULTS['step_backoff_distance_mm']))
+        step['arc_rapids_enabled_var'].set(bool(d.get(
+            'arc_rapids_enabled', bool(int(DEFAULTS['step_arc_rapids_enabled'])))))
+        step['arc_radius_mm_var'].set(d.get(
+            'arc_radius_mm', DEFAULTS['step_arc_radius_mm']))
 
     def _project_snapshot(self):
         """Return a JSON-able dict describing all persistable project state."""
@@ -1153,13 +1210,6 @@ class GCodeGeneratorApp:
                 'accel_mm_s2': self._settings['accel_mm_s2'],
                 'preamble':    self._settings['preamble'],
                 'postamble':   self._settings['postamble'],
-                'ramp_in_enabled':     self._settings['ramp_in_enabled'],
-                'ramp_angle_deg':      self._settings['ramp_angle_deg'],
-                'ramp_max_length_mm':  self._settings['ramp_max_length_mm'],
-                'backoff_enabled':     self._settings['backoff_enabled'],
-                'backoff_distance_mm': self._settings['backoff_distance_mm'],
-                'arc_rapids_enabled':  self._settings['arc_rapids_enabled'],
-                'arc_radius_mm':       self._settings['arc_radius_mm'],
             },
             'steps': [self._step_to_dict(s) for s in self.steps],
         }
@@ -1210,13 +1260,6 @@ class GCodeGeneratorApp:
         self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
         self._settings['preamble']    = DEFAULTS['preamble']
         self._settings['postamble']   = DEFAULTS['postamble']
-        self._settings['ramp_in_enabled']     = bool(int(DEFAULTS['ramp_in_enabled']))
-        self._settings['ramp_angle_deg']      = float(DEFAULTS['ramp_angle_deg'])
-        self._settings['ramp_max_length_mm']  = float(DEFAULTS['ramp_max_length_mm'])
-        self._settings['backoff_enabled']     = bool(int(DEFAULTS['backoff_enabled']))
-        self._settings['backoff_distance_mm'] = float(DEFAULTS['backoff_distance_mm'])
-        self._settings['arc_rapids_enabled']  = bool(int(DEFAULTS['arc_rapids_enabled']))
-        self._settings['arc_radius_mm']       = float(DEFAULTS['arc_radius_mm'])
 
         while len(self.steps) > 1:
             self._remove_step(self.steps[-1])
@@ -1329,19 +1372,24 @@ class GCodeGeneratorApp:
         self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
         self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
         self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
-        self._settings['ramp_in_enabled']     = bool(m.get('ramp_in_enabled',     self._settings['ramp_in_enabled']))
-        self._settings['ramp_angle_deg']      = m.get('ramp_angle_deg',      self._settings['ramp_angle_deg'])
-        self._settings['ramp_max_length_mm']  = m.get('ramp_max_length_mm',  self._settings['ramp_max_length_mm'])
-        self._settings['backoff_enabled']     = bool(m.get('backoff_enabled',     self._settings['backoff_enabled']))
-        self._settings['backoff_distance_mm'] = m.get('backoff_distance_mm', self._settings['backoff_distance_mm'])
-        self._settings['arc_rapids_enabled']  = bool(m.get('arc_rapids_enabled',  self._settings['arc_rapids_enabled']))
-        self._settings['arc_radius_mm']       = m.get('arc_radius_mm',       self._settings['arc_radius_mm'])
 
         # ── Steps ─────────────────────────────────────────────────────
         step_dicts = project.get('steps', [])
         if not step_dicts:
             messagebox.showwarning("Load Warning", "Project contains no steps.")
             return
+
+        # Older project files stored dress-up settings once, globally, under
+        # 'machine'. Carry them over as every step's dress-up settings when
+        # a step dict doesn't already have its own (current-format) values.
+        _legacy_dressup_keys = ('ramp_in_enabled', 'ramp_angle_deg', 'ramp_max_length_mm',
+                                'backoff_enabled', 'backoff_distance_mm',
+                                'arc_rapids_enabled', 'arc_radius_mm')
+        legacy_dressup = {k: m[k] for k in _legacy_dressup_keys if k in m}
+        if legacy_dressup:
+            for d in step_dicts:
+                for k, v in legacy_dressup.items():
+                    d.setdefault(k, v)
 
         # Trim or extend the steps list to match the saved count.
         while len(self.steps) > len(step_dicts):
@@ -1736,9 +1784,9 @@ class GCodeGeneratorApp:
                     feed_rapid  = self._settings['feed_rapid'],
                     z_safe      = self._settings['z_safe'],
                     accel_mm_s2 = self._settings['accel_mm_s2'],
-                    ramp        = self._ramp_settings(),
-                    backoff     = self._backoff_settings(),
-                    arc         = self._arc_settings(),
+                    ramp        = self._ramp_settings(step),
+                    backoff     = self._backoff_settings(step),
+                    arc         = self._arc_settings(step),
                 )
                 dlg.close("Completed.")
                 step['info_var'].set(
@@ -1811,9 +1859,9 @@ class GCodeGeneratorApp:
                         feed_rapid  = self._settings['feed_rapid'],
                         z_safe      = self._settings['z_safe'],
                         accel_mm_s2 = self._settings['accel_mm_s2'],
-                        ramp        = self._ramp_settings(),
-                        backoff     = self._backoff_settings(),
-                        arc         = self._arc_settings(),
+                        ramp        = self._ramp_settings(s),
+                        backoff     = self._backoff_settings(s),
+                        arc         = self._arc_settings(s),
                     )
                     s['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -1848,18 +1896,9 @@ class GCodeGeneratorApp:
             })
         return info
 
-    def _export_from_step(self, step):
-        idx = self.steps.index(step)
-        if self.toolpaths[idx] is None:
-            messagebox.showinfo("Not computed",
-                                f"Compute Step {idx + 1} first.")
-            return
-        self._export_toolpaths(precheck_indices=[idx])
-
-    def _export_toolpaths(self, precheck_indices=None):
+    def _export_toolpaths(self):
         steps_info = self._build_steps_info()
-        dlg = ExportToolpathDialog(self.root, steps_info,
-                                   precheck_indices=precheck_indices)
+        dlg = ExportToolpathDialog(self.root, steps_info)
         indices = dlg.selected_indices
         if not indices:
             return
@@ -1897,12 +1936,13 @@ class GCodeGeneratorApp:
         try:
             bodies = []
             for idx in indices:
-                tp = self.toolpaths[idx]
+                tp   = self.toolpaths[idx]
+                step = self.steps[idx]
                 feed_rate = tp.metadata.get('feed_rate', 800.0)
                 bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe, accel_mm_s2,
-                                           ramp=self._ramp_settings(),
-                                           backoff=self._backoff_settings(),
-                                           arc=self._arc_settings()))
+                                           ramp=self._ramp_settings(step),
+                                           backoff=self._backoff_settings(step),
+                                           arc=self._arc_settings(step)))
 
             gcode = preamble + "\n\n" + "\n\n".join(bodies) + "\n\n" + postamble
             with open(path, "w", encoding="utf-8") as f:
@@ -2068,7 +2108,7 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  3D rendering
     # ------------------------------------------------------------------ #
-    def _render_3d(self, toolpath, title):
+    def _render_3d(self, toolpath, title, step):
         """Render the depth-map surface and G-code tool path in 3D."""
         from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 
@@ -2090,8 +2130,8 @@ class GCodeGeneratorApp:
         }
         for kind, pts in toolpath.iter_moves(
                 segments=self._toolpath_progress_segments(toolpath),
-                z_safe=z_safe, ramp=self._ramp_settings(),
-                backoff=self._backoff_settings(), arc=self._arc_settings()):
+                z_safe=z_safe, ramp=self._ramp_settings(step),
+                backoff=self._backoff_settings(step), arc=self._arc_settings(step)):
             if len(pts) < 2:
                 continue
             buckets.get(kind, cuts).append(pts)
@@ -2201,7 +2241,8 @@ class GCodeGeneratorApp:
             tp = (self.toolpaths[step_idx]
                   if 0 <= step_idx < len(self.toolpaths) else None)
             if tp:
-                self._render_3d(tp, f"Step {step_idx + 1} Tool Path")
+                self._render_3d(tp, f"Step {step_idx + 1} Tool Path",
+                                self.steps[step_idx])
                 return
 
         # ── 2D modes — ensure we have a flat 2D axes ──────────────────
