@@ -135,6 +135,7 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 | Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). |
 | Diameter | Cutter diameter in mm. |
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
+| Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. |
 | Feed rate | Cutting feed rate in mm/min. |
 
 **Step-down controls (Raster Scan and V-Carving):**

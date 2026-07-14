@@ -1,3 +1,4 @@
+import dataclasses
 import numpy as np
 from tool import Tool
 from toolpath import ToolPath
@@ -289,6 +290,23 @@ def _build_kernel(tool, px_per_mm, max_depth):
         footprint = r_px <= k_rad
 
     return kernel, footprint
+
+
+def _planning_kernel(tool, px_per_mm, max_depth, extra_offset_mm,
+                      real_kernel, real_footprint):
+    """Return (kernel, footprint) for the achievable-depth surface.
+
+    Inflates the tool diameter by 2*extra_offset_mm so the erosion/dilation
+    plans lateral clearance for a subsequent finishing step, without
+    affecting the real tool geometry used elsewhere (material-removal
+    simulation, link thresholds, metadata). Falls back to real_kernel/
+    real_footprint when extra_offset_mm <= 0 (no behaviour change).
+    """
+    if extra_offset_mm <= 0.0:
+        return real_kernel, real_footprint
+    inflated = dataclasses.replace(
+        tool, diameter_mm=max(tool.diameter_mm + 2.0 * extra_offset_mm, 0.01))
+    return _build_kernel(inflated, px_per_mm, max_depth)
 
 
 def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
@@ -776,6 +794,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             use_2opt=False,
                             cut_direction="Either",
                             final_stepdown_mm=0.0,
+                            extra_offset_mm=0.0,
                             progress=None,
                             erosion_cache=None,
                             erosion_cache_key=None):
@@ -833,6 +852,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     final_stepdown_mm : depth (mm) reserved for a dedicated finishing pass.
                         Roughing passes stop this far above each pixel's target;
                         a final pass then cuts to full depth.  0 = no reservation.
+    extra_offset_mm   : stock-to-leave allowance (mm) applied laterally and
+                        vertically, so a subsequent step (typically with
+                        extra_offset_mm=0) can refine the result. Laterally,
+                        the tool is treated as 2*extra_offset_mm larger when
+                        computing the achievable-depth surface. Vertically,
+                        that surface is lowered by extra_offset_mm. 0 = none.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     erosion_cache     : optional dict used to memoise the grey-erosion/grey-dilation
                         achievable-depth surface (keyed by erosion_cache_key), so a
@@ -886,6 +911,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     # ── Stage 1 · Build tool kernel (0–10 %) ─────────────────────────────
     progress(0, "Building tool geometry kernel…")
     kernel_raster, footprint_raster = _build_kernel(tool, px_per_mm, max_depth)
+    kernel_plan, footprint_plan = _planning_kernel(
+        tool, px_per_mm, max_depth, extra_offset_mm, kernel_raster, footprint_raster)
     ksize = kernel_raster.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
@@ -896,12 +923,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
-        structure = -kernel_raster.astype(np.float64)
+        structure = -kernel_plan.astype(np.float64)
 
         # Max depth the tool can reach when centred at each pixel (erosion).
         # Used internally as per-pixel depth targets during toolpath planning.
         center_depth_contour_raster = grey_erosion(depth_map.astype(np.float64),
-                                  footprint=footprint_raster,
+                                  footprint=footprint_plan,
                                   structure=structure).astype(np.float32)
         center_depth_contour_raster = np.clip(center_depth_contour_raster, 0.0, 1.0)
 
@@ -909,12 +936,17 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         # point: the tool can carve (x,y) while centred at an offset position.
         # Erosion followed by dilation = morphological opening.
         accessible_raster = grey_dilation(center_depth_contour_raster.astype(np.float64),
-                                   footprint=footprint_raster,
+                                   footprint=footprint_plan,
                                    structure=structure).astype(np.float32)
         accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
         progress(35, "Achievable depth surface computed.")
         if erosion_cache is not None:
             erosion_cache[erosion_cache_key] = (center_depth_contour_raster, accessible_raster)
+
+    if extra_offset_mm > 0.0:
+        off_norm = extra_offset_mm / max_depth
+        center_depth_contour_raster = np.clip(center_depth_contour_raster - off_norm, 0.0, 1.0)
+        accessible_raster = np.clip(accessible_raster - off_norm, 0.0, 1.0)
 
     # ── Stage 3 · Plan passes (35–40 %) ───────────────────────────
     progress(35, "Planning depth passes…")
@@ -1158,6 +1190,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'step_mm': step_mm,
             'stepdown_mm': stepdown_mm,
             'final_stepdown_mm': final_stepdown_mm,
+            'extra_offset_mm': extra_offset_mm,
             'max_depth': max_depth,
             'width_mm': width_mm,
             'height_mm': height_mm,
@@ -1221,6 +1254,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior_reference=None, previous_result=None,
                             subtract_unaccessible=False,
                             use_2opt=False,
+                            extra_offset_mm=0.0,
                             progress=None,
                             erosion_cache=None,
                             erosion_cache_key=None):
@@ -1242,6 +1276,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     stepdown_mm           : max depth increment per z-pass in mm; 0 = single pass
     final_stepdown_mm     : depth increment for the finishing pass
                             (0 = same as stepdown_mm)
+    extra_offset_mm       : stock-to-leave allowance (mm) applied laterally and
+                            vertically, so a subsequent step (typically with
+                            extra_offset_mm=0) can refine the result. Laterally,
+                            the tool is treated as 2*extra_offset_mm larger when
+                            computing the achievable-depth surface. Vertically,
+                            that surface is lowered by extra_offset_mm. 0 = none.
     skeleton_mode         : "medial_axis" | "voronoi" | "inscribed"
     prior_reference       : optional 2-D float32 [0,1] reference surface from a
                             prior step, subtracted from depth_map to obtain the
@@ -1309,6 +1349,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     if tool.profile == "Ball" and tool.diameter_mm <= 0.0:
         raise ValueError("Ball profile requires a positive tool diameter.")
     kernel_vcarve, footprint_vcarve = _build_kernel(tool, px_per_mm, max_depth)
+    kernel_plan, footprint_plan = _planning_kernel(
+        tool, px_per_mm, max_depth, extra_offset_mm, kernel_vcarve, footprint_vcarve)
     ksize = kernel_vcarve.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
@@ -1321,20 +1363,25 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         progress(10, "Computing achievable depth surface (morphological opening)…")
         center_depth_contour_vcarve = grey_erosion(
             depth_map.astype(np.float64),
-            footprint=footprint_vcarve,
-            structure=-kernel_vcarve.astype(np.float64),
+            footprint=footprint_plan,
+            structure=-kernel_plan.astype(np.float64),
         ).astype(np.float32)
         center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
 
         accessible_vcarve = grey_dilation(
             center_depth_contour_vcarve.astype(np.float64),
-            footprint=footprint_vcarve,
-            structure=-kernel_vcarve.astype(np.float64),
+            footprint=footprint_plan,
+            structure=-kernel_plan.astype(np.float64),
         ).astype(np.float32)
         accessible_vcarve = np.clip(accessible_vcarve, 0.0, 1.0)
         progress(35, "Achievable depth surface computed.")
         if erosion_cache is not None:
             erosion_cache[erosion_cache_key] = (center_depth_contour_vcarve, accessible_vcarve)
+
+    if extra_offset_mm > 0.0:
+        off_norm = extra_offset_mm / max_depth
+        center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve - off_norm, 0.0, 1.0)
+        accessible_vcarve = np.clip(accessible_vcarve - off_norm, 0.0, 1.0)
 
     # ── Stage 1 · V-carving mask (35–45 %) ────────────────
     progress(35, "Computing V-carving mask…")
@@ -1752,6 +1799,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'threshold_mm':          threshold_mm,
             'stepdown_mm':           stepdown_mm,
             'final_stepdown_mm':     final_stepdown_mm,
+            'extra_offset_mm':       extra_offset_mm,
             'max_depth':       max_depth,
             'width_mm':        width_mm,
             'height_mm':       height_mm,
@@ -1935,6 +1983,7 @@ def compute_contour_toolpath(
     use_2opt=False,
     cut_direction="Either",
     max_step_down_mm=None,
+    extra_offset_mm=0.0,
     erosion_cache=None,
     erosion_cache_key=None,
 ):
@@ -1996,6 +2045,12 @@ def compute_contour_toolpath(
         round(max_step_down_mm / z_increment_mm) levels.  None or <= 0 means
         unconstrained — pruning may collapse any number of redundant levels
         and 2-opt may mix across the full level range.
+    extra_offset_mm : float
+        Stock-to-leave allowance (mm) applied laterally and vertically, so a
+        subsequent step (typically with extra_offset_mm=0) can refine the
+        result. Laterally, the tool is treated as 2*extra_offset_mm larger
+        when computing the achievable-depth surface. Vertically, that
+        surface is lowered by extra_offset_mm. 0 = none.
     z_safe : float
         Safe Z height above the workpiece surface in mm.  Used with
         feed_rapid to compute the retract+plunge breakeven arc length per
@@ -2059,6 +2114,8 @@ def compute_contour_toolpath(
     # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
     progress(0, "Building tool geometry kernel…")
     kernel_contour, footprint_contour = _build_kernel(tool, px_per_mm, max_depth)
+    kernel_plan, footprint_plan = _planning_kernel(
+        tool, px_per_mm, max_depth, extra_offset_mm, kernel_contour, footprint_contour)
     ksize = kernel_contour.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
@@ -2069,12 +2126,12 @@ def compute_contour_toolpath(
         progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
-        structure = -kernel_contour.astype(np.float64)
+        structure = -kernel_plan.astype(np.float64)
 
         # Max depth the tool can reach when centred at each pixel (erosion).
         # Used for contour extraction and adaptive level planning.
         center_depth_contour = grey_erosion(depth_map.astype(np.float64),
-                                  footprint=footprint_contour,
+                                  footprint=footprint_plan,
                                   structure=structure).astype(np.float32)
         center_depth_contour = np.clip(center_depth_contour, 0.0, 1.0)
 
@@ -2082,12 +2139,17 @@ def compute_contour_toolpath(
         # point: the tool can carve (x,y) while centred at an offset position.
         # Erosion followed by dilation = morphological opening.
         accessible_contour = grey_dilation(center_depth_contour.astype(np.float64),
-                                           footprint=footprint_contour,
+                                           footprint=footprint_plan,
                                            structure=structure).astype(np.float32)
         accessible_contour = np.clip(accessible_contour, 0.0, 1.0)
         progress(35, "Achievable depth surface computed.")
         if erosion_cache is not None:
             erosion_cache[erosion_cache_key] = (center_depth_contour, accessible_contour)
+
+    if extra_offset_mm > 0.0:
+        off_norm = extra_offset_mm / max_depth
+        center_depth_contour = np.clip(center_depth_contour - off_norm, 0.0, 1.0)
+        accessible_contour = np.clip(accessible_contour - off_norm, 0.0, 1.0)
 
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")
@@ -2351,6 +2413,7 @@ def compute_contour_toolpath(
             'adaptive_levels': adaptive_levels,
             'use_2opt':           use_2opt,
             'max_step_down_mm':   _msd,
+            'extra_offset_mm':    extra_offset_mm,
             'lateral_tol_mm':     lateral_tol_mm,
             'n_passes':        len(z_levels),
             'width_mm':        width_mm,

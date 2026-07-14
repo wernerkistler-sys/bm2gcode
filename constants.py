@@ -44,6 +44,7 @@ DEFAULTS = {
     "step_raster_offset": "0",
     "step_stepdown":              "6.0",
     "step_raster_final_stepdown": "0.0",
+    "step_extra_offset":          "0.0", # stock-to-leave allowance, lateral+vertical (mm); 0 = none
     "step_feed_rate":    "800",
     "step_raster_dir":   "Vertical",
     "step_cut_direction": "Either",

@@ -415,6 +415,7 @@ class GCodeGeneratorApp:
         dst['algorithm_var'].set(src['algorithm_var'].get())
         dst['profile_var'].set(src['profile_var'].get())
         for key in ('diameter', 'stepover', 'raster_offset', 'stepdown', 'raster_final_stepdown',
+                    'extra_offset',
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
                     'min_fw', 'max_fw'):
@@ -602,6 +603,12 @@ class GCodeGeneratorApp:
         raster_final_stepdown.pack(fill=tk.X, pady=2)
         step['raster_final_stepdown'] = raster_final_stepdown
 
+        extra_offset = LabeledEntry(tool_lf, "Extra offset", "mm",
+                                    DEFAULTS["step_extra_offset"],
+                                    minval=0.0, maxval=50.0, increment=0.1)
+        extra_offset.pack(fill=tk.X, pady=2)
+        step['extra_offset'] = extra_offset
+
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
         vbit_frame = ttk.Frame(tool_lf)
         step['vbit_frame'] = vbit_frame
@@ -657,6 +664,7 @@ class GCodeGeneratorApp:
                     step['profile_var'].set("V-Bit")
                 step['vbit_angle'].set_state(
                     "disabled" if profile == "Ball" else "normal")
+                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['vcarve_frame'])
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
@@ -674,6 +682,7 @@ class GCodeGeneratorApp:
                 else:
                     step['vbit_frame'].pack_forget()
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['contour_frame'])
                 step['vbit_angle'].set_state("normal")
@@ -695,6 +704,8 @@ class GCodeGeneratorApp:
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
                 step['raster_final_stepdown'].pack(fill=tk.X, pady=2,
                                                    after=step['stepdown'])
+                step['extra_offset'].pack(fill=tk.X, pady=2,
+                                          after=step['raster_final_stepdown'])
                 step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
@@ -759,6 +770,7 @@ class GCodeGeneratorApp:
         step['stepover'].set(DEFAULTS["step_stepover"])
         step['raster_offset'].set(DEFAULTS["step_raster_offset"])
         step['stepdown'].set(DEFAULTS["step_stepdown"])
+        step['extra_offset'].set(DEFAULTS["step_extra_offset"])
         step['feed_rate'].set(DEFAULTS["step_feed_rate"])
         step['threshold'].set(DEFAULTS["step_threshold"])
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
@@ -1025,6 +1037,7 @@ class GCodeGeneratorApp:
             'raster_offset':        step['raster_offset'].get(),
             'stepdown':             step['stepdown'].get(),
             'raster_final_stepdown': step['raster_final_stepdown'].get(),
+            'extra_offset':         step['extra_offset'].get(),
             'raster_dir':           step['raster_dir_var'].get(),
             'cut_direction':        step['cut_dir_var'].get(),
             'vbit_angle':           step['vbit_angle'].get(),
@@ -1050,6 +1063,7 @@ class GCodeGeneratorApp:
         step['raster_offset'].set(d.get('raster_offset', DEFAULTS['step_raster_offset']))
         step['stepdown'].set(d.get('stepdown', DEFAULTS['step_stepdown']))
         step['raster_final_stepdown'].set(d.get('raster_final_stepdown', DEFAULTS['step_raster_final_stepdown']))
+        step['extra_offset'].set(d.get('extra_offset', DEFAULTS['step_extra_offset']))
         step['raster_dir_var'].set(d.get('raster_dir', DEFAULTS['step_raster_dir']))
         step['cut_dir_var'].set(d.get('cut_direction', DEFAULTS['step_cut_direction']))
         step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
@@ -1406,6 +1420,7 @@ class GCodeGeneratorApp:
             'eff_height_mm': eff_height_mm,
             'max_depth':     max_depth,
             'origin':        origin,
+            'extra_offset_mm': float(step['extra_offset'].get()),
         }
 
         if algorithm.startswith("V-Carving"):
@@ -1468,7 +1483,8 @@ class GCodeGeneratorApp:
 
         tool = params['tool']
         erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
-                             params['max_depth'], params['eff_width_mm'], params['eff_height_mm'])
+                             params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
+                             params['extra_offset_mm'])
 
         if algorithm.startswith("V-Carving"):
             gating_mode = params['gating_mode']
@@ -1504,6 +1520,7 @@ class GCodeGeneratorApp:
                 max_feature_width_mm = params['max_feature_width_mm'],
                 stepdown_mm          = params['vcarve_stepdown_mm'],
                 final_stepdown_mm    = params['vcarve_final_stepdown_mm'],
+                extra_offset_mm      = params['extra_offset_mm'],
                 skeleton_mode        = params['skeleton_mode'],
                 use_2opt             = params['use_2opt'],
                 progress             = progress_fn,
@@ -1531,6 +1548,7 @@ class GCodeGeneratorApp:
                 use_2opt           = params['use_2opt'],
                 cut_direction      = params['cut_direction'],
                 max_step_down_mm   = params['contour_max_step_down'],
+                extra_offset_mm    = params['extra_offset_mm'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
             )
@@ -1563,6 +1581,7 @@ class GCodeGeneratorApp:
                 step_mm               = step_mm,
                 stepdown_mm           = params['raster_stepdown_mm'],
                 final_stepdown_mm     = params['raster_final_stepdown_mm'],
+                extra_offset_mm       = params['extra_offset_mm'],
                 max_depth             = params['max_depth'],
                 width_mm              = params['eff_width_mm'],
                 height_mm             = params['eff_height_mm'],
