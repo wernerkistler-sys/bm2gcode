@@ -1991,9 +1991,10 @@ class GCodeGeneratorApp:
         """Render the depth-map surface and G-code tool path in 3D."""
         from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 
-        z_safe = self._settings['z_safe']
-        rapids = []
-        cuts   = []
+        z_safe  = self._settings['z_safe']
+        rapids  = []
+        plunges = []
+        cuts    = []
         prev_end = None
         for pts in self._toolpath_progress_segments(toolpath):
             if not pts:
@@ -2007,7 +2008,10 @@ class GCodeGeneratorApp:
                     (px, py, pz),        # current position
                     (px, py, z_safe),    # retract
                     (nx, ny, z_safe),    # traverse at safe height
-                    (nx, ny, nz),        # plunge
+                ])
+                plunges.append([
+                    (nx, ny, z_safe),    # traverse at safe height
+                    (nx, ny, nz),        # plunge (slow G1 move)
                 ])
             elif prev_end is not None and abs(prev_end[2] - pts[0][2]) > 1e-4:
                 cuts.append([prev_end, pts[0]])  # vertical G1 move, no XY change
@@ -2049,7 +2053,8 @@ class GCodeGeneratorApp:
             self.ax.add_collection3d(col, autolim=False)
 
         if self.show_rapids_var.get():
-            add_segments(rapids, "#ff0000",   1.0, 1.0, 'Rapids')
+            add_segments(rapids,  "#ff0000",   1.0, 1.0, 'Rapids')
+            add_segments(plunges, "#3399ff",   1.0, 1.0, 'Plunges')
         if self.show_cut_moves_var.get():
             add_segments(cuts,   "#61b970ff", 1.0, 1.0, 'Cut moves')
 
