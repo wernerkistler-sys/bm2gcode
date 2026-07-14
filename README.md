@@ -82,7 +82,7 @@ Traces the depth map as a stack of iso-depth contours, like topographic lines on
 
 | Parameter | Description |
 |---|---|
-| Step-down | Vertical distance between contour levels (mm). |
+| Z increment | Vertical distance between contour levels (mm). |
 | Adaptive levels (CDF) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. |
 | Lateral tolerance | Discards contour segments that lie within this distance (mm) of an adjacent deeper-level contour, removing redundant passes over areas already covered. |
 | Cut direction | Climb or Conventional forces every contour to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained, so path ordering is free to reverse segments for shorter travel. |
@@ -153,7 +153,7 @@ meaning: it bounds how many redundant levels lateral pruning may collapse
 and the window (in Z-levels) that contour ordering and 2-opt are allowed
 to mix contours across — see
 [Contour lateral pruning](#contour-lateral-pruning). Contour's actual
-Z-level spacing is the separate **Step-down** field under
+Z-level spacing is the separate **Z increment** field under
 [Step / Operation / Contour](#step--operation--contour).
 
 ---
@@ -282,7 +282,7 @@ This section describes how each algorithm works internally — the pipeline stag
 
 1. **Kernel + accessibility map** — Identical to Raster (steps 1–2).
 2. **Level planning** — Two modes:
-   - *Uniform*: Z-levels at equal step-down intervals.
+   - *Uniform*: Z-levels at equal Z-increment intervals.
    - *Adaptive (CDF)*: Z-levels placed at quantile boundaries of the depth-map pixel distribution. This concentrates levels where many pixels share the same depth value ("plateaus"), so contour lines align with flat areas rather than spanning empty gray ranges.
 3. **Contour extraction** — `skimage.find_contours` traces iso-depth curves at each Z-level on the accessibility map. If Cut direction is Climb or Conventional, every contour is reversed (or not) by a single global rule applied at this stage (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
 4. **Lateral pruning (optional)** — For each level, the distance transform to all committed deeper-level cuts is computed. Contour segments closer than the Lateral tolerance are discarded. Short pruned runs are restored if the retract/plunge overhead would cost more machine time than the cut saves.

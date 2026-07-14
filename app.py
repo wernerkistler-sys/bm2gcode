@@ -416,7 +416,7 @@ class GCodeGeneratorApp:
         dst['profile_var'].set(src['profile_var'].get())
         for key in ('diameter', 'stepover', 'raster_offset', 'stepdown', 'raster_final_stepdown',
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
-                    'contour_stepdown', 'contour_lateral_tol', 'feed_rate', 'threshold',
+                    'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
                     'min_fw', 'max_fw'):
             dst[key].set(src[key].get())
             if dst[key].auto_var is not None and src[key].auto_var is not None:
@@ -507,11 +507,11 @@ class GCodeGeneratorApp:
         step['contour_frame'] = contour_frame
         # (not packed initially — shown on demand by _refresh_layout)
 
-        contour_stepdown = LabeledEntry(contour_frame, "Step-down", "mm",
-                                        DEFAULTS["step_contour_stepdown"],
+        contour_z_increment = LabeledEntry(contour_frame, "Z increment", "mm",
+                                        DEFAULTS["step_contour_z_increment"],
                                         minval=0.01, maxval=50.0, increment=0.05)
-        contour_stepdown.pack(fill=tk.X, pady=2)
-        step['contour_stepdown'] = contour_stepdown
+        contour_z_increment.pack(fill=tk.X, pady=2)
+        step['contour_z_increment'] = contour_z_increment
 
         contour_adaptive_var = tk.BooleanVar(
             value=bool(int(DEFAULTS["step_contour_adaptive"])))
@@ -769,7 +769,7 @@ class GCodeGeneratorApp:
         step['max_fw'].set(DEFAULTS["step_max_fw"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
-        step['contour_stepdown'].set(DEFAULTS["step_contour_stepdown"])
+        step['contour_z_increment'].set(DEFAULTS["step_contour_z_increment"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
@@ -1030,7 +1030,7 @@ class GCodeGeneratorApp:
             'vbit_angle':           step['vbit_angle'].get(),
             'vcarve_stepdown':      step['vcarve_stepdown'].get(),
             'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
-            'contour_stepdown':     step['contour_stepdown'].get(),
+            'contour_z_increment':  step['contour_z_increment'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
             'tsp_2opt':             step['tsp_2opt_var'].get(),
@@ -1055,7 +1055,7 @@ class GCodeGeneratorApp:
         step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
         step['vcarve_stepdown'].set(d.get('vcarve_stepdown', DEFAULTS['step_vcarve_stepdown']))
         step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
-        step['contour_stepdown'].set(d.get('contour_stepdown', DEFAULTS['step_contour_stepdown']))
+        step['contour_z_increment'].set(d.get('contour_z_increment', DEFAULTS['step_contour_z_increment']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
@@ -1430,7 +1430,7 @@ class GCodeGeneratorApp:
             tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
             params.update({
                 'tool':                tool,
-                'contour_stepdown':    float(step['contour_stepdown'].get()),
+                'contour_z_increment_mm': float(step['contour_z_increment'].get()),
                 'contour_adaptive':    step['contour_adaptive_var'].get(),
                 'contour_lateral_tol': float(step['contour_lateral_tol'].get()),
                 'use_2opt':            step['tsp_2opt_var'].get(),
@@ -1515,7 +1515,7 @@ class GCodeGeneratorApp:
                 depth_map        = depth_map,
                 n_grey_levels    = n_grey_levels,
                 tool             = params['tool'],
-                stepdown_mm      = params['contour_stepdown'],
+                z_increment_mm   = params['contour_z_increment_mm'],
                 max_depth        = params['max_depth'],
                 width_mm         = params['eff_width_mm'],
                 height_mm        = params['eff_height_mm'],

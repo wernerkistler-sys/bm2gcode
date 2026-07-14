@@ -57,7 +57,7 @@ DEFAULTS = {
     "step_vcarve_stepdown":       "0.0", # max step-down per roughing pass (mm); 0 = single pass
     "step_vcarve_final_stepdown": "0.0", # final finishing pass depth (mm); 0 = none
     # Contour-specific defaults
-    "step_contour_stepdown":      "0.2", # Z increment between contour levels (mm)
+    "step_contour_z_increment":   "0.2", # Z increment between contour levels (mm)
     "step_contour_adaptive":      "0",   # 0 = fixed levels, 1 = adaptive CDF levels
     "step_contour_lateral_tol":   "0.0", # lateral tolerance for redundancy pruning (mm); 0 = disabled
     # Path-ordering

@@ -1921,7 +1921,7 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
 
 def compute_contour_toolpath(
     depth_map, n_grey_levels,
-    tool, stepdown_mm, max_depth,
+    tool, z_increment_mm, max_depth,
     width_mm, height_mm,
     origin="Bottom-Left",
     feed_rate=800.0,
@@ -1941,7 +1941,7 @@ def compute_contour_toolpath(
     """Compute a waterline (contour) tool path from a normalised depth map.
 
     The achievable depth surface is sliced at evenly-spaced Z-levels separated
-    by *stepdown_mm*.  At each level the iso-depth contour lines are extracted
+    by *z_increment_mm*.  At each level the iso-depth contour lines are extracted
     and emitted as cut segments, giving a layer-by-layer waterline strategy.
     To account for tool geometry, the tool-centre depth limit is first computed
     by grey-eroding the depth map with the tool profile kernel; contours are
@@ -1957,9 +1957,9 @@ def compute_contour_toolpath(
         Number of grey levels in the source image (used for RDP tolerance).
     tool : Tool
         Encapsulates profile, diameter_mm, and vbit_angle_deg.
-    stepdown_mm : float
+    z_increment_mm : float
         Z increment between contour levels in mm.  Also controls the number of
-        passes in adaptive mode: n_passes = ceil(max_depth / stepdown_mm).
+        passes in adaptive mode: n_passes = ceil(max_depth / z_increment_mm).
     adaptive_levels : bool
         When True, place the n_passes contour levels at equal-area (CDF-based)
         depth intervals rather than uniform Z spacing.  This concentrates passes
@@ -1993,7 +1993,7 @@ def compute_contour_toolpath(
         z-levels) that cross-level 2-opt is allowed to mix contours across.
         Both are derived from this single value: the pruning bound is used
         directly (see _prune_contours), and the mixing window is
-        round(max_step_down_mm / stepdown_mm) levels.  None or <= 0 means
+        round(max_step_down_mm / z_increment_mm) levels.  None or <= 0 means
         unconstrained — pruning may collapse any number of redundant levels
         and 2-opt may mix across the full level range.
     z_safe : float
@@ -2091,7 +2091,7 @@ def compute_contour_toolpath(
 
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")
-    n_passes = max(1, math.ceil(max_depth / stepdown_mm))
+    n_passes = max(1, math.ceil(max_depth / z_increment_mm))
     if adaptive_levels:
         flat = center_depth_contour[center_depth_contour > 1e-6].ravel()
         if flat.size >= 2:
@@ -2106,15 +2106,15 @@ def compute_contour_toolpath(
             if not z_levels or z_levels[-1] < 1.0 - min_gap:
                 z_levels.append(1.0)
         else:
-            z_levels = [min(i * stepdown_mm / max_depth, 1.0)
+            z_levels = [min(i * z_increment_mm / max_depth, 1.0)
                         for i in range(1, n_passes + 1)]
         progress(40, f"{len(z_levels)} contour level{'s' if len(z_levels) != 1 else ''}  "
-                     f"(adaptive, target stepdown {stepdown_mm:.2f} mm).")
+                     f"(adaptive, target Z increment {z_increment_mm:.2f} mm).")
     else:
-        z_levels = [min(i * stepdown_mm / max_depth, 1.0)
+        z_levels = [min(i * z_increment_mm / max_depth, 1.0)
                     for i in range(1, n_passes + 1)]
         progress(40, f"{n_passes} contour level{'s' if n_passes != 1 else ''}  "
-                     f"({stepdown_mm:.2f} mm each).")
+                     f"({z_increment_mm:.2f} mm each).")
 
     # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
     rdp_tol = max(1.0 / px_per_mm,
@@ -2168,9 +2168,9 @@ def compute_contour_toolpath(
     all_segments      = []
     current_pos       = np.array([0.0, 0.0])
     link_threshold_mm = tool.diameter_mm
-    z_jump_weight_mm  = stepdown_mm * 1.5
-    win_size     = (max(1, round(_msd / stepdown_mm))
-                     if _msd and stepdown_mm > 0 else len(z_levels))
+    z_jump_weight_mm  = z_increment_mm * 1.5
+    win_size     = (max(1, round(_msd / z_increment_mm))
+                     if _msd and z_increment_mm > 0 else len(z_levels))
     n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
 
     for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
@@ -2347,7 +2347,7 @@ def compute_contour_toolpath(
             'profile':         tool.profile,
             'max_depth':       max_depth,
             'radius_mm':       tool.diameter_mm / 2,
-            'stepdown_mm':     stepdown_mm,
+            'z_increment_mm':  z_increment_mm,
             'adaptive_levels': adaptive_levels,
             'use_2opt':           use_2opt,
             'max_step_down_mm':   _msd,
