@@ -74,6 +74,7 @@ class GCodeGeneratorApp:
         self._3d_zoom        = 1.0    # zoom factor (larger = more zoomed out)
         self._3d_pan_offset  = np.array([0.0, 0.0, 0.0])  # XYZ pan offset
         self._3d_mouse_start = None   # (x_px, y_px, elev, azim) or pan variant
+        self._prev_display_mode = None  # last mode seen by _on_display_mode_changed
 
         # Currently rendered 2D array (used for hover coordinate readout)
         self._displayed_array = None
@@ -1873,16 +1874,21 @@ class GCodeGeneratorApp:
         if mode not in available_modes:
             self.display_mode_var.set(DISPLAY_ORIGINAL)
             mode = DISPLAY_ORIGINAL
-        # Reset 3D view state when entering a 3D mode fresh
+        # Reset 3D view state only when actually entering a 3D mode from a
+        # non-3D mode — not on every re-render (e.g. toggling rapids/cut
+        # moves or recomputing a step) while already viewing in 3D, so the
+        # user's camera position is preserved.
         if mode in DISPLAY_3D_MODES:
-            self._3d_elev = 30.0
-            self._3d_azim = -60.0
-            self._3d_zoom = 1.0
-            self._3d_pan_offset = np.array([0.0, 0.0, 0.0])
+            if self._prev_display_mode not in DISPLAY_3D_MODES:
+                self._3d_elev = 30.0
+                self._3d_azim = -60.0
+                self._3d_zoom = 1.0
+                self._3d_pan_offset = np.array([0.0, 0.0, 0.0])
             # Ensure at least the path is visible — nothing to see without it
             if not self.show_cut_moves_var.get() and not self.show_rapids_var.get():
                 self.show_cut_moves_var.set(True)
                 self.show_rapids_var.set(True)
+        self._prev_display_mode = mode
         self._render()
 
     # ------------------------------------------------------------------ #
@@ -2085,10 +2091,11 @@ class GCodeGeneratorApp:
 
         self.ax.view_init(elev=self._3d_elev, azim=self._3d_azim)
 
-        # Legend
-        self.ax.legend(loc='upper left', fontsize=7,
-                       facecolor='#333333', edgecolor='#555555',
-                       labelcolor='white')
+        # Legend — only if there's at least one labeled artist to show
+        if self.show_rapids_var.get() or self.show_cut_moves_var.get():
+            self.ax.legend(loc='upper left', fontsize=7,
+                           facecolor='#333333', edgecolor='#555555',
+                           labelcolor='white')
 
         self.fig.tight_layout()
         self.mpl_canvas.draw()
