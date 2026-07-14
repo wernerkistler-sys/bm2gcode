@@ -4,6 +4,8 @@ bm2gcode converts a depth map, represented by a grayscale bitmap image, into CNC
 
 The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces and then a V-bit to cut fine details that the ball bit could not reach.
 
+Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, and arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid. All three can be configured in the Settings dialog (File → Settings), together with other global and machine-related parameters.
+
 A set of visualization modes supports strategy planning. In addition to the 3D toolpath preview, available views include the simulated surface after each step, the material not removed by a step, regions inaccessible to the tool geometry, and a binary processing mask showing which areas the current gating configuration will cut. These views, together with the estimated machining time for each step, allow users to optimize the cutting strategy for a particular depth map.
 
 ![bm2gcode screenshot](docs/screenshot.png)
@@ -197,6 +199,27 @@ Reads a binary or ASCII STL file and rasterizes it into a grayscale depth map �
 | G-code Preamble | G-code inserted before the cutting program (spindle start, dwell, etc.). |
 | G-code Postamble | G-code inserted after cutting (spindle stop, return to home, etc.). |
 
+**Tool Path Dress-Up** — three optional, off-by-default G-code refinements, all configured in the Settings dialog. They only change how the tool travels between cuts; the cut geometry itself is unaffected. See [G-code generation](#g-code-generation) for how they fit into path emission.
+
+**Ramp-in** — replaces a straight vertical plunge with a zig-zag ramp for the portion of the descent that lies inside the stock (below the surface, z < 0). Any travel above the surface remains a plain vertical plunge. The ramp retraces the upcoming cut path's own footprint — so it never cuts outside it — and never rises above the depth the final pass leaves at that position.
+
+| Parameter | Description |
+|---|---|
+| Ramp angle | Target descent angle of the zig-zag, in degrees. |
+| Max ramp length | How far ahead along the upcoming cut path the zig-zag is allowed to range, in mm. |
+
+**Back off before retract** — before retracting to safe height, backs the tool away a short distance from the wall it just cut, opposite its last direction of travel, to avoid rubbing or burning the surface while lifting.
+
+| Parameter | Description |
+|---|---|
+| Back-off distance | How far to back away before retracting, in mm. |
+
+**Arc-round rapid corners** — rounds the two sharp 90° turns of a rapid move (retract → traverse → plunge) into tangent arcs, so the tool can carry speed through the corner instead of coming to a full stop twice. Both corners always share the same radius.
+
+| Parameter | Description |
+|---|---|
+| Arc radius | Requested corner radius, in mm. Automatically reduced when there isn't enough room — e.g. a shallow cut, a short rapid, or a small safe height — and never exceeds the safe height, since a corner's lateral sweep is only safe above the stock surface. |
+
 ---
 
 #### Compute Menu
@@ -210,7 +233,7 @@ Reads a binary or ASCII STL file and rasterizes it into a grayscale depth map �
 
 #### View Menu
 
-All visualization modes show data for the currently active step. Cut moves and rapid moves can be toggled in any mode with **C** and **R**.
+All visualization modes show data for the currently active step. Cut moves and rapid moves can be toggled in any mode with **C** and **R**. When ramp-in, back-off, or arc-rounding dress-ups are enabled (see the Settings dialog under File Menu, above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves.
 
 | Mode | Hotkey | Shows |
 |---|---|---|
@@ -368,7 +391,13 @@ The medial axis (`skimage.morphology.medial_axis`) is the set of centres of all 
 
 #### G-code generation
 
-Iterates over the ordered segments. Consecutive segments whose endpoints touch are joined as G1 feed moves. Gaps trigger a retract (G0 to safe height), a rapid to the next entry XY position, and a plunge (G1 to entry Z). The preamble and postamble are injected verbatim. A comment header records tool profile, work area dimensions, estimated run time, cut distance, and rapid distance.
+Iterates over the ordered segments. Consecutive segments whose endpoints touch are joined as G1 feed moves. Gaps trigger a retract (G0 to safe height), a rapid to the next entry XY position, and a plunge (G1 to entry Z). Three optional dress-ups (Settings dialog under File Menu, off by default) modify this base behaviour without changing the underlying cut geometry:
+
+- **Ramp-in** replaces the plunge below the stock surface (z < 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
+- **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract.
+- **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius.
+
+The preamble and postamble are injected verbatim. A comment header records tool profile, work area dimensions, estimated run time, cut distance, and rapid distance.
 
 ---
 

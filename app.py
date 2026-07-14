@@ -35,6 +35,7 @@ from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
+from dressup import RampSettings, BackoffSettings, ArcSettings
 import stl_mesh
 
 
@@ -53,6 +54,13 @@ class GCodeGeneratorApp:
             'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
             'preamble':    DEFAULTS['preamble'],
             'postamble':   DEFAULTS['postamble'],
+            'ramp_in_enabled':     bool(int(DEFAULTS['ramp_in_enabled'])),
+            'ramp_angle_deg':      float(DEFAULTS['ramp_angle_deg']),
+            'ramp_max_length_mm':  float(DEFAULTS['ramp_max_length_mm']),
+            'backoff_enabled':     bool(int(DEFAULTS['backoff_enabled'])),
+            'backoff_distance_mm': float(DEFAULTS['backoff_distance_mm']),
+            'arc_rapids_enabled':  bool(int(DEFAULTS['arc_rapids_enabled'])),
+            'arc_radius_mm':       float(DEFAULTS['arc_radius_mm']),
         }
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array
@@ -288,13 +296,13 @@ class GCodeGeneratorApp:
                         ).pack(side=tk.RIGHT, padx=(0, 4))
 
         self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"],
-                                      minval=0.01, maxval=200.0, increment=0.1)
+                                      minval=0.01, maxval=200.0, increment=1.0)
         self.max_depth.pack(fill=tk.X, pady=2)
         self.margin_mm = LabeledEntry(sf, "Stock margin", "mm", DEFAULTS["margin_mm"],
                                       minval=0.0, maxval=5000.0, increment=1.0)
         self.margin_mm.pack(fill=tk.X, pady=2)
         self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"],
-                                             minval=0.0, maxval=100.0, increment=1.0)
+                                             minval=0.0, maxval=100.0, increment=5.0)
         self.margin_depth_pct.pack(fill=tk.X, pady=2)
         self.width_mm.var.trace_add("write", self._on_width_changed)
         self.height_mm.var.trace_add("write", lambda *_: self._render())
@@ -476,12 +484,12 @@ class GCodeGeneratorApp:
         step['raster_frame'] = raster_frame
 
         stepover = LabeledEntry(raster_frame, "Step-over", "%", DEFAULTS["step_stepover"],
-                                minval=1.0, maxval=100.0, increment=1.0)
+                                minval=1.0, maxval=100.0, increment=10.0)
         stepover.pack(fill=tk.X, pady=2)
         step['stepover'] = stepover
 
         raster_offset = LabeledEntry(raster_frame, "Line offset", "%", DEFAULTS["step_raster_offset"],
-                                     minval=0.0, maxval=99.0, increment=1.0)
+                                     minval=0.0, maxval=99.0, increment=10.0)
         raster_offset.pack(fill=tk.X, pady=2)
         step['raster_offset'] = raster_offset
 
@@ -511,7 +519,7 @@ class GCodeGeneratorApp:
 
         contour_z_increment = LabeledEntry(contour_frame, "Z increment", "mm",
                                         DEFAULTS["step_contour_z_increment"],
-                                        minval=0.01, maxval=50.0, increment=0.05)
+                                        minval=0.01, maxval=50.0, increment=0.1)
         contour_z_increment.pack(fill=tk.X, pady=2)
         step['contour_z_increment'] = contour_z_increment
 
@@ -588,7 +596,7 @@ class GCodeGeneratorApp:
         step['profile_cb'] = profile_cb
 
         diam = LabeledEntry(tool_lf, "Diameter", "mm", DEFAULTS["step_diameter"],
-                            minval=0.01, maxval=200.0, increment=0.1)
+                            minval=0.01, maxval=200.0, increment=1.0)
         diam.pack(fill=tk.X, pady=2)
         step['diameter'] = diam
 
@@ -616,7 +624,7 @@ class GCodeGeneratorApp:
         # (not packed initially — shown on demand)
 
         vbit_angle = LabeledEntry(vbit_frame, "V-bit angle", "°", DEFAULTS["step_vbit_angle"],
-                                  minval=1.0, maxval=179.0, increment=1.0)
+                                  minval=1.0, maxval=179.0, increment=10.0)
         vbit_angle.pack(fill=tk.X, pady=2)
         step['vbit_angle'] = vbit_angle
 
@@ -1024,7 +1032,50 @@ class GCodeGeneratorApp:
         self._render()
 
     def _open_settings(self):
-        SettingsDialog(self.root, self._settings)
+        dlg = SettingsDialog(self.root, self._settings)
+        if dlg.confirmed:
+            self._refresh_stats_and_view()
+
+    def _refresh_stats_and_view(self):
+        """Re-derive the displayed stats (motion count / est. time) and
+        refresh the 3D preview for every already-computed step, using the
+        current dress-up settings. Ramp-in/back-off/arc-rounding only affect
+        G-code emission/rendering, not the underlying toolpath geometry, so
+        this refresh is cheap and doesn't require recomputing any step."""
+        ramp    = self._ramp_settings()
+        backoff = self._backoff_settings()
+        arc     = self._arc_settings()
+        for idx, (step, tp) in enumerate(zip(self.steps, self.toolpaths)):
+            if tp is None:
+                continue
+            feed_rate = tp.metadata.get('feed_rate', 800.0)
+            stats = tp.get_stats(
+                feed_rate   = feed_rate,
+                feed_rapid  = self._settings['feed_rapid'],
+                z_safe      = self._settings['z_safe'],
+                accel_mm_s2 = self._settings['accel_mm_s2'],
+                ramp        = ramp,
+                backoff     = backoff,
+                arc         = arc,
+            )
+            step['info_var'].set(
+                f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+                f"Est. time: {_fmt_time(stats['est_minutes'])}"
+                f" @ {feed_rate:.0f} mm/min")
+        self._on_display_mode_changed()
+
+    def _ramp_settings(self):
+        return RampSettings(enabled=self._settings['ramp_in_enabled'],
+                             angle_deg=self._settings['ramp_angle_deg'],
+                             max_length_mm=self._settings['ramp_max_length_mm'])
+
+    def _backoff_settings(self):
+        return BackoffSettings(enabled=self._settings['backoff_enabled'],
+                                distance_mm=self._settings['backoff_distance_mm'])
+
+    def _arc_settings(self):
+        return ArcSettings(enabled=self._settings['arc_rapids_enabled'],
+                            radius_mm=self._settings['arc_radius_mm'])
 
     # ------------------------------------------------------------------ #
     #  Project save / load
@@ -1102,6 +1153,13 @@ class GCodeGeneratorApp:
                 'accel_mm_s2': self._settings['accel_mm_s2'],
                 'preamble':    self._settings['preamble'],
                 'postamble':   self._settings['postamble'],
+                'ramp_in_enabled':     self._settings['ramp_in_enabled'],
+                'ramp_angle_deg':      self._settings['ramp_angle_deg'],
+                'ramp_max_length_mm':  self._settings['ramp_max_length_mm'],
+                'backoff_enabled':     self._settings['backoff_enabled'],
+                'backoff_distance_mm': self._settings['backoff_distance_mm'],
+                'arc_rapids_enabled':  self._settings['arc_rapids_enabled'],
+                'arc_radius_mm':       self._settings['arc_radius_mm'],
             },
             'steps': [self._step_to_dict(s) for s in self.steps],
         }
@@ -1152,6 +1210,13 @@ class GCodeGeneratorApp:
         self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
         self._settings['preamble']    = DEFAULTS['preamble']
         self._settings['postamble']   = DEFAULTS['postamble']
+        self._settings['ramp_in_enabled']     = bool(int(DEFAULTS['ramp_in_enabled']))
+        self._settings['ramp_angle_deg']      = float(DEFAULTS['ramp_angle_deg'])
+        self._settings['ramp_max_length_mm']  = float(DEFAULTS['ramp_max_length_mm'])
+        self._settings['backoff_enabled']     = bool(int(DEFAULTS['backoff_enabled']))
+        self._settings['backoff_distance_mm'] = float(DEFAULTS['backoff_distance_mm'])
+        self._settings['arc_rapids_enabled']  = bool(int(DEFAULTS['arc_rapids_enabled']))
+        self._settings['arc_radius_mm']       = float(DEFAULTS['arc_radius_mm'])
 
         while len(self.steps) > 1:
             self._remove_step(self.steps[-1])
@@ -1264,6 +1329,13 @@ class GCodeGeneratorApp:
         self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
         self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
         self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
+        self._settings['ramp_in_enabled']     = bool(m.get('ramp_in_enabled',     self._settings['ramp_in_enabled']))
+        self._settings['ramp_angle_deg']      = m.get('ramp_angle_deg',      self._settings['ramp_angle_deg'])
+        self._settings['ramp_max_length_mm']  = m.get('ramp_max_length_mm',  self._settings['ramp_max_length_mm'])
+        self._settings['backoff_enabled']     = bool(m.get('backoff_enabled',     self._settings['backoff_enabled']))
+        self._settings['backoff_distance_mm'] = m.get('backoff_distance_mm', self._settings['backoff_distance_mm'])
+        self._settings['arc_rapids_enabled']  = bool(m.get('arc_rapids_enabled',  self._settings['arc_rapids_enabled']))
+        self._settings['arc_radius_mm']       = m.get('arc_radius_mm',       self._settings['arc_radius_mm'])
 
         # ── Steps ─────────────────────────────────────────────────────
         step_dicts = project.get('steps', [])
@@ -1664,6 +1736,9 @@ class GCodeGeneratorApp:
                     feed_rapid  = self._settings['feed_rapid'],
                     z_safe      = self._settings['z_safe'],
                     accel_mm_s2 = self._settings['accel_mm_s2'],
+                    ramp        = self._ramp_settings(),
+                    backoff     = self._backoff_settings(),
+                    arc         = self._arc_settings(),
                 )
                 dlg.close("Completed.")
                 step['info_var'].set(
@@ -1736,6 +1811,9 @@ class GCodeGeneratorApp:
                         feed_rapid  = self._settings['feed_rapid'],
                         z_safe      = self._settings['z_safe'],
                         accel_mm_s2 = self._settings['accel_mm_s2'],
+                        ramp        = self._ramp_settings(),
+                        backoff     = self._backoff_settings(),
+                        arc         = self._arc_settings(),
                     )
                     s['info_var'].set(
                         f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
@@ -1821,7 +1899,10 @@ class GCodeGeneratorApp:
             for idx in indices:
                 tp = self.toolpaths[idx]
                 feed_rate = tp.metadata.get('feed_rate', 800.0)
-                bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe, accel_mm_s2))
+                bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe, accel_mm_s2,
+                                           ramp=self._ramp_settings(),
+                                           backoff=self._backoff_settings(),
+                                           arc=self._arc_settings()))
 
             gcode = preamble + "\n\n" + "\n\n".join(bodies) + "\n\n" + postamble
             with open(path, "w", encoding="utf-8") as f:
@@ -1992,31 +2073,28 @@ class GCodeGeneratorApp:
         from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 
         z_safe  = self._settings['z_safe']
-        rapids  = []
-        plunges = []
-        cuts    = []
-        prev_end = None
-        for pts in self._toolpath_progress_segments(toolpath):
-            if not pts:
+        rapids   = []
+        plunges  = []
+        ramps    = []
+        backoffs = []
+        arcs     = []
+        cuts     = []
+        buckets = {
+            'rapid_retract':  rapids,
+            'rapid_traverse': rapids,
+            'plunge':         plunges,
+            'ramp':           ramps,
+            'backoff':        backoffs,
+            'arc':            arcs,
+            'cut':            cuts,
+        }
+        for kind, pts in toolpath.iter_moves(
+                segments=self._toolpath_progress_segments(toolpath),
+                z_safe=z_safe, ramp=self._ramp_settings(),
+                backoff=self._backoff_settings(), arc=self._arc_settings()):
+            if len(pts) < 2:
                 continue
-            if prev_end is not None and (
-                    abs(prev_end[0] - pts[0][0]) > 1e-4
-                    or abs(prev_end[1] - pts[0][1]) > 1e-4):
-                px, py, pz = prev_end
-                nx, ny, nz = pts[0]
-                rapids.append([
-                    (px, py, pz),        # current position
-                    (px, py, z_safe),    # retract
-                    (nx, ny, z_safe),    # traverse at safe height
-                ])
-                plunges.append([
-                    (nx, ny, z_safe),    # traverse at safe height
-                    (nx, ny, nz),        # plunge (slow G1 move)
-                ])
-            elif prev_end is not None and abs(prev_end[2] - pts[0][2]) > 1e-4:
-                cuts.append([prev_end, pts[0]])  # vertical G1 move, no XY change
-            cuts.append(pts)
-            prev_end = pts[-1]
+            buckets.get(kind, cuts).append(pts)
 
         # ── Rebuild figure with a 3D axes ─────────────────────────────
         self.fig.clear()
@@ -2053,8 +2131,11 @@ class GCodeGeneratorApp:
             self.ax.add_collection3d(col, autolim=False)
 
         if self.show_rapids_var.get():
-            add_segments(rapids,  "#ff0000",   1.0, 1.0, 'Rapids')
-            add_segments(plunges, "#3399ff",   1.0, 1.0, 'Plunges')
+            add_segments(rapids,   "#ff0000",   1.0, 1.0, 'Rapids')
+            add_segments(plunges,  "#3399ff",   1.0, 1.0, 'Plunges')
+            add_segments(ramps,    "#33cfff",   1.0, 1.0, 'Ramp-in')
+            add_segments(backoffs, "#ffaa33",   1.5, 1.0, 'Back-off')
+            add_segments(arcs,     "#cc66ff",   1.0, 1.0, 'Arc corner')
         if self.show_cut_moves_var.get():
             add_segments(cuts,   "#61b970ff", 1.0, 1.0, 'Cut moves')
 

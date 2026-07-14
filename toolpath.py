@@ -1,6 +1,45 @@
+import math
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
+
+from dressup import generate_ramp, compute_backoff_point, generate_corner_arc
+
+
+def _ramp_plan(points, z_from, ramp):
+    """Plan the descent from z_from down to points[0]'s Z (points[0][2]).
+
+    Ramp-in only ever replaces the portion of a plunge that is inside the
+    stock (z < 0) -- the air above the stock surface (z = 0) is always a
+    plain vertical plunge. Returns (split_z, ramp_pts):
+
+    - split_z = min(z_from, 0.0), the Z at which the vertical-in-air leg (if
+      any) hands off to the zig-zag (if any).
+    - ramp_pts = generate_ramp(points, split_z, ramp) when there's actually
+      material below split_z to ramp into (points[0][2] < split_z), else
+      [points[0]] (nothing to ramp -- the caller should do a single plain
+      plunge for the whole z_from -> points[0][2] descent).
+    """
+    z0 = points[0][2]
+    split_z = min(z_from, 0.0)
+    if z0 < split_z:
+        return split_z, generate_ramp(points, split_z, ramp)
+    return split_z, [points[0]]
+
+
+def _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts):
+    """Yield the ('plunge', ...) / ('ramp', ...) move(s) for a descent from
+    z_from to z0 at fixed XY, per the plan from _ramp_plan(): a plain
+    vertical plunge through any air above the stock surface, followed by the
+    zig-zag for the material portion -- or a single plain plunge for the
+    whole descent when there's nothing to ramp into or ramping isn't usable.
+    """
+    if len(ramp_pts) > 1:
+        if split_z < z_from - 1e-9:
+            yield ('plunge', [(x0, y0, z_from), (x0, y0, split_z)])
+        yield ('ramp', [(x0, y0, split_z)] + ramp_pts)
+    else:
+        yield ('plunge', [(x0, y0, z_from), (x0, y0, z0)])
 
 
 @dataclass
@@ -57,8 +96,127 @@ class ToolPath:
             return np.empty((0, 3), dtype=np.float64)
         return np.array(pts_out, dtype=np.float64)
 
+    def iter_moves(self, segments=None, z_safe=5.0, ramp=None, backoff=None, arc=None):
+        """Single source of truth for rapid/retract/plunge/ramp/back-off/arc
+        geometry — shared by ``to_gcode``, ``get_stats``, and the 3D preview
+        so they can never disagree about what the tool actually does between
+        cuts.
+
+        Yields ``(kind, pts)`` tuples where ``kind`` is one of
+        ``'rapid_retract'``, ``'rapid_traverse'``, ``'backoff'``, ``'arc'``,
+        ``'ramp'``, ``'plunge'``, ``'cut'``, and ``pts`` is an ordered list of
+        two or more ``(x, y, z)`` mm waypoints — the first waypoint is always
+        the position the tool is already at (i.e. the previous move's last
+        point). This method only synthesizes geometry; feed rates and G-code
+        formatting are the caller's concern.
+
+        ``segments`` defaults to ``self.segments``; callers may pass a
+        truncated list (e.g. for a progress-scrub preview) to only dress up
+        a prefix of the path. ``ramp``/``backoff``/``arc`` are optional
+        ``dressup.RampSettings`` / ``BackoffSettings`` / ``ArcSettings``
+        instances (or ``None``/disabled, which reproduces the plain
+        retract → traverse → plunge behaviour).
+
+        Ramp-in only ever replaces the portion of a plunge that is inside
+        the stock (z < 0) with a zig-zag; any air above the stock surface
+        (z = 0) is always a plain vertical plunge down to z = 0 first (see
+        ``_ramp_plan``/``_emit_plunge_ramp``).
+        """
+        segs = segments if segments is not None else self.segments
+        prev_points = None
+
+        for points in segs:
+            if not points:
+                continue
+            x0, y0, z0 = points[0]
+            gap = prev_points is None or (
+                abs(prev_points[-1][0] - x0) > 1e-4
+                or abs(prev_points[-1][1] - y0) > 1e-4
+            )
+
+            if gap:
+                if prev_points is not None:
+                    base = prev_points[-1]
+                    bo = compute_backoff_point(prev_points, backoff)
+                    if bo is not None:
+                        yield ('backoff', [base, bo])
+                        base = bo
+                    px, py, pz = base
+                    nx, ny = x0, y0
+                    horiz = math.hypot(nx - px, ny - py)
+
+                    # Both corners of this rapid (retract-side and
+                    # plunge-side) share a single radius, clamped by
+                    # whichever side has less room: the retract's climb
+                    # (z_safe - pz), the plunge's descent (z_safe - z0), half
+                    # the horizontal traverse (so the two arcs don't overlap),
+                    # and z_safe itself -- each arc's Z sweeps between z_safe
+                    # and (z_safe - r) while moving laterally, which is only
+                    # guaranteed safe at z >= 0 (this app's flat stock top).
+                    r = 0.0
+                    u = None
+                    if horiz > 1e-9:
+                        u = ((nx - px) / horiz, (ny - py) / horiz, 0.0)
+                        if arc is not None and arc.enabled:
+                            r = min(arc.radius_mm, (z_safe - pz) / 2.0,
+                                    (z_safe - z0) / 2.0, horiz / 2.0, z_safe)
+                            if r < 0.1:
+                                r = 0.0
+
+                    if r > 0.0:
+                        retract_top = z_safe - r
+                        yield ('rapid_retract', [(px, py, pz), (px, py, retract_top)])
+                        arc_a = generate_corner_arc((px, py, z_safe), (0.0, 0.0, 1.0),
+                                                     u, r, arc.n_segments)
+                        yield ('arc', [(px, py, retract_top)] + arc_a)
+                        trav_start = arc_a[-1]
+                    else:
+                        yield ('rapid_retract', [(px, py, pz), (px, py, z_safe)])
+                        trav_start = (px, py, z_safe)
+
+                    if r > 0.0:
+                        trav_end = (nx - u[0] * r, ny - u[1] * r, z_safe)
+                        yield ('rapid_traverse', [trav_start, trav_end])
+                        arc_b = generate_corner_arc((nx, ny, z_safe), u, (0.0, 0.0, -1.0),
+                                                     r, arc.n_segments)
+                        yield ('arc', [trav_end] + arc_b)
+                        z_from = z_safe - r
+                    else:
+                        yield ('rapid_traverse', [trav_start, (nx, ny, z_safe)])
+                        z_from = z_safe
+
+                    # Ramp-in only ever replaces the portion of the descent
+                    # that is inside the stock (z < 0); the air above the
+                    # stock surface is always a plain vertical plunge.
+                    split_z, ramp_pts = _ramp_plan(points, z_from, ramp)
+                    yield from _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts)
+                else:
+                    # First move: prior machine position is unknown, so there
+                    # is no direction to fillet a corner against.
+                    yield ('rapid_traverse', [(x0, y0, z_safe)])
+                    split_z, ramp_pts = _ramp_plan(points, z_safe, ramp)
+                    yield from _emit_plunge_ramp(x0, y0, z0, z_safe, split_z, ramp_pts)
+
+            elif abs(prev_points[-1][2] - z0) > 1e-4:
+                z_from = prev_points[-1][2]
+                split_z, ramp_pts = _ramp_plan(points, z_from, ramp)
+                yield from _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts)
+
+            if len(points) >= 2:
+                yield ('cut', points)
+
+            prev_points = points
+
+        if prev_points is not None:
+            base = prev_points[-1]
+            bo = compute_backoff_point(prev_points, backoff)
+            if bo is not None:
+                yield ('backoff', [base, bo])
+                base = bo
+            yield ('rapid_retract', [base, (base[0], base[1], z_safe)])
+
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
-                  accel_mm_s2=300.0):
+                  accel_mm_s2=300.0, ramp=None, backoff=None, arc=None):
         """Compute statistics from the path segments.
 
         ``est_minutes`` models a trapezoidal (or triangular, for motions too
@@ -71,10 +229,13 @@ class ToolPath:
         paths with many short, zig-zagging motions (dense raster/V-carve
         scans), since the tool never actually reaches the commanded feed
         rate on them.
+
+        Geometry (rapid/retract/plunge/ramp/back-off/arc synthesis) comes
+        from :meth:`iter_moves`, so these stats always match what
+        :meth:`to_gcode` actually emits.
         """
         cut_dist = rapid_dist = 0.0
         motion_count = 0
-        prev_end = None
 
         # (length_mm, cruise_mm_s, unit_dir) per straight motion, in path
         # order, used below for the acceleration-aware time estimate.
@@ -90,36 +251,19 @@ class ToolPath:
                 return
             motions.append((length, vmax, (dx/length, dy/length, dz/length)))
 
-        for points in self.segments:
-            if not points:
-                continue
+        rapid_kinds = ('rapid_retract', 'rapid_traverse', 'arc')
 
-            # Rapid gap between consecutive segments: retract + traverse + plunge
-            if prev_end is not None and (
-                    abs(prev_end[0] - points[0][0]) > 1e-4
-                    or abs(prev_end[1] - points[0][1]) > 1e-4):
-                px, py, pz = prev_end
-                nx, ny, nz = points[0]
-                retract  = (px, py, z_safe)
-                traverse = (nx, ny, z_safe)
-                plunge   = (nx, ny, nz)
-                rapid_dist += (abs(z_safe - pz)                              # retract
-                               + ((nx-px)**2 + (ny-py)**2) ** 0.5           # traverse
-                               + abs(z_safe - nz))                           # plunge
-                add_motion(prev_end, retract,  feed_rapid_s)
-                add_motion(retract,  traverse, feed_rapid_s)
-                add_motion(traverse, plunge,   feed_rapid_s)
-                motion_count += 3
-
-            if len(points) >= 2:
-                motion_count += len(points) - 1
-                for i in range(len(points) - 1):
-                    x0, y0, z0 = points[i]
-                    x1, y1, z1 = points[i + 1]
-                    cut_dist += ((x1-x0)**2 + (y1-y0)**2 + (z1-z0)**2) ** 0.5
-                    add_motion(points[i], points[i + 1], feed_rate_s)
-
-            prev_end = points[-1]
+        for kind, pts in self.iter_moves(z_safe=z_safe, ramp=ramp, backoff=backoff, arc=arc):
+            vmax = feed_rapid_s if kind in rapid_kinds else feed_rate_s
+            for i in range(len(pts) - 1):
+                p0, p1 = pts[i], pts[i + 1]
+                d = ((p1[0]-p0[0])**2 + (p1[1]-p0[1])**2 + (p1[2]-p0[2])**2) ** 0.5
+                if kind in rapid_kinds:
+                    rapid_dist += d
+                else:
+                    cut_dist += d
+                add_motion(p0, p1, vmax)
+                motion_count += 1
 
         # Junction (corner) velocities: the machine starts and ends the
         # whole path at rest, so junction_v[0] and junction_v[-1] stay 0.
@@ -156,12 +300,18 @@ class ToolPath:
         }
 
     def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
-                 accel_mm_s2=300.0):
+                 accel_mm_s2=300.0, ramp=None, backoff=None, arc=None):
         """Generate G-code string for the motion segments.
 
         The output is self-contained: it starts with a move to z_safe and ends
         at z_safe.  Preamble and postamble (spindle on/off, units, etc.) are
         handled by the caller and are not included here.
+
+        *ramp*, *backoff* and *arc* are optional ``dressup`` settings objects
+        that replace vertical plunges with a zig-zag ramp, back the tool away
+        from the wall before retracting, and round the rapid's sharp corners
+        into tangent arcs, respectively. Left as ``None`` (or disabled),
+        output is the plain retract/traverse/plunge behaviour.
         """
 
         def fmt_time(minutes):
@@ -197,7 +347,8 @@ class ToolPath:
                         f"{meta['refining_threshold_um']:.0f} µm "
                         f"(spans from prior residual only)")
 
-        stats = self.get_stats(feed_rate, feed_rapid, z_safe, accel_mm_s2)
+        stats = self.get_stats(feed_rate, feed_rapid, z_safe, accel_mm_s2,
+                                ramp, backoff, arc)
 
         lines += [
             f"; Total motion lines: {stats['motion_count']}",
@@ -211,36 +362,26 @@ class ToolPath:
         # Explicit safe-height move at the start — body is self-contained and
         # does not rely on the preamble having done this.
         lines.append(f"G0 Z{z_safe:.3f}  ; move to safe height")
-        at_safe = True
 
-        prev_end = None   # (x, y, z) of the last emitted endpoint
-
-        for points in self.segments:
-            if not points:
-                continue
-
-            x0, y0, z0 = points[0]
-
-            needs_rapid = (
-                prev_end is None
-                or abs(prev_end[0] - x0) > 1e-4
-                or abs(prev_end[1] - y0) > 1e-4
-            )
-            if needs_rapid:
-                if not at_safe:
-                    lines.append(f"G0 Z{z_safe:.3f}  ; retract")
-                lines.append(f"G0 X{x0:.3f} Y{y0:.3f}  ; rapid to span start")
-                lines.append(f"G1 Z{z0:.3f} F{feed_rate}  ; plunge")
-                at_safe = False
-            elif abs(prev_end[2] - z0) > 1e-4:
-                lines.append(f"G1 Z{z0:.3f} F{feed_rate}")
-
-            for x, y, z in points[1:]:
-                lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
-
-            prev_end = points[-1]
-
-        if not at_safe:
-            lines.append(f"G0 Z{z_safe:.3f}  ; retract")
+        for kind, pts in self.iter_moves(z_safe=z_safe, ramp=ramp, backoff=backoff, arc=arc):
+            if kind == 'rapid_retract':
+                lines.append(f"G0 Z{pts[-1][2]:.3f}  ; retract")
+            elif kind == 'rapid_traverse':
+                x, y, _ = pts[-1]
+                lines.append(f"G0 X{x:.3f} Y{y:.3f}  ; rapid to span start")
+            elif kind == 'backoff':
+                x, y, _ = pts[-1]
+                lines.append(f"G1 X{x:.3f} Y{y:.3f} F{feed_rate}  ; back off before retract")
+            elif kind == 'arc':
+                for x, y, z in pts[1:]:
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rapid}  ; arc")
+            elif kind == 'ramp':
+                for x, y, z in pts[1:]:
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}  ; ramp")
+            elif kind == 'plunge':
+                lines.append(f"G1 Z{pts[-1][2]:.3f} F{feed_rate}  ; plunge")
+            elif kind == 'cut':
+                for x, y, z in pts[1:]:
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
 
         return "\n".join(lines)

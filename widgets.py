@@ -255,17 +255,19 @@ def _fmt_time(minutes):
 
 class SettingsDialog(tk.Toplevel):
     """Modal dialog for editing global G-code settings (z_safe, feed_rapid,
-    preamble, postamble).  Modifies *settings* dict in-place on OK."""
+    preamble, postamble, tool path dress-ups).  Modifies *settings* dict
+    in-place on OK."""
 
     def __init__(self, parent, settings):
         super().__init__(parent)
         self.title("Settings")
         self.resizable(True, True)
-        self.minsize(480, 540)
+        self.minsize(480, 760)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.grab_set()
 
         self._settings = settings
+        self.confirmed = False
 
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -276,7 +278,7 @@ class SettingsDialog(tk.Toplevel):
 
         self._z_safe = LabeledEntry(mf, "Safe height (z_safe)", "mm",
                                     str(settings.get('z_safe', 5.0)),
-                                    minval=0.0, maxval=200.0, increment=0.5)
+                                    minval=0.0, maxval=200.0, increment=1.0)
         self._z_safe.pack(fill=tk.X, pady=2)
 
         self._feed_rapid = LabeledEntry(mf, "Rapid feed (time estimate only)", "mm/min",
@@ -288,6 +290,53 @@ class SettingsDialog(tk.Toplevel):
                                    str(settings.get('accel_mm_s2', 300.0)),
                                    minval=1.0, maxval=10000.0, increment=10.0)
         self._accel.pack(fill=tk.X, pady=2)
+
+        # ── Tool path dress-ups ─────────────────────────────────────────
+        du_sf = SectionFrame(outer, "Tool Path Dress-Up")
+        du_sf.pack(fill=tk.X, pady=(0, 8))
+
+        self._ramp_enabled_var = tk.BooleanVar(value=bool(settings.get('ramp_in_enabled', False)))
+        ttk.Checkbutton(du_sf, text="Ramp-in (replace vertical plunges with a zigzag ramp)",
+                        variable=self._ramp_enabled_var,
+                        command=self._on_ramp_toggle).pack(anchor=tk.W, pady=2)
+
+        self._ramp_angle = LabeledEntry(du_sf, "Ramp angle", "deg",
+                                        str(settings.get('ramp_angle_deg', 30.0)),
+                                        minval=5.0, maxval=85.0, increment=5)
+        self._ramp_angle.pack(fill=tk.X, pady=2)
+
+        self._ramp_length = LabeledEntry(du_sf, "Max ramp length", "mm",
+                                         str(settings.get('ramp_max_length_mm', 15.0)),
+                                         minval=0.5, maxval=200.0, increment=1.0)
+        self._ramp_length.pack(fill=tk.X, pady=2)
+
+        ttk.Separator(du_sf).pack(fill=tk.X, pady=4)
+
+        self._backoff_enabled_var = tk.BooleanVar(value=bool(settings.get('backoff_enabled', False)))
+        ttk.Checkbutton(du_sf, text="Back off before retract",
+                        variable=self._backoff_enabled_var,
+                        command=self._on_backoff_toggle).pack(anchor=tk.W, pady=2)
+
+        self._backoff_dist = LabeledEntry(du_sf, "Back-off distance", "mm",
+                                          str(settings.get('backoff_distance_mm', 0.5)),
+                                          minval=0.0, maxval=20.0, increment=0.1)
+        self._backoff_dist.pack(fill=tk.X, pady=2)
+
+        ttk.Separator(du_sf).pack(fill=tk.X, pady=4)
+
+        self._arc_enabled_var = tk.BooleanVar(value=bool(settings.get('arc_rapids_enabled', False)))
+        ttk.Checkbutton(du_sf, text="Arc-round rapid corners",
+                        variable=self._arc_enabled_var,
+                        command=self._on_arc_toggle).pack(anchor=tk.W, pady=2)
+
+        self._arc_radius = LabeledEntry(du_sf, "Arc radius", "mm",
+                                        str(settings.get('arc_radius_mm', 3.0)),
+                                        minval=0.0, maxval=50.0, increment=1.0)
+        self._arc_radius.pack(fill=tk.X, pady=2)
+
+        self._on_ramp_toggle()
+        self._on_backoff_toggle()
+        self._on_arc_toggle()
 
         # ── G-code preamble ───────────────────────────────────────────
         pre_sf = SectionFrame(outer, "G-code Preamble")
@@ -357,6 +406,17 @@ class SettingsDialog(tk.Toplevel):
     def _default_postamble():
         return DEFAULT_POSTAMBLE
 
+    def _on_ramp_toggle(self):
+        state = tk.NORMAL if self._ramp_enabled_var.get() else tk.DISABLED
+        self._ramp_angle.set_state(state)
+        self._ramp_length.set_state(state)
+
+    def _on_backoff_toggle(self):
+        self._backoff_dist.set_state(tk.NORMAL if self._backoff_enabled_var.get() else tk.DISABLED)
+
+    def _on_arc_toggle(self):
+        self._arc_radius.set_state(tk.NORMAL if self._arc_enabled_var.get() else tk.DISABLED)
+
     def _reset_preamble(self):
         self._pre_text.delete('1.0', tk.END)
         self._pre_text.insert('1.0', self._default_preamble())
@@ -370,10 +430,43 @@ class SettingsDialog(tk.Toplevel):
             z_safe      = float(self._z_safe.get())
             feed_rapid  = float(self._feed_rapid.get())
             accel_mm_s2 = float(self._accel.get())
+            ramp_angle  = float(self._ramp_angle.get())
+            ramp_length = float(self._ramp_length.get())
+            backoff_dist = float(self._backoff_dist.get())
+            arc_radius  = float(self._arc_radius.get())
         except ValueError:
             messagebox.showerror("Invalid input",
-                                 "Safe height, rapid feed and max acceleration "
-                                 "must be numbers.",
+                                 "Safe height, rapid feed, max acceleration and "
+                                 "the dress-up parameters must be numbers.",
+                                 parent=self)
+            return
+
+        if not (0.0 < ramp_angle < 90.0):
+            messagebox.showerror("Invalid input",
+                                 "Ramp angle must be between 0 and 90 degrees.",
+                                 parent=self)
+            return
+        if ramp_length <= 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Max ramp length must be positive.",
+                                 parent=self)
+            return
+        if backoff_dist < 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Back-off distance cannot be negative.",
+                                 parent=self)
+            return
+        if arc_radius < 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Arc radius cannot be negative.",
+                                 parent=self)
+            return
+        if arc_radius > z_safe:
+            messagebox.showerror("Invalid input",
+                                 "Arc radius cannot exceed the safe height (z_safe) -- "
+                                 "the arc's lateral sweep is only safe above the stock "
+                                 "surface, so it can never be larger than the available "
+                                 "clearance below z_safe.",
                                  parent=self)
             return
 
@@ -392,6 +485,14 @@ class SettingsDialog(tk.Toplevel):
         self._settings['accel_mm_s2'] = accel_mm_s2
         self._settings['preamble']    = preamble
         self._settings['postamble']   = postamble
+        self._settings['ramp_in_enabled']     = self._ramp_enabled_var.get()
+        self._settings['ramp_angle_deg']      = ramp_angle
+        self._settings['ramp_max_length_mm']  = ramp_length
+        self._settings['backoff_enabled']     = self._backoff_enabled_var.get()
+        self._settings['backoff_distance_mm'] = backoff_dist
+        self._settings['arc_rapids_enabled']  = self._arc_enabled_var.get()
+        self._settings['arc_radius_mm']       = arc_radius
+        self.confirmed = True
         self.grab_release()
         self.destroy()
 
