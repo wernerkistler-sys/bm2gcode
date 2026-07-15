@@ -164,7 +164,7 @@ def compute_backoff_point(prev_points: List[Point],
         return None
     ux, uy = dx / horiz, dy / horiz
     dist = min(settings.distance_mm, horiz)
-    return (x2 - ux * dist, y2 - uy * dist, z2)
+    return (x2 - ux * dist, y2 - uy * dist, z2 + dist)
 
 
 def generate_corner_arc(corner: Point, dir_in: Tuple[float, float, float],
