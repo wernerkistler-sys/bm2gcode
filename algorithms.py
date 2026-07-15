@@ -233,7 +233,12 @@ def simplify_line(points, tol):
             dists = np.linalg.norm(pts[start+1:end] - pts[start], axis=1)
         else:
             diff  = pts[start+1:end] - pts[start]
-            t     = np.dot(diff, seg) / (seg_len * seg_len)
+            # Clamp to [0, 1] so points beyond either endpoint (e.g. a
+            # backtracking spike that is collinear with start/end but not
+            # between them) are measured against the nearest endpoint
+            # instead of the infinite line, and so are never mistaken for
+            # redundant collinear points.
+            t     = np.clip(np.dot(diff, seg) / (seg_len * seg_len), 0.0, 1.0)
             proj  = pts[start] + t[:, None] * seg
             dists = np.linalg.norm(pts[start+1:end] - proj, axis=1)
 
