@@ -6,6 +6,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)"]
+BLEND_MODES       = ["Replace", "Add", "Subtract", "Max", "Min"]
 
 DEFAULT_PREAMBLE = (
     "G21         ; units = mm\n"
@@ -37,6 +38,19 @@ DEFAULTS = {
     "accel_mm_s2":       "300",
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
+    # Per-layer defaults (used for every newly added layer)
+    "layer_offset_x_mm":  "0.0",
+    "layer_offset_y_mm":  "0.0",
+    "layer_rotation_deg": "0.0",
+    "layer_scale_pct":    "100.0",
+    "layer_opacity_pct":  "100.0",
+    "layer_blend_mode":   "Replace",  # see BLEND_MODES
+    "layer_depth_scale_pct": "100.0",
+    "layer_invert":       "0",
+    "layer_visible":      "1",
+    # Background depth for canvas area no layer covers, set once when the
+    # base layer is (re)established (see widgets.CanvasSetupDialog)
+    "canvas_background_depth_pct": "0.0",
     # Per-step defaults (prefix-free; used for every new step tab)
     "step_profile":      "End Mill",
     "step_diameter":     "6.0",

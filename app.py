@@ -32,11 +32,13 @@ from constants import (
 )
 from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
                      SettingsDialog, DressUpDialog, ExportToolpathDialog,
-                     ImportSTLDialog, _fmt_time)
+                     ImportSTLDialog, LayerPropertiesDialog, CanvasSetupDialog,
+                     _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
 from dressup import RampSettings, BackoffSettings, ArcSettings
+import layers as layers_mod
 import stl_mesh
 
 
@@ -57,10 +59,13 @@ class GCodeGeneratorApp:
             'postamble':   DEFAULTS['postamble'],
         }
 
-        self.current_image   = None   # 2-D float32 [0,1] grayscale array
+        self.current_image   = None   # 2-D float32 [0,1] grayscale array -- cached
+                                       # composite of self.layers, see _recompute_composite()
         self.n_grey_levels   = 256
-        self.image_path      = None
-        self.stl_source      = None   # dict describing an STL-derived current_image, or None
+        self.layers = []   # list[layers_mod.Layer]; layers[0] = bottom/base layer
+        self._next_layer_id = 1   # monotonically increasing, for stable Treeview iids
+        self._layer_props_dialog = None   # singleton LayerPropertiesDialog, retargeted not stacked
+        self._canvas_background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
@@ -272,6 +277,9 @@ class GCodeGeneratorApp:
 
     def _build_sidebar(self, p):
 
+        # ── 0. Layers ───────────────────────────────────────────────────
+        self._build_layers_section(p)
+
         # ── 1. Physical Image Size ─────────────────────────────────────
         sf = SectionFrame(p, "Physical Image Size")
         sf.pack(fill=tk.X, pady=(0, 8))
@@ -335,6 +343,145 @@ class GCodeGeneratorApp:
         self._info_frame.pack(fill=tk.X)
 
         self._add_step()   # start with one step
+
+    # ------------------------------------------------------------------ #
+    #  Layers panel
+    # ------------------------------------------------------------------ #
+    def _build_layers_section(self, p):
+        sf = SectionFrame(p, "Layers", collapsible=True)
+        sf.pack(fill=tk.X, pady=(0, 8))
+        body = sf.body
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill=tk.X, pady=(0, 4))
+        self._layers_tree = ttk.Treeview(
+            tree_frame, columns=("blend",), show="tree headings",
+            height=5, selectmode="browse")
+        self._layers_tree.heading("#0", text="Layer")
+        self._layers_tree.heading("blend", text="Blend")
+        self._layers_tree.column("#0", width=140, anchor=tk.W, stretch=True)
+        self._layers_tree.column("blend", width=70, anchor=tk.W, stretch=False)
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._layers_tree.yview)
+        self._layers_tree.configure(yscrollcommand=vsb.set)
+        self._layers_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._layers_tree.bind("<Double-Button-1>", self._on_layers_tree_double_click)
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="+ Image…", width=9,
+                   command=self._add_layer_from_image_dialog).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(btn_row, text="+ STL…", width=7,
+                   command=self._add_layer_from_stl_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="↑", width=2,
+                   command=lambda: self._move_layer_selected(+1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="↓", width=2,
+                   command=lambda: self._move_layer_selected(-1)).pack(side=tk.LEFT, padx=2)
+
+        btn_row2 = ttk.Frame(body)
+        btn_row2.pack(fill=tk.X, pady=(2, 0))
+        self._layer_remove_btn = ttk.Button(btn_row2, text="Remove",
+                                            command=self._remove_selected_layer)
+        self._layer_remove_btn.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(btn_row2, text="Duplicate",
+                   command=self._duplicate_selected_layer).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row2, text="Properties…",
+                   command=self._open_selected_layer_properties).pack(side=tk.LEFT, padx=2)
+
+        self._refresh_layers_tree()
+
+    def _layers_display_order(self):
+        """Top-of-stack first, matching how a user expects a layer list to
+        read (self.layers[0] is the bottom/base layer internally)."""
+        return list(reversed(self.layers))
+
+    def _refresh_layers_tree(self):
+        tree = self._layers_tree
+        sel = tree.selection()
+        tree.delete(*tree.get_children())
+        for layer in self._layers_display_order():
+            tree.insert("", tk.END, iid=layer.layer_id, text=layer.name,
+                       values=(layer.blend_mode,),
+                       tags=() if layer.visible else ("hidden",))
+        tree.tag_configure("hidden", foreground="#999999")
+        for iid in sel:
+            if tree.exists(iid):
+                tree.selection_add(iid)
+        self._layer_remove_btn.config(
+            state=tk.DISABLED if len(self.layers) <= 1 else tk.NORMAL)
+
+    def _selected_layer(self):
+        sel = self._layers_tree.selection()
+        if not sel:
+            return None
+        for layer in self.layers:
+            if layer.layer_id == sel[0]:
+                return layer
+        return None
+
+    def _select_layer(self, layer):
+        self._layers_tree.selection_set(layer.layer_id)
+        self._layers_tree.see(layer.layer_id)
+
+    def _on_layers_tree_double_click(self, _event):
+        layer = self._selected_layer()
+        if layer is not None:
+            self._open_layer_properties(layer)
+
+    def _open_selected_layer_properties(self):
+        layer = self._selected_layer()
+        if layer is not None:
+            self._open_layer_properties(layer)
+
+    def _open_layer_properties(self, layer):
+        title = f"Layer Properties — {layer.name}"
+        is_base = self.layers.index(layer) == 0
+        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
+            self._layer_props_dialog.retarget(layer, title=title, is_base=is_base)
+            self._layer_props_dialog.lift()
+            self._layer_props_dialog.focus_set()
+        else:
+            self._layer_props_dialog = LayerPropertiesDialog(
+                self.root, layer, self._on_layer_property_changed, title=title, is_base=is_base)
+
+    def _remove_selected_layer(self):
+        layer = self._selected_layer()
+        if layer is None or len(self.layers) <= 1:
+            return
+        self.layers.remove(layer)
+        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists() \
+                and self._layer_props_dialog.layer is layer:
+            self._layer_props_dialog.destroy()
+            self._layer_props_dialog = None
+        self._on_layers_structure_changed()
+
+    def _duplicate_selected_layer(self):
+        layer = self._selected_layer()
+        if layer is None:
+            return
+        import copy
+        dup = copy.copy(layer)
+        dup.layer_id = self._new_layer_id()
+        dup.name = f"{layer.name} copy"
+        idx = self.layers.index(layer)
+        self.layers.insert(idx + 1, dup)
+        self._on_layers_structure_changed()
+        self._select_layer(dup)
+
+    def _move_layer_selected(self, list_index_delta):
+        """list_index_delta is in self.layers order (bottom-to-top); the ↑
+        button (move toward the top of the stack, i.e. toward the top of the
+        displayed list) therefore passes +1, ↓ passes -1."""
+        layer = self._selected_layer()
+        if layer is None:
+            return
+        idx = self.layers.index(layer)
+        new_idx = idx + list_index_delta
+        if not (0 <= new_idx < len(self.layers)):
+            return
+        self.layers[idx], self.layers[new_idx] = self.layers[new_idx], self.layers[idx]
+        self._on_layers_structure_changed()
+        self._select_layer(layer)
 
     def _add_step(self):
         """Insert a new step tab after the currently selected tab."""
@@ -867,36 +1014,211 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  File / image actions
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _to_grayscale(raw: np.ndarray) -> np.ndarray:
-        """Convert any loaded image array to a 2-D float32 [0, 1] grayscale array.
+    def _new_layer_id(self):
+        lid = f"layer{self._next_layer_id}"
+        self._next_layer_id += 1
+        return lid
 
-        Alpha-channel handling: fully transparent pixels (alpha == 0) become white
-        (1.0), so a PNG that encodes shapes with black ink on a fully-transparent
-        background is treated as black-on-white rather than all-black.
-        """
-        img = raw.astype(np.float32)
+    def _load_image_layer(self, path):
+        """Load *path* and wrap it as a new (unattached) Layer at its native
+        resolution, or show an error dialog and return None on failure."""
+        try:
+            raw = mpimg.imread(path)
+            gray, alpha = layers_mod.to_grayscale(raw)
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not load image:\n{exc}")
+            return None
+        return layers_mod.Layer(name=os.path.basename(path), raw=gray, alpha=alpha,
+                                source_kind="image", path=path,
+                                layer_id=self._new_layer_id())
 
-        # Normalise to [0, 1]
-        if img.max() > 1.0:
-            img = img / 255.0
+    def _load_stl_layer(self, image, alpha, path, dlg):
+        """Wrap an already-rasterized STL heightmap (*image*/*alpha*, from
+        stl_mesh.normalize_and_orient) as a new (unattached) Layer. *alpha*
+        excludes holes (no triangle coverage) from the layer's footprint."""
+        stl_params = {'width_px': dlg.width_px, 'height_px': dlg.height_px,
+                      'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y, 'rot_z': dlg.rot_z}
+        return layers_mod.Layer(name=os.path.basename(path), raw=image, alpha=alpha,
+                                source_kind="stl", path=path, stl_params=stl_params,
+                                layer_id=self._new_layer_id())
 
-        # Composite alpha onto a white background before discarding the channel
-        if img.ndim == 3 and img.shape[2] == 4:
-            rgb   = img[..., :3]
-            alpha = img[..., 3:4]          # keep dims for broadcasting
-            img   = rgb * alpha + (1.0 - alpha)   # blend onto white
+    def _establish_base_image_layer(self, path):
+        """Load *path* as a fresh base/canvas-defining layer: shows
+        CanvasSetupDialog to let the user pick canvas resolution (default =
+        the image's own native size) and background depth, resizes the
+        loaded layer to match if the user changed the resolution, and sets
+        self.layers = [layer]. Returns True on success, False if the user
+        cancelled or loading failed -- caller is responsible for calling
+        _on_layers_structure_changed() afterward."""
+        layer = self._load_image_layer(path)
+        if layer is None:
+            return False
+        h, w = layer.raw.shape
+        dlg = CanvasSetupDialog(self.root, w, h,
+                                default_background_depth_pct=self._canvas_background_depth_pct)
+        if not dlg.confirmed:
+            return False
+        if (dlg.height_px, dlg.width_px) != (h, w):
+            layer.raw = layers_mod.resize_raw(layer.raw, (dlg.height_px, dlg.width_px))
+            if layer.alpha is not None:
+                layer.alpha = layers_mod.resize_raw(layer.alpha, (dlg.height_px, dlg.width_px))
+        self._canvas_background_depth_pct = dlg.background_depth_pct
+        self.layers = [layer]
+        h, w = layer.raw.shape
+        if self._aspect_lock_var.get():
+            self._image_aspect = w / h
+            self._recalc_height()
+        return True
 
-        # Convert RGB to grayscale (ITU-R BT.601 luminance weights)
-        if img.ndim == 3:
-            img = np.dot(img[..., :3], [0.299, 0.587, 0.114]).astype(np.float32)
+    def _recompute_composite(self):
+        """Recompute self.current_image (and self.n_grey_levels) from
+        self.layers. self.current_image keeps its old role -- the single
+        flattened depth map everything downstream of _get_depth_map() reads
+        -- it's just a cached compositor output now instead of a direct load."""
+        if not self.layers:
+            self.current_image = None
+            self.n_grey_levels = 256
+            return
 
-        return np.clip(img, 0.0, 1.0)
+        base = self.layers[0]
+        H, W = base.raw.shape
+
+        # Bit-identical fast path for the overwhelmingly common case (one
+        # layer, default settings): skip the depth round-trip entirely
+        # rather than merely approximating it, so a fresh single-layer
+        # project behaves exactly as it did before layers existed. A base
+        # layer with real alpha must NOT take this shortcut -- background
+        # would never show through wherever it's partially transparent.
+        if (len(self.layers) == 1 and base.visible and base.opacity_pct >= 100.0
+                and base.blend_mode == "Replace" and not base.invert
+                and base.is_identity_placement() and base.alpha is None):
+            self.current_image = base.raw
+            self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
+            return
+
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+        px_per_mm_x = W / width_mm if width_mm > 1e-9 else 1.0
+        px_per_mm_y = H / height_mm if height_mm > 1e-9 else 1.0
+
+        self.current_image = layers_mod.composite(
+            self.layers, (H, W), px_per_mm_x, px_per_mm_y, self.surface.get(),
+            background_depth=self._canvas_background_depth_pct / 100.0)
+        self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
+
+    def _on_layer_property_changed(self):
+        """Live-edit callback: a layer's placement/blend/visibility changed,
+        but the layer stack's membership/order/canvas-defining layer didn't.
+        Mirrors _on_depth_map_content_changed's cache-invalidation scope."""
+        self._recompute_composite()
+        self._erosion_cache.clear()
+        self._refresh_layers_tree()
+        self._render()
+
+    def _on_layers_structure_changed(self):
+        """Shared tail for anything that changes which layers exist, their
+        order, or which one defines canvas resolution: layer add/remove/
+        reorder/duplicate, open_image, _finish_stl_import, and project load.
+        Equivalent to the reset block that used to live inline in
+        open_image()/_finish_stl_import()."""
+        self._recompute_composite()
+        self._erosion_cache.clear()
+        self.toolpaths = [None] * len(self.steps)
+        for i, s in enumerate(self.steps):
+            s['info_var'].set(f"Step {i + 1}: not computed")
+        self.display_mode_var.set(DISPLAY_ORIGINAL)
+        self._reset_zoom()
+        if self.layers:
+            self.placeholder.place_forget()
+        else:
+            self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self._refresh_layers_tree()
+        self._render()
+
+    def _add_layer_from_image_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Add Image Layer",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp"),
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg *.jpeg"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not path:
+            return
+        if not self.layers:
+            # No canvas established yet -- this append action is actually
+            # the first layer, so it goes through the same canvas-setup flow
+            # as File -> Open Image rather than a plain append.
+            if not self._establish_base_image_layer(path):
+                return
+            self._on_layers_structure_changed()
+            self._select_layer(self.layers[0])
+            self.status_var.set(f"Loaded: {path}")
+            return
+        layer = self._load_image_layer(path)
+        if layer is None:
+            return
+        self.layers.append(layer)
+        self._on_layers_structure_changed()
+        self._select_layer(layer)
+        self.status_var.set(f"Added image layer: {path}")
+
+    def _add_layer_from_stl_dialog(self):
+        """Appends an STL-derived layer onto the existing canvas -- unlike
+        Import STL (which resets to a fresh single-layer project), this
+        never touches Physical Image Size, since resizing the canvas to fit
+        a newly-appended decorative layer would silently move every other
+        layer's placement relative to the stock. If no canvas exists yet
+        (self.layers is empty), this action IS establishing the base layer,
+        so it delegates to _finish_stl_import -- the same full reset flow
+        Import STL uses -- instead of a plain append."""
+        is_base = not self.layers
+        path = filedialog.askopenfilename(
+            title="Add STL Layer",
+            filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            triangles = stl_mesh.load_stl(path)
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
+            return
+
+        xy_bounds = stl_mesh.mesh_xy_bounds(triangles)
+        z_bounds  = stl_mesh.mesh_z_bounds(triangles)
+        dlg = ImportSTLDialog(self.root, triangles, xy_bounds, z_bounds, is_base=is_base)
+        if not dlg.confirmed:
+            return
+
+        try:
+            rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            raw     = stl_mesh.generate_heightmap(rotated, dlg.width_px, dlg.height_px)
+            image, alpha = stl_mesh.normalize_and_orient(raw)
+        except Exception as exc:
+            messagebox.showerror("Import Error", str(exc))
+            return
+
+        if is_base:
+            self._finish_stl_import(image, alpha, path, triangles, dlg, xy_bounds, z_bounds)
+            self._select_layer(self.layers[0])
+            return
+
+        layer = self._load_stl_layer(image, alpha, path, dlg)
+        self.layers.append(layer)
+        self._on_layers_structure_changed()
+        self._select_layer(layer)
+        self.status_var.set(f"Added STL layer: {os.path.basename(path)}")
 
     def _on_aspect_lock_toggle(self):
         if self._aspect_lock_var.get():
-            if self.current_image is not None:
-                h, w = self.current_image.shape
+            if self.layers:
+                h, w = self.layers[0].raw.shape
                 self._image_aspect = w / h
             self.height_mm.set_state("disabled")
             self._recalc_height()
@@ -920,7 +1242,13 @@ class GCodeGeneratorApp:
 
     def _on_depth_map_content_changed(self, *_):
         """z=0 colour / margin depth change the *content* of depth_map without
-        changing the erosion cache key, so any cached entry is now stale."""
+        changing the erosion cache key, so any cached entry is now stale.
+        z=0 colour also feeds directly into layer compositing (raw<->depth
+        polarity), so the composite itself must be recomputed too -- for a
+        single default layer this is a no-op via the fast path in
+        _recompute_composite(), but blended/inverted multi-layer stacks
+        genuinely change result when the polarity flips."""
+        self._recompute_composite()
         self._erosion_cache.clear()
         self._render()
 
@@ -936,34 +1264,12 @@ class GCodeGeneratorApp:
         )
         if not path:
             return
-        try:
-            raw = mpimg.imread(path)
-            self.current_image = self._to_grayscale(raw)
-            self.image_path    = path
-            self.stl_source    = None
-        except Exception as exc:
-            messagebox.showerror("Error", f"Could not load image:\n{exc}")
+        if not self._establish_base_image_layer(path):
             return
-
-        # Update stored aspect ratio from the new image's pixel dimensions
-        h, w = self.current_image.shape
-        if self._aspect_lock_var.get():
-            self._image_aspect = w / h
-            self._recalc_height()
-
-        # Reset any previously computed tool paths
-        self.toolpaths = [None] * len(self.steps)
-        self._erosion_cache.clear()
-        for i, s in enumerate(self.steps):
-            s['info_var'].set(f"Step {i + 1}: not computed")
-        self.display_mode_var.set(DISPLAY_ORIGINAL)
-        self._reset_zoom()
-
-        self.placeholder.place_forget()
-        levels = int(np.round((self.current_image.max() - self.current_image.min()) * 255)) + 1
-        self.n_grey_levels = levels
-        self.status_var.set(f"Loaded: {path}  |  {w} x {h} px  |  {levels} gray levels")
-        self._render()
+        h, w = self.layers[0].raw.shape
+        self._on_layers_structure_changed()
+        self.status_var.set(
+            f"Loaded: {path}  |  {w} x {h} px  |  {self.n_grey_levels} gray levels")
 
     def import_stl(self):
         path = filedialog.askopenfilename(
@@ -981,33 +1287,26 @@ class GCodeGeneratorApp:
 
         xy_bounds = stl_mesh.mesh_xy_bounds(triangles)
         z_bounds  = stl_mesh.mesh_z_bounds(triangles)
-        dlg = ImportSTLDialog(self.root, triangles, xy_bounds, z_bounds)
+        dlg = ImportSTLDialog(self.root, triangles, xy_bounds, z_bounds, is_base=True)
         if not dlg.confirmed:
             return
 
         try:
             rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
             raw     = stl_mesh.generate_heightmap(rotated, dlg.width_px, dlg.height_px)
-            image   = stl_mesh.normalize_and_orient(raw)
+            image, alpha = stl_mesh.normalize_and_orient(raw)
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
             return
 
-        self._finish_stl_import(image, path, triangles, dlg, xy_bounds, z_bounds)
+        self._finish_stl_import(image, alpha, path, triangles, dlg, xy_bounds, z_bounds)
 
-    def _finish_stl_import(self, image, path, triangles, dlg, xy_bounds, z_bounds):
-        self.current_image = image
-        self.image_path     = None   # STL isn't reloadable via mpimg.imread
-        self.stl_source     = {
-            'path':      path,
-            'width_px':  dlg.width_px,
-            'height_px': dlg.height_px,
-            'rot_x':     dlg.rot_x,
-            'rot_y':     dlg.rot_y,
-            'rot_z':     dlg.rot_z,
-        }
+    def _finish_stl_import(self, image, alpha, path, triangles, dlg, xy_bounds, z_bounds):
+        layer = self._load_stl_layer(image, alpha, path, dlg)
+        self.layers = [layer]
+        self._canvas_background_depth_pct = getattr(dlg, 'background_depth_pct', 0.0)
 
-        h, w = self.current_image.shape
+        h, w = layer.raw.shape
         if dlg.populate_physical:
             rotated_xy, rotated_z = stl_mesh.rotate_bounds(
                 xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
@@ -1031,20 +1330,11 @@ class GCodeGeneratorApp:
                 self._image_aspect = w / h
                 self._recalc_height()
 
-        # Reset any previously computed tool paths
-        self.toolpaths = [None] * len(self.steps)
-        self._erosion_cache.clear()
-        for i, s in enumerate(self.steps):
-            s['info_var'].set(f"Step {i + 1}: not computed")
-        self.display_mode_var.set(DISPLAY_ORIGINAL)
-        self._reset_zoom()
-
-        self.placeholder.place_forget()
-        self.n_grey_levels = 65536   # continuous STL-derived data, not 8-bit-quantized
+        self._on_layers_structure_changed()   # recomputes composite (n_grey_levels forced
+                                               # to 65536 for STL layers), resets toolpaths/view
         self.status_var.set(
             f"Imported STL: {os.path.basename(path)}  |  {w} x {h} px  |  "
             f"{len(triangles)} triangles")
-        self._render()
 
     def _open_settings(self):
         dlg = SettingsDialog(self.root, self._settings)
@@ -1189,11 +1479,103 @@ class GCodeGeneratorApp:
         step['arc_radius_mm_var'].set(d.get(
             'arc_radius_mm', DEFAULTS['step_arc_radius_mm']))
 
+    def _resolve_rel_path(self, prj_path, saved_path, saved_path_rel):
+        """Try *saved_path_rel* relative to prj_path's directory first,
+        falling back to the stored absolute *saved_path*. Returns the
+        resolved absolute path, or None if neither exists. Shared by the
+        legacy single-image/STL load branch and per-layer v2 loading."""
+        if saved_path_rel:
+            candidate = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(prj_path)), saved_path_rel))
+            if os.path.isfile(candidate):
+                return candidate
+        if saved_path and os.path.isfile(saved_path):
+            return saved_path
+        return None
+
+    def _make_rel_path(self, abs_path, prj_path):
+        """Inverse of _resolve_rel_path's relative half, used at save time."""
+        if not abs_path:
+            return None
+        try:
+            return os.path.relpath(abs_path, os.path.dirname(os.path.abspath(prj_path)))
+        except ValueError:
+            return None  # e.g. different drive on Windows
+
+    def _layer_to_dict(self, layer):
+        d = {
+            'name':         layer.name,
+            'source_kind':  layer.source_kind,
+            'path':         layer.path,
+            'offset_x_mm':  layer.offset_x_mm,
+            'offset_y_mm':  layer.offset_y_mm,
+            'rotation_deg': layer.rotation_deg,
+            'scale_pct':    layer.scale_pct,
+            'blend_mode':   layer.blend_mode,
+            'opacity_pct':  layer.opacity_pct,
+            'depth_scale_pct': layer.depth_scale_pct,
+            'invert':       layer.invert,
+            'visible':      layer.visible,
+        }
+        if layer.source_kind == 'stl' and layer.stl_params:
+            d['stl_params'] = dict(layer.stl_params)
+        return d
+
+    def _layer_from_dict(self, d, prj_path):
+        """Resolve and (re)load one saved layer. Returns a Layer, or None if
+        its source file can't be found or fails to load/rasterize -- the
+        caller is responsible for surfacing that as a warning."""
+        source_kind = d.get('source_kind', 'image')
+        resolved = self._resolve_rel_path(prj_path, d.get('path'), d.get('path_rel'))
+        if resolved is None:
+            return None
+        try:
+            if source_kind == 'stl':
+                stl_params = d.get('stl_params') or {}
+                width_px  = stl_params['width_px']
+                height_px = stl_params['height_px']
+                rot_x = stl_params.get('rot_x', 0)
+                rot_y = stl_params.get('rot_y', 0)
+                rot_z = stl_params.get('rot_z', 0)
+                triangles = stl_mesh.load_stl(resolved)
+                rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
+                raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
+                image, alpha = stl_mesh.normalize_and_orient(raw)
+                layer = layers_mod.Layer(
+                    name=d.get('name') or os.path.basename(resolved), raw=image, alpha=alpha,
+                    source_kind='stl', path=resolved,
+                    stl_params={'width_px': width_px, 'height_px': height_px,
+                                'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z},
+                    layer_id=self._new_layer_id())
+            else:
+                raw = mpimg.imread(resolved)
+                gray, alpha = layers_mod.to_grayscale(raw)
+                layer = layers_mod.Layer(
+                    name=d.get('name') or os.path.basename(resolved), raw=gray, alpha=alpha,
+                    source_kind='image', path=resolved, layer_id=self._new_layer_id())
+        except Exception:
+            return None
+
+        layer.offset_x_mm  = float(d.get('offset_x_mm', 0.0))
+        layer.offset_y_mm  = float(d.get('offset_y_mm', 0.0))
+        layer.rotation_deg = float(d.get('rotation_deg', 0.0))
+        layer.scale_pct    = float(d.get('scale_pct', 100.0))
+        layer.blend_mode   = d.get('blend_mode', 'Replace')
+        layer.opacity_pct  = float(d.get('opacity_pct', 100.0))
+        layer.depth_scale_pct = float(d.get('depth_scale_pct', 100.0))
+        layer.invert       = bool(d.get('invert', False))
+        layer.visible      = bool(d.get('visible', True))
+        return layer
+
     def _project_snapshot(self):
         """Return a JSON-able dict describing all persistable project state."""
         return {
-            'image_path': self.image_path,
-            'stl_source': self.stl_source,
+            'layers': [self._layer_to_dict(l) for l in self.layers],
+            'canvas': {
+                'background_depth_pct': self._canvas_background_depth_pct,
+                'width_px':  self.layers[0].raw.shape[1] if self.layers else None,
+                'height_px': self.layers[0].raw.shape[0] if self.layers else None,
+            },
             'global': {
                 'width_mm':        self.width_mm.get(),
                 'height_mm':       self.height_mm.get(),
@@ -1245,6 +1627,9 @@ class GCodeGeneratorApp:
     def _new_project(self):
         if not self._confirm_discard("starting a new project"):
             return
+        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
+            self._layer_props_dialog.destroy()
+        self._layer_props_dialog = None
 
         self._aspect_lock_var.set(True)
         self.width_mm.set(DEFAULTS['width_mm'])
@@ -1265,14 +1650,15 @@ class GCodeGeneratorApp:
             self._remove_step(self.steps[-1])
         self._apply_step_dict(self.steps[0], {})
 
-        self.current_image = None
-        self.image_path     = None
-        self.stl_source     = None
+        self.layers         = []
+        self.current_image  = None
         self._image_aspect  = None
         self.n_grey_levels  = 256
+        self._canvas_background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
         self.toolpaths      = [None]
         self._erosion_cache.clear()
         self.steps[0]['info_var'].set("Step 1: not computed")
+        self._refresh_layers_tree()
 
         self.display_mode_var.set(DISPLAY_ORIGINAL)
         self._reset_zoom()
@@ -1298,27 +1684,16 @@ class GCodeGeneratorApp:
         )
         if not path:
             return False
-        image_path_rel = None
-        if self.image_path:
-            try:
-                image_path_rel = os.path.relpath(
-                    self.image_path, os.path.dirname(os.path.abspath(path)))
-            except ValueError:
-                image_path_rel = None  # e.g. different drive on Windows
-        stl_source = None
-        if self.stl_source:
-            stl_source = dict(self.stl_source)
-            try:
-                stl_source['path_rel'] = os.path.relpath(
-                    self.stl_source['path'], os.path.dirname(os.path.abspath(path)))
-            except ValueError:
-                stl_source['path_rel'] = None  # e.g. different drive on Windows
         snapshot = self._project_snapshot()
+        layers_out = []
+        for layer, d in zip(self.layers, snapshot['layers']):
+            d = dict(d)
+            d['path_rel'] = self._make_rel_path(layer.path, path)
+            layers_out.append(d)
         project = {
-            'version': 1,
-            'image_path': snapshot['image_path'],
-            'image_path_rel': image_path_rel,
-            'stl_source': stl_source,
+            'version': 2,
+            'layers': layers_out,
+            'canvas': snapshot['canvas'],
             'global': snapshot['global'],
             'machine': snapshot['machine'],
             'steps': snapshot['steps'],
@@ -1347,12 +1722,16 @@ class GCodeGeneratorApp:
             messagebox.showerror("Load Error", f"Could not read project file:\n{exc}")
             return
 
-        if project.get('version', 1) != 1:
+        version = project.get('version', 1)
+        if version not in (1, 2):
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
         if not self._confirm_discard("opening another project"):
             return
+        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
+            self._layer_props_dialog.destroy()
+        self._layer_props_dialog = None
 
         # ── Global image-size parameters ──────────────────────────────
         g = project.get('global', {})
@@ -1400,42 +1779,67 @@ class GCodeGeneratorApp:
         for step, d in zip(self.steps, step_dicts):
             self._apply_step_dict(step, d)
 
-        # ── Image ─────────────────────────────────────────────────────
+        # ── Layers (version 2) ───────────────────────────────────────────
+        if version == 2 and 'layers' in project:
+            layer_dicts = project.get('layers') or []
+            resolved_layers = []
+            failed = []
+            for d in layer_dicts:
+                layer = self._layer_from_dict(d, path)
+                if layer is not None:
+                    resolved_layers.append(layer)
+                else:
+                    failed.append(d.get('name') or d.get('path') or d.get('path_rel') or "?")
+            self.layers = resolved_layers
+            c = project.get('canvas', {})
+            self._canvas_background_depth_pct = float(c.get('background_depth_pct', 0.0))
+            saved_w, saved_h = c.get('width_px'), c.get('height_px')
+            if self.layers and saved_w and saved_h:
+                base = self.layers[0]
+                if base.raw.shape != (saved_h, saved_w):
+                    base.raw = layers_mod.resize_raw(base.raw, (saved_h, saved_w))
+                    if base.alpha is not None:
+                        base.alpha = layers_mod.resize_raw(base.alpha, (saved_h, saved_w))
+            if self._aspect_lock_var.get() and self.layers:
+                h, w = self.layers[0].raw.shape
+                self._image_aspect = w / h
+                self._recalc_height()
+            self._on_layers_structure_changed()
+            if failed:
+                messagebox.showwarning(
+                    "Layer Load Warning",
+                    "Project loaded, but these layer sources could not be found "
+                    "or re-rasterized:\n" + "\n".join(failed) +
+                    "\n\nUse the Layers panel to reload them manually.")
+            if resolved_layers:
+                self.status_var.set(f"Project loaded: {path}  |  {len(resolved_layers)} layer(s)")
+            else:
+                self.status_var.set(f"Project loaded: {path}")
+            self._saved_snapshot = self._snapshot_key()
+            return
+
+        # ── Legacy single image/STL (version 1) ──────────────────────────
         saved_image_path     = project.get('image_path')
         saved_image_path_rel = project.get('image_path_rel')
         saved_stl_source     = project.get('stl_source')
 
-        resolved_image_path = None
-        if saved_image_path_rel:
-            candidate = os.path.normpath(os.path.join(
-                os.path.dirname(os.path.abspath(path)), saved_image_path_rel))
-            if os.path.isfile(candidate):
-                resolved_image_path = candidate
-        if resolved_image_path is None and saved_image_path and os.path.isfile(saved_image_path):
-            resolved_image_path = saved_image_path
+        resolved_image_path = self._resolve_rel_path(path, saved_image_path, saved_image_path_rel)
 
         if saved_image_path or saved_image_path_rel:
             if resolved_image_path:
                 try:
                     raw = mpimg.imread(resolved_image_path)
-                    self.current_image = self._to_grayscale(raw)
-                    self.image_path    = resolved_image_path
-                    self.stl_source    = None
-                    h, w = self.current_image.shape
+                    gray, alpha = layers_mod.to_grayscale(raw)
+                    layer = layers_mod.Layer(name=os.path.basename(resolved_image_path),
+                                             raw=gray, alpha=alpha, source_kind='image',
+                                             path=resolved_image_path,
+                                             layer_id=self._new_layer_id())
+                    self.layers = [layer]
                     if self._aspect_lock_var.get():
+                        h, w = layer.raw.shape
                         self._image_aspect = w / h
                         self._recalc_height()
-                    self.toolpaths = [None] * len(self.steps)
-                    self._erosion_cache.clear()
-                    for i, s in enumerate(self.steps):
-                        s['info_var'].set(f"Step {i + 1}: not computed")
-                    self.display_mode_var.set(DISPLAY_ORIGINAL)
-                    self._reset_zoom()
-                    self.placeholder.place_forget()
-                    levels = int(np.round(
-                        (self.current_image.max() - self.current_image.min()) * 255)) + 1
-                    self.n_grey_levels = levels
-                    self._render()
+                    self._on_layers_structure_changed()
                     self.status_var.set(
                         f"Project loaded: {path}  |  Image: {resolved_image_path}")
                     self._saved_snapshot = self._snapshot_key()
@@ -1454,15 +1858,7 @@ class GCodeGeneratorApp:
         elif saved_stl_source:
             stl_path     = saved_stl_source.get('path')
             stl_path_rel = saved_stl_source.get('path_rel')
-
-            resolved_stl_path = None
-            if stl_path_rel:
-                candidate = os.path.normpath(os.path.join(
-                    os.path.dirname(os.path.abspath(path)), stl_path_rel))
-                if os.path.isfile(candidate):
-                    resolved_stl_path = candidate
-            if resolved_stl_path is None and stl_path and os.path.isfile(stl_path):
-                resolved_stl_path = stl_path
+            resolved_stl_path = self._resolve_rel_path(path, stl_path, stl_path_rel)
 
             if resolved_stl_path:
                 try:
@@ -1474,25 +1870,19 @@ class GCodeGeneratorApp:
                     triangles = stl_mesh.load_stl(resolved_stl_path)
                     rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
                     raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                    self.current_image = stl_mesh.normalize_and_orient(raw)
-                    self.image_path = None
-                    self.stl_source = {
-                        'path': resolved_stl_path, 'width_px': width_px, 'height_px': height_px,
-                        'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z,
-                    }
-                    h, w = self.current_image.shape
+                    image, alpha = stl_mesh.normalize_and_orient(raw)
+                    layer = layers_mod.Layer(
+                        name=os.path.basename(resolved_stl_path), raw=image, alpha=alpha,
+                        source_kind='stl', path=resolved_stl_path,
+                        stl_params={'width_px': width_px, 'height_px': height_px,
+                                    'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z},
+                        layer_id=self._new_layer_id())
+                    self.layers = [layer]
                     if self._aspect_lock_var.get():
+                        h, w = layer.raw.shape
                         self._image_aspect = w / h
                         self._recalc_height()
-                    self.toolpaths = [None] * len(self.steps)
-                    self._erosion_cache.clear()
-                    for i, s in enumerate(self.steps):
-                        s['info_var'].set(f"Step {i + 1}: not computed")
-                    self.display_mode_var.set(DISPLAY_ORIGINAL)
-                    self._reset_zoom()
-                    self.placeholder.place_forget()
-                    self.n_grey_levels = 65536   # continuous STL-derived data
-                    self._render()
+                    self._on_layers_structure_changed()
                     self.status_var.set(
                         f"Project loaded: {path}  |  STL: {resolved_stl_path}")
                     self._saved_snapshot = self._snapshot_key()

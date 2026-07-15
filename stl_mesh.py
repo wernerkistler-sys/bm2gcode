@@ -191,10 +191,21 @@ def generate_heightmap(triangles, width, height):
 def normalize_and_orient(raw_heightmap):
     """Convert a raw rasterized heightmap (row 0 = min Y, per
     generate_heightmap) into bm2gcode's image convention: row 0 = max Y,
-    float32, normalized to [0, 1], with holes (NaN) mapped to the deepest
-    cut (0.0).
+    float32, normalized to [0, 1].
+
+    Returns (gray, alpha): holes (NaN, pixels no triangle covered) are
+    excluded via alpha=0.0 (gray is set to 0.0 there too, but is moot since
+    zero alpha means the layer compositor ignores it entirely) rather than
+    being silently treated as real geometry -- a hole is "no data", not "cut
+    to the deepest point", so it should let whatever is beneath show through
+    (e.g. under "Replace" blend mode) instead of gouging to max depth. alpha
+    is None (not an all-ones array) when the mesh has no holes at all, so a
+    fully-covered mesh doesn't pay for per-pixel alpha compositing it
+    doesn't need.
     """
     oriented = np.flipud(raw_heightmap)
+    has_holes = np.isnan(oriented).any()
+    alpha = (~np.isnan(oriented)).astype(np.float32) if has_holes else None
     z_min = np.nanmin(oriented)
     z_max = np.nanmax(oriented)
     z_range = z_max - z_min
@@ -203,7 +214,7 @@ def normalize_and_orient(raw_heightmap):
     else:
         z_norm = (oriented - z_min) / z_range
     z_norm = np.where(np.isnan(z_norm), 0.0, z_norm)
-    return np.clip(z_norm, 0.0, 1.0).astype(np.float32)
+    return np.clip(z_norm, 0.0, 1.0).astype(np.float32), alpha
 
 
 def physical_size_from_bounds(x_range, y_range, z_range):

@@ -3,7 +3,7 @@ from tkinter import ttk, messagebox
 import queue
 import re
 
-from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
+from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES
 import stl_mesh
 
 
@@ -236,10 +236,72 @@ class LabeledEntry(ttk.Frame):
 
 
 class SectionFrame(ttk.LabelFrame):
-    """Labelled group frame with consistent internal padding."""
+    """Labelled group frame with consistent internal padding.
 
-    def __init__(self, parent, title, **kw):
-        super().__init__(parent, text=title, padding=(8, 6), **kw)
+    Pass ``collapsible=True`` to get a clickable disclosure-triangle title
+    instead of a plain label; callers must then pack their content into
+    ``self.body`` rather than ``self`` directly. Default (``collapsible=False``)
+    behaves exactly as before -- ``self.body`` is just an alias for ``self``.
+    """
+
+    def __init__(self, parent, title, collapsible=False, start_collapsed=False, **kw):
+        if not collapsible:
+            super().__init__(parent, text=title, padding=(8, 6), **kw)
+            self.body = self
+            return
+
+        self._title = title
+        self._collapsed = start_collapsed
+
+        # A LabelFrame's title is normally drawn straight from -text, which
+        # can't be made clickable. -labelwidget lets us supply our own Label
+        # (must be created with `parent`, not `self`, as its master) so the
+        # disclosure caption sits properly embedded in the border notch,
+        # like every other SectionFrame's title, instead of floating as a
+        # separate line of ordinary content inside the frame.
+        self._toggle_lbl = ttk.Label(parent, text=self._caption(),
+                                     cursor="hand2", font=("Helvetica", 9, "bold"))
+        super().__init__(parent, labelwidget=self._toggle_lbl, padding=(8, 6), **kw)
+        self._toggle_lbl.bind("<Button-1>", lambda e: self._toggle())
+
+        self.body = ttk.Frame(self)
+        if start_collapsed:
+            self._collapse()
+        else:
+            self.body.pack(fill=tk.X)
+
+    def _caption(self):
+        # Plain ASCII, not a Unicode triangle glyph (">"/"v") -- some
+        # environments' default Tk font substitutes render geometric-shape
+        # code points as invisible/blank, which silently hides the
+        # disclosure indicator entirely rather than just looking different.
+        return f"{'>' if self._collapsed else 'v'} {self._title}"
+
+    def _collapse(self):
+        # A plain pack_forget() here is not enough: once a pack master's
+        # last remaining child is forgotten, Tk's geometry manager does not
+        # reliably recompute the master's (now much smaller) requested
+        # size on its own -- the LabelFrame is left occupying exactly the
+        # screen space it had before, so nothing below it ever slides up
+        # and collapsing buys back no room at all. Forcing the height
+        # explicitly (pack_propagate(False) + config(height=...)) sidesteps
+        # that and shrinks the frame down to just its title row.
+        self.body.pack_forget()
+        self.update_idletasks()
+        self.pack_propagate(False)
+        self.config(height=self._toggle_lbl.winfo_reqheight())
+
+    def _expand(self):
+        self.pack_propagate(True)   # let content dictate height again
+        self.body.pack(fill=tk.X)
+
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self._toggle_lbl.config(text=self._caption())
+        if self._collapsed:
+            self._collapse()
+        else:
+            self._expand()
 
 
 def _fmt_time(minutes):
@@ -554,6 +616,271 @@ class DressUpDialog(tk.Toplevel):
         self.destroy()
 
 
+class LayerPropertiesDialog(tk.Toplevel):
+    """Non-modal popup for editing one layer's placement/blend settings.
+
+    Unlike DressUpDialog, this dialog is NOT modal (no grab_set()/wait_window())
+    and has no OK/Cancel batching -- every field is live: each edit is written
+    straight onto *layer* and `on_change()` is called immediately so the
+    caller can recompute the composite and re-render, the same trace_add-on-
+    every-keystroke idiom already used for the Physical Image Size fields.
+    Just a single Close button; there is nothing to confirm or discard.
+    """
+
+    def __init__(self, parent, layer, on_change, title=None, is_base=False):
+        super().__init__(parent)
+        self.layer = layer
+        self._on_change = on_change
+        self._is_base = is_base
+        self.title(title or f"Layer Properties — {layer.name}")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        sf = SectionFrame(outer, "Placement")
+        sf.pack(fill=tk.X, pady=(0, 8))
+
+        self._ox = LabeledEntry(sf, "Offset X", "mm", str(layer.offset_x_mm),
+                                minval=-100000.0, maxval=100000.0, increment=1.0)
+        self._ox.pack(fill=tk.X, pady=2)
+        self._oy = LabeledEntry(sf, "Offset Y", "mm", str(layer.offset_y_mm),
+                                minval=-100000.0, maxval=100000.0, increment=1.0)
+        self._oy.pack(fill=tk.X, pady=2)
+        self._rot = LabeledEntry(sf, "Rotation", "deg", str(layer.rotation_deg),
+                                 minval=-360.0, maxval=360.0, increment=1.0)
+        self._rot.pack(fill=tk.X, pady=2)
+        self._scale = LabeledEntry(sf, "Scale", "%", str(layer.scale_pct),
+                                   minval=1.0, maxval=1000.0, increment=1.0)
+        self._scale.pack(fill=tk.X, pady=2)
+
+        self._blend_sf = SectionFrame(outer, "Blend")
+        self._blend_sf.pack(fill=tk.X, pady=(0, 8))
+
+        self._blend_row = ttk.Frame(self._blend_sf)
+        self._blend_row.pack(fill=tk.X, pady=2)
+        ttk.Label(self._blend_row, text="Blend mode:").pack(side=tk.LEFT)
+        self._blend_var = tk.StringVar(value=layer.blend_mode)
+        self._blend_widget = None
+        self._build_blend_widget()
+
+        self._opacity = LabeledEntry(self._blend_sf, "Opacity", "%", str(layer.opacity_pct),
+                                     minval=0.0, maxval=100.0, increment=5.0)
+        self._opacity.pack(fill=tk.X, pady=2)
+
+        self._depth_scale = LabeledEntry(self._blend_sf, "Depth scale", "%",
+                                         str(layer.depth_scale_pct),
+                                         minval=0.0, maxval=1000.0, increment=5.0)
+        self._depth_scale.pack(fill=tk.X, pady=2)
+
+        self._invert_var = tk.BooleanVar(value=layer.invert)
+        ttk.Checkbutton(self._blend_sf, text="Invert (flip this layer's polarity)",
+                        variable=self._invert_var).pack(anchor=tk.W, pady=2)
+
+        self._visible_var = tk.BooleanVar(value=layer.visible)
+        ttk.Checkbutton(self._blend_sf, text="Visible",
+                        variable=self._visible_var).pack(anchor=tk.W, pady=2)
+
+        for var in (self._ox.var, self._oy.var, self._rot.var, self._scale.var,
+                    self._opacity.var, self._depth_scale.var, self._blend_var):
+            var.trace_add("write", self._apply)
+        self._invert_var.trace_add("write", self._apply)
+        self._visible_var.trace_add("write", self._apply)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+    def _build_blend_widget(self):
+        """(Re)build the blend-mode row's right-hand widget: a Combobox for
+        a normal layer, or a static label for the base layer, whose blend
+        mode is always forced to Replace at composite time regardless of
+        what's stored (see layers.composite) -- so it isn't user-editable."""
+        if self._blend_widget is not None:
+            self._blend_widget.destroy()
+        if self._is_base:
+            self._blend_widget = ttk.Label(self._blend_row, text="Replace (base layer)",
+                                           foreground="#666666")
+        else:
+            self._blend_widget = ttk.Combobox(self._blend_row, textvariable=self._blend_var,
+                                              values=BLEND_MODES, state="readonly", width=14)
+        self._blend_widget.pack(side=tk.RIGHT)
+
+    def retarget(self, layer, title=None, is_base=False):
+        """Point this already-open dialog at a different layer, so selecting
+        a new row in the Layers list re-uses the one popup instead of
+        stacking a second window."""
+        self.layer = layer
+        self.title(title or f"Layer Properties — {layer.name}")
+        self._ox.set(str(layer.offset_x_mm))
+        self._oy.set(str(layer.offset_y_mm))
+        self._rot.set(str(layer.rotation_deg))
+        self._scale.set(str(layer.scale_pct))
+        self._opacity.set(str(layer.opacity_pct))
+        self._depth_scale.set(str(layer.depth_scale_pct))
+        self._blend_var.set(layer.blend_mode)
+        if is_base != self._is_base:
+            self._is_base = is_base
+            self._build_blend_widget()
+        self._invert_var.set(layer.invert)
+        self._visible_var.set(layer.visible)
+
+    def _apply(self, *_):
+        try:
+            self.layer.offset_x_mm    = float(self._ox.get())
+            self.layer.offset_y_mm    = float(self._oy.get())
+            self.layer.rotation_deg   = float(self._rot.get())
+            self.layer.scale_pct      = float(self._scale.get())
+            self.layer.opacity_pct    = float(self._opacity.get())
+            self.layer.depth_scale_pct = float(self._depth_scale.get())
+        except ValueError:
+            return   # mid-edit invalid text (e.g. "-" while typing "-5") -- skip silently
+        self.layer.blend_mode = self._blend_var.get()   # no-op when is_base (no Combobox to edit it)
+        self.layer.invert     = self._invert_var.get()
+        self.layer.visible    = self._visible_var.get()
+        self._on_change()
+
+
+class CanvasSetupDialog(tk.Toplevel):
+    """Modal dialog shown when (re)establishing the base/canvas-defining
+    layer (File -> Open Image, or "+ Image..." when no layer exists yet).
+    Lets the user pick the canvas's pixel resolution independent of the
+    loaded image's own native size (defaulting to that native size, so the
+    common case is unchanged) and a background depth for any canvas area no
+    layer ends up covering. Mirrors ImportSTLDialog's "Output Resolution"
+    section, since STL import already offers the equivalent width/height
+    choice for its own case.
+
+    After ``wait_window()`` returns, read:
+    - ``self.confirmed``                     -- bool
+    - ``self.width_px``, ``self.height_px``  -- int
+    - ``self.background_depth_pct``          -- float
+    """
+
+    def __init__(self, parent, native_width_px, native_height_px,
+                 default_background_depth_pct=0.0):
+        super().__init__(parent)
+        self.title("Canvas Setup")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self.confirmed = False
+        self._native_w = native_width_px
+        self._native_h = native_height_px
+        self._updating = False
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        res_sf = SectionFrame(outer, "Canvas Resolution")
+        res_sf.pack(fill=tk.X, pady=(0, 8))
+
+        self.width_var  = tk.StringVar(value=str(native_width_px))
+        self.height_var = tk.StringVar(value=str(native_height_px))
+        self.keep_aspect_var = tk.BooleanVar(value=True)
+
+        row_w = ttk.Frame(res_sf)
+        row_w.pack(fill=tk.X, pady=2)
+        ttk.Label(row_w, text="Width", width=8, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Spinbox(row_w, from_=2, to=20000, textvariable=self.width_var,
+                    width=8).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row_w, text="px", foreground="#666666").pack(side=tk.LEFT)
+
+        row_h = ttk.Frame(res_sf)
+        row_h.pack(fill=tk.X, pady=2)
+        ttk.Label(row_h, text="Height", width=8, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Spinbox(row_h, from_=2, to=20000, textvariable=self.height_var,
+                    width=8).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row_h, text="px", foreground="#666666").pack(side=tk.LEFT)
+
+        ttk.Checkbutton(res_sf, text="Keep aspect ratio",
+                        variable=self.keep_aspect_var).pack(anchor=tk.W, pady=2)
+
+        self.width_var.trace_add("write", self._on_width_changed)
+        self.height_var.trace_add("write", self._on_height_changed)
+
+        bg_sf = SectionFrame(outer, "Background")
+        bg_sf.pack(fill=tk.X, pady=(0, 8))
+        self._bg_depth = LabeledEntry(bg_sf, "Background depth", "%",
+                                      str(default_background_depth_pct),
+                                      minval=0.0, maxval=100.0, increment=5.0)
+        self._bg_depth.pack(fill=tk.X, pady=2)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="OK", command=self._confirm).pack(
+            side=tk.RIGHT, padx=(0, 6))
+
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+        self.wait_window()
+
+    def _on_width_changed(self, *_):
+        if self._updating or not self.keep_aspect_var.get():
+            return
+        try:
+            w = int(self.width_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self._updating = True
+        try:
+            self.height_var.set(str(max(2, round(w * self._native_h / self._native_w))))
+        finally:
+            self._updating = False
+
+    def _on_height_changed(self, *_):
+        if self._updating or not self.keep_aspect_var.get():
+            return
+        try:
+            h = int(self.height_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self._updating = True
+        try:
+            self.width_var.set(str(max(2, round(h * self._native_w / self._native_h))))
+        finally:
+            self._updating = False
+
+    def _confirm(self):
+        try:
+            width_px  = int(self.width_var.get())
+            height_px = int(self.height_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid Input",
+                                 "Width and height must be integers.", parent=self)
+            return
+        if width_px < 2 or height_px < 2:
+            messagebox.showerror("Invalid Input",
+                                 "Width and height must each be at least 2.",
+                                 parent=self)
+            return
+        try:
+            background_depth_pct = float(self._bg_depth.get())
+        except ValueError:
+            background_depth_pct = 0.0
+        self.width_px, self.height_px = width_px, height_px
+        self.background_depth_pct = background_depth_pct
+        self.confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.confirmed = False
+        self.grab_release()
+        self.destroy()
+
+
 class ExportToolpathDialog(tk.Toplevel):
     """Modal dialog for selecting which computed steps to include in a single
     exported G-code file.
@@ -689,7 +1016,7 @@ class ImportSTLDialog(tk.Toplevel):
 
     _ROT_VALUES = ["0", "90", "180", "270"]
 
-    def __init__(self, parent, triangles, xy_bounds, z_bounds):
+    def __init__(self, parent, triangles, xy_bounds, z_bounds, is_base=True):
         super().__init__(parent)
         self.title("Import STL")
         self.resizable(False, False)
@@ -701,6 +1028,8 @@ class ImportSTLDialog(tk.Toplevel):
         self._xy_bounds  = xy_bounds
         self._z_bounds   = z_bounds
         self._updating   = False
+        self._is_base    = is_base
+        self.background_depth_pct = 0.0
 
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -754,18 +1083,34 @@ class ImportSTLDialog(tk.Toplevel):
         self.width_var.trace_add("write", self._on_width_changed)
         self.height_var.trace_add("write", self._on_height_changed)
 
-        # ── Physical Size ────────────────────────────────────────────
-        phys_sf = SectionFrame(outer, "Physical Size")
-        phys_sf.pack(fill=tk.X, pady=(0, 8))
-
-        self.populate_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(phys_sf,
-                        text="Set width/height/max depth from mesh bounding box",
-                        variable=self.populate_var).pack(anchor=tk.W)
-
+        # ── Physical Size (only relevant when establishing the base/canvas-
+        #    defining layer -- appending an STL layer onto an existing
+        #    canvas never touches Physical Image Size, since resizing it to
+        #    fit a newly-appended decorative layer would silently move
+        #    every other layer's placement relative to the stock) ────────
+        self.populate_var = tk.BooleanVar(value=self._is_base)
         self._preview_var = tk.StringVar()
-        ttk.Label(phys_sf, textvariable=self._preview_var,
-                  foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+        if self._is_base:
+            phys_sf = SectionFrame(outer, "Physical Size")
+            phys_sf.pack(fill=tk.X, pady=(0, 8))
+
+            ttk.Checkbutton(phys_sf,
+                            text="Set width/height/max depth from mesh bounding box",
+                            variable=self.populate_var).pack(anchor=tk.W)
+
+            ttk.Label(phys_sf, textvariable=self._preview_var,
+                      foreground="#555555").pack(anchor=tk.W, pady=(4, 0))
+
+        # ── Background depth (only relevant when establishing the base/
+        #    canvas-defining layer -- appending an STL layer onto an
+        #    existing canvas never touches the background) ─────────────
+        self._bg_depth = None
+        if self._is_base:
+            bg_sf = SectionFrame(outer, "Background")
+            bg_sf.pack(fill=tk.X, pady=(0, 8))
+            self._bg_depth = LabeledEntry(bg_sf, "Background depth", "%", "0.0",
+                                          minval=0.0, maxval=100.0, increment=5.0)
+            self._bg_depth.pack(fill=tk.X, pady=2)
 
         # ── Buttons ──────────────────────────────────────────────────
         btn_row = ttk.Frame(outer)
@@ -885,6 +1230,11 @@ class ImportSTLDialog(tk.Toplevel):
         self.width_px, self.height_px = width_px, height_px
         self.rot_x, self.rot_y, self.rot_z = self._current_rotation()
         self.populate_physical = self.populate_var.get()
+        if self._bg_depth is not None:
+            try:
+                self.background_depth_pct = float(self._bg_depth.get())
+            except ValueError:
+                self.background_depth_pct = 0.0
         self.confirmed = True
         self.grab_release()
         self.destroy()
