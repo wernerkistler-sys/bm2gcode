@@ -218,16 +218,22 @@ check("resize_raw with an unchanged shape returns the content unmodified",
 
 
 # --------------------------------------------------------------------------
-# depth_scale_pct
+# min_depth_pct / max_depth_pct
 # --------------------------------------------------------------------------
-print("depth_scale_pct")
+print("min_depth_pct / max_depth_pct")
 
 layer_full = make_layer(np.array([[0.6, 0.8]], dtype=np.float32))
-layer_half = make_layer(np.array([[0.6, 0.8]], dtype=np.float32), depth_scale_pct=50.0)
+layer_half = make_layer(np.array([[0.6, 0.8]], dtype=np.float32), max_depth_pct=50.0)
 out_full = composite([layer_full], (1, 2), 1.0, 1.0, "black")
 out_half = composite([layer_half], (1, 2), 1.0, 1.0, "black")
-check("50% depth scale halves the composited depth contribution",
+check("halving max_depth_pct halves the composited depth contribution",
       np.allclose(out_half, out_full * 0.5))
+
+layer_swapped = make_layer(np.array([[0.0, 1.0]], dtype=np.float32),
+                           min_depth_pct=100.0, max_depth_pct=0.0)
+out_swapped = composite([layer_swapped], (1, 2), 1.0, 1.0, "black")
+check("max_depth_pct < min_depth_pct flips the layer's polarity",
+      np.allclose(out_swapped, [[1.0, 0.0]]))
 
 
 # --------------------------------------------------------------------------

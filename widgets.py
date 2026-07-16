@@ -669,23 +669,23 @@ class LayerPropertiesDialog(tk.Toplevel):
                                      minval=0.0, maxval=100.0, increment=5.0)
         self._opacity.pack(fill=tk.X, pady=2)
 
-        self._depth_scale = LabeledEntry(self._blend_sf, "Depth scale", "%",
-                                         str(layer.depth_scale_pct),
-                                         minval=0.0, maxval=1000.0, increment=5.0)
-        self._depth_scale.pack(fill=tk.X, pady=2)
-
-        self._invert_var = tk.BooleanVar(value=layer.invert)
-        ttk.Checkbutton(self._blend_sf, text="Invert (flip this layer's polarity)",
-                        variable=self._invert_var).pack(anchor=tk.W, pady=2)
+        self._min_depth = LabeledEntry(self._blend_sf, "Min depth", "%",
+                                       str(layer.min_depth_pct),
+                                       minval=0.0, maxval=100.0, increment=5.0)
+        self._min_depth.pack(fill=tk.X, pady=2)
+        self._max_depth = LabeledEntry(self._blend_sf, "Max depth", "%",
+                                       str(layer.max_depth_pct),
+                                       minval=0.0, maxval=100.0, increment=5.0)
+        self._max_depth.pack(fill=tk.X, pady=2)
 
         self._visible_var = tk.BooleanVar(value=layer.visible)
         ttk.Checkbutton(self._blend_sf, text="Visible",
                         variable=self._visible_var).pack(anchor=tk.W, pady=2)
 
         for var in (self._ox.var, self._oy.var, self._rot.var, self._scale.var,
-                    self._opacity.var, self._depth_scale.var, self._blend_var):
+                    self._opacity.var, self._min_depth.var, self._max_depth.var,
+                    self._blend_var):
             var.trace_add("write", self._apply)
-        self._invert_var.trace_add("write", self._apply)
         self._visible_var.trace_add("write", self._apply)
 
         btn_row = ttk.Frame(outer)
@@ -723,12 +723,12 @@ class LayerPropertiesDialog(tk.Toplevel):
         self._rot.set(str(layer.rotation_deg))
         self._scale.set(str(layer.scale_pct))
         self._opacity.set(str(layer.opacity_pct))
-        self._depth_scale.set(str(layer.depth_scale_pct))
+        self._min_depth.set(str(layer.min_depth_pct))
+        self._max_depth.set(str(layer.max_depth_pct))
         self._blend_var.set(layer.blend_mode)
         if is_base != self._is_base:
             self._is_base = is_base
             self._build_blend_widget()
-        self._invert_var.set(layer.invert)
         self._visible_var.set(layer.visible)
 
     def _apply(self, *_):
@@ -738,11 +738,11 @@ class LayerPropertiesDialog(tk.Toplevel):
             self.layer.rotation_deg   = float(self._rot.get())
             self.layer.scale_pct      = float(self._scale.get())
             self.layer.opacity_pct    = float(self._opacity.get())
-            self.layer.depth_scale_pct = float(self._depth_scale.get())
+            self.layer.min_depth_pct  = float(self._min_depth.get())
+            self.layer.max_depth_pct  = float(self._max_depth.get())
         except ValueError:
             return   # mid-edit invalid text (e.g. "-" while typing "-5") -- skip silently
         self.layer.blend_mode = self._blend_var.get()   # no-op when is_base (no Combobox to edit it)
-        self.layer.invert     = self._invert_var.get()
         self.layer.visible    = self._visible_var.get()
         self._on_change()
 

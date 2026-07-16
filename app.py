@@ -1090,7 +1090,8 @@ class GCodeGeneratorApp:
         # layer with real alpha must NOT take this shortcut -- background
         # would never show through wherever it's partially transparent.
         if (len(self.layers) == 1 and base.visible and base.opacity_pct >= 100.0
-                and base.blend_mode == "Replace" and not base.invert
+                and base.blend_mode == "Replace"
+                and base.min_depth_pct == 0.0 and base.max_depth_pct == 100.0
                 and base.is_identity_placement() and base.alpha is None):
             self.current_image = base.raw
             self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
@@ -1513,8 +1514,8 @@ class GCodeGeneratorApp:
             'scale_pct':    layer.scale_pct,
             'blend_mode':   layer.blend_mode,
             'opacity_pct':  layer.opacity_pct,
-            'depth_scale_pct': layer.depth_scale_pct,
-            'invert':       layer.invert,
+            'min_depth_pct': layer.min_depth_pct,
+            'max_depth_pct': layer.max_depth_pct,
             'visible':      layer.visible,
         }
         if layer.source_kind == 'stl' and layer.stl_params:
@@ -1562,8 +1563,8 @@ class GCodeGeneratorApp:
         layer.scale_pct    = float(d.get('scale_pct', 100.0))
         layer.blend_mode   = d.get('blend_mode', 'Replace')
         layer.opacity_pct  = float(d.get('opacity_pct', 100.0))
-        layer.depth_scale_pct = float(d.get('depth_scale_pct', 100.0))
-        layer.invert       = bool(d.get('invert', False))
+        layer.min_depth_pct = float(d.get('min_depth_pct', 0.0))
+        layer.max_depth_pct = float(d.get('max_depth_pct', 100.0))
         layer.visible      = bool(d.get('visible', True))
         return layer
 

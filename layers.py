@@ -33,9 +33,12 @@ class Layer:
     scale_pct: float = 100.0
     blend_mode: str = "Replace"      # see constants.BLEND_MODES
     opacity_pct: float = 100.0
-    depth_scale_pct: float = 100.0   # multiplicative scale on this layer's own
-                                      # depth contribution, applied before blending
-    invert: bool = False
+    min_depth_pct: float = 0.0       # depth (% of max_cut_depth) that this
+                                      # layer's white pixels are mapped to
+    max_depth_pct: float = 100.0     # depth (% of max_cut_depth) that this
+                                      # layer's black pixels are mapped to;
+                                      # max_depth_pct < min_depth_pct flips
+                                      # the layer's polarity
     visible: bool = True
 
     def is_identity_placement(self) -> bool:
@@ -97,9 +100,10 @@ def to_depth(raw: np.ndarray, surface: str, invert: bool) -> np.ndarray:
 
     Mirrors the polarity convention already used by
     GCodeGeneratorApp._get_depth_map(): "white" means white pixels are the
-    uncut surface, so depth = 1 - raw; "black" means depth = raw. A per-layer
-    `invert` flag additionally flips the result, for sources whose polarity
-    doesn't match the project's.
+    uncut surface, so depth = 1 - raw; "black" means depth = raw. The
+    `invert` flag additionally flips the result; composite() always passes
+    False, since a layer's own polarity is instead expressed by its
+    min_depth_pct/max_depth_pct ordering (see Layer).
     """
     depth = (1.0 - raw) if surface == "white" else raw
     return (1.0 - depth) if invert else depth
@@ -218,8 +222,9 @@ def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
         if not layer.visible or layer.opacity_pct <= 0.0:
             continue
         resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x, px_per_mm_y)
-        layer_depth = to_depth(resampled, surface, layer.invert)
-        layer_depth = np.clip(layer_depth * (layer.depth_scale_pct / 100.0), 0.0, 1.0)
+        depth = to_depth(resampled, surface, False)
+        min_frac, max_frac = layer.min_depth_pct / 100.0, layer.max_depth_pct / 100.0
+        layer_depth = np.clip(min_frac + (max_frac - min_frac) * depth, 0.0, 1.0)
         alpha = coverage * (layer.opacity_pct / 100.0)
         mode = "Replace" if i == 0 else layer.blend_mode
         blended = np.clip(_blend_op(mode, canvas_depth, layer_depth), 0.0, 1.0)

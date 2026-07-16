@@ -45,8 +45,8 @@ DEFAULTS = {
     "layer_scale_pct":    "100.0",
     "layer_opacity_pct":  "100.0",
     "layer_blend_mode":   "Replace",  # see BLEND_MODES
-    "layer_depth_scale_pct": "100.0",
-    "layer_invert":       "0",
+    "layer_min_depth_pct": "0.0",
+    "layer_max_depth_pct": "100.0",
     "layer_visible":      "1",
     # Background depth for canvas area no layer covers, set once when the
     # base layer is (re)established (see widgets.CanvasSetupDialog)
