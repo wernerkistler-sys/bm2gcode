@@ -303,6 +303,17 @@ class GCodeGeneratorApp:
         self._layers_nb.pack(fill=tk.X, pady=(0, 8))
         self._layer_tabs = []   # list of dicts, index-aligned with self.layers
         self._build_canvas_tab()
+        # ttk.Notebook sizes itself to the tallest pane it has ever held, not
+        # the one currently showing (Tk always reports the max reqheight
+        # across every managed tab) -- so the Canvas tab, which has no
+        # Duplicate/Add Source/Remove button row, would otherwise carry a
+        # dead strip at the bottom the moment any Source tab exists, and the
+        # whole notebook (and everything packed below it) would briefly
+        # resize whenever _refresh_layer_tabs() tears down and rebuilds every
+        # Source tab. Pin -height explicitly to whichever tab is actually
+        # selected so the notebook always matches just that tab's content.
+        self._layers_nb.bind("<<NotebookTabChanged>>", self._on_layers_tab_changed)
+        self._on_layers_tab_changed()
 
     def _build_canvas_tab(self):
         tab = ttk.Frame(self._layers_nb, padding=(8, 6))
@@ -635,7 +646,7 @@ class GCodeGeneratorApp:
 
     def _renumber_layer_tabs(self):
         for i, entry in enumerate(self._layer_tabs, start=1):
-            self._layers_nb.tab(entry['tab'], text=f"Source {i}: {entry['layer'].name}")
+            self._layers_nb.tab(entry['tab'], text=f"{i}: {entry['layer'].name}")
 
     def _update_layer_remove_buttons(self):
         state = tk.DISABLED if len(self._layer_tabs) <= 1 else tk.NORMAL
@@ -647,6 +658,24 @@ class GCodeGeneratorApp:
             if entry['layer'] is layer:
                 self._layers_nb.select(entry['tab'])
                 return
+
+    def _on_layers_tab_changed(self, *_):
+        """Keep self._layers_nb's -height pinned to whichever tab is
+        currently selected (see _build_layers_notebook for why)."""
+        try:
+            tab_id = self._layers_nb.select()
+        except tk.TclError:
+            return
+        if not tab_id:
+            return
+        tab = self._layers_nb.nametowidget(tab_id)
+        # A freshly built/packed tab hasn't had its requested size computed
+        # yet -- pack's geometry pass is deferred to idle time, so reading
+        # winfo_reqheight() right after construction (startup, or right
+        # after _refresh_layer_tabs() rebuilds tabs) sees a stale ~1px
+        # placeholder, not the real content height. Force that pass now.
+        tab.update_idletasks()
+        self._layers_nb.configure(height=tab.winfo_reqheight())
 
     def _refresh_layer_tabs(self):
         """(Re)build every source tab from self.layers. Full teardown/
@@ -675,6 +704,11 @@ class GCodeGeneratorApp:
 
         if selected_layer is not None:
             self._select_layer_tab(selected_layer)
+        # Forgetting the previously-selected Source tab above can make Tk
+        # briefly reselect the Canvas tab before it's set back above; make
+        # sure the notebook's pinned height reflects whichever tab actually
+        # ends up selected, not a stale mid-rebuild snapshot.
+        self._on_layers_tab_changed()
 
     def _remove_layer_tab(self, entry):
         if len(self.layers) <= 1:
