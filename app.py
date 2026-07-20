@@ -403,19 +403,46 @@ class GCodeGeneratorApp:
         scale = min(canvas_w_px / native_w_px, canvas_h_px / native_h_px)
         return max(1.0, scale * 100.0)
 
+    _MAX_CANVAS_PX = 16_000_000
+
     def _on_canvas_shape_changed(self, *_):
         """Shared tail once canvas pixel shape and/or every source's
         placement has already been reconciled with whatever just changed
         (Width/Height via _on_canvas_size_changed, Precision via
-        _on_precision_changed): warn if the resulting array is huge, then
-        treat this as a structural change like add/remove -- invalidate
-        caches and recomposite every source onto the new grid."""
+        _on_precision_changed) -- both already gated the change itself on
+        _confirm_canvas_shape, so by the time we get here a huge canvas is
+        something the user explicitly chose to proceed with. Note it in the
+        status line, then treat this as a structural change like add/remove
+        -- invalidate caches and recomposite every source onto the new grid."""
         W, H = self._canvas_shape_px()
-        if W * H > 16_000_000:
+        if W * H > self._MAX_CANVAS_PX:
             self.status_var.set(
-                f"Warning: canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
-                "this may be slow. Consider a coarser Precision.")
+                f"Canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
+                "this may be slow.")
         self._on_layers_structure_changed()
+
+    def _confirm_canvas_shape(self, width_mm, height_mm, precision_mm):
+        """Ask before committing to a Width/Height/Precision combination
+        that would make the canvas huge -- W*H drives every per-pixel pass
+        (compositing, rasterizing, toolpath generation), so a multi-hundred-
+        megapixel canvas doesn't error out, it just makes the app sit there
+        looking hung for however long that pass takes. A status-line
+        warning printed *after* the shape already changed doesn't help,
+        since by the time it's on screen the expensive work triggered by
+        that same change is already queued -- the gate has to sit in front
+        of the change, not after it."""
+        if precision_mm <= 1e-9:
+            precision_mm = float(DEFAULTS["precision_mm"])
+        W = max(2, round(width_mm / precision_mm))
+        H = max(2, round(height_mm / precision_mm))
+        if W * H <= self._MAX_CANVAS_PX:
+            return True
+        return messagebox.askyesno(
+            "Large canvas",
+            f"This would create a {W}x{H} px canvas (~{W * H / 1e6:.0f} MP).\n\n"
+            "Compositing and generating toolpaths at this resolution can "
+            "take a long time and may make the app unresponsive.\n\n"
+            "Proceed anyway?")
 
     def _on_canvas_size_changed(self, *_):
         """Width/Height changed. The canvas's pixel *density* is set solely
@@ -437,6 +464,11 @@ class GCodeGeneratorApp:
         except ValueError:
             return
         if new_width_mm > 1e-9 and new_height_mm > 1e-9:
+            if not self._confirm_canvas_shape(new_width_mm, new_height_mm,
+                                               float(self.precision_mm.get())):
+                self.width_mm.set(str(self._last_width_mm))
+                self.height_mm.set(str(self._last_height_mm))
+                return
             old_width_mm, old_height_mm = self._last_width_mm, self._last_height_mm
             if (old_width_mm > 1e-9 and old_height_mm > 1e-9
                     and (new_width_mm != old_width_mm or new_height_mm != old_height_mm)):
@@ -470,6 +502,11 @@ class GCodeGeneratorApp:
         except ValueError:
             return
         if new_precision_mm > 1e-9:
+            if not self._confirm_canvas_shape(float(self.width_mm.get()),
+                                               float(self.height_mm.get()),
+                                               new_precision_mm):
+                self.precision_mm.set(str(self._last_precision_mm))
+                return
             old_precision_mm = self._last_precision_mm
             if old_precision_mm > 1e-9 and new_precision_mm != old_precision_mm:
                 ratio = old_precision_mm / new_precision_mm
@@ -1539,21 +1576,31 @@ class GCodeGeneratorApp:
             self.height_mm.set_state("normal")
 
     def _recalc_height(self):
+        """Returns True if height_mm.set() actually ran (and so already
+        cascaded into _on_canvas_size_changed via height_mm's own trace),
+        False otherwise -- callers that need that cascade to happen at all
+        (see _on_width_changed) use this to tell "it already ran" apart
+        from "aspect lock is off / no image loaded yet, nothing will"."""
         if not self._aspect_lock_var.get() or self._image_aspect is None:
-            return
+            return False
         try:
             w = float(self.width_mm.get())
             self.height_mm.set(f"{w / self._image_aspect:.4f}")
+            return True
         except (ValueError, ZeroDivisionError):
-            pass
+            return False
 
     def _on_width_changed(self, *_):
-        self._recalc_height()
-        if not self._aspect_lock_var.get():
-            # Aspect-locked: _recalc_height()'s height_mm.set() cascades into
-            # height_mm's own trace (_on_canvas_size_changed), which already
-            # sees both the new width and new height in one shot -- calling
-            # it again here would double-apply the correction.
+        cascaded = self._recalc_height()
+        if not cascaded:
+            # Either aspect lock is off, or it's on but there's no image
+            # yet to derive a ratio from -- either way _recalc_height()
+            # didn't set height_mm, so nothing else will run
+            # _on_canvas_size_changed (which the confirm-before-huge-canvas
+            # gate lives in) for this edit unless we do it here. When it
+            # DID cascade, height_mm's own trace already saw both the new
+            # width and height in one shot -- calling it again here would
+            # double-apply the correction.
             self._on_canvas_size_changed()
 
     def _on_depth_map_content_changed(self, *_):

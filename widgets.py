@@ -187,6 +187,8 @@ class LabeledEntry(ttk.Frame):
     def __init__(self, parent, label, unit, default, width=8, auto_label=None,
                  minval=0.0, maxval=100000.0, increment=1.0, **kw):
         super().__init__(parent, **kw)
+        self._minval = minval
+        self._maxval = maxval
         ttk.Label(self, text=label).pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
         self.entry = ttk.Spinbox(self, textvariable=self.var, width=width,
@@ -223,11 +225,42 @@ class LabeledEntry(ttk.Frame):
         self.entry.bind("<Return>",   self._commit)
         self.entry.bind("<KP_Enter>", self._commit)
         self.entry.bind("<FocusOut>", self._commit)
-        self.entry.bind("<<Increment>>", self._commit, add="+")
-        self.entry.bind("<<Decrement>>", self._commit, add="+")
+        # <<Increment>>/<<Decrement>> fire *before* ttk.Spinbox's own C-level
+        # button handler writes its new (unclamped -- from_/to only bound
+        # the arrows' own arithmetic, not what's rejected) value into
+        # self.var, not after -- so committing synchronously here validates
+        # the value the click is about to replace, then gets silently
+        # overwritten a moment later by Tk's own out-of-range write. Defer
+        # to after_idle so _commit runs once Tk's own update has landed.
+        self.entry.bind("<<Increment>>", self._commit_idle, add="+")
+        self.entry.bind("<<Decrement>>", self._commit_idle, add="+")
+
+    def _clamped(self, value):
+        """Parse *value* as a float and clamp it into [minval, maxval].
+        Returns the clamped value as a string, or None if *value* isn't a
+        valid number (caller should then leave the field untouched)."""
+        try:
+            f = float(value)
+        except ValueError:
+            return None
+        f = min(max(f, self._minval), self._maxval)
+        return str(int(f)) if f == int(f) else repr(f)
 
     def _commit(self, *_):
-        self.committed_var.set(self.var.get())
+        # The Spinbox's from_/to only clamp the arrow buttons and mouse
+        # wheel -- typed text (then Enter/Tab/click-away) bypasses them
+        # entirely, so e.g. a Diameter or Step-over field can commit "0"
+        # even though downstream toolpath generation divides by it. Re-clamp
+        # here so a committed value is always in-range, whether it arrived
+        # by typing or by nudging.
+        clamped = self._clamped(self.var.get())
+        if clamped is None:
+            clamped = self.committed_var.get() or str(self._minval)
+        self.var.set(clamped)
+        self.committed_var.set(clamped)
+
+    def _commit_idle(self, *_):
+        self.after_idle(self._commit)
 
     def _on_mousewheel(self, event):
         if "disabled" in self.entry.state():
@@ -245,15 +278,25 @@ class LabeledEntry(ttk.Frame):
             self.entry.config(state="normal")
 
     def get(self):
-        return self.var.get()
+        # committed_var, not var: var mirrors the raw Spinbox text, which
+        # can transiently hold an out-of-range value -- e.g. between an
+        # arrow-key click and the deferred _commit_idle correction (see
+        # <<Decrement>> binding above) -- that callers must never see.
+        return self.committed_var.get()
 
     def set(self, value):
         # A programmatic set is already a complete, deliberate value (not a
         # keystroke on the way to one), so it should land immediately --
         # update both vars in lockstep rather than waiting for a commit
         # event that will never come (nothing is focused/being typed into).
-        self.var.set(value)
-        self.committed_var.set(value)
+        # Still re-clamped like a typed commit: a value loaded from an old
+        # or hand-edited project file (e.g. a stray precision_mm: 0) is no
+        # more trustworthy than something typed into the box.
+        clamped = self._clamped(value)
+        if clamped is None:
+            clamped = str(value)
+        self.var.set(clamped)
+        self.committed_var.set(clamped)
 
     def set_state(self, state):
         self.entry.config(state=state)
