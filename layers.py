@@ -203,7 +203,8 @@ def _blend_op(mode: str, base: np.ndarray, layer_depth: np.ndarray) -> np.ndarra
 
 def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
               px_per_mm_x: float, px_per_mm_y: float,
-              surface: str, background_depth: float = 0.0) -> np.ndarray:
+              surface: str, background_depth: float = 0.0,
+              visibility_override: Optional[List[bool]] = None) -> np.ndarray:
     """Composite the visible layers bottom-to-top into a single float32 raw
     grayscale array (canvas_shape), in the project's own polarity.
 
@@ -216,10 +217,21 @@ def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
     beneath it but the background, so Subtract/Min there would otherwise
     corrupt the result; this is enforced structurally here rather than by
     mutating the layer's stored data, since layers can be reordered.
+
+    visibility_override, if given, is a list index-aligned with *layers*
+    (visibility_override[i] gates layers[i]) and takes precedence over that
+    layer's own .visible -- lets a caller (e.g. a specific carving step's
+    own stored per-source visibility) gate the composite without mutating
+    any Layer's shared .visible state. Missing/short lists fall back to
+    the layer's own .visible for the uncovered tail.
     """
     canvas_depth = np.full(canvas_shape, background_depth, dtype=np.float32)
     for i, layer in enumerate(layers):
-        if not layer.visible or layer.opacity_pct <= 0.0:
+        if visibility_override is not None and i < len(visibility_override):
+            visible = visibility_override[i]
+        else:
+            visible = layer.visible
+        if not visible or layer.opacity_pct <= 0.0:
             continue
         resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x, px_per_mm_y)
         depth = to_depth(resampled, surface, False)

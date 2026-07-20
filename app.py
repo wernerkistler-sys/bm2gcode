@@ -548,9 +548,35 @@ class GCodeGeneratorApp:
                                  minval=0.0, maxval=100.0, increment=5.0)
         max_depth.pack(fill=tk.X, pady=2)
 
-        visible_var = tk.BooleanVar(value=layer.visible)
+        # Visible is per-STEP (see step['source_visibility']), not a
+        # property of the Layer itself -- its checked state reflects
+        # whichever step tab is currently selected, and toggling it edits
+        # that step's own list, not layer.visible (which is only used as a
+        # fallback default -- see _composite_with_visibility). Kept on a
+        # dedicated trace (not the combined _apply below) so re-syncing
+        # this checkbox on a step-tab switch doesn't re-touch every other
+        # field.
+        idx = self.layers.index(layer)
+        step = self._current_step()
+        initial_visible = (step['source_visibility'][idx]
+                           if step is not None and idx < len(step['source_visibility'])
+                           else layer.visible)
+        visible_var = tk.BooleanVar(value=initial_visible)
         ttk.Checkbutton(tab, text="Visible", variable=visible_var
                         ).pack(anchor=tk.W, pady=2)
+        entry['visible_var'] = visible_var
+
+        def _apply_visible(*_):
+            if getattr(self, '_suspend_visibility_apply', False):
+                return
+            cur_step = self._current_step()
+            if cur_step is not None:
+                vis = cur_step['source_visibility']
+                i = self.layers.index(layer)
+                if i < len(vis):
+                    vis[i] = visible_var.get()
+            self._on_layer_property_changed()
+        visible_var.trace_add("write", _apply_visible)
 
         def _apply(*_):
             try:
@@ -564,13 +590,11 @@ class GCodeGeneratorApp:
             except ValueError:
                 return   # mid-edit invalid text -- skip silently
             layer.blend_mode = blend_var.get()   # no-op when is_base
-            layer.visible    = visible_var.get()
             self._on_layer_property_changed()
 
         for var in (ox.var, oy.var, rot.var, scale.var, opacity.var,
                     min_depth.var, max_depth.var, blend_var):
             var.trace_add("write", _apply)
-        visible_var.trace_add("write", _apply)
 
     def _renumber_layer_tabs(self):
         for i, entry in enumerate(self._layer_tabs, start=1):
@@ -618,7 +642,12 @@ class GCodeGeneratorApp:
     def _remove_layer_tab(self, entry):
         if len(self.layers) <= 1:
             return
+        idx = self.layers.index(entry['layer'])
         self.layers.remove(entry['layer'])
+        for s in self.steps:
+            vis = s.setdefault('source_visibility', [])
+            if idx < len(vis):
+                del vis[idx]
         self._on_layers_structure_changed()
 
     def _duplicate_layer_tab(self, entry):
@@ -628,6 +657,12 @@ class GCodeGeneratorApp:
         dup.name = f"{entry['layer'].name} copy"
         idx = self.layers.index(entry['layer'])
         self.layers.insert(idx + 1, dup)
+        # The duplicate starts visible/hidden in each step exactly like the
+        # source it was copied from, matching how its other settings (via
+        # copy.copy) are cloned rather than reset to defaults.
+        for s in self.steps:
+            vis = s.setdefault('source_visibility', [])
+            vis.insert(idx + 1, vis[idx] if idx < len(vis) else True)
         self._on_layers_structure_changed()
         self._select_layer_tab(dup)
 
@@ -656,7 +691,12 @@ class GCodeGeneratorApp:
         else:
             self._steps_nb.add(tab, text=f"Step {insert_at + 1}")
 
-        step = {'tab': tab}
+        # source_visibility is a list index-aligned with self.layers (True =
+        # visible in this step); cloned from src when adding after an
+        # existing step, or all-visible when this is the very first step.
+        step = {'tab': tab,
+                'source_visibility': (list(src['source_visibility']) if src is not None
+                                      else [True] * len(self.layers))}
         self.steps.insert(insert_at, step)
         self.toolpaths.insert(insert_at, None)
 
@@ -1268,36 +1308,36 @@ class GCodeGeneratorApp:
         # rather than being letterboxed against a stale height.
         layer.scale_pct = self._fit_scale_pct(w, h)
         self.layers = [layer]
+        # Fresh single-source project: every step now has exactly one
+        # (visible) source, regardless of whatever the old stack's
+        # per-step visibility lists happened to contain.
+        for s in self.steps:
+            s['source_visibility'] = [True]
         return True
 
-    def _recompute_composite(self):
-        """Recompute self.current_image (and self.n_grey_levels) from
-        self.layers. self.current_image keeps its old role -- the single
-        flattened depth map everything downstream of _get_depth_map() reads
-        -- it's just a cached compositor output now instead of a direct load."""
+    def _current_step(self):
+        """The step dict whose tab is currently selected in the Steps
+        notebook, or None if there's no valid selection (shouldn't
+        normally happen -- _add_step() guarantees at least one step)."""
+        if not self.steps:
+            return None
+        try:
+            idx = self._steps_nb.index("current")
+        except (tk.TclError, AttributeError):
+            return None
+        if 0 <= idx < len(self.steps):
+            return self.steps[idx]
+        return None
+
+    def _composite_with_visibility(self, visibility):
+        """Composite self.layers onto the current canvas shape, gating
+        source visibility via *visibility* (a list index-aligned with
+        self.layers, or None to fall back to each Layer's own .visible).
+        Returns (composite_raw, n_grey_levels), or (None, 256) if there
+        are no sources at all."""
         if not self.layers:
-            self.current_image = None
-            self.n_grey_levels = 256
-            return
-
-        base = self.layers[0]
+            return None, 256
         W, H = self._canvas_shape_px()
-
-        # Bit-identical fast path for the overwhelmingly common case (one
-        # source, default settings, already at the canvas's own pixel
-        # shape): skip the depth round-trip entirely rather than merely
-        # approximating it. A base source with real alpha must NOT take
-        # this shortcut -- background would never show through wherever
-        # it's partially transparent.
-        if (len(self.layers) == 1 and base.visible and base.opacity_pct >= 100.0
-                and base.blend_mode == "Replace"
-                and base.min_depth_pct == 0.0 and base.max_depth_pct == 100.0
-                and base.is_identity_placement() and base.alpha is None
-                and base.raw.shape == (H, W)):
-            self.current_image = base.raw
-            self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
-            return
-
         try:
             width_mm  = float(self.width_mm.get())
             height_mm = float(self.height_mm.get())
@@ -1310,10 +1350,48 @@ class GCodeGeneratorApp:
         except ValueError:
             background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
 
-        self.current_image = layers_mod.composite(
+        composite_raw = layers_mod.composite(
             self.layers, (H, W), px_per_mm_x, px_per_mm_y, self.surface.get(),
-            background_depth=background_depth_pct / 100.0)
-        self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
+            background_depth=background_depth_pct / 100.0,
+            visibility_override=visibility)
+        n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, composite_raw)
+        return composite_raw, n_grey_levels
+
+    def _recompute_composite(self):
+        """Recompute self.current_image (and self.n_grey_levels) from
+        self.layers, gated by whichever step tab is currently selected (see
+        _current_step) so the live preview always matches what that step
+        would actually carve. self.current_image keeps its old role -- the
+        single flattened depth map everything downstream of
+        _get_depth_map() reads -- it's just a cached compositor output now
+        instead of a direct load."""
+        if not self.layers:
+            self.current_image = None
+            self.n_grey_levels = 256
+            return
+
+        base = self.layers[0]
+        W, H = self._canvas_shape_px()
+        step = self._current_step()
+        visibility = step['source_visibility'] if step is not None else None
+        base_visible = visibility[0] if visibility else base.visible
+
+        # Bit-identical fast path for the overwhelmingly common case (one
+        # source, default settings, already at the canvas's own pixel
+        # shape, visible in the currently-selected step): skip the depth
+        # round-trip entirely rather than merely approximating it. A base
+        # source with real alpha must NOT take this shortcut -- background
+        # would never show through wherever it's partially transparent.
+        if (len(self.layers) == 1 and base_visible and base.opacity_pct >= 100.0
+                and base.blend_mode == "Replace"
+                and base.min_depth_pct == 0.0 and base.max_depth_pct == 100.0
+                and base.is_identity_placement() and base.alpha is None
+                and base.raw.shape == (H, W)):
+            self.current_image = base.raw
+            self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
+            return
+
+        self.current_image, self.n_grey_levels = self._composite_with_visibility(visibility)
 
     def _on_layer_property_changed(self):
         """Live-edit callback: a source's placement/blend/visibility
@@ -1329,6 +1407,19 @@ class GCodeGeneratorApp:
         """Shared tail for anything that changes which sources exist, their
         order, or the canvas's pixel shape: source add/remove/duplicate,
         Canvas Width/Height/Precision edits, project load."""
+        # Defensive-only: every call site that actually inserts/removes a
+        # source is responsible for making the matching index-aligned edit
+        # to every step's source_visibility (see e.g. _remove_layer_tab) --
+        # this just pads/truncates away any length mismatch that slips
+        # through some other path (project load, a missed call site).
+        n = len(self.layers)
+        for s in self.steps:
+            vis = s.setdefault('source_visibility', [])
+            if len(vis) < n:
+                vis.extend([True] * (n - len(vis)))
+            elif len(vis) > n:
+                del vis[n:]
+
         self._recompute_composite()
         self._erosion_cache.clear()
         self.toolpaths = [None] * len(self.steps)
@@ -1390,7 +1481,10 @@ class GCodeGeneratorApp:
             return
         h, w = layer.raw.shape
         layer.scale_pct = self._fit_scale_pct(w, h)
-        self.layers.insert(max(0, min(insert_at, len(self.layers))), layer)
+        insert_at = max(0, min(insert_at, len(self.layers)))
+        self.layers.insert(insert_at, layer)
+        for s in self.steps:
+            s.setdefault('source_visibility', []).insert(insert_at, True)
         self._on_layers_structure_changed()
         self._select_layer_tab(layer)
         self.status_var.set(f"Added image source: {path}")
@@ -1425,7 +1519,10 @@ class GCodeGeneratorApp:
         layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
         if layer is None:
             return
-        self.layers.insert(max(0, min(insert_at, len(self.layers))), layer)
+        insert_at = max(0, min(insert_at, len(self.layers)))
+        self.layers.insert(insert_at, layer)
+        for s in self.steps:
+            s.setdefault('source_visibility', []).insert(insert_at, True)
         self._on_layers_structure_changed()
         self._select_layer_tab(layer)
         self.status_var.set(f"Added STL source: {os.path.basename(path)}")
@@ -1524,6 +1621,11 @@ class GCodeGeneratorApp:
                 self._recalc_height()
 
         self.layers = [layer]
+        # Fresh single-source project: every step now has exactly one
+        # (visible) source, regardless of whatever the old stack's
+        # per-step visibility lists happened to contain.
+        for s in self.steps:
+            s['source_visibility'] = [True]
         self._on_layers_structure_changed()   # recomputes composite (n_grey_levels forced
                                                # to 65536 for STL layers), resets toolpaths/view
         self.status_var.set(
@@ -1632,6 +1734,10 @@ class GCodeGeneratorApp:
             'backoff_distance_mm':  step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':   step['arc_rapids_enabled_var'].get(),
             'arc_radius_mm':        step['arc_radius_mm_var'].get(),
+            # Index-aligned with self.layers at save time (not layer_id --
+            # see _on_layers_structure_changed's docstring on why position
+            # is what's persisted).
+            'source_visibility':    list(step.get('source_visibility', [])),
         }
 
     def _apply_step_dict(self, step, d):
@@ -1672,6 +1778,12 @@ class GCodeGeneratorApp:
             'arc_rapids_enabled', bool(int(DEFAULTS['step_arc_rapids_enabled'])))))
         step['arc_radius_mm_var'].set(d.get(
             'arc_radius_mm', DEFAULTS['step_arc_radius_mm']))
+        # Index-aligned with self.layers, which isn't loaded yet at this
+        # point in _load_project -- any length mismatch (including an
+        # older project file with no saved source_visibility at all) gets
+        # padded/truncated to match once layers ARE loaded, by
+        # _on_layers_structure_changed's defensive sync.
+        step['source_visibility'] = [bool(v) for v in d.get('source_visibility', [])]
 
     def _resolve_rel_path(self, prj_path, saved_path, saved_path_rel):
         """Try *saved_path_rel* relative to prj_path's directory first,
@@ -2137,6 +2249,10 @@ class GCodeGeneratorApp:
             'max_depth':     max_depth,
             'origin':        origin,
             'extra_offset_mm': float(step['extra_offset'].get()),
+            # Used only to key the erosion cache (see _compute_step_work) --
+            # the actual depth map is precomputed on the main thread and
+            # passed in separately, since it needs Tkinter reads.
+            'source_visibility': tuple(step.get('source_visibility', ())),
         }
 
         if algorithm.startswith("V-Carving"):
@@ -2188,19 +2304,24 @@ class GCodeGeneratorApp:
 
         return params
 
-    def _compute_step_work(self, params, progress_fn, prev_tp):
+    def _compute_step_work(self, params, progress_fn, prev_tp, depth_map, n_grey_levels):
         """Synchronous algorithm computation — call from a background thread.
+
+        depth_map/n_grey_levels are precomputed on the main thread (see
+        _get_depth_map_for_step) rather than read here, both because this
+        runs off the main thread and because each step must be computed
+        against its OWN source_visibility, not whichever step tab happens
+        to be selected.
 
         Returns a toolpath result. Raises ProgressDialog.Cancelled or any
         algorithm exception on failure.
         """
         algorithm    = params['algorithm']
-        depth_map, n_grey_levels = self._get_depth_map()
 
         tool = params['tool']
         erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
                              params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
-                             params['extra_offset_mm'])
+                             params['extra_offset_mm'], params['source_visibility'])
 
         if algorithm.startswith("V-Carving"):
             gating_mode = params['gating_mode']
@@ -2390,6 +2511,7 @@ class GCodeGeneratorApp:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
             return
+        depth_map, n_grey_levels = self._get_depth_map_for_step(step)
 
         # ── Prior-step checks (all before the dialog opens) ─────────────────
         prev_tp   = self.toolpaths[idx - 1] if idx > 0 else None
@@ -2423,7 +2545,8 @@ class GCodeGeneratorApp:
 
         def _worker():
             try:
-                result = self._compute_step_work(params, dlg.report, prev_tp)
+                result = self._compute_step_work(
+                    params, dlg.report, prev_tp, depth_map, n_grey_levels)
             except ProgressDialog.Cancelled:
                 self.root.after(0, lambda: dlg.close("Cancelled."))
                 return
@@ -2468,8 +2591,11 @@ class GCodeGeneratorApp:
         if not self.steps:
             return
 
-        # Validate every step upfront so the dialog never opens on bad input.
+        # Validate every step upfront so the dialog never opens on bad input,
+        # and precompute each step's own depth map here on the main thread
+        # (each step has its own source_visibility, so these can differ).
         all_params = []
+        all_depth_maps = []
         for step in self.steps:
             try:
                 all_params.append(self._gather_step_params(step))
@@ -2478,6 +2604,7 @@ class GCodeGeneratorApp:
                 messagebox.showerror("Invalid input",
                                      f"Please check the settings for Step {idx + 1}.")
                 return
+            all_depth_maps.append(self._get_depth_map_for_step(step))
 
         n   = len(self.steps)
         dlg = ProgressDialog(self.root, title="Computing All Step Tool Paths")
@@ -2489,13 +2616,14 @@ class GCodeGeneratorApp:
                     dlg.report(scaled, f"Step {step_i + 1}/{n}: {msg}" if msg else "")
                 return fn
 
-            for i, (step, params) in enumerate(zip(self.steps, all_params)):
+            for i, (step, params, (depth_map, n_grey_levels)) in enumerate(
+                    zip(self.steps, all_params, all_depth_maps)):
                 idx     = params['idx']
                 prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
                 try:
                     dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
                     result = self._compute_step_work(
-                        params, step_progress(i), prev_tp)
+                        params, step_progress(i), prev_tp, depth_map, n_grey_levels)
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
@@ -2612,13 +2740,35 @@ class GCodeGeneratorApp:
     #  Display mode
     # ------------------------------------------------------------------ #
     def _on_step_tab_changed(self, _event=None):
-        """Sync display_step_var to whichever step tab is now selected."""
+        """Sync display_step_var to whichever step tab is now selected, and
+        -- since source visibility is per-step -- refresh every source
+        tab's Visible checkbox and the live preview to match."""
         tab_id = self._steps_nb.select()
         if not tab_id or not hasattr(self, 'display_mode_var'):
             return
         selected = self._steps_nb.index(tab_id)
         self.display_step_var.set(selected + 1)
+        self._sync_layer_visible_checkboxes()
+        self._recompute_composite()
+        self._erosion_cache.clear()
         self._on_display_mode_changed()
+
+    def _sync_layer_visible_checkboxes(self):
+        """Refresh every source tab's Visible checkbox to reflect the
+        currently-selected step's stored source_visibility, without
+        triggering each checkbox's own write-back (which would otherwise
+        recompute the composite once per source instead of once overall --
+        _on_step_tab_changed does that itself right after)."""
+        step = self._current_step()
+        if step is None:
+            return
+        vis = step['source_visibility']
+        self._suspend_visibility_apply = True
+        try:
+            for i, entry in enumerate(self._layer_tabs):
+                entry['visible_var'].set(vis[i] if i < len(vis) else True)
+        finally:
+            self._suspend_visibility_apply = False
 
     def _on_display_mode_changed(self):
         mode = self.display_mode_var.get()
@@ -2696,20 +2846,37 @@ class GCodeGeneratorApp:
         return np.pad(img, ((pad_y, pad_y), (pad_x, pad_x)),
                       mode="constant", constant_values=pad_val)
 
-    def _get_depth_map(self):
-        """Return ``(depth_map, n_grey_levels)``.
+    def _finish_depth_map(self, composite_raw, n_grey_levels):
+        """Shared tail: pad for stock margin and flip to cut-depth polarity.
 
-        depth_map   : 2-D float32 [0, 1]  — 1.0 = maximum cut depth (intaglio).
-        n_grey_levels: number of distinct depth steps the source image can encode.
-                      current_image is stored as float32 so we use 65536 (16-bit
-                      equivalent) as a conservative estimate.
+        Returns ``(depth_map, n_grey_levels)``.
+        depth_map: 2-D float32 [0, 1]  — 1.0 = maximum cut depth (intaglio).
         """
-        img = self._pad_image(np.clip(self.current_image, 0.0, 1.0))
-        n_grey_levels = self.n_grey_levels
+        img = self._pad_image(np.clip(composite_raw, 0.0, 1.0))
         if self.surface.get() == "white":
             return 1.0 - img, n_grey_levels   # white = z=0, black = deepest cut
         else:
             return img, n_grey_levels          # black = z=0, white = deepest cut
+
+    def _get_depth_map(self):
+        """Depth map for the live preview (self.current_image, already
+        gated by whichever step is currently selected -- see
+        _recompute_composite)."""
+        return self._finish_depth_map(self.current_image, self.n_grey_levels)
+
+    def _get_depth_map_for_step(self, step):
+        """Depth map for *step* specifically, built from its own stored
+        source_visibility rather than whichever step tab happens to be
+        selected right now -- so computing (including Compute All Steps)
+        always uses that step's own carving layout regardless of the
+        currently-displayed tab. Call from the main thread (like
+        _gather_step_params) -- it reads Tkinter variables."""
+        composite_raw, n_grey_levels = self._composite_with_visibility(
+            step.get('source_visibility'))
+        if composite_raw is None:
+            W, H = self._canvas_shape_px()
+            composite_raw = np.zeros((H, W), dtype=np.float32)
+        return self._finish_depth_map(composite_raw, n_grey_levels)
 
     def _is_3d_mode(self):
         return self.display_mode_var.get() in DISPLAY_3D_MODES
