@@ -305,19 +305,27 @@ class GCodeGeneratorApp:
         self._build_canvas_tab()
         # ttk.Notebook sizes itself to the tallest pane it has ever held, not
         # the one currently showing (Tk always reports the max reqheight
-        # across every managed tab) -- so the Canvas tab, which has no
-        # Duplicate/Add Source/Remove button row, would otherwise carry a
-        # dead strip at the bottom the moment any Source tab exists, and the
-        # whole notebook (and everything packed below it) would briefly
-        # resize whenever _refresh_layer_tabs() tears down and rebuilds every
-        # Source tab. Pin -height explicitly to whichever tab is actually
-        # selected so the notebook always matches just that tab's content.
+        # across every managed tab) -- so the Canvas tab, whose button row is
+        # shorter than a Source tab's Duplicate/Add Source/Remove row, would
+        # otherwise carry a dead strip at the bottom the moment any Source
+        # tab exists, and the whole notebook (and everything packed below it)
+        # would briefly resize whenever _refresh_layer_tabs() tears down and
+        # rebuilds every Source tab. Pin -height explicitly to whichever tab
+        # is actually selected so the notebook always matches just that
+        # tab's content.
         self._layers_nb.bind("<<NotebookTabChanged>>", self._on_layers_tab_changed)
         self._on_layers_tab_changed()
 
     def _build_canvas_tab(self):
         tab = ttk.Frame(self._layers_nb, padding=(8, 6))
         self._layers_nb.add(tab, text="Canvas")
+
+        # Claim bottom space before content so the button stays pinned to
+        # the bottom, mirroring _make_layer_tab's Source tabs.
+        bf = ttk.Frame(tab)
+        bf.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Button(bf, text="Add Source",
+                   command=self._add_source_at_canvas).pack(fill=tk.X)
 
         self.width_mm  = LabeledEntry(tab, "Width",  "mm", DEFAULTS["width_mm"],
                                       minval=1.0, maxval=20000.0, increment=1.0)
@@ -649,9 +657,8 @@ class GCodeGeneratorApp:
             self._layers_nb.tab(entry['tab'], text=f"{i}: {entry['layer'].name}")
 
     def _update_layer_remove_buttons(self):
-        state = tk.DISABLED if len(self._layer_tabs) <= 1 else tk.NORMAL
         for entry in self._layer_tabs:
-            entry['remove_btn'].config(state=state)
+            entry['remove_btn'].config(state=tk.NORMAL)
 
     def _select_layer_tab(self, layer):
         for entry in self._layer_tabs:
@@ -711,8 +718,6 @@ class GCodeGeneratorApp:
         self._on_layers_tab_changed()
 
     def _remove_layer_tab(self, entry):
-        if len(self.layers) <= 1:
-            return
         idx = self.layers.index(entry['layer'])
         self.layers.remove(entry['layer'])
         for s in self.steps:
@@ -1522,6 +1527,22 @@ class GCodeGeneratorApp:
             self._on_layers_structure_changed()
             self.status_var.set(
                 f"Loaded: {path}  |  {w} x {h} px  |  {self.n_grey_levels} gray levels")
+        if self.layers:
+            self._select_layer_tab(self.layers[0])
+
+    def _add_source_at_canvas(self):
+        """Canvas tab's 'Add Source' button: establishes the base source
+        when none exists yet (same as File -> Open Source...), otherwise
+        inserts the new source at the bottom of the stack -- the one
+        stack position no per-tab 'Add Source' button can reach."""
+        path = filedialog.askopenfilename(title="Add Source",
+                                          filetypes=self._SOURCE_FILETYPES)
+        if not path:
+            return
+        if path.lower().endswith(".stl"):
+            self._add_stl_source(path, 0)
+        else:
+            self._add_image_source(path, 0)
 
     def _add_source_after(self, entry):
         """Per-tab 'Add Source' button: inserts a new source right after
@@ -3136,6 +3157,14 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     def _render(self):
         if self.current_image is None:
+            if getattr(self.ax, 'name', '') == '3d':
+                self.fig.clear()
+                self.ax = self.fig.add_subplot(111)
+                self.fig.patch.set_facecolor("#2b2b2b")
+                self.ax.set_facecolor("#2b2b2b")
+            self.ax.clear()
+            self.ax.set_visible(False)
+            self.mpl_canvas.draw()
             return
 
         mode = self.display_mode_var.get()
