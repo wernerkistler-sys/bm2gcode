@@ -341,13 +341,13 @@ class GCodeGeneratorApp:
             minval=0.0, maxval=100.0, increment=5.0)
         self.background_depth_pct.pack(fill=tk.X, pady=2)
 
-        self.width_mm.var.trace_add("write", self._on_width_changed)
-        self.height_mm.var.trace_add("write", self._on_canvas_size_changed)
-        self.precision_mm.var.trace_add("write", self._on_precision_changed)
-        self.max_depth.var.trace_add("write", lambda *_: self._render())
-        self.margin_mm.var.trace_add("write", lambda *_: self._render())
-        self.margin_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
-        self.background_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
+        self.width_mm.committed_var.trace_add("write", self._on_width_changed)
+        self.height_mm.committed_var.trace_add("write", self._on_canvas_size_changed)
+        self.precision_mm.committed_var.trace_add("write", self._on_precision_changed)
+        self.max_depth.committed_var.trace_add("write", lambda *_: self._render())
+        self.margin_mm.committed_var.trace_add("write", lambda *_: self._render())
+        self.margin_depth_pct.committed_var.trace_add("write", self._on_depth_map_content_changed)
+        self.background_depth_pct.committed_var.trace_add("write", self._on_depth_map_content_changed)
         self._on_aspect_lock_toggle()   # apply initial locked state
 
         polarity_row = ttk.Frame(tab)
@@ -592,9 +592,9 @@ class GCodeGeneratorApp:
             layer.blend_mode = blend_var.get()   # no-op when is_base
             self._on_layer_property_changed()
 
-        for var in (ox.var, oy.var, rot.var, scale.var, opacity.var,
-                    min_depth.var, max_depth.var, blend_var):
-            var.trace_add("write", _apply)
+        for entry in (ox, oy, rot, scale, opacity, min_depth, max_depth):
+            entry.committed_var.trace_add("write", _apply)
+        blend_var.trace_add("write", _apply)
 
     def _renumber_layer_tabs(self):
         for i, entry in enumerate(self._layer_tabs, start=1):
@@ -1107,17 +1107,17 @@ class GCodeGeneratorApp:
                 r = math.sqrt(max(0.0, 2.0 * R * d - d * d))
             else:
                 return
-            max_fw.var.set(f"{2.0 * r:.3f}")
+            max_fw.set(f"{2.0 * r:.3f}")
 
         max_fw.auto_var.trace_add("write", _update_auto_max_fw)
         step['profile_var'].trace_add("write", _update_auto_max_fw)
-        step['vbit_angle'].var.trace_add("write", _update_auto_max_fw)
-        step['diameter'].var.trace_add("write", _update_auto_max_fw)
-        self.max_depth.var.trace_add("write", _update_auto_max_fw)
+        step['vbit_angle'].committed_var.trace_add("write", _update_auto_max_fw)
+        step['diameter'].committed_var.trace_add("write", _update_auto_max_fw)
+        self.max_depth.committed_var.trace_add("write", _update_auto_max_fw)
 
-        threshold.var.trace_add("write", _on_mask_param_changed)
-        min_fw.var.trace_add("write", _on_mask_param_changed)
-        max_fw.var.trace_add("write", _on_mask_param_changed)
+        threshold.committed_var.trace_add("write", _on_mask_param_changed)
+        min_fw.committed_var.trace_add("write", _on_mask_param_changed)
+        max_fw.committed_var.trace_add("write", _on_mask_param_changed)
         gating_var.trace_add("write", _on_mask_param_changed)
 
     def _reset_step_widgets(self, step):

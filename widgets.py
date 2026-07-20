@@ -210,6 +210,25 @@ class LabeledEntry(ttk.Frame):
         self.entry.bind("<Button-4>", self._on_mousewheel)
         self.entry.bind("<Button-5>", self._on_mousewheel)
 
+        # ``self.var`` mirrors every keystroke (it's the Spinbox's own
+        # textvariable -- Tk offers no way to decouple what's displayed from
+        # it), so callers that want a *reactive* callback (trace_add) rather
+        # than a one-off read (get()) should watch ``committed_var`` instead:
+        # it only updates once editing is "done" -- Enter, tab/click-away, or
+        # an arrow/wheel nudge (which always lands on a complete, valid
+        # value, unlike a value built up digit by digit) -- so a callback
+        # doesn't get invoked with a truncated in-progress number, e.g. "1"
+        # and "10" on the way to typing "100".
+        self.committed_var = tk.StringVar(value=self.var.get())
+        self.entry.bind("<Return>",   self._commit)
+        self.entry.bind("<KP_Enter>", self._commit)
+        self.entry.bind("<FocusOut>", self._commit)
+        self.entry.bind("<<Increment>>", self._commit, add="+")
+        self.entry.bind("<<Decrement>>", self._commit, add="+")
+
+    def _commit(self, *_):
+        self.committed_var.set(self.var.get())
+
     def _on_mousewheel(self, event):
         if "disabled" in self.entry.state():
             return None
@@ -229,7 +248,12 @@ class LabeledEntry(ttk.Frame):
         return self.var.get()
 
     def set(self, value):
+        # A programmatic set is already a complete, deliberate value (not a
+        # keystroke on the way to one), so it should land immediately --
+        # update both vars in lockstep rather than waiting for a commit
+        # event that will never come (nothing is focused/being typed into).
         self.var.set(value)
+        self.committed_var.set(value)
 
     def set_state(self, state):
         self.entry.config(state=state)
