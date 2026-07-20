@@ -27,6 +27,7 @@ DEFAULT_POSTAMBLE = (
 DEFAULTS = {
     "width_mm":          "100.0",
     "height_mm":         "100.0",
+    "precision_mm":      "0.2",
     "max_depth":         "5.0",
     "margin_mm":         "0.0",
     "margin_depth_pct":  "0.0",
@@ -48,8 +49,7 @@ DEFAULTS = {
     "layer_min_depth_pct": "0.0",
     "layer_max_depth_pct": "100.0",
     "layer_visible":      "1",
-    # Background depth for canvas area no layer covers, set once when the
-    # base layer is (re)established (see widgets.CanvasSetupDialog)
+    # Background depth for canvas area no source covers (Canvas tab field)
     "canvas_background_depth_pct": "0.0",
     # Per-step defaults (prefix-free; used for every new step tab)
     "step_profile":      "End Mill",

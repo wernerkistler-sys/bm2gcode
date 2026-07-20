@@ -24,16 +24,15 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
-    DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE,
+    DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
     DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
-from widgets import (ProgressDialog, LabeledEntry, SectionFrame,
+from widgets import (ProgressDialog, LabeledEntry,
                      SettingsDialog, DressUpDialog, ExportToolpathDialog,
-                     ImportSTLDialog, LayerPropertiesDialog, CanvasSetupDialog,
-                     _fmt_time)
+                     ImportSTLDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask)
 from tool import Tool
@@ -62,10 +61,11 @@ class GCodeGeneratorApp:
         self.current_image   = None   # 2-D float32 [0,1] grayscale array -- cached
                                        # composite of self.layers, see _recompute_composite()
         self.n_grey_levels   = 256
-        self.layers = []   # list[layers_mod.Layer]; layers[0] = bottom/base layer
-        self._next_layer_id = 1   # monotonically increasing, for stable Treeview iids
-        self._layer_props_dialog = None   # singleton LayerPropertiesDialog, retargeted not stacked
-        self._canvas_background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
+        self.layers = []   # list[layers_mod.Layer]; layers[0] = bottom/base source
+        self._next_layer_id = 1   # monotonically increasing, for stable Layer ids
+        self._last_precision_mm = float(DEFAULTS["precision_mm"])   # see _on_precision_changed
+        self._last_width_mm  = float(DEFAULTS["width_mm"])          # see _on_canvas_size_changed
+        self._last_height_mm = float(DEFAULTS["height_mm"])
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
@@ -113,11 +113,9 @@ class GCodeGeneratorApp:
         file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
                               command=self._save_project)
         file_menu.add_separator()
-        # ── Image ───────────────────────────────────────────────────
-        file_menu.add_command(label="Open Image…",  accelerator="Ctrl+O",
-                              command=self.open_image)
-        file_menu.add_command(label="Import STL…",  accelerator="Ctrl+I",
-                              command=self.import_stl)
+        # ── Source ──────────────────────────────────────────────────
+        file_menu.add_command(label="Open Source…",  accelerator="Ctrl+O",
+                              command=self._open_source_file)
         file_menu.add_separator()
         # ── Toolpath ────────────────────────────────────────────────
         file_menu.add_command(label="Export Toolpath…",
@@ -183,8 +181,7 @@ class GCodeGeneratorApp:
 
         self.root.config(menu=menubar)
         self.root.bind("<Control-n>", lambda e: self._new_project())
-        self.root.bind("<Control-o>", lambda e: self.open_image())
-        self.root.bind("<Control-i>", lambda e: self.import_stl())
+        self.root.bind("<Control-o>", lambda e: self._open_source_file())
         self.root.bind("<Control-s>", lambda e: self._save_project())
         self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self._on_exit())
@@ -277,66 +274,15 @@ class GCodeGeneratorApp:
 
     def _build_sidebar(self, p):
 
-        # ── 0. Layers ───────────────────────────────────────────────────
-        self._build_layers_section(p)
+        # ── 0. Canvas + Sources (dynamic notebook) ─────────────────────
+        self._build_layers_notebook(p)
 
-        # ── 1. Physical Image Size ─────────────────────────────────────
-        sf = SectionFrame(p, "Physical Image Size")
-        sf.pack(fill=tk.X, pady=(0, 8))
-        self.width_mm    = LabeledEntry(sf, "Width",         "mm", DEFAULTS["width_mm"],
-                                        minval=1.0, maxval=20000.0, increment=1.0)
-        self.height_mm   = LabeledEntry(sf, "Height",        "mm", DEFAULTS["height_mm"],
-                                        minval=1.0, maxval=20000.0, increment=1.0)
-        self.width_mm.pack(fill=tk.X, pady=2)
-        self.height_mm.pack(fill=tk.X, pady=2)
-
-        self._aspect_lock_var = tk.BooleanVar(value=True)
-        self._image_aspect    = None   # pixel W/H of the loaded image
-        ttk.Checkbutton(self.height_mm, text="Lock",
-                        variable=self._aspect_lock_var,
-                        command=self._on_aspect_lock_toggle
-                        ).pack(side=tk.RIGHT, padx=(0, 4))
-
-        self.max_depth = LabeledEntry(sf, "Max cut depth", "mm", DEFAULTS["max_depth"],
-                                      minval=0.01, maxval=200.0, increment=1.0)
-        self.max_depth.pack(fill=tk.X, pady=2)
-        self.margin_mm = LabeledEntry(sf, "Stock margin", "mm", DEFAULTS["margin_mm"],
-                                      minval=0.0, maxval=5000.0, increment=1.0)
-        self.margin_mm.pack(fill=tk.X, pady=2)
-        self.margin_depth_pct = LabeledEntry(sf, "Margin depth", "%", DEFAULTS["margin_depth_pct"],
-                                             minval=0.0, maxval=100.0, increment=5.0)
-        self.margin_depth_pct.pack(fill=tk.X, pady=2)
-        self.width_mm.var.trace_add("write", self._on_width_changed)
-        self.height_mm.var.trace_add("write", lambda *_: self._render())
-        self.max_depth.var.trace_add("write", lambda *_: self._render())
-        self.margin_mm.var.trace_add("write", lambda *_: self._render())
-        self.margin_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
-        self._on_aspect_lock_toggle()   # apply initial locked state
-
-        polarity_row = ttk.Frame(sf)
-        polarity_row.pack(fill=tk.X, pady=(6, 2))
-        ttk.Label(polarity_row, text="z=0 colour:").pack(side=tk.LEFT)
-        self.surface = tk.StringVar(value=DEFAULTS["surface"])
-        ttk.Combobox(polarity_row, textvariable=self.surface,
-                     values=["white", "black"],
-                     state="readonly", width=22).pack(side=tk.RIGHT)
-        self.surface.trace_add("write", self._on_depth_map_content_changed)
-
-        origin_row = ttk.Frame(sf)
-        origin_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(origin_row, text="G-code origin:").pack(side=tk.LEFT)
-        self.origin_var = tk.StringVar(value=DEFAULTS["origin"])
-        ttk.Combobox(origin_row, textvariable=self.origin_var,
-                     values=["Bottom-Left", "Bottom-Right",
-                             "Top-Left", "Top-Right", "Center"],
-                     state="readonly", width=22).pack(side=tk.RIGHT)
-
-        # ── 2. Tool path steps (dynamic notebook) ─────────────────────
+        # ── 1. Tool path steps (dynamic notebook) ──────────────────────
         self._steps_nb = ttk.Notebook(p)
         self._steps_nb.pack(fill=tk.X, pady=(0, 4))
         self._steps_nb.bind("<<NotebookTabChanged>>", self._on_step_tab_changed)
 
-        # ── 3. G-code Info ────────────────────────────────────────────
+        # ── 2. G-code Info ────────────────────────────────────────────
         # Must be created before _add_step() so that info labels can attach.
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
         self._info_frame = ttk.Frame(p)
@@ -345,143 +291,345 @@ class GCodeGeneratorApp:
         self._add_step()   # start with one step
 
     # ------------------------------------------------------------------ #
-    #  Layers panel
+    #  Canvas + Sources notebook
     # ------------------------------------------------------------------ #
-    def _build_layers_section(self, p):
-        sf = SectionFrame(p, "Layers", collapsible=True)
-        sf.pack(fill=tk.X, pady=(0, 8))
-        body = sf.body
+    def _build_layers_notebook(self, p):
+        """One ttk.Notebook mirroring the Steps notebook's pattern: tab 0 is
+        the permanent Canvas tab (physical size / precision / etc, never
+        closed or reordered), tabs 1..N are one per imported source
+        (self.layers), index-aligned, in stack order (bottom-of-stack first,
+        same order as self.layers -- no reversal, no separate list widget)."""
+        self._layers_nb = ttk.Notebook(p)
+        self._layers_nb.pack(fill=tk.X, pady=(0, 8))
+        self._layer_tabs = []   # list of dicts, index-aligned with self.layers
+        self._build_canvas_tab()
 
-        tree_frame = ttk.Frame(body)
-        tree_frame.pack(fill=tk.X, pady=(0, 4))
-        self._layers_tree = ttk.Treeview(
-            tree_frame, columns=("blend",), show="tree headings",
-            height=5, selectmode="browse")
-        self._layers_tree.heading("#0", text="Layer")
-        self._layers_tree.heading("blend", text="Blend")
-        self._layers_tree.column("#0", width=140, anchor=tk.W, stretch=True)
-        self._layers_tree.column("blend", width=70, anchor=tk.W, stretch=False)
-        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._layers_tree.yview)
-        self._layers_tree.configure(yscrollcommand=vsb.set)
-        self._layers_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._layers_tree.bind("<Double-Button-1>", self._on_layers_tree_double_click)
+    def _build_canvas_tab(self):
+        tab = ttk.Frame(self._layers_nb, padding=(8, 6))
+        self._layers_nb.add(tab, text="Canvas")
 
-        btn_row = ttk.Frame(body)
-        btn_row.pack(fill=tk.X)
-        ttk.Button(btn_row, text="+ Image…", width=9,
-                   command=self._add_layer_from_image_dialog).pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Button(btn_row, text="+ STL…", width=7,
-                   command=self._add_layer_from_stl_dialog).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="↑", width=2,
-                   command=lambda: self._move_layer_selected(+1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="↓", width=2,
-                   command=lambda: self._move_layer_selected(-1)).pack(side=tk.LEFT, padx=2)
+        self.width_mm  = LabeledEntry(tab, "Width",  "mm", DEFAULTS["width_mm"],
+                                      minval=1.0, maxval=20000.0, increment=1.0)
+        self.height_mm = LabeledEntry(tab, "Height", "mm", DEFAULTS["height_mm"],
+                                      minval=1.0, maxval=20000.0, increment=1.0)
+        self.width_mm.pack(fill=tk.X, pady=2)
+        self.height_mm.pack(fill=tk.X, pady=2)
 
-        btn_row2 = ttk.Frame(body)
-        btn_row2.pack(fill=tk.X, pady=(2, 0))
-        self._layer_remove_btn = ttk.Button(btn_row2, text="Remove",
-                                            command=self._remove_selected_layer)
-        self._layer_remove_btn.pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Button(btn_row2, text="Duplicate",
-                   command=self._duplicate_selected_layer).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row2, text="Properties…",
-                   command=self._open_selected_layer_properties).pack(side=tk.LEFT, padx=2)
+        self._aspect_lock_var = tk.BooleanVar(value=True)
+        self._image_aspect    = None   # pixel W/H of the first imported source
+        ttk.Checkbutton(self.height_mm, text="Lock",
+                        variable=self._aspect_lock_var,
+                        command=self._on_aspect_lock_toggle
+                        ).pack(side=tk.RIGHT, padx=(0, 4))
 
-        self._refresh_layers_tree()
+        self.precision_mm = LabeledEntry(
+            tab, "Precision", "mm", DEFAULTS["precision_mm"],
+            minval=0.01, maxval=50.0, increment=0.1)
+        self.precision_mm.pack(fill=tk.X, pady=2)
 
-    def _layers_display_order(self):
-        """Top-of-stack first, matching how a user expects a layer list to
-        read (self.layers[0] is the bottom/base layer internally)."""
-        return list(reversed(self.layers))
+        self.max_depth = LabeledEntry(tab, "Max cut depth", "mm", DEFAULTS["max_depth"],
+                                      minval=0.01, maxval=200.0, increment=1.0)
+        self.max_depth.pack(fill=tk.X, pady=2)
+        self.margin_mm = LabeledEntry(tab, "Stock margin", "mm", DEFAULTS["margin_mm"],
+                                      minval=0.0, maxval=5000.0, increment=1.0)
+        self.margin_mm.pack(fill=tk.X, pady=2)
+        self.margin_depth_pct = LabeledEntry(tab, "Margin depth", "%", DEFAULTS["margin_depth_pct"],
+                                             minval=0.0, maxval=100.0, increment=5.0)
+        self.margin_depth_pct.pack(fill=tk.X, pady=2)
+        self.background_depth_pct = LabeledEntry(
+            tab, "Background depth", "%", DEFAULTS["canvas_background_depth_pct"],
+            minval=0.0, maxval=100.0, increment=5.0)
+        self.background_depth_pct.pack(fill=tk.X, pady=2)
 
-    def _refresh_layers_tree(self):
-        tree = self._layers_tree
-        sel = tree.selection()
-        tree.delete(*tree.get_children())
-        for layer in self._layers_display_order():
-            tree.insert("", tk.END, iid=layer.layer_id, text=layer.name,
-                       values=(layer.blend_mode,),
-                       tags=() if layer.visible else ("hidden",))
-        tree.tag_configure("hidden", foreground="#999999")
-        for iid in sel:
-            if tree.exists(iid):
-                tree.selection_add(iid)
-        self._layer_remove_btn.config(
-            state=tk.DISABLED if len(self.layers) <= 1 else tk.NORMAL)
+        self.width_mm.var.trace_add("write", self._on_width_changed)
+        self.height_mm.var.trace_add("write", self._on_canvas_size_changed)
+        self.precision_mm.var.trace_add("write", self._on_precision_changed)
+        self.max_depth.var.trace_add("write", lambda *_: self._render())
+        self.margin_mm.var.trace_add("write", lambda *_: self._render())
+        self.margin_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
+        self.background_depth_pct.var.trace_add("write", self._on_depth_map_content_changed)
+        self._on_aspect_lock_toggle()   # apply initial locked state
 
-    def _selected_layer(self):
-        sel = self._layers_tree.selection()
-        if not sel:
-            return None
-        for layer in self.layers:
-            if layer.layer_id == sel[0]:
-                return layer
-        return None
+        polarity_row = ttk.Frame(tab)
+        polarity_row.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(polarity_row, text="z=0 colour:").pack(side=tk.LEFT)
+        self.surface = tk.StringVar(value=DEFAULTS["surface"])
+        ttk.Combobox(polarity_row, textvariable=self.surface,
+                     values=["white", "black"],
+                     state="readonly", width=22).pack(side=tk.RIGHT)
+        self.surface.trace_add("write", self._on_depth_map_content_changed)
 
-    def _select_layer(self, layer):
-        self._layers_tree.selection_set(layer.layer_id)
-        self._layers_tree.see(layer.layer_id)
+        origin_row = ttk.Frame(tab)
+        origin_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(origin_row, text="G-code origin:").pack(side=tk.LEFT)
+        self.origin_var = tk.StringVar(value=DEFAULTS["origin"])
+        ttk.Combobox(origin_row, textvariable=self.origin_var,
+                     values=["Bottom-Left", "Bottom-Right",
+                             "Top-Left", "Top-Right", "Center"],
+                     state="readonly", width=22).pack(side=tk.RIGHT)
 
-    def _on_layers_tree_double_click(self, _event):
-        layer = self._selected_layer()
-        if layer is not None:
-            self._open_layer_properties(layer)
+    def _canvas_shape_px(self):
+        """Canvas pixel shape (W, H), derived from physical size and
+        Precision -- the single source of truth for how big the depth map
+        is, replacing the old 'whichever source was imported first' rule."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+        try:
+            precision_mm = float(self.precision_mm.get())
+        except ValueError:
+            precision_mm = float(DEFAULTS["precision_mm"])
+        if precision_mm <= 1e-9:
+            precision_mm = float(DEFAULTS["precision_mm"])
+        W = max(2, round(width_mm / precision_mm))
+        H = max(2, round(height_mm / precision_mm))
+        return W, H
 
-    def _open_selected_layer_properties(self):
-        layer = self._selected_layer()
-        if layer is not None:
-            self._open_layer_properties(layer)
+    def _fit_scale_pct(self, native_w_px, native_h_px):
+        """Scale-% that makes a *native_w_px* x *native_h_px* image fit
+        entirely within the current canvas (preserving the image's own
+        aspect ratio -- 'contain', not stretch/crop). At scale_pct=100, one
+        image pixel maps to exactly one canvas pixel (see
+        layers._affine_params), so an image whose native resolution has no
+        relation to the canvas's Precision-driven pixel density would
+        otherwise appear cropped to a tiny corner or absurdly oversized;
+        this makes a freshly added image appear at a sensible size by
+        default regardless of its native resolution."""
+        if native_w_px <= 0 or native_h_px <= 0:
+            return 100.0
+        canvas_w_px, canvas_h_px = self._canvas_shape_px()
+        scale = min(canvas_w_px / native_w_px, canvas_h_px / native_h_px)
+        return max(1.0, scale * 100.0)
 
-    def _open_layer_properties(self, layer):
-        title = f"Layer Properties — {layer.name}"
-        is_base = self.layers.index(layer) == 0
-        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
-            self._layer_props_dialog.retarget(layer, title=title, is_base=is_base)
-            self._layer_props_dialog.lift()
-            self._layer_props_dialog.focus_set()
-        else:
-            self._layer_props_dialog = LayerPropertiesDialog(
-                self.root, layer, self._on_layer_property_changed, title=title, is_base=is_base)
-
-    def _remove_selected_layer(self):
-        layer = self._selected_layer()
-        if layer is None or len(self.layers) <= 1:
-            return
-        self.layers.remove(layer)
-        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists() \
-                and self._layer_props_dialog.layer is layer:
-            self._layer_props_dialog.destroy()
-            self._layer_props_dialog = None
+    def _on_canvas_shape_changed(self, *_):
+        """Shared tail once canvas pixel shape and/or every source's
+        placement has already been reconciled with whatever just changed
+        (Width/Height via _on_canvas_size_changed, Precision via
+        _on_precision_changed): warn if the resulting array is huge, then
+        treat this as a structural change like add/remove -- invalidate
+        caches and recomposite every source onto the new grid."""
+        W, H = self._canvas_shape_px()
+        if W * H > 16_000_000:
+            self.status_var.set(
+                f"Warning: canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
+                "this may be slow. Consider a coarser Precision.")
         self._on_layers_structure_changed()
 
-    def _duplicate_selected_layer(self):
-        layer = self._selected_layer()
-        if layer is None:
+    def _on_canvas_size_changed(self, *_):
+        """Width/Height changed. The canvas's pixel *density* is set solely
+        by Precision (_canvas_shape_px's W/width_mm ratio is always
+        ~1/Precision, independent of width_mm) -- but its *extent* just
+        changed, and every source's placement (Scale-%, Offset X/Y) is
+        stored either in raw pixel-space terms or in absolute mm, neither
+        of which moves with the canvas's own size. Left alone, resizing the
+        board would silently shrink/grow every source's size and position
+        RELATIVE TO THE CANVAS, discarding a layout the user already tuned
+        by hand. Rescale every source's Offset X/Y and Scale-% by the ratio
+        each canvas dimension changed by, so the whole composition simply
+        scales together with the board -- the user's relative layout
+        survives a Width/Height edit untouched; only the absolute physical
+        size of the whole carving changes."""
+        try:
+            new_width_mm  = float(self.width_mm.get())
+            new_height_mm = float(self.height_mm.get())
+        except ValueError:
             return
+        if new_width_mm > 1e-9 and new_height_mm > 1e-9:
+            old_width_mm, old_height_mm = self._last_width_mm, self._last_height_mm
+            if (old_width_mm > 1e-9 and old_height_mm > 1e-9
+                    and (new_width_mm != old_width_mm or new_height_mm != old_height_mm)):
+                width_ratio  = new_width_mm / old_width_mm
+                height_ratio = new_height_mm / old_height_mm
+                # Scale-% is a single pixel-space factor shared by both axes
+                # (layers._affine_params has one 's', not sx/sy), so when
+                # width/height didn't change by the same ratio (aspect lock
+                # off), the geometric mean is the closest a uniform factor
+                # can get to matching both axes at once.
+                scale_ratio = float(np.sqrt(width_ratio * height_ratio))
+                for layer in self.layers:
+                    layer.offset_x_mm *= width_ratio
+                    layer.offset_y_mm *= height_ratio
+                    layer.scale_pct = min(1000.0, max(1.0, layer.scale_pct * scale_ratio))
+            self._last_width_mm, self._last_height_mm = new_width_mm, new_height_mm
+        self._on_canvas_shape_changed()
+
+    def _on_precision_changed(self, *_):
+        """Precision changed -- unlike Width/Height, this DOES change canvas
+        pixel density (1/Precision), and Scale-% is a pixel-space factor
+        (layers._affine_params' scale matrix has no mm/px_per_mm term at
+        all -- only the offset does), so a fixed Scale-% would otherwise
+        render at a different physical size purely because Precision moved.
+        Rescale every source's Scale-% by the same ratio the density
+        changed by, so each source's physical footprint on the stock --
+        the user's actual design decision -- survives untouched; only the
+        internal detail/resolution changes."""
+        try:
+            new_precision_mm = float(self.precision_mm.get())
+        except ValueError:
+            return
+        if new_precision_mm > 1e-9:
+            old_precision_mm = self._last_precision_mm
+            if old_precision_mm > 1e-9 and new_precision_mm != old_precision_mm:
+                ratio = old_precision_mm / new_precision_mm
+                for layer in self.layers:
+                    layer.scale_pct = min(1000.0, max(1.0, layer.scale_pct * ratio))
+            self._last_precision_mm = new_precision_mm
+        self._on_canvas_shape_changed()
+
+    # ------------------------------------------------------------------ #
+    #  Source tabs
+    # ------------------------------------------------------------------ #
+    def _make_layer_tab(self, layer):
+        tab = ttk.Frame(self._layers_nb, padding=(8, 6))
+        self._layers_nb.add(tab, text="")
+        entry = {'tab': tab, 'layer': layer}
+
+        # Claim bottom space before content so buttons stay pinned to the
+        # bottom, mirroring Steps' _add_step.
+        bf = ttk.Frame(tab)
+        bf.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        bf.columnconfigure(0, weight=1)
+        bf.columnconfigure(1, weight=1)
+
+        self._build_layer_tab_widgets(tab, entry)
+
+        ttk.Button(bf, text="Duplicate",
+                   command=lambda: self._duplicate_layer_tab(entry)
+                   ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        ttk.Button(bf, text="Add Source",
+                   command=lambda: self._add_source_after(entry)
+                   ).grid(row=1, column=0, sticky="ew", padx=(0, 2))
+        entry['remove_btn'] = ttk.Button(
+            bf, text="Remove this source",
+            command=lambda: self._remove_layer_tab(entry))
+        entry['remove_btn'].grid(row=1, column=1, sticky="ew", padx=(2, 0))
+        return entry
+
+    def _build_layer_tab_widgets(self, tab, entry):
+        layer = entry['layer']
+        is_base = self.layers.index(layer) == 0
+
+        ox = LabeledEntry(tab, "Offset X", "mm", str(layer.offset_x_mm),
+                          minval=-100000.0, maxval=100000.0, increment=1.0)
+        ox.pack(fill=tk.X, pady=2)
+        oy = LabeledEntry(tab, "Offset Y", "mm", str(layer.offset_y_mm),
+                          minval=-100000.0, maxval=100000.0, increment=1.0)
+        oy.pack(fill=tk.X, pady=2)
+        rot = LabeledEntry(tab, "Rotation", "deg", str(layer.rotation_deg),
+                           minval=-360.0, maxval=360.0, increment=1.0)
+        rot.pack(fill=tk.X, pady=2)
+        scale = LabeledEntry(tab, "Scale", "%", str(layer.scale_pct),
+                             minval=1.0, maxval=1000.0, increment=1.0)
+        scale.pack(fill=tk.X, pady=2)
+
+        blend_row = ttk.Frame(tab)
+        blend_row.pack(fill=tk.X, pady=2)
+        ttk.Label(blend_row, text="Blend mode:").pack(side=tk.LEFT)
+        blend_var = tk.StringVar(value=layer.blend_mode)
+        if is_base:
+            # Forced to Replace at composite time regardless of what's
+            # stored (see layers.composite) -- so it isn't user-editable.
+            ttk.Label(blend_row, text="Replace (base source)",
+                      foreground="#666666").pack(side=tk.RIGHT)
+        else:
+            ttk.Combobox(blend_row, textvariable=blend_var,
+                        values=BLEND_MODES, state="readonly", width=14
+                        ).pack(side=tk.RIGHT)
+
+        opacity = LabeledEntry(tab, "Opacity", "%", str(layer.opacity_pct),
+                               minval=0.0, maxval=100.0, increment=5.0)
+        opacity.pack(fill=tk.X, pady=2)
+        min_depth = LabeledEntry(tab, "Min depth", "%", str(layer.min_depth_pct),
+                                 minval=0.0, maxval=100.0, increment=5.0)
+        min_depth.pack(fill=tk.X, pady=2)
+        max_depth = LabeledEntry(tab, "Max depth", "%", str(layer.max_depth_pct),
+                                 minval=0.0, maxval=100.0, increment=5.0)
+        max_depth.pack(fill=tk.X, pady=2)
+
+        visible_var = tk.BooleanVar(value=layer.visible)
+        ttk.Checkbutton(tab, text="Visible", variable=visible_var
+                        ).pack(anchor=tk.W, pady=2)
+
+        def _apply(*_):
+            try:
+                layer.offset_x_mm   = float(ox.get())
+                layer.offset_y_mm   = float(oy.get())
+                layer.rotation_deg  = float(rot.get())
+                layer.scale_pct     = float(scale.get())
+                layer.opacity_pct   = float(opacity.get())
+                layer.min_depth_pct = float(min_depth.get())
+                layer.max_depth_pct = float(max_depth.get())
+            except ValueError:
+                return   # mid-edit invalid text -- skip silently
+            layer.blend_mode = blend_var.get()   # no-op when is_base
+            layer.visible    = visible_var.get()
+            self._on_layer_property_changed()
+
+        for var in (ox.var, oy.var, rot.var, scale.var, opacity.var,
+                    min_depth.var, max_depth.var, blend_var):
+            var.trace_add("write", _apply)
+        visible_var.trace_add("write", _apply)
+
+    def _renumber_layer_tabs(self):
+        for i, entry in enumerate(self._layer_tabs, start=1):
+            self._layers_nb.tab(entry['tab'], text=f"Source {i}: {entry['layer'].name}")
+
+    def _update_layer_remove_buttons(self):
+        state = tk.DISABLED if len(self._layer_tabs) <= 1 else tk.NORMAL
+        for entry in self._layer_tabs:
+            entry['remove_btn'].config(state=state)
+
+    def _select_layer_tab(self, layer):
+        for entry in self._layer_tabs:
+            if entry['layer'] is layer:
+                self._layers_nb.select(entry['tab'])
+                return
+
+    def _refresh_layer_tabs(self):
+        """(Re)build every source tab from self.layers. Full teardown/
+        rebuild rather than Steps' incremental insert/forget: sources
+        restructure far less often than steps get added/removed, and
+        unlike Steps there's no 'insert after the currently selected tab'
+        position to preserve -- append-only plus arbitrary-position
+        Duplicate is simplest to get right by just recomputing from
+        scratch."""
+        selected_layer = None
+        if self._layer_tabs:
+            try:
+                current = self._layers_nb.index("current")
+                if current > 0:   # 0 is the Canvas tab
+                    selected_layer = self._layer_tabs[current - 1]['layer']
+            except tk.TclError:
+                pass
+
+        for entry in self._layer_tabs:
+            self._layers_nb.forget(entry['tab'])
+            entry['tab'].destroy()
+
+        self._layer_tabs = [self._make_layer_tab(layer) for layer in self.layers]
+        self._renumber_layer_tabs()
+        self._update_layer_remove_buttons()
+
+        if selected_layer is not None:
+            self._select_layer_tab(selected_layer)
+
+    def _remove_layer_tab(self, entry):
+        if len(self.layers) <= 1:
+            return
+        self.layers.remove(entry['layer'])
+        self._on_layers_structure_changed()
+
+    def _duplicate_layer_tab(self, entry):
         import copy
-        dup = copy.copy(layer)
+        dup = copy.copy(entry['layer'])
         dup.layer_id = self._new_layer_id()
-        dup.name = f"{layer.name} copy"
-        idx = self.layers.index(layer)
+        dup.name = f"{entry['layer'].name} copy"
+        idx = self.layers.index(entry['layer'])
         self.layers.insert(idx + 1, dup)
         self._on_layers_structure_changed()
-        self._select_layer(dup)
-
-    def _move_layer_selected(self, list_index_delta):
-        """list_index_delta is in self.layers order (bottom-to-top); the ↑
-        button (move toward the top of the stack, i.e. toward the top of the
-        displayed list) therefore passes +1, ↓ passes -1."""
-        layer = self._selected_layer()
-        if layer is None:
-            return
-        idx = self.layers.index(layer)
-        new_idx = idx + list_index_delta
-        if not (0 <= new_idx < len(self.layers)):
-            return
-        self.layers[idx], self.layers[new_idx] = self.layers[new_idx], self.layers[idx]
-        self._on_layers_structure_changed()
-        self._select_layer(layer)
+        self._select_layer_tab(dup)
 
     def _add_step(self):
         """Insert a new step tab after the currently selected tab."""
@@ -1005,15 +1153,22 @@ class GCodeGeneratorApp:
 
         self.placeholder = ttk.Label(
             parent,
-            text="Open an image via File → Open Image…",
+            text="Open a source via File → Open Source…",
             font=("Helvetica", 13),
             foreground="#888888",
         )
         self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     # ------------------------------------------------------------------ #
-    #  File / image actions
+    #  File / source actions
     # ------------------------------------------------------------------ #
+    _SOURCE_FILETYPES = [
+        ("All supported files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp *.stl"),
+        ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp"),
+        ("STL files", "*.stl"),
+        ("All files", "*.*"),
+    ]
+
     def _new_layer_id(self):
         lid = f"layer{self._next_layer_id}"
         self._next_layer_id += 1
@@ -1032,42 +1187,87 @@ class GCodeGeneratorApp:
                                 source_kind="image", path=path,
                                 layer_id=self._new_layer_id())
 
-    def _load_stl_layer(self, image, alpha, path, dlg):
-        """Wrap an already-rasterized STL heightmap (*image*/*alpha*, from
-        stl_mesh.normalize_and_orient) as a new (unattached) Layer. *alpha*
-        excludes holes (no triangle coverage) from the layer's footprint."""
-        stl_params = {'width_px': dlg.width_px, 'height_px': dlg.height_px,
+    def _stl_raster_px(self, mesh_w_mm, mesh_h_mm, scale_pct=100.0):
+        """Target (width_px, height_px) for rasterizing an STL source of the
+        given (rotated) mesh bounding-box size at the canvas's current pixel
+        density (1/Precision, independent of Width/Height mm -- see
+        _canvas_shape_px), scaled up if the source will be enlarged on the
+        canvas (scale_pct > 100) so upscaling at composite time doesn't
+        blur mesh detail that could have been rasterized at higher
+        resolution to begin with. Bounds-independent so it can be reused
+        both at import time (fresh bounds) and to re-evaluate an already-
+        rasterized source's staleness (stored mesh_w_mm/mesh_h_mm)."""
+        try:
+            precision_mm = float(self.precision_mm.get())
+        except ValueError:
+            precision_mm = float(DEFAULTS["precision_mm"])
+        if precision_mm <= 1e-9:
+            precision_mm = float(DEFAULTS["precision_mm"])
+        # canvas_footprint_px = width_px * (scale_pct/100) (see
+        # layers._affine_params), so matching the canvas's own density at
+        # the ENLARGED footprint means width_px must grow WITH scale_pct,
+        # not shrink -- detail_factor = scale_pct/100, not its reciprocal.
+        detail_factor = max(scale_pct, 1.0) / 100.0
+        width_px  = max(2, round(mesh_w_mm / precision_mm * detail_factor))
+        height_px = max(2, round(mesh_h_mm / precision_mm * detail_factor))
+        return width_px, height_px
+
+    def _stl_raster_dims(self, xy_bounds, z_bounds, rot_x, rot_y, rot_z, scale_pct=100.0):
+        """Compute (width_px, height_px, mesh_w_mm, mesh_h_mm) for
+        rasterizing an STL source described by *xy_bounds*/*z_bounds* at
+        rotation (0,0,0), rotated by rot_x/rot_y/rot_z first."""
+        (x_min, x_max, y_min, y_max), _ = stl_mesh.rotate_bounds(
+            xy_bounds, z_bounds, rot_x, rot_y, rot_z)
+        mesh_w_mm = max(x_max - x_min, 1e-6)
+        mesh_h_mm = max(y_max - y_min, 1e-6)
+        width_px, height_px = self._stl_raster_px(mesh_w_mm, mesh_h_mm, scale_pct)
+        return width_px, height_px, mesh_w_mm, mesh_h_mm
+
+    def _build_stl_layer(self, path, triangles, dlg, xy_bounds, z_bounds):
+        """Rasterize *triangles* (already validated/loaded) per *dlg*'s
+        orientation at the canvas's current density and wrap the result as
+        a new (unattached) Layer, or show an error dialog and return None
+        on failure."""
+        width_px, height_px, mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
+            xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+        try:
+            rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            raw     = stl_mesh.generate_heightmap(rotated, width_px, height_px)
+            image, alpha = stl_mesh.normalize_and_orient(raw)
+        except Exception as exc:
+            messagebox.showerror("Import Error", str(exc))
+            return None
+        stl_params = {'width_px': width_px, 'height_px': height_px,
+                      'mesh_w_mm': mesh_w_mm, 'mesh_h_mm': mesh_h_mm,
                       'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y, 'rot_z': dlg.rot_z}
         return layers_mod.Layer(name=os.path.basename(path), raw=image, alpha=alpha,
                                 source_kind="stl", path=path, stl_params=stl_params,
                                 layer_id=self._new_layer_id())
 
     def _establish_base_image_layer(self, path):
-        """Load *path* as a fresh base/canvas-defining layer: shows
-        CanvasSetupDialog to let the user pick canvas resolution (default =
-        the image's own native size) and background depth, resizes the
-        loaded layer to match if the user changed the resolution, and sets
-        self.layers = [layer]. Returns True on success, False if the user
-        cancelled or loading failed -- caller is responsible for calling
+        """Load *path* as a fresh base/canvas-defining source at its native
+        resolution and set self.layers = [layer] -- it gets resampled onto
+        the canvas grid like every other source during compositing (see
+        _recompute_composite). Returns True on success, False if loading
+        failed -- caller is responsible for calling
         _on_layers_structure_changed() afterward."""
         layer = self._load_image_layer(path)
         if layer is None:
             return False
         h, w = layer.raw.shape
-        dlg = CanvasSetupDialog(self.root, w, h,
-                                default_background_depth_pct=self._canvas_background_depth_pct)
-        if not dlg.confirmed:
-            return False
-        if (dlg.height_px, dlg.width_px) != (h, w):
-            layer.raw = layers_mod.resize_raw(layer.raw, (dlg.height_px, dlg.width_px))
-            if layer.alpha is not None:
-                layer.alpha = layers_mod.resize_raw(layer.alpha, (dlg.height_px, dlg.width_px))
-        self._canvas_background_depth_pct = dlg.background_depth_pct
-        self.layers = [layer]
-        h, w = layer.raw.shape
+        # self.layers is assigned last, after any height_mm recalc: while
+        # it cascades through _on_canvas_size_changed (see there), that
+        # must not rescale THIS brand-new, not-yet-placed layer -- it
+        # should only ever apply to sources that existed before the resize.
         if self._aspect_lock_var.get():
             self._image_aspect = w / h
             self._recalc_height()
+        # Recalc first (when aspect-locked) so the canvas already matches
+        # the image's own aspect ratio -- fit-to-canvas then lands on
+        # scale_x == scale_y, i.e. the image exactly fills the canvas
+        # rather than being letterboxed against a stale height.
+        layer.scale_pct = self._fit_scale_pct(w, h)
+        self.layers = [layer]
         return True
 
     def _recompute_composite(self):
@@ -1081,18 +1281,19 @@ class GCodeGeneratorApp:
             return
 
         base = self.layers[0]
-        H, W = base.raw.shape
+        W, H = self._canvas_shape_px()
 
         # Bit-identical fast path for the overwhelmingly common case (one
-        # layer, default settings): skip the depth round-trip entirely
-        # rather than merely approximating it, so a fresh single-layer
-        # project behaves exactly as it did before layers existed. A base
-        # layer with real alpha must NOT take this shortcut -- background
-        # would never show through wherever it's partially transparent.
+        # source, default settings, already at the canvas's own pixel
+        # shape): skip the depth round-trip entirely rather than merely
+        # approximating it. A base source with real alpha must NOT take
+        # this shortcut -- background would never show through wherever
+        # it's partially transparent.
         if (len(self.layers) == 1 and base.visible and base.opacity_pct >= 100.0
                 and base.blend_mode == "Replace"
                 and base.min_depth_pct == 0.0 and base.max_depth_pct == 100.0
-                and base.is_identity_placement() and base.alpha is None):
+                and base.is_identity_placement() and base.alpha is None
+                and base.raw.shape == (H, W)):
             self.current_image = base.raw
             self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
             return
@@ -1104,27 +1305,30 @@ class GCodeGeneratorApp:
             width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
         px_per_mm_x = W / width_mm if width_mm > 1e-9 else 1.0
         px_per_mm_y = H / height_mm if height_mm > 1e-9 else 1.0
+        try:
+            background_depth_pct = float(self.background_depth_pct.get())
+        except ValueError:
+            background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
 
         self.current_image = layers_mod.composite(
             self.layers, (H, W), px_per_mm_x, px_per_mm_y, self.surface.get(),
-            background_depth=self._canvas_background_depth_pct / 100.0)
+            background_depth=background_depth_pct / 100.0)
         self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
 
     def _on_layer_property_changed(self):
-        """Live-edit callback: a layer's placement/blend/visibility changed,
-        but the layer stack's membership/order/canvas-defining layer didn't.
-        Mirrors _on_depth_map_content_changed's cache-invalidation scope."""
+        """Live-edit callback: a source's placement/blend/visibility
+        changed, but the stack's membership/order didn't. Mirrors
+        _on_depth_map_content_changed's cache-invalidation scope. No tab
+        refresh needed -- the edited fields already live on the source's
+        own tab, so there's nothing else to resync."""
         self._recompute_composite()
         self._erosion_cache.clear()
-        self._refresh_layers_tree()
         self._render()
 
     def _on_layers_structure_changed(self):
-        """Shared tail for anything that changes which layers exist, their
-        order, or which one defines canvas resolution: layer add/remove/
-        reorder/duplicate, open_image, _finish_stl_import, and project load.
-        Equivalent to the reset block that used to live inline in
-        open_image()/_finish_stl_import()."""
+        """Shared tail for anything that changes which sources exist, their
+        order, or the canvas's pixel shape: source add/remove/duplicate,
+        Canvas Width/Height/Precision edits, project load."""
         self._recompute_composite()
         self._erosion_cache.clear()
         self.toolpaths = [None] * len(self.steps)
@@ -1136,55 +1340,71 @@ class GCodeGeneratorApp:
             self.placeholder.place_forget()
         else:
             self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-        self._refresh_layers_tree()
+        self._refresh_layer_tabs()
         self._render()
 
-    def _add_layer_from_image_dialog(self):
-        path = filedialog.askopenfilename(
-            title="Add Image Layer",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp"),
-                ("PNG files", "*.png"),
-                ("JPEG files", "*.jpg *.jpeg"),
-                ("All files", "*.*"),
-            ]
-        )
+    def _open_source_file(self):
+        """File -> Open Source...: replaces the whole project with just
+        this one source, establishing it as the base/canvas-defining
+        source (same as the pre-unification 'Open Image'/'Import STL')."""
+        path = filedialog.askopenfilename(title="Open Source",
+                                          filetypes=self._SOURCE_FILETYPES)
         if not path:
             return
+        if path.lower().endswith(".stl"):
+            self._import_stl_as_base(path)
+        else:
+            if not self._establish_base_image_layer(path):
+                return
+            h, w = self.layers[0].raw.shape
+            self._on_layers_structure_changed()
+            self.status_var.set(
+                f"Loaded: {path}  |  {w} x {h} px  |  {self.n_grey_levels} gray levels")
+
+    def _add_source_after(self, entry):
+        """Per-tab 'Add Source' button: inserts a new source right after
+        the tab it's on, mirroring Steps' 'Add Step After'."""
+        path = filedialog.askopenfilename(title="Add Source",
+                                          filetypes=self._SOURCE_FILETYPES)
+        if not path:
+            return
+        insert_at = self.layers.index(entry['layer']) + 1
+        if path.lower().endswith(".stl"):
+            self._add_stl_source(path, insert_at)
+        else:
+            self._add_image_source(path, insert_at)
+
+    def _add_image_source(self, path, insert_at):
         if not self.layers:
-            # No canvas established yet -- this append action is actually
-            # the first layer, so it goes through the same canvas-setup flow
-            # as File -> Open Image rather than a plain append.
+            # No canvas established yet -- this action is actually the
+            # first source, so it establishes the base rather than a
+            # plain insert.
             if not self._establish_base_image_layer(path):
                 return
             self._on_layers_structure_changed()
-            self._select_layer(self.layers[0])
+            self._select_layer_tab(self.layers[0])
             self.status_var.set(f"Loaded: {path}")
             return
         layer = self._load_image_layer(path)
         if layer is None:
             return
-        self.layers.append(layer)
+        h, w = layer.raw.shape
+        layer.scale_pct = self._fit_scale_pct(w, h)
+        self.layers.insert(max(0, min(insert_at, len(self.layers))), layer)
         self._on_layers_structure_changed()
-        self._select_layer(layer)
-        self.status_var.set(f"Added image layer: {path}")
+        self._select_layer_tab(layer)
+        self.status_var.set(f"Added image source: {path}")
 
-    def _add_layer_from_stl_dialog(self):
-        """Appends an STL-derived layer onto the existing canvas -- unlike
-        Import STL (which resets to a fresh single-layer project), this
+    def _add_stl_source(self, path, insert_at):
+        """Inserts an STL-derived source onto the existing canvas -- unlike
+        Open Source (which resets to a fresh single-source project), this
         never touches Physical Image Size, since resizing the canvas to fit
-        a newly-appended decorative layer would silently move every other
-        layer's placement relative to the stock. If no canvas exists yet
-        (self.layers is empty), this action IS establishing the base layer,
-        so it delegates to _finish_stl_import -- the same full reset flow
-        Import STL uses -- instead of a plain append."""
+        a newly-inserted decorative source would silently move every other
+        source's placement relative to the stock. If no canvas exists yet
+        (self.layers is empty), this action IS establishing the base
+        source, so it delegates to _finish_stl_import -- the same full
+        reset flow Open Source uses -- instead of a plain insert."""
         is_base = not self.layers
-        path = filedialog.askopenfilename(
-            title="Add STL Layer",
-            filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
-        )
-        if not path:
-            return
         try:
             triangles = stl_mesh.load_stl(path)
         except Exception as exc:
@@ -1197,24 +1417,18 @@ class GCodeGeneratorApp:
         if not dlg.confirmed:
             return
 
-        try:
-            rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
-            raw     = stl_mesh.generate_heightmap(rotated, dlg.width_px, dlg.height_px)
-            image, alpha = stl_mesh.normalize_and_orient(raw)
-        except Exception as exc:
-            messagebox.showerror("Import Error", str(exc))
-            return
-
         if is_base:
-            self._finish_stl_import(image, alpha, path, triangles, dlg, xy_bounds, z_bounds)
-            self._select_layer(self.layers[0])
+            self._finish_stl_import(path, triangles, dlg, xy_bounds, z_bounds)
+            self._select_layer_tab(self.layers[0])
             return
 
-        layer = self._load_stl_layer(image, alpha, path, dlg)
-        self.layers.append(layer)
+        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
+        if layer is None:
+            return
+        self.layers.insert(max(0, min(insert_at, len(self.layers))), layer)
         self._on_layers_structure_changed()
-        self._select_layer(layer)
-        self.status_var.set(f"Added STL layer: {os.path.basename(path)}")
+        self._select_layer_tab(layer)
+        self.status_var.set(f"Added STL source: {os.path.basename(path)}")
 
     def _on_aspect_lock_toggle(self):
         if self._aspect_lock_var.get():
@@ -1239,47 +1453,26 @@ class GCodeGeneratorApp:
     def _on_width_changed(self, *_):
         self._recalc_height()
         if not self._aspect_lock_var.get():
-            self._render()
+            # Aspect-locked: _recalc_height()'s height_mm.set() cascades into
+            # height_mm's own trace (_on_canvas_size_changed), which already
+            # sees both the new width and new height in one shot -- calling
+            # it again here would double-apply the correction.
+            self._on_canvas_size_changed()
 
     def _on_depth_map_content_changed(self, *_):
-        """z=0 colour / margin depth change the *content* of depth_map without
-        changing the erosion cache key, so any cached entry is now stale.
-        z=0 colour also feeds directly into layer compositing (raw<->depth
-        polarity), so the composite itself must be recomputed too -- for a
-        single default layer this is a no-op via the fast path in
-        _recompute_composite(), but blended/inverted multi-layer stacks
-        genuinely change result when the polarity flips."""
+        """z=0 colour / margin depth / background depth change the *content*
+        of depth_map without changing the erosion cache key, so any cached
+        entry is now stale. z=0 colour also feeds directly into source
+        compositing (raw<->depth polarity), so the composite itself must be
+        recomputed too -- for a single default source this is a no-op via
+        the fast path in _recompute_composite(), but blended/inverted
+        multi-source stacks genuinely change result when the polarity
+        flips."""
         self._recompute_composite()
         self._erosion_cache.clear()
         self._render()
 
-    def open_image(self):
-        path = filedialog.askopenfilename(
-            title="Open Image",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp"),
-                ("PNG files", "*.png"),
-                ("JPEG files", "*.jpg *.jpeg"),
-                ("All files", "*.*"),
-            ]
-        )
-        if not path:
-            return
-        if not self._establish_base_image_layer(path):
-            return
-        h, w = self.layers[0].raw.shape
-        self._on_layers_structure_changed()
-        self.status_var.set(
-            f"Loaded: {path}  |  {w} x {h} px  |  {self.n_grey_levels} gray levels")
-
-    def import_stl(self):
-        path = filedialog.askopenfilename(
-            title="Import STL",
-            filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-
+    def _import_stl_as_base(self, path):
         try:
             triangles = stl_mesh.load_stl(path)
         except Exception as exc:
@@ -1292,21 +1485,17 @@ class GCodeGeneratorApp:
         if not dlg.confirmed:
             return
 
-        try:
-            rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
-            raw     = stl_mesh.generate_heightmap(rotated, dlg.width_px, dlg.height_px)
-            image, alpha = stl_mesh.normalize_and_orient(raw)
-        except Exception as exc:
-            messagebox.showerror("Import Error", str(exc))
+        self._finish_stl_import(path, triangles, dlg, xy_bounds, z_bounds)
+
+    def _finish_stl_import(self, path, triangles, dlg, xy_bounds, z_bounds):
+        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
+        if layer is None:
             return
 
-        self._finish_stl_import(image, alpha, path, triangles, dlg, xy_bounds, z_bounds)
-
-    def _finish_stl_import(self, image, alpha, path, triangles, dlg, xy_bounds, z_bounds):
-        layer = self._load_stl_layer(image, alpha, path, dlg)
-        self.layers = [layer]
-        self._canvas_background_depth_pct = getattr(dlg, 'background_depth_pct', 0.0)
-
+        # self.layers is assigned last (see the matching note in
+        # _establish_base_image_layer): the width_mm/height_mm.set() calls
+        # below cascade through _on_canvas_size_changed, which must not
+        # rescale THIS brand-new, not-yet-placed layer.
         h, w = layer.raw.shape
         if dlg.populate_physical:
             rotated_xy, rotated_z = stl_mesh.rotate_bounds(
@@ -1316,12 +1505,15 @@ class GCodeGeneratorApp:
             width_mm, height_mm, max_depth_mm = stl_mesh.physical_size_from_bounds(
                 x_max - x_min, y_max - y_min, z_max - z_min)
 
-            x_range, y_range = x_max - x_min, y_max - y_min
-            mesh_aspect  = x_range / y_range if y_range > 1e-12 else 1.0
-            pixel_aspect = dlg.width_px / dlg.height_px
-            matches = mesh_aspect > 1e-12 and abs(pixel_aspect / mesh_aspect - 1.0) < 0.01
-            self._aspect_lock_var.set(matches)
-            self._on_aspect_lock_toggle()
+            # The raster is always generated proportional to the mesh's own
+            # bounding box (see _stl_raster_dims), so its pixel aspect ratio
+            # already matches the mesh -- aspect lock can simply be enabled.
+            # (Not routed through _on_aspect_lock_toggle(): that reads
+            # self.layers[0], which is still the *previous* project's layer
+            # at this point.)
+            self._aspect_lock_var.set(True)
+            self._image_aspect = w / h
+            self.height_mm.set_state("disabled")
 
             self.width_mm.set(f"{width_mm:.4f}")
             self.height_mm.set(f"{height_mm:.4f}")
@@ -1331,6 +1523,7 @@ class GCodeGeneratorApp:
                 self._image_aspect = w / h
                 self._recalc_height()
 
+        self.layers = [layer]
         self._on_layers_structure_changed()   # recomputes composite (n_grey_levels forced
                                                # to 65536 for STL layers), resets toolpaths/view
         self.status_var.set(
@@ -1570,16 +1763,22 @@ class GCodeGeneratorApp:
 
     def _project_snapshot(self):
         """Return a JSON-able dict describing all persistable project state."""
+        W, H = self._canvas_shape_px() if self.layers else (None, None)
+        try:
+            background_depth_pct = float(self.background_depth_pct.get())
+        except ValueError:
+            background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
         return {
             'layers': [self._layer_to_dict(l) for l in self.layers],
             'canvas': {
-                'background_depth_pct': self._canvas_background_depth_pct,
-                'width_px':  self.layers[0].raw.shape[1] if self.layers else None,
-                'height_px': self.layers[0].raw.shape[0] if self.layers else None,
+                'background_depth_pct': background_depth_pct,
+                'width_px':  W,
+                'height_px': H,
             },
             'global': {
                 'width_mm':        self.width_mm.get(),
                 'height_mm':       self.height_mm.get(),
+                'precision_mm':    self.precision_mm.get(),
                 'max_depth':       self.max_depth.get(),
                 'margin_mm':       self.margin_mm.get(),
                 'margin_depth_pct': self.margin_depth_pct.get(),
@@ -1628,16 +1827,15 @@ class GCodeGeneratorApp:
     def _new_project(self):
         if not self._confirm_discard("starting a new project"):
             return
-        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
-            self._layer_props_dialog.destroy()
-        self._layer_props_dialog = None
 
         self._aspect_lock_var.set(True)
         self.width_mm.set(DEFAULTS['width_mm'])
         self.height_mm.set(DEFAULTS['height_mm'])
+        self.precision_mm.set(DEFAULTS['precision_mm'])
         self.max_depth.set(DEFAULTS['max_depth'])
         self.margin_mm.set(DEFAULTS['margin_mm'])
         self.margin_depth_pct.set(DEFAULTS['margin_depth_pct'])
+        self.background_depth_pct.set(DEFAULTS['canvas_background_depth_pct'])
         self.surface.set(DEFAULTS['surface'])
         self.origin_var.set(DEFAULTS['origin'])
 
@@ -1655,11 +1853,10 @@ class GCodeGeneratorApp:
         self.current_image  = None
         self._image_aspect  = None
         self.n_grey_levels  = 256
-        self._canvas_background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
         self.toolpaths      = [None]
         self._erosion_cache.clear()
         self.steps[0]['info_var'].set("Step 1: not computed")
-        self._refresh_layers_tree()
+        self._refresh_layer_tabs()
 
         self.display_mode_var.set(DISPLAY_ORIGINAL)
         self._reset_zoom()
@@ -1692,7 +1889,7 @@ class GCodeGeneratorApp:
             d['path_rel'] = self._make_rel_path(layer.path, path)
             layers_out.append(d)
         project = {
-            'version': 2,
+            'version': 3,
             'layers': layers_out,
             'canvas': snapshot['canvas'],
             'global': snapshot['global'],
@@ -1724,21 +1921,34 @@ class GCodeGeneratorApp:
             return
 
         version = project.get('version', 1)
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
         if not self._confirm_discard("opening another project"):
             return
-        if self._layer_props_dialog is not None and self._layer_props_dialog.winfo_exists():
-            self._layer_props_dialog.destroy()
-        self._layer_props_dialog = None
 
         # ── Global image-size parameters ──────────────────────────────
         g = project.get('global', {})
+        c = project.get('canvas', {})
         self._aspect_lock_var.set(bool(g.get('aspect_locked', True)))
         self.width_mm.set(g.get('width_mm', DEFAULTS['width_mm']))
         self.height_mm.set(g.get('height_mm', DEFAULTS['height_mm']))
+        precision_mm = g.get('precision_mm')
+        if precision_mm is None:
+            # Pre-v3 project: derive an equivalent Precision from the old
+            # base-layer-defined canvas resolution so re-opening reproduces
+            # close to the same effective detail before the user adjusts it.
+            try:
+                width_mm_val = float(g.get('width_mm', DEFAULTS['width_mm']))
+            except (TypeError, ValueError):
+                width_mm_val = float(DEFAULTS['width_mm'])
+            saved_width_px = c.get('width_px')
+            if saved_width_px:
+                precision_mm = width_mm_val / saved_width_px
+            else:
+                precision_mm = DEFAULTS['precision_mm']
+        self.precision_mm.set(str(precision_mm))
         self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
         self.margin_mm.set(g.get('margin_mm', DEFAULTS['margin_mm']))
         self.margin_depth_pct.set(g.get('margin_depth_pct', DEFAULTS['margin_depth_pct']))
@@ -1780,8 +1990,8 @@ class GCodeGeneratorApp:
         for step, d in zip(self.steps, step_dicts):
             self._apply_step_dict(step, d)
 
-        # ── Layers (version 2) ───────────────────────────────────────────
-        if version == 2 and 'layers' in project:
+        # ── Layers (version 2+) ───────────────────────────────────────────
+        if version in (2, 3) and 'layers' in project:
             layer_dicts = project.get('layers') or []
             resolved_layers = []
             failed = []
@@ -1792,15 +2002,8 @@ class GCodeGeneratorApp:
                 else:
                     failed.append(d.get('name') or d.get('path') or d.get('path_rel') or "?")
             self.layers = resolved_layers
-            c = project.get('canvas', {})
-            self._canvas_background_depth_pct = float(c.get('background_depth_pct', 0.0))
-            saved_w, saved_h = c.get('width_px'), c.get('height_px')
-            if self.layers and saved_w and saved_h:
-                base = self.layers[0]
-                if base.raw.shape != (saved_h, saved_w):
-                    base.raw = layers_mod.resize_raw(base.raw, (saved_h, saved_w))
-                    if base.alpha is not None:
-                        base.alpha = layers_mod.resize_raw(base.alpha, (saved_h, saved_w))
+            self.background_depth_pct.set(
+                str(c.get('background_depth_pct', DEFAULTS['canvas_background_depth_pct'])))
             if self._aspect_lock_var.get() and self.layers:
                 h, w = self.layers[0].raw.shape
                 self._image_aspect = w / h
@@ -1808,10 +2011,11 @@ class GCodeGeneratorApp:
             self._on_layers_structure_changed()
             if failed:
                 messagebox.showwarning(
-                    "Layer Load Warning",
-                    "Project loaded, but these layer sources could not be found "
+                    "Source Load Warning",
+                    "Project loaded, but these sources could not be found "
                     "or re-rasterized:\n" + "\n".join(failed) +
-                    "\n\nUse the Layers panel to reload them manually.")
+                    "\n\nUse a source tab's Add Source button, or "
+                    "File → Open Source…, to reload them manually.")
             if resolved_layers:
                 self.status_var.set(f"Project loaded: {path}  |  {len(resolved_layers)} layer(s)")
             else:
@@ -1854,7 +2058,7 @@ class GCodeGeneratorApp:
                     "Image Not Found",
                     "Project loaded, but the saved image was not found:\n"
                     f"{saved_image_path or saved_image_path_rel}\n\n"
-                    "Use File → Open Image… to load an image manually.")
+                    "Use File → Open Source… to load an image manually.")
 
         elif saved_stl_source:
             stl_path     = saved_stl_source.get('path')
@@ -1897,7 +2101,7 @@ class GCodeGeneratorApp:
                     "STL Not Found",
                     "Project loaded, but the saved STL file was not found:\n"
                     f"{stl_path or stl_path_rel}\n\n"
-                    "Use File → Import STL… to load it manually.")
+                    "Use File → Open Source… to load it manually.")
 
         self.status_var.set(f"Project loaded: {path}")
         self._saved_snapshot = self._snapshot_key()
@@ -2112,9 +2316,71 @@ class GCodeGeneratorApp:
                 erosion_cache_key = erosion_cache_key,
             )
 
+    def _stale_stl_sources(self):
+        """STL sources whose rasterized detail no longer matches what the
+        canvas's current Precision and the source's own Scale call for --
+        e.g. Precision was tightened, or Scale was increased, since the
+        source was last (re)rasterized from its mesh."""
+        stale = []
+        for layer in self.layers:
+            if layer.source_kind != 'stl' or not layer.stl_params:
+                continue
+            mesh_w_mm = layer.stl_params.get('mesh_w_mm')
+            mesh_h_mm = layer.stl_params.get('mesh_h_mm')
+            if mesh_w_mm is None or mesh_h_mm is None:
+                continue   # legacy project file predates this bookkeeping
+            target_w, target_h = self._stl_raster_px(
+                mesh_w_mm, mesh_h_mm, scale_pct=layer.scale_pct)
+            cur_w = layer.stl_params.get('width_px', target_w)
+            cur_h = layer.stl_params.get('height_px', target_h)
+            if (abs(target_w - cur_w) > 0.05 * max(target_w, 1)
+                    or abs(target_h - cur_h) > 0.05 * max(target_h, 1)):
+                stale.append((layer, target_w, target_h))
+        return stale
+
+    def _confirm_stale_stl_sources(self):
+        """Offer to re-rasterize stale STL sources (see _stale_stl_sources)
+        from their source mesh before a step is computed. Always returns
+        True (computing proceeds either way) -- declining just means the
+        step is computed against the existing, less-detailed rasters, same
+        as it would be if this check didn't exist."""
+        stale = self._stale_stl_sources()
+        if not stale:
+            return True
+        names = ", ".join(layer.name for layer, _, _ in stale)
+        if not messagebox.askyesno(
+                "Mesh detail out of date",
+                f"{len(stale)} mesh source(s) ({names}) were rasterized at a "
+                "different detail level than the canvas currently calls for.\n\n"
+                "Re-rasterize from source for full detail before computing?"):
+            return True
+        for layer, target_w, target_h in stale:
+            try:
+                triangles = stl_mesh.load_stl(layer.path)
+                rot_x = layer.stl_params.get('rot_x', 0)
+                rot_y = layer.stl_params.get('rot_y', 0)
+                rot_z = layer.stl_params.get('rot_z', 0)
+                rotated = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
+                raw     = stl_mesh.generate_heightmap(rotated, target_w, target_h)
+                image, alpha = stl_mesh.normalize_and_orient(raw)
+            except Exception as exc:
+                messagebox.showerror("Re-rasterize Error",
+                                     f"Could not re-rasterize {layer.name}:\n{exc}")
+                continue
+            layer.raw, layer.alpha = image, alpha
+            layer.stl_params['width_px']  = target_w
+            layer.stl_params['height_px'] = target_h
+        self._recompute_composite()
+        self._erosion_cache.clear()
+        self._render()
+        return True
+
     def _compute_step(self, step):
         if self.current_image is None:
             messagebox.showinfo("No image", "Please open an image first.")
+            return
+
+        if not self._confirm_stale_stl_sources():
             return
 
         idx = self.steps.index(step)
