@@ -336,6 +336,7 @@ class GCodeGeneratorApp:
 
         self._aspect_lock_var = tk.BooleanVar(value=True)
         self._image_aspect    = None   # pixel W/H of the first imported source
+        self._updating_aspect_pair = False   # reentrancy guard, see _recalc_height/_recalc_width
         ttk.Checkbutton(self.height_mm, text="Lock",
                         variable=self._aspect_lock_var,
                         command=self._on_aspect_lock_toggle
@@ -361,7 +362,7 @@ class GCodeGeneratorApp:
         self.background_depth_pct.pack(fill=tk.X, pady=2)
 
         self.width_mm.committed_var.trace_add("write", self._on_width_changed)
-        self.height_mm.committed_var.trace_add("write", self._on_canvas_size_changed)
+        self.height_mm.committed_var.trace_add("write", self._on_height_changed)
         self.precision_mm.committed_var.trace_add("write", self._on_precision_changed)
         self.max_depth.committed_var.trace_add("write", lambda *_: self._render())
         self.margin_mm.committed_var.trace_add("write", lambda *_: self._render())
@@ -1624,39 +1625,59 @@ class GCodeGeneratorApp:
             if self.layers:
                 h, w = self.layers[0].raw.shape
                 self._image_aspect = w / h
-            self.height_mm.set_state("disabled")
             self._recalc_height()
         else:
             self._image_aspect = None
-            self.height_mm.set_state("normal")
 
     def _recalc_height(self):
-        """Returns True if height_mm.set() actually ran (and so already
-        cascaded into _on_canvas_size_changed via height_mm's own trace),
-        False otherwise -- callers that need that cascade to happen at all
-        (see _on_width_changed) use this to tell "it already ran" apart
-        from "aspect lock is off / no image loaded yet, nothing will"."""
+        """When aspect-locked with a known ratio, set height_mm from the
+        current width_mm. Returns whether it did. Guarded by
+        _updating_aspect_pair so the height_mm.set() below -- which fires
+        _on_height_changed synchronously via its own trace -- doesn't turn
+        around and recompute width_mm right back, which would otherwise
+        ping-pong between the two fields on every edit."""
         if not self._aspect_lock_var.get() or self._image_aspect is None:
             return False
         try:
             w = float(self.width_mm.get())
-            self.height_mm.set(f"{w / self._image_aspect:.4f}")
-            return True
+            new_height = f"{w / self._image_aspect:.4f}"
         except (ValueError, ZeroDivisionError):
             return False
+        self._updating_aspect_pair = True
+        try:
+            self.height_mm.set(new_height)
+        finally:
+            self._updating_aspect_pair = False
+        return True
+
+    def _recalc_width(self):
+        """Mirror of _recalc_height: derives width_mm from the current
+        height_mm when aspect-locked, so editing either field keeps both in
+        sync with _image_aspect."""
+        if not self._aspect_lock_var.get() or self._image_aspect is None:
+            return False
+        try:
+            h = float(self.height_mm.get())
+        except ValueError:
+            return False
+        self._updating_aspect_pair = True
+        try:
+            self.width_mm.set(f"{h * self._image_aspect:.4f}")
+        finally:
+            self._updating_aspect_pair = False
+        return True
 
     def _on_width_changed(self, *_):
-        cascaded = self._recalc_height()
-        if not cascaded:
-            # Either aspect lock is off, or it's on but there's no image
-            # yet to derive a ratio from -- either way _recalc_height()
-            # didn't set height_mm, so nothing else will run
-            # _on_canvas_size_changed (which the confirm-before-huge-canvas
-            # gate lives in) for this edit unless we do it here. When it
-            # DID cascade, height_mm's own trace already saw both the new
-            # width and height in one shot -- calling it again here would
-            # double-apply the correction.
-            self._on_canvas_size_changed()
+        if self._updating_aspect_pair:
+            return
+        self._recalc_height()
+        self._on_canvas_size_changed()
+
+    def _on_height_changed(self, *_):
+        if self._updating_aspect_pair:
+            return
+        self._recalc_width()
+        self._on_canvas_size_changed()
 
     def _on_depth_map_content_changed(self, *_):
         """z=0 colour / margin depth / background depth change the *content*
@@ -1712,7 +1733,6 @@ class GCodeGeneratorApp:
             # at this point.)
             self._aspect_lock_var.set(True)
             self._image_aspect = w / h
-            self.height_mm.set_state("disabled")
 
             self.width_mm.set(f"{width_mm:.4f}")
             self.height_mm.set(f"{height_mm:.4f}")
