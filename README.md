@@ -1,8 +1,8 @@
 # bm2gcode
 
-bm2gcode converts a depth map, represented by a grayscale bitmap image, into CNC G-code for relief carving. 
+bm2gcode converts a depth map into CNC G-code for relief carving. The depth map is composited on a **canvas** from one or more **sources** — grayscale images and/or 3D meshes (STL) — each independently positioned, scaled, rotated, and blended together.
 
-The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces and then a V-bit to cut fine details that the ball bit could not reach.
+The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces and then a V-bit to cut fine details that the ball bit could not reach. Each step can also choose which sources on the canvas it sees, so different steps can carve different subsets of the same composition.
 
 Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, and arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid. Each step has its own dress-up settings, configured via the **Dress-up…** button on that step's tab; a newly added step inherits the dress-up settings of the step it was added after.
 
@@ -27,29 +27,70 @@ python bm2gcode.py
 
 ## Quick Start
 
-1. **File → Open Image** (Ctrl+O) — load a grayscale image (PNG, JPG, BMP, TIFF, WEBP, …). Alternatively, **File → Import STL…** (Ctrl+I) converts a 3D mesh into a depth map directly (see below).
-2. Set **Physical Image Size** — enter the real-world dimensions and maximum cut depth. (Skip this if you used Import STL and let it populate these fields from the mesh.)
-3. Configure one or more **steps** — choose algorithm, tool, and region targeting for each.
-4. **Compute → Compute All Steps** (F6) — generate toolpaths.
-5. Use the **View** menu (hotkeys 1–7) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
-6. **File → Export Toolpath** — save a `.nc` G-code file for your CNC machine.
+1. **File → Open Source…** (Ctrl+O) — load a grayscale image or an STL mesh; the file's extension decides which. This creates the canvas's base source and, for an image, sizes the canvas to it; for an STL, an orientation dialog lets you populate the canvas's physical size from the mesh's bounding box.
+2. Review the **Canvas** tab — physical width/height, precision, max cut depth, and other canvas-wide settings (see [Canvas](#canvas) below).
+3. Optionally add more sources with **Add Source** (on the Canvas tab, or on any source's own tab) and arrange them with each source's Offset, Rotation, Scale, and Blend mode (see [Sources](#sources) below).
+4. Configure one or more **steps** — choose algorithm, tool, region targeting, and which sources it should see for each.
+5. **Compute → Compute All Steps** (F6) — generate toolpaths.
+6. Use the **View** menu (hotkeys 1–8) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
+7. **File → Export Toolpath…** — save a `.nc` G-code file for your CNC machine.
 
-Save your work at any time with **File → Save Project** (Ctrl+S); reload it later with **File → Open Project** (Ctrl+Shift+O). Project files store all parameters and a path back to the source image or STL file (re-rasterized with the same settings on reload).
+Save your work at any time with **File → Save Project…** (Ctrl+S); reload it later with **File → Open Project…** (Ctrl+Shift+O). Project files store the canvas, every source's placement, all step configuration, and a path back to each source's original image or STL file (re-rasterized with the same settings on reload).
 
 ---
 
 ## Parameter Reference
 
-### Physical Image Size
+### Canvas
+
+The Canvas tab is the notebook's permanent first tab, above the source tabs. Its settings are canvas-wide — shared by every source and every step, not tied to any one of them.
 
 | Parameter | Description |
 |---|---|
-| Width / Height | Physical size of the carving area in cm. The lock icon maintains the image's aspect ratio; unlock it to set width and height independently. |
-| Max cut depth | Maximum cut depth in mm. The pixel representing full depth (black when Z=0 colour = "white", white when Z=0 colour = "black") is carved to this depth. |
-| Stock margin | Flat uncarved border around the image, in cm. |
+| Width / Height | Physical size of the carving area, in mm. The **Lock** checkbox next to Height maintains the current aspect ratio when either field changes; uncheck it to set width and height independently. Changing Width/Height rescales every source's offset and scale so the composed layout is preserved, and warns first if the resulting pixel grid would be very large. |
+| Precision | The internal pixel density of the canvas's working depth-map grid, in mm per pixel — independent of Width/Height and of any source's own native resolution. Smaller values produce a finer, denser grid (more pixels, more detail, slower); larger values a coarser one. Also used as the target resolution when rasterizing an STL source. Changing Precision rescales every source's Scale so each source's physical footprint on the stock stays the same even though pixel density changed. |
+| Max cut depth | Maximum cut depth in mm. The pixel representing full depth (black when z=0 colour = "white", white when z=0 colour = "black") is carved to this depth. |
+| Stock margin | Flat uncarved border around the canvas, in mm. |
 | Margin depth | How deep to cut the stock margin, as a percentage of Max cut depth. |
-| Z=0 colour | Which pixel colour represents the uncut surface. "White": white = surface (z = 0), black = deepest cut. "Black": the reverse. |
+| Background depth | Depth, as a percentage of Max cut depth, given to any canvas pixel that no source covers. |
+| z=0 colour | Which pixel colour represents the uncut surface. "white": white = surface (z = 0), black = deepest cut. "black": the reverse. |
 | G-code origin | Which corner — or the center — of the work area corresponds to X0 Y0 in the G-code output. |
+
+The **Add Source** button at the bottom of the Canvas tab adds a new source at the bottom of the stack (or establishes the base source if the canvas is empty) — see [Sources](#sources).
+
+---
+
+### Sources
+
+Each source — an opened image or imported STL — gets its own tab in the notebook, labeled with its stack position and name (e.g. `1: photo.png`, `2: logo.stl`), in stack order from bottom to top. A source's tab holds its compositing properties:
+
+| Parameter | Description |
+|---|---|
+| Offset X / Offset Y | Position relative to the canvas center, in mm. +X is right, +Y is up. |
+| Rotation | Counter-clockwise rotation, in degrees. |
+| Scale | Size as a percentage of the source's native resolution mapped onto the canvas grid. |
+| Blend mode | How this source combines with everything beneath it — see below. The bottom-most source in the stack always reads "Replace (base source)" and can't be changed, since there's nothing under it to blend with. |
+| Opacity | How strongly this source's blended result replaces what's beneath it, as a percentage; 0 hides it. |
+| Min depth / Max depth | Remaps this source's black/white pixels into a depth range, each a percentage of the canvas's Max cut depth: white maps to Min depth and black to Max depth. Setting Max depth below Min depth flips the source's polarity. |
+| Visible | Whether this source is included in the depth map for the *currently selected step* — see [Per-step source visibility](#per-step-source-visibility) below. |
+
+**Blend modes**, applied in depth-space (0 = surface, 1 = full depth) against the composite of everything below:
+
+| Mode | Result |
+|---|---|
+| Replace | This source's depth value outright. |
+| Add | Base depth + this source's depth. |
+| Subtract | Base depth − this source's depth. |
+| Max | The deeper of the two. |
+| Min | The shallower of the two. |
+
+Each source tab also has **Duplicate** (clones the source and inserts the copy right after it), **Add Source** (inserts a newly opened source immediately after this one in the stack), and **Remove this source** (removes it — including the last remaining source, which leaves the canvas empty until a new one is added; canvas settings are unaffected).
+
+---
+
+#### Per-step source visibility
+
+Each step has its own Visible/hidden choice for every source on the canvas: when a step tab is selected, each source's **Visible** checkbox shows and edits that step's own setting rather than a canvas-wide one, so different steps can carve different subsets of the same source stack — for example, one step carving a photo while a second step carves an overlaid logo, or a finishing step that excludes a source a roughing step included. A newly added step inherits the visibility of the step it was added after.
 
 ---
 
@@ -192,28 +233,28 @@ The **Dress-up…** button on each step's tab opens that step's tool path dress-
 
 | Item | Shortcut | Description |
 |---|---|---|
-| New Project | Ctrl+N | Discard the current steps and parameters and restart from default values. |
-| Open Project | Ctrl+Shift+O | Reload a previously saved `.prj` file, restoring all parameters and step configuration. |
-| Save Project | Ctrl+S | Save all current parameters and step configuration to a `.prj` file. |
-| Open Image | Ctrl+O | Load a grayscale bitmap. |
-| Import STL | Ctrl+I | Convert a 3D mesh (STL) into a depth map (see below). |
-| Export Toolpath | — | Export G-code for selected computed steps to a `.nc` file. |
-| Settings | — | Configure machine parameters (see below). |
+| New Project | Ctrl+N | Discard the current canvas, sources, steps, and parameters and restart from default values. |
+| Open Project… | Ctrl+Shift+O | Reload a previously saved `.prj` file, restoring the canvas, every source's placement, and all step configuration. |
+| Save Project… | Ctrl+S | Save the current canvas, sources, and step configuration to a `.prj` file. |
+| Open Source… | Ctrl+O | Load a grayscale image or import an STL mesh as the canvas's base source, replacing the whole project (see below). |
+| Export Toolpath… | — | Export G-code for selected computed steps to a `.nc` file. |
+| Settings… | — | Configure machine parameters (see below). |
 | Exit | Ctrl+Q | Quit the application. |
 
-New Project, Open Project, and Exit all check for unsaved changes first: if the current project differs from what was last saved (or loaded), you're prompted to save, discard, or cancel before continuing.
+New Project, Open Project…, and Exit all check for unsaved changes first: if the current project differs from what was last saved (or loaded), you're prompted to save, discard, or cancel before continuing.
 
-**Import STL dialog:**
-
-Reads a binary or ASCII STL file and rasterizes it into a grayscale depth map — a top-down view where each pixel's brightness is the mesh's height at that point (white = highest point, black = lowest, matching the default Z=0 colour setting). The result becomes the current image, exactly as if it had been loaded with Open Image.
+**Open Source…** opens a single file picker that accepts either an image (PNG, JPG, BMP, GIF, TIFF, WEBP) or an STL mesh; which one you pick decides what happens next. An image becomes the canvas's base source directly. An STL brings up an **Import STL** dialog first:
 
 | Parameter | Description |
 |---|---|
 | Rotate around X / Y / Z axis | Rotates the mesh by 0°, 90°, 180°, or 270° around each axis before rasterizing, applied in X → Y → Z order. A 90°/270° rotation around X or Y turns a *side* of the mesh into the top-down view, so a side profile can become the depth map, not just the mesh's native top or bottom face. |
-| Width / Height (px) | Resolution of the rasterized depth map. "Keep aspect ratio" ties the two together to match the (rotated) mesh's own proportions. |
-| Set width/height/max depth from mesh bounding box | When checked, populates the Physical Image Size fields (Width, Height, Max cut depth) from the rotated mesh's bounding box, assumed to be in millimeters — the common STL convention. A live preview shows the resulting physical size as the rotation changes. |
+| Set width/height/max depth from mesh bounding box | Shown only when this STL is establishing the canvas's base source. When checked (the default), populates the Canvas tab's Width, Height, and Max cut depth from the rotated mesh's bounding box, assumed to be in millimeters — the common STL convention — and locks the aspect ratio. A live preview shows the resulting physical size as the rotation changes. |
 
-**File → Save Project** after an STL import stores the STL file's path together with the chosen resolution and rotation, instead of a bitmap reference. Reopening the project re-parses the STL and re-rasterizes the depth map with the same settings, so the result is reproduced exactly. If the STL file has since been moved or deleted, the project still loads with all other settings intact, and a warning explains that Import STL must be run again manually.
+The rasterization resolution itself isn't chosen in this dialog — it follows automatically from the canvas's Precision setting and the source's own Scale.
+
+Adding an STL as an additional source (via a source tab's or the Canvas tab's **Add Source** button, rather than as the very first/base source) shows the same dialog without the Physical Size section, since a non-base source must never resize the canvas.
+
+**File → Save Project…** after an STL import stores the STL file's path together with its chosen rotation, instead of a bitmap reference. Reopening the project re-parses the STL and re-rasterizes the depth map with the same settings, so the result is reproduced exactly. If a source's file has since been moved or deleted, the project still loads with every other source and setting intact, and a warning explains that it must be re-added manually via **Open Source…** or a source tab's **Add Source** button.
 
 **Settings dialog:**
 
@@ -243,7 +284,7 @@ All visualization modes show data for the currently active step. Cut moves and r
 
 | Mode | Hotkey | Shows |
 |---|---|---|
-| Original | 1 | The source image, with stock margin if configured. |
+| Original | 1 | The composited depth map for the current step — every source it can see, blended together — with stock margin if configured. |
 | Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
 | Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. Requires toolpath to be computed.|
 | Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
@@ -276,7 +317,7 @@ This section describes how each algorithm works internally — the pipeline stag
 
 ### Core Concepts
 
-**Depth map.** The loaded image is converted to a float32 array where each pixel value represents the desired cut depth as a fraction of Max cut depth (0 = surface, 1 = full depth). The Z=0 colour setting controls polarity.
+**Depth map.** Each source is converted to a float32 grayscale array and resampled onto the canvas's pixel grid according to its Offset, Rotation, and Scale. The visible sources for a given step (see [Per-step source visibility](#per-step-source-visibility)) are then composited bottom-to-top — using each source's Blend mode, Opacity, and Min/Max depth remap — into a single depth map for that step, where each pixel value is the desired cut depth as a fraction of Max cut depth (0 = surface, 1 = full depth). The z=0 colour setting controls overall polarity; canvas pixels not covered by any source get the Background depth.
 
 **Tool accessibility (morphological opening).** Before path planning, bm2gcode computes where the tool can physically reach. Grey-erosion of the depth map with a tool-shaped kernel gives the maximum depth achievable with the tool centred at each pixel. A subsequent grey-dilation recovers the reachable depth at each material point — because the tool can be centred nearby rather than directly above. Together these form a morphological opening and are the basis for all gating modes. The kernel shape depends on the tool profile:
 
@@ -284,7 +325,7 @@ This section describes how each algorithm works internally — the pipeline stag
 - *V-Bit*: cone slope — `r / (tan(half-angle) × max_depth)`
 - *End Mill*: zero inside the radius, infinity outside
 
-**Accessibility caching.** The grey-erosion/grey-dilation pair above is the most expensive part of computing a step, and it depends only on the tool geometry, Max cut depth, and the work area's physical dimensions — not on step-down, threshold, gating mode, or any other per-step parameter. bm2gcode keeps a cache of these accessibility maps keyed by that combination, so recomputing a step after tweaking an unrelated parameter, or computing a later step with the same tool, reuses the previously computed result instead of rerunning the erosion/dilation. The cache is cleared whenever the source image or project changes.
+**Accessibility caching.** The grey-erosion/grey-dilation pair above is the most expensive part of computing a step, and it depends only on the tool geometry, Max cut depth, and the work area's physical dimensions — not on step-down, threshold, gating mode, or any other per-step parameter. bm2gcode keeps a cache of these accessibility maps keyed by that combination, so recomputing a step after tweaking an unrelated parameter, or computing a later step with the same tool, reuses the previously computed result instead of rerunning the erosion/dilation. The cache is cleared whenever a source, the canvas, or the project changes.
 
 **Result map.** After each step is computed, a float32 *result map* records how deep the material has been cut at every pixel. This is passed to the next step as the prior reference, enabling the Residual and Reachable gating modes.
 
