@@ -1614,6 +1614,8 @@ class GCodeGeneratorApp:
         """File -> Open Source...: replaces the whole project with just
         this one source, establishing it as the base/canvas-defining
         source (same as the pre-unification 'Open Image'/'Import STL')."""
+        if not self._confirm_discard("opening a new source"):
+            return
         path = filedialog.askopenfilename(title="Open Source",
                                           filetypes=self._SOURCE_FILETYPES)
         if not path:
