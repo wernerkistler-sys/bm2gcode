@@ -1102,7 +1102,7 @@ class GCodeGeneratorApp:
         cutout_final_stepdown.pack(fill=tk.X, pady=2)
         step['cutout_final_stepdown'] = cutout_final_stepdown
 
-        cutout_extra_offset = LabeledEntry(cutout_frame, "Extra offset", "mm",
+        cutout_extra_offset = LabeledEntry(cutout_frame, "Boundary offset", "mm",
                                            DEFAULTS["step_cutout_extra_offset"],
                                            minval=0.0, maxval=50.0, increment=0.1)
         cutout_extra_offset.pack(fill=tk.X, pady=2)

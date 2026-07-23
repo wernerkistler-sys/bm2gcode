@@ -2,7 +2,7 @@
 
 bm2gcode converts a depth map into CNC G-code for relief carving. The depth map is composited on a **canvas** from one or more **sources** — grayscale images and/or 3D meshes (STL) — each independently positioned, scaled, rotated, and blended together.
 
-The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces and then a V-bit to cut fine details that the ball bit could not reach. Each step can also choose which sources on the canvas it sees, so different steps can carve different subsets of the same composition.
+The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces, then a V-bit to cut fine details that the ball bit could not reach, and finally a Cutout pass to free the finished part from the surrounding stock. Each step can also choose which sources on the canvas it sees, so different steps can carve different subsets of the same composition.
 
 Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, and arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid. Each step has its own dress-up settings, configured via the **Dress-up…** button on that step's tab; a newly added step inherits the dress-up settings of the step it was added after.
 
@@ -147,6 +147,22 @@ Uses a V-bit or ball-nose bit whose effective cutting width varies with depth to
 
 ---
 
+##### Step / Operation / Cutout
+
+Traces the outer perimeter of the depth map's silhouette and cuts straight down through the full stock thickness, freeing the finished part from the surrounding waste material — unlike the other three algorithms, which all follow the depth map's own relief detail. Restricted to an End Mill tool, since a straight vertical wall only makes sense with a flat-bottomed bit. Interior holes in the silhouette (e.g. the counter of a letter "O") are always filled before tracing, so only the outer perimeter of each shape is cut; cutting interior holes is not supported yet.
+
+| Parameter | Description |
+|---|---|
+| Cut depth | Absolute total cut depth, in mm — independent of, and typically deeper than, Max cut depth, since this must cut all the way through the stock rather than follow the depth map's relief detail. |
+| Max step-down | Maximum depth per roughing pass (mm). If Cut depth exceeds this, multiple passes are generated automatically. |
+| Final step-down | Depth of a separate finishing pass (mm). 0 means no finishing pass. |
+| Boundary offset | Lateral-only outward push of the tool-centre path beyond the minimum tool-radius clearance, in mm. 0 = tool tangent to the traced silhouette edge. |
+| Cut direction | Climb or Conventional forces the perimeter cut to travel in one consistent direction relative to the spindle rotation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained. |
+
+There's no Process Region selector for Cutout — Z-threshold is always applied to the full depth map, never to a prior step's residual or accessible surface, so what any prior step accomplished has no bearing on which pixels get cut. **Z-threshold** is the depth-map split point between "the object" and "the background". Since depth map polarity — whether the object is the deeply-cut region or the shallow/uncarved region — depends on how the source was authored, both split directions are tried automatically; see [Cutout Pipeline](#cutout-pipeline) below.
+
+---
+
 ##### Step / Operation / Process Region
 
 The **Process Region** selector is the adaptive gating mechanism. It defines which areas of the depth map this step will process, based on what prior steps have already accomplished.
@@ -175,10 +191,10 @@ Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccess
 
 | Parameter | Description |
 |---|---|
-| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). |
+| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). Cutout restricts this to End Mill only. |
 | Diameter | Cutter diameter in mm. |
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
-| Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. |
+| Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. Not shown for Cutout, which has its own separate Boundary offset field instead — see [Step / Operation / Cutout](#step--operation--cutout). |
 | Feed rate | Cutting feed rate in mm/min. |
 
 **Step-down controls (Raster Scan and V-Carving):**
@@ -199,6 +215,10 @@ to mix contours across — see
 [Contour lateral pruning](#contour-lateral-pruning). Contour's actual
 Z-level spacing is the separate **Z increment** field under
 [Step / Operation / Contour](#step--operation--contour).
+
+Cutout shows its own independent Max/Final step-down pair too, alongside
+its own Cut depth and Boundary offset fields — see
+[Step / Operation / Cutout](#step--operation--cutout).
 
 ---
 
@@ -286,7 +306,7 @@ All visualization modes show data for the currently active step. Cut moves and r
 |---|---|---|
 | Original | 1 | The composited depth map for the current step — every source it can see, blended together — with stock margin if configured. |
 | Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
-| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. Requires toolpath to be computed.|
+| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. For a Cutout step whose Cut depth exceeds Max cut depth, pixels actually cut all the way through render as a distinct highlighted colour instead of the ordinary depth grayscale, since a through-cut clips to the same value as reaching full relief depth — see [Cutout Pipeline](#cutout-pipeline). Requires toolpath to be computed.|
 | Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
 | Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
 | Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
@@ -381,6 +401,20 @@ All three V-Carving variants share stages 1–2 and 4–8; they differ in how th
 6. **Multi-pass depth slicing** — Same mechanism as Raster: branches are split into per-pass sub-segments when Max step-down > 0.
 7. **Per-pass ordering** — Optional 2-opt.
 8. **Simplification + result simulation** — Same as Raster.
+
+---
+
+### Cutout Pipeline
+
+Cutout doesn't share Raster/Contour/V-Carving's kernel + accessibility (morphological opening) stage — since it's a straight-wall cut, only the tool's lateral radius matters, not a depth-shaping kernel — and it ignores Process Region gating entirely, always working from its own Z-threshold against the current depth map regardless of what any prior step accomplished.
+
+1. **Silhouette mask** — Splits the depth map into "object" and "background" at Z-threshold. Because depth map polarity — whether the object is the deeply-cut region or the shallow/uncarved region left standing proud of a deeply-recessed background — depends on how the source was authored, both split directions (`<=` and `>=` the threshold) are tried; whichever produces a workable mask (neither empty nor spanning the entire canvas) is used. A Z-threshold of 0 is treated as "not set" and auto-splits at the midpoint of the depth map's own value range instead. Interior holes are then filled — keeping only the outer perimeter of each shape — and the result is dilated outward by the tool radius plus Boundary offset, so the traced boundary already accounts for the tool's own width.
+2. **Contour extraction** — `skimage.find_contours` traces the outer boundary of the dilated mask. If Cut direction is Climb or Conventional, every contour is reversed (or not) by the same single global rule Contour uses (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
+3. **Depth-slicing (multi-pass)** — Every point of every traced loop targets the same full-depth Z (Cut depth) — unlike the other algorithms' per-pixel varying depth — so Max step-down / Final step-down simply produce a sequence of identical loops at progressively deeper ceilings.
+4. **Ordering** — Greedy nearest-endpoint ordering per pass, with support for closed-loop rotation; optional 2-opt. No terrain linking: unlike Raster/Contour, there's no surface underneath to route a gap-bridging move along, since this is a flat through-cut, so gaps become a plain retract → rapid → plunge instead.
+5. **Simplification + result simulation** — Same as Raster.
+
+Because Cut depth is typically deeper than Max cut depth, a genuine through-cut clips to the same depth-map value (1.0) as ordinary full-depth relief carving elsewhere in the project — the two would otherwise be indistinguishable in the Step Result view. To keep them distinguishable, the result carries a second, separate channel recording exactly which pixels were actually cut all the way through (only when Cut depth exceeds Max cut depth — a shallower Cutout pass is just an ordinary partial cut, not a hole, and needs no special marking); the Step Result view renders those pixels fully transparent, showing a distinct highlight colour through instead of the ordinary depth grayscale.
 
 ---
 
