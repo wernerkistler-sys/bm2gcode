@@ -1568,6 +1568,14 @@ class GCodeGeneratorApp:
         own tab, so there's nothing else to resync."""
         self._recompute_composite()
         self._erosion_cache.clear()
+        # rings_key (see _compute_step_work) covers tool/geometry/threshold
+        # params but not the depth map's own pixel content -- a Scale/Offset/
+        # Rotation/Opacity/blend/min-max-depth edit changes the composite
+        # without touching any of those, so the cached rings must be
+        # invalidated explicitly or a subsequent Compute would silently
+        # reuse Phase-A results from the stale depth map.
+        for s in self.steps:
+            s['_cutout_rings_cache'] = None
         self._render()
 
     def _on_layers_structure_changed(self):
@@ -1592,6 +1600,7 @@ class GCodeGeneratorApp:
         self.toolpaths = [None] * len(self.steps)
         for i, s in enumerate(self.steps):
             s['info_var'].set(f"Step {i + 1}: not computed")
+            s['_cutout_rings_cache'] = None
         self.display_mode_var.set(DISPLAY_ORIGINAL)
         self._reset_zoom()
         if self.layers:
