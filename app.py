@@ -55,8 +55,8 @@ class GCodeGeneratorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("CNC Relief Carving — Parameter Setup")
-        self.root.geometry("1200x780")
-        self.root.minsize(900, 560)
+        self.root.geometry("1240x780")
+        self.root.minsize(940, 560)
 
         self._settings = {
             'z_safe':      float(DEFAULTS['z_safe']),
@@ -254,9 +254,9 @@ class GCodeGeneratorApp:
         self._build_right_panel(right)
 
         # ── Sidebar ────────────────────────────────────────────────────
-        sidebar_outer = ttk.Frame(pane, width=275)
+        sidebar_outer = ttk.Frame(pane, width=315)
         sidebar_outer.pack_propagate(False)
-        pane.add(sidebar_outer, minsize=240, stretch="never")
+        pane.add(sidebar_outer, minsize=280, stretch="never")
         self._build_scrollable_sidebar(sidebar_outer)
 
     # ------------------------------------------------------------------ #
