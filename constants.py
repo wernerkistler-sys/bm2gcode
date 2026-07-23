@@ -91,6 +91,12 @@ DEFAULTS = {
     "step_backoff_distance_mm": "0.5",
     "step_arc_rapids_enabled":  "0",
     "step_arc_radius_mm":       "3.0",
+    "step_tab_enabled":                 "0",
+    "step_tab_count":                   "4",
+    "step_tab_width_mm":                "5.0",
+    "step_tab_height_mm":  "1.0",
+    "step_tab_phase_pct":               "0.0",
+    "step_tab_angle_deg":                "60.0",
 }
 
 DISPLAY_ORIGINAL    = "Original"

@@ -41,9 +41,10 @@ from widgets import (ProgressDialog, LabeledEntry,
                      ImportSTLDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask,
-                        compute_cutout_toolpath)
+                        compute_cutout_toolpath, _compute_cutout_rings,
+                        _compute_cutout_from_rings)
 from tool import Tool
-from dressup import RampSettings, BackoffSettings, ArcSettings
+from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
 import stl_mesh
 
@@ -109,6 +110,7 @@ class GCodeGeneratorApp:
         self.display_step_var   = tk.IntVar(value=1)
         self.show_cut_moves_var = tk.BooleanVar(value=True)
         self.show_rapids_var    = tk.BooleanVar(value=True)
+        self.show_tabs_var      = tk.BooleanVar(value=True)
 
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -180,6 +182,10 @@ class GCodeGeneratorApp:
                                         accelerator="R",
                                         variable=self.show_rapids_var,
                                         command=self._on_display_mode_changed)
+        self._view_menu.add_checkbutton(label="Show tabs",
+                                        accelerator="T",
+                                        variable=self.show_tabs_var,
+                                        command=self._on_display_mode_changed)
         self._view_menu.add_separator()
         self._view_menu.add_command(label="Reset Zoom  (double-click)",
                                     command=self._reset_zoom_and_render)
@@ -219,6 +225,7 @@ class GCodeGeneratorApp:
 
         self.root.bind("<Key-c>", _make_toggle_handler(self.show_cut_moves_var))
         self.root.bind("<Key-r>", _make_toggle_handler(self.show_rapids_var))
+        self.root.bind("<Key-t>", _make_toggle_handler(self.show_tabs_var))
 
     # ------------------------------------------------------------------ #
     #  Top-level layout
@@ -897,6 +904,19 @@ class GCodeGeneratorApp:
             value=bool(int(DEFAULTS['step_arc_rapids_enabled'])))
         step['arc_radius_mm_var']       = tk.DoubleVar(
             value=float(DEFAULTS['step_arc_radius_mm']))
+        step['tab_enabled_var']         = tk.BooleanVar(
+            value=bool(int(DEFAULTS['step_tab_enabled'])))
+        step['tab_count_var']           = tk.IntVar(
+            value=int(DEFAULTS['step_tab_count']))
+        step['tab_width_mm_var']        = tk.DoubleVar(
+            value=float(DEFAULTS['step_tab_width_mm']))
+        step['tab_height_mm_var']       = tk.DoubleVar(
+            value=float(DEFAULTS['step_tab_height_mm']))
+        step['tab_phase_pct_var']       = tk.DoubleVar(
+            value=float(DEFAULTS['step_tab_phase_pct']))
+        step['tab_angle_deg_var']       = tk.DoubleVar(
+            value=float(DEFAULTS['step_tab_angle_deg']))
+        step['_cutout_rings_cache']     = None
 
         # ── Operation group ────────────────────────────────────────────
         operation_lf = ttk.LabelFrame(frame, text="Operation", padding=4)
@@ -1839,9 +1859,19 @@ class GCodeGeneratorApp:
             'backoff_distance_mm': step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':  step['arc_rapids_enabled_var'].get(),
             'arc_radius_mm':       step['arc_radius_mm_var'].get(),
+            'tab_enabled':         step['tab_enabled_var'].get(),
+            'tab_count':           step['tab_count_var'].get(),
+            'tab_width_mm':        step['tab_width_mm_var'].get(),
+            'tab_height_mm':       step['tab_height_mm_var'].get(),
+            'tab_phase_pct':       step['tab_phase_pct_var'].get(),
+            'tab_angle_deg':       step['tab_angle_deg_var'].get(),
         }
+        tab_keys = ('tab_enabled', 'tab_count', 'tab_width_mm',
+                    'tab_height_mm', 'tab_phase_pct', 'tab_angle_deg')
+        old_tab_values = tuple(settings[k] for k in tab_keys)
         dlg = DressUpDialog(self.root, settings, self._settings['z_safe'],
-                            title=f"Tool Path Dress-Up — Step {idx + 1}")
+                            title=f"Tool Path Dress-Up — Step {idx + 1}",
+                            algorithm=step['algorithm_var'].get())
         if dlg.confirmed:
             step['ramp_in_enabled_var'].set(settings['ramp_in_enabled'])
             step['ramp_angle_deg_var'].set(settings['ramp_angle_deg'])
@@ -1850,7 +1880,26 @@ class GCodeGeneratorApp:
             step['backoff_distance_mm_var'].set(settings['backoff_distance_mm'])
             step['arc_rapids_enabled_var'].set(settings['arc_rapids_enabled'])
             step['arc_radius_mm_var'].set(settings['arc_radius_mm'])
-            self._refresh_stats_and_view()
+            step['tab_enabled_var'].set(settings['tab_enabled'])
+            step['tab_count_var'].set(settings['tab_count'])
+            step['tab_width_mm_var'].set(settings['tab_width_mm'])
+            step['tab_height_mm_var'].set(settings['tab_height_mm'])
+            step['tab_phase_pct_var'].set(settings['tab_phase_pct'])
+            step['tab_angle_deg_var'].set(settings['tab_angle_deg'])
+
+            # Tabs change the cut geometry itself (unlike ramp/backoff/arc,
+            # which only affect G-code emission) -- if they changed on an
+            # already-computed Cutout step, recompute automatically rather
+            # than leaving the preview stale. _compute_step_work's rings
+            # cache means this normally re-runs only Phase B (fast), not the
+            # full mask/contour extraction.
+            new_tab_values = tuple(settings[k] for k in tab_keys)
+            already_computed = 0 <= idx < len(self.toolpaths) and self.toolpaths[idx] is not None
+            if (step['algorithm_var'].get() == "Cutout"
+                    and new_tab_values != old_tab_values and already_computed):
+                self._compute_step(step)
+            else:
+                self._refresh_stats_and_view()
 
     def _refresh_stats_and_view(self):
         """Re-derive the displayed stats (motion count / est. time) and
@@ -1891,6 +1940,15 @@ class GCodeGeneratorApp:
         return ArcSettings(enabled=step['arc_rapids_enabled_var'].get(),
                             radius_mm=step['arc_radius_mm_var'].get())
 
+    def _tab_settings(self, step):
+        return TabSettings(
+            enabled=step['tab_enabled_var'].get(),
+            count=step['tab_count_var'].get(),
+            width_mm=step['tab_width_mm_var'].get(),
+            height_mm=step['tab_height_mm_var'].get(),
+            phase_pct=step['tab_phase_pct_var'].get(),
+            tab_angle_deg=step['tab_angle_deg_var'].get())
+
     # ------------------------------------------------------------------ #
     #  Project save / load
     # ------------------------------------------------------------------ #
@@ -1930,6 +1988,12 @@ class GCodeGeneratorApp:
             'backoff_distance_mm':  step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':   step['arc_rapids_enabled_var'].get(),
             'arc_radius_mm':        step['arc_radius_mm_var'].get(),
+            'tab_enabled':          step['tab_enabled_var'].get(),
+            'tab_count':            step['tab_count_var'].get(),
+            'tab_width_mm':         step['tab_width_mm_var'].get(),
+            'tab_height_mm':        step['tab_height_mm_var'].get(),
+            'tab_phase_pct':        step['tab_phase_pct_var'].get(),
+            'tab_angle_deg':        step['tab_angle_deg_var'].get(),
             # Index-aligned with self.layers at save time (not layer_id --
             # see _on_layers_structure_changed's docstring on why position
             # is what's persisted).
@@ -1978,6 +2042,18 @@ class GCodeGeneratorApp:
             'arc_rapids_enabled', bool(int(DEFAULTS['step_arc_rapids_enabled'])))))
         step['arc_radius_mm_var'].set(d.get(
             'arc_radius_mm', DEFAULTS['step_arc_radius_mm']))
+        step['tab_enabled_var'].set(bool(d.get(
+            'tab_enabled', bool(int(DEFAULTS['step_tab_enabled'])))))
+        step['tab_count_var'].set(d.get(
+            'tab_count', int(DEFAULTS['step_tab_count'])))
+        step['tab_width_mm_var'].set(d.get(
+            'tab_width_mm', DEFAULTS['step_tab_width_mm']))
+        step['tab_height_mm_var'].set(d.get(
+            'tab_height_mm', DEFAULTS['step_tab_height_mm']))
+        step['tab_phase_pct_var'].set(d.get(
+            'tab_phase_pct', DEFAULTS['step_tab_phase_pct']))
+        step['tab_angle_deg_var'].set(d.get(
+            'tab_angle_deg', DEFAULTS['step_tab_angle_deg']))
         # Index-aligned with self.layers, which isn't loaded yet at this
         # point in _load_project -- any length mismatch (including an
         # older project file with no saved source_visibility at all) gets
@@ -2494,6 +2570,7 @@ class GCodeGeneratorApp:
                 'cutout_extra_offset_mm':   float(step['cutout_extra_offset'].get()),
                 'cut_direction':            step['cut_dir_var'].get(),
                 'use_2opt':                 step['tsp_2opt_var'].get(),
+                'tab_settings':             self._tab_settings(step),
             })
         else:  # Raster
             _profile    = step['profile_var'].get()
@@ -2515,7 +2592,7 @@ class GCodeGeneratorApp:
 
         return params
 
-    def _compute_step_work(self, params, progress_fn, prev_tp, depth_map, n_grey_levels):
+    def _compute_step_work(self, step, params, progress_fn, prev_tp, depth_map, n_grey_levels):
         """Synchronous algorithm computation — call from a background thread.
 
         depth_map/n_grey_levels are precomputed on the main thread (see
@@ -2601,27 +2678,56 @@ class GCodeGeneratorApp:
                 erosion_cache_key  = erosion_cache_key,
             )
         elif algorithm == "Cutout":
-            return compute_cutout_toolpath(
-                depth_map          = depth_map,
-                n_grey_levels      = n_grey_levels,
-                tool               = params['tool'],
-                cutout_depth_mm    = params['cutout_depth_mm'],
-                max_depth          = params['max_depth'],
-                width_mm           = params['eff_width_mm'],
-                height_mm          = params['eff_height_mm'],
-                origin             = params['origin'],
-                feed_rate          = params['feed_rate'],
+            # Split into Phase A (silhouette mask + contour extraction) and
+            # Phase B (tabs + multipass + ordering + simulation) so a
+            # tab-settings-only change (the common case when tuning the tab
+            # dress-up) can skip straight to Phase B -- see _open_dressup and
+            # dressup.apply_tabs. rings_key covers every Phase-A input,
+            # including the previous step's identity (Phase A copies its
+            # result/accessible/alpha through for Phase B to union with).
+            rings_key = (
+                tool.profile, tool.diameter_mm,
+                params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
+                params['origin'], params['threshold_mm'], params['cutout_extra_offset_mm'],
+                params['cut_direction'], params['source_visibility'], id(prev_tp),
+            )
+            # cached[2] (prev_tp) is held onto only so the id(prev_tp) baked
+            # into rings_key above stays meaningful -- without a live
+            # reference here, CPython could reuse that id() for an unrelated
+            # object once the old prev_tp is garbage-collected, producing a
+            # false cache hit.
+            cached = step.get('_cutout_rings_cache')
+            if cached is not None and cached[0] == rings_key:
+                rings_cache = cached[1]
+            else:
+                rings_cache = _compute_cutout_rings(
+                    depth_map          = depth_map,
+                    tool               = tool,
+                    max_depth          = params['max_depth'],
+                    width_mm           = params['eff_width_mm'],
+                    height_mm          = params['eff_height_mm'],
+                    origin             = params['origin'],
+                    threshold_mm       = params['threshold_mm'],
+                    extra_offset_mm    = params['cutout_extra_offset_mm'],
+                    cut_direction      = params['cut_direction'],
+                    prior_accessible   = prev_tp.accessible if prev_tp is not None else None,
+                    previous_result    = prev_tp.result     if prev_tp is not None else None,
+                    previous_alpha     = prev_tp.alpha      if prev_tp is not None else None,
+                    progress           = progress_fn,
+                )
+                step['_cutout_rings_cache'] = (rings_key, rings_cache, prev_tp)
+            return _compute_cutout_from_rings(
+                rings_cache, tool, params['cutout_depth_mm'], params['max_depth'],
+                params['eff_width_mm'], params['eff_height_mm'],
                 threshold_mm       = params['threshold_mm'],
                 stepdown_mm        = params['cutout_stepdown_mm'],
                 final_stepdown_mm  = params['cutout_final_stepdown_mm'],
                 extra_offset_mm    = params['cutout_extra_offset_mm'],
                 cut_direction      = params['cut_direction'],
-                prior_accessible   = prev_tp.accessible if prev_tp is not None else None,
-                previous_result    = prev_tp.result     if prev_tp is not None else None,
-                previous_alpha     = prev_tp.alpha      if prev_tp is not None else None,
                 use_2opt           = params['use_2opt'],
                 z_safe             = self._settings['z_safe'],
                 feed_rapid         = self._settings['feed_rapid'],
+                tab_settings       = params['tab_settings'],
                 progress           = progress_fn,
             )
         else:  # Raster
@@ -2786,7 +2892,7 @@ class GCodeGeneratorApp:
         def _worker():
             try:
                 result = self._compute_step_work(
-                    params, dlg.report, prev_tp, depth_map, n_grey_levels)
+                    step, params, dlg.report, prev_tp, depth_map, n_grey_levels)
             except ProgressDialog.Cancelled:
                 self.root.after(0, lambda: dlg.close("Cancelled."))
                 return
@@ -2863,7 +2969,7 @@ class GCodeGeneratorApp:
                 try:
                     dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
                     result = self._compute_step_work(
-                        params, step_progress(i), prev_tp, depth_map, n_grey_levels)
+                        step, params, step_progress(i), prev_tp, depth_map, n_grey_levels)
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
@@ -3503,10 +3609,11 @@ class GCodeGeneratorApp:
         self.mpl_canvas.draw()
 
     def _overlay_toolpath_2d(self, img, step_idx):
-        """Overlay cut moves and rapids on the current 2D axes."""
+        """Overlay cut moves, rapids, and tab markers on the current 2D axes."""
         show_cuts   = self.show_cut_moves_var.get()
         show_rapids = self.show_rapids_var.get()
-        if not show_cuts and not show_rapids:
+        show_tabs   = self.show_tabs_var.get()
+        if not show_cuts and not show_rapids and not show_tabs:
             return
         tp = (self.toolpaths[step_idx]
               if 0 <= step_idx < len(self.toolpaths) else None)
@@ -3562,6 +3669,25 @@ class GCodeGeneratorApp:
             self.ax.add_collection(LineCollection(
                 rapid_lines, colors="#ff4444", linewidths=0.8, alpha=0.85,
                 zorder=2))
+
+        # Tab markers: a Z-only change is otherwise invisible in this
+        # top-down view, so mark each tab's position/extent with a filled
+        # circle (diameter ~ the tab's actual width along the path) on top
+        # of the cut-line overlay.
+        if show_tabs:
+            tab_regions = (tp.metadata or {}).get('tab_regions')
+            if tab_regions:
+                from matplotlib.patches import Circle
+                px_scale = (sx + sy) / 2.0
+                for (cx, cy), (bx, by), (ex, ey) in tab_regions:
+                    radius_mm = np.hypot(bx - cx, by - cy)
+                    if radius_mm < 1e-6:
+                        radius_mm = np.hypot(ex - cx, ey - cy)
+                    cpx, cpy = to_px(cx, cy)
+                    self.ax.add_patch(Circle(
+                        (cpx, cpy), radius=max(radius_mm * px_scale, 1.5),
+                        facecolor="#ff8c00", edgecolor="none", alpha=0.55,
+                        zorder=3))
 
     # ------------------------------------------------------------------ #
     #  Zoom & Pan — 2D and 3D

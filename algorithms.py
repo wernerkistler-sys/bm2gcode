@@ -2,6 +2,7 @@ import dataclasses
 import numpy as np
 from tool import Tool
 from toolpath import ToolPath
+from dressup import apply_tabs
 
 
 def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
@@ -2447,9 +2448,16 @@ def compute_cutout_toolpath(
     use_2opt=False,
     z_safe=5.0,
     feed_rapid=3000.0,
+    tab_settings=None,
     progress=None,
 ):
     """Compute an outer-silhouette cutout tool path.
+
+    Thin wrapper over _compute_cutout_rings (Phase A: silhouette mask +
+    contour extraction -- independent of cutout depth/stepdown/tab settings)
+    and _compute_cutout_from_rings (Phase B: depth-slicing, tabs, ordering,
+    simulation). Split so a tab-settings-only change can re-run just Phase B
+    -- see app.py's per-step rings cache.
 
     Traces the outer perimeter of every connected region of *depth_map* at
     or above *threshold_mm*, offsets it outward by the tool radius (plus
@@ -2537,12 +2545,69 @@ def compute_cutout_toolpath(
     z_safe, feed_rapid : float
         Used only to seed per-rapid overhead in the optional 2-opt cost
         model.
+    tab_settings : dressup.TabSettings or None
+        When enabled, leaves evenly-spaced uncut bridges ("tabs") in every
+        closed ring, applied to the full-depth ring geometry before
+        make_multipass() depth-slices it -- see dressup.apply_tabs.
     progress : callable(pct, message)
         Thread-safe progress reporter.
 
     Returns
     -------
     ToolPath
+    """
+    rings_cache = _compute_cutout_rings(
+        depth_map, tool, max_depth, width_mm, height_mm,
+        origin=origin, threshold_mm=threshold_mm, extra_offset_mm=extra_offset_mm,
+        cut_direction=cut_direction,
+        prior_accessible=prior_accessible, previous_result=previous_result,
+        previous_alpha=previous_alpha, progress=progress,
+    )
+    return _compute_cutout_from_rings(
+        rings_cache, tool, cutout_depth_mm, max_depth, width_mm, height_mm,
+        threshold_mm=threshold_mm, stepdown_mm=stepdown_mm,
+        final_stepdown_mm=final_stepdown_mm, extra_offset_mm=extra_offset_mm,
+        cut_direction=cut_direction, use_2opt=use_2opt, z_safe=z_safe,
+        feed_rapid=feed_rapid, tab_settings=tab_settings, progress=progress,
+    )
+
+
+@dataclasses.dataclass
+class _CutoutRings:
+    """Phase-A output of compute_cutout_toolpath: everything Phase B
+    (_compute_cutout_from_rings) needs to depth-slice and assemble the final
+    ToolPath. Independent of cutout depth/stepdown/tab settings, so it can
+    be cached and reused across tab-only settings changes -- see app.py's
+    per-step rings cache."""
+    rings: list                # raw pixel-space contours; [] if none found
+    message: str                # status, or the reason `rings` is empty
+    px_per_mm: float
+    H: int
+    W: int
+    ox: float
+    oy: float
+    kernel_cutout: np.ndarray
+    footprint_cutout: np.ndarray
+    mask_direction: str
+    depth_map: np.ndarray               # possibly resampled (Stage 0)
+    previous_result: np.ndarray
+    prior_accessible: np.ndarray
+    previous_alpha: np.ndarray
+
+
+def _compute_cutout_rings(
+    depth_map, tool, max_depth, width_mm, height_mm,
+    origin="Bottom-Left",
+    threshold_mm=0.0,
+    extra_offset_mm=0.0,
+    cut_direction="Either",
+    prior_accessible=None,
+    previous_result=None,
+    previous_alpha=None,
+    progress=None,
+):
+    """Phase A of compute_cutout_toolpath: silhouette mask + outer contour
+    extraction. See compute_cutout_toolpath for full parameter docs.
     """
     from scipy.ndimage import binary_fill_holes, binary_dilation
     from skimage.morphology import disk
@@ -2589,18 +2654,16 @@ def compute_cutout_toolpath(
     ksize = kernel_cutout.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
-    def _empty_result(message):
-        progress(100, message)
-        return ToolPath(
-            segments=[],
-            result=(previous_result.copy() if previous_result is not None
-                    else np.zeros_like(depth_map, dtype=np.float32)),
-            accessible=(prior_accessible.copy() if prior_accessible is not None
-                        else np.zeros_like(depth_map, dtype=np.float32)),
-            alpha=(previous_alpha.copy() if previous_alpha is not None else None),
-            metadata={'algorithm': 'Cutout', 'profile': tool.profile,
-                      'max_depth': max_depth, 'cutout_depth_mm': cutout_depth_mm,
-                      'threshold_mm': threshold_mm}
+    mask_direction = None
+
+    def _empty(message):
+        progress(45, message)
+        return _CutoutRings(
+            rings=[], message=message, px_per_mm=px_per_mm, H=H, W=W,
+            ox=_ox, oy=_oy, kernel_cutout=kernel_cutout, footprint_cutout=footprint_cutout,
+            mask_direction=mask_direction, depth_map=depth_map,
+            previous_result=previous_result, prior_accessible=prior_accessible,
+            previous_alpha=previous_alpha,
         )
 
     # ── Stage 2 · Silhouette mask: threshold → fill holes → dilate (10–35 %)
@@ -2640,7 +2703,7 @@ def compute_cutout_toolpath(
         mask_cutout = _try_mask('>=')
         mask_direction = '>='
     if mask_cutout is None:
-        return _empty_result(
+        return _empty(
             "No usable silhouette boundary found (tried both depth-threshold "
             "directions) — nothing to cut.")
     progress(35, f"Silhouette mask ready ({np.count_nonzero(mask_cutout)} px, "
@@ -2653,15 +2716,69 @@ def compute_cutout_toolpath(
     # uncut material consistently on one side, so no per-contour
     # inside/outside analysis is needed.
     reverse_contours = (cut_direction == "Conventional")
-    lock_direction    = cut_direction in ("Climb", "Conventional")
     rings = [c for c in find_contours(mask_cutout.astype(np.float64), 0.5) if len(c) >= 3]
     if reverse_contours:
         rings = [c[::-1] for c in rings]
     if not rings:
-        return _empty_result("No closed silhouette boundary found — nothing to cut.")
+        return _empty("No closed silhouette boundary found — nothing to cut.")
     progress(45, f"{len(rings)} outer boundary loop{'s' if len(rings) != 1 else ''} found.")
 
-    # ── Stage 4 · Multipass + ordering + simplify (45–75 %) ───────────────
+    return _CutoutRings(
+        rings=rings, message="", px_per_mm=px_per_mm, H=H, W=W, ox=_ox, oy=_oy,
+        kernel_cutout=kernel_cutout, footprint_cutout=footprint_cutout,
+        mask_direction=mask_direction, depth_map=depth_map,
+        previous_result=previous_result, prior_accessible=prior_accessible,
+        previous_alpha=previous_alpha,
+    )
+
+
+def _compute_cutout_from_rings(
+    rings_cache, tool, cutout_depth_mm, max_depth, width_mm, height_mm,
+    threshold_mm=0.0,
+    stepdown_mm=0.0,
+    final_stepdown_mm=0.0,
+    extra_offset_mm=0.0,
+    cut_direction="Either",
+    use_2opt=False,
+    z_safe=5.0,
+    feed_rapid=3000.0,
+    tab_settings=None,
+    progress=None,
+):
+    """Phase B of compute_cutout_toolpath: apply tabs, depth-slice into
+    passes, order/simplify them, and simulate the result. This is the part
+    that changes when only stepdown/tab settings change, so it's the part
+    worth recomputing on its own -- see compute_cutout_toolpath for full
+    parameter docs.
+    """
+    px_per_mm = rings_cache.px_per_mm
+    H, W = rings_cache.H, rings_cache.W
+    _ox, _oy = rings_cache.ox, rings_cache.oy
+    depth_map = rings_cache.depth_map
+    previous_result = rings_cache.previous_result
+    prior_accessible = rings_cache.prior_accessible
+    previous_alpha = rings_cache.previous_alpha
+
+    def _empty_result(message):
+        progress(100, message)
+        return ToolPath(
+            segments=[],
+            result=(previous_result.copy() if previous_result is not None
+                    else np.zeros_like(depth_map, dtype=np.float32)),
+            accessible=(prior_accessible.copy() if prior_accessible is not None
+                        else np.zeros_like(depth_map, dtype=np.float32)),
+            alpha=(previous_alpha.copy() if previous_alpha is not None else None),
+            metadata={'algorithm': 'Cutout', 'profile': tool.profile,
+                      'max_depth': max_depth, 'cutout_depth_mm': cutout_depth_mm,
+                      'threshold_mm': threshold_mm}
+        )
+
+    if not rings_cache.rings:
+        return _empty_result(rings_cache.message or "Nothing to cut.")
+
+    lock_direction = cut_direction in ("Climb", "Conventional")
+
+    # ── Stage 4 · Tabs + multipass + ordering + simplify (45–75 %) ────────
     # Every ring gets the exact same full-depth Z -- there is only one
     # cutout_depth_mm for the whole tool path, so (unlike compute_contour_
     # toolpath's per-level Z jumps) no z-jump weighting is ever needed
@@ -2669,8 +2786,16 @@ def compute_cutout_toolpath(
     full_depth_segs = [
         [(col / px_per_mm - _ox, (H - 1 - row) / px_per_mm - _oy, -cutout_depth_mm)
          for row, col in ring]
-        for ring in rings
+        for ring in rings_cache.rings
     ]
+
+    tab_regions = []
+    if tab_settings is not None and tab_settings.enabled:
+        full_depth_segs, tab_regions, tab_warnings = apply_tabs(
+            full_depth_segs, tab_settings, closed_tol_mm=1.5 / px_per_mm)
+        for warning in tab_warnings:
+            progress(45, warning)
+
     pass_list = make_multipass(full_depth_segs, cutout_depth_mm, stepdown_mm, final_stepdown_mm)
     n_passes = len(pass_list)
 
@@ -2762,7 +2887,7 @@ def compute_cutout_toolpath(
     material_removed_cutout = simulate_toolpath_result(
         ToolPath(segments=all_segments),
         (H, W), px_per_mm, px_per_mm, _ox, _oy,
-        max_depth, kernel_cutout, footprint_cutout,
+        max_depth, rings_cache.kernel_cutout, rings_cache.footprint_cutout,
     )
     result = np.maximum(
         previous_result if previous_result is not None else 0.0,
@@ -2780,8 +2905,19 @@ def compute_cutout_toolpath(
     # own grey level (< 1.0) already represents it correctly; no pixel here
     # has been clipped to 1.0 by simulate_toolpath_result, so there is
     # nothing to flag.
+    #
+    # kerf_mask requires the achieved depth to have actually SATURATED the
+    # max_depth-normalised scale (>= 1.0), not merely to be non-zero: with
+    # tabs, a touched pixel can fall well short of full depth (result's own
+    # grey level already reflects that correctly there), so "touched at
+    # all" is no longer equivalent to "reached full depth" the way it was
+    # before tabs existed (every kerf pixel used to share the exact same
+    # full-depth Z). A tab whose depth still exceeds max_depth but stays
+    # short of cutout_depth_mm remains indistinguishable from a real hole
+    # here -- an existing limitation of this shared max_depth scale, not
+    # something tabs introduce.
     if cutout_depth_mm > max_depth:
-        kerf_mask = material_removed_cutout > 1e-6
+        kerf_mask = material_removed_cutout >= 1.0 - 1e-3
         alpha = np.minimum(
             previous_alpha if previous_alpha is not None else 1.0,
             np.where(kerf_mask, 0.0, 1.0)).astype(np.float32)
@@ -2791,29 +2927,32 @@ def compute_cutout_toolpath(
 
     # ── Stage 6 · Assemble ToolPath (90–100 %) ────────────────────────────
     progress(90, "Assembling tool path…")
+    metadata = {
+        'algorithm':         'Cutout',
+        'profile':           tool.profile,
+        'radius_mm':         tool.diameter_mm / 2,
+        'max_depth':         max_depth,
+        'cutout_depth_mm':   cutout_depth_mm,
+        'stepdown_mm':       stepdown_mm,
+        'final_stepdown_mm': final_stepdown_mm,
+        'extra_offset_mm':   extra_offset_mm,
+        'threshold_mm':      threshold_mm,
+        'mask_direction':    rings_cache.mask_direction,
+        'cut_direction':     cut_direction,
+        'use_2opt':          use_2opt,
+        'n_passes':          n_passes,
+        'width_mm':          width_mm,
+        'height_mm':         height_mm,
+        'rdp_tolerance':     rdp_tol,
+    }
+    if tab_regions:
+        metadata['tab_regions'] = tab_regions
     tp = ToolPath(
         segments=all_segments,
         result=result,
         accessible=accessible,
         alpha=alpha,
-        metadata={
-            'algorithm':         'Cutout',
-            'profile':           tool.profile,
-            'radius_mm':         tool.diameter_mm / 2,
-            'max_depth':         max_depth,
-            'cutout_depth_mm':   cutout_depth_mm,
-            'stepdown_mm':       stepdown_mm,
-            'final_stepdown_mm': final_stepdown_mm,
-            'extra_offset_mm':   extra_offset_mm,
-            'threshold_mm':      threshold_mm,
-            'mask_direction':    mask_direction,
-            'cut_direction':     cut_direction,
-            'use_2opt':          use_2opt,
-            'n_passes':          n_passes,
-            'width_mm':          width_mm,
-            'height_mm':         height_mm,
-            'rdp_tolerance':     rdp_tol,
-        }
+        metadata=metadata,
     )
     progress(100, "Cutout tool path computation complete!")
     return tp

@@ -1,11 +1,17 @@
-"""Pure-geometry helpers for optional G-code "dress-ups" applied at emission
-time on top of an already-computed ToolPath: ramp-in (replaces a vertical
-plunge with a zig-zag descent), back-off (pulls the tool away from the wall
-it just cut before retracting), and arc-rounded rapid corners (replaces the
-sharp 90-degree turns of a retract/traverse/plunge rapid with a tangent-arc
-polyline). None of these functions touch ToolPath.segments; they only
-synthesize the extra travel geometry that toolpath.py's iter_moves() splices
-into the motion stream.
+"""Pure-geometry helpers for optional "dress-ups" applied to a toolpath.
+
+Most of these (ramp-in, back-off, arc-rounded rapid corners) run at G-code
+emission time on top of an already-computed ToolPath: they synthesize extra
+travel geometry that toolpath.py's iter_moves() splices into the motion
+stream at the gaps between segments, and never touch ToolPath.segments
+itself.
+
+apply_tabs() is the one exception. Leaving uncut "tabs" (bridges) in a
+closed Cutout ring means raising Z for a stretch of the ring's *interior* --
+that's a change to the cut geometry itself, not gap-filling travel, so it
+has to run earlier: on the flat, full-depth ring points computed by
+compute_cutout_toolpath(), before make_multipass() depth-slices them into
+passes. See algorithms.py's compute_cutout_toolpath for the call site.
 """
 
 import math
@@ -34,6 +40,16 @@ class ArcSettings:
     enabled: bool = False
     radius_mm: float = 3.0
     n_segments: int = 8           # polyline segments per quarter-circle, internal
+
+
+@dataclass
+class TabSettings:
+    enabled: bool = False
+    count: int = 4
+    width_mm: float = 5.0
+    height_mm: float = 1.0
+    phase_pct: float = 0.0        # 0-100, shifts all tabs together; wraps (100 == 0)
+    tab_angle_deg: float = 60.0   # wall angle from horizontal; 90 = vertical/rectangular
 
 
 def _xy_dist(a: Point, b: Point) -> float:
@@ -198,3 +214,176 @@ def generate_corner_arc(corner: Point, dir_in: Tuple[float, float, float],
             o[2] + v1[2] * c + v2[2] * s,
         ))
     return pts
+
+
+TabRegion = Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]
+
+
+def _apply_tabs_to_ring(ring: List[Point], settings: TabSettings,
+                         closed_tol_mm: float):
+    """Raise Z to leave uncut, trapezoid-profiled tabs at evenly-spaced
+    points around one closed, flat ring -- tapered walls (angle set by
+    settings.tab_angle_deg, measured from horizontal like RampSettings'
+    angle_deg; 90 = the old vertical-walled rectangular profile) so the
+    tool ramps onto/off the tab instead of stepping straight into a wall.
+    Returns (new_ring, tab_regions, warnings). `ring` is returned unchanged
+    (and no regions/warnings) if it isn't closed, is degenerate, or tabs
+    don't fit."""
+    n = len(ring)
+    if n < 3:
+        return ring, [], []
+    if _xy_dist(ring[0], ring[-1]) > closed_tol_mm:
+        return ring, [], []  # open contour -- tabs need a closed loop
+
+    cum = [0.0] * n
+    for i in range(1, n):
+        cum[i] = cum[i - 1] + _xy_dist(ring[i - 1], ring[i])
+    L = cum[-1]
+    if L < 1e-6:
+        return ring, [], []
+
+    z_full = ring[0][2]
+    climb_mm = settings.height_mm
+    tab_top_z = z_full + climb_mm
+    half_w = min(settings.width_mm / 2.0, L / 2.0 - 1e-9)
+    if half_w <= 1e-9:
+        return ring, [], []
+
+    # Ramp run: the arc-length distance needed to climb climb_mm at the
+    # requested wall angle (from horizontal). 90 degrees (or anything close
+    # enough that tan() blows up) means an instant vertical step -- the old
+    # rectangular profile -- with no run at all. The run is clamped to
+    # half_w so a shallow angle can't ask for more room than the tab's own
+    # footprint; past that clamp the profile is just a full triangular
+    # "roof" with no flat top, rather than encroaching on the neighbours
+    # count/max_count already keep clear.
+    angle_deg = min(max(settings.tab_angle_deg, 1.0), 90.0)
+    if angle_deg >= 89.999:
+        ramp_run = 0.0
+    else:
+        ramp_run = climb_mm / math.tan(math.radians(angle_deg))
+    ramp_run = min(ramp_run, half_w)
+    flat_half_w = half_w - ramp_run
+
+    warnings: List[str] = []
+    count = max(1, int(settings.count))
+    max_count = max(1, int(L // max(settings.width_mm, 1e-6)))
+    if count > max_count:
+        warnings.append(
+            f"Tab count reduced from {count} to {max_count} "
+            f"(ring only {L:.1f}mm long, too short for "
+            f"{count} tabs of {settings.width_mm}mm)")
+        count = max_count
+
+    # phase is in units of "one inter-tab spacing" (not one full ring lap) --
+    # shifting by a whole inter-tab spacing maps an evenly-spaced tab set
+    # onto itself, so anchoring phase_pct's full 0-100 range to exactly one
+    # spacing (rather than one full lap) means every value in that range
+    # produces a genuinely distinct arrangement instead of repeating the
+    # same pattern `count` times over.
+    phase = (settings.phase_pct % 100.0) / 100.0
+    centers = [(((i + phase) / count) % 1.0) * L for i in range(count)]
+
+    def sample_at(s: float) -> Point:
+        if s <= 0.0:
+            return ring[0]
+        if s >= L:
+            return ring[-1]
+        for i in range(1, n):
+            if cum[i] >= s - 1e-9:
+                seg_len = cum[i] - cum[i - 1]
+                t = 0.0 if seg_len < 1e-12 else (s - cum[i - 1]) / seg_len
+                x1, y1, z1 = ring[i - 1]
+                x2, y2, z2 = ring[i]
+                return (x1 + t * (x2 - x1), y1 + t * (y2 - y1), z1 + t * (z2 - z1))
+        return ring[-1]
+
+    def circ_dist(s: float, c: float) -> float:
+        d = abs(s - c)
+        return min(d, L - d)
+
+    def tab_target_z(s: float):
+        """Highest tab-raised Z any tab wants at arc length s, or None if no
+        tab reaches this far (flat top for |s-center| <= flat_half_w,
+        linear taper for flat_half_w < |s-center| <= half_w)."""
+        best = None
+        for c in centers:
+            d = circ_dist(s, c)
+            if d > half_w + 1e-9:
+                continue
+            if d <= flat_half_w + 1e-9:
+                t = tab_top_z
+            elif ramp_run > 1e-9:
+                t = z_full + climb_mm * (half_w - d) / ramp_run
+            else:
+                t = tab_top_z
+            if best is None or t > best:
+                best = t
+        return best
+
+    # Guarantee an explicit vertex at each trapezoid corner (footprint edge
+    # and flat-top edge), regardless of the ring's natural point density --
+    # the sloped walls between these and whatever natural points fall
+    # between them are already straight-line-correct without further
+    # subdivision, since a taper is linear in (arc length, Z).
+    extra_s = set()
+    for c in centers:
+        for s in (c - half_w, c - flat_half_w, c + flat_half_w, c + half_w):
+            extra_s.add(s % L)
+
+    events: List[Tuple[float, Point, bool]] = [
+        (cum[i], ring[i], False) for i in range(n)
+    ]
+    for s in extra_s:
+        events.append((s, sample_at(s), True))
+    events.sort(key=lambda e: e[0])
+
+    new_ring: List[Point] = []
+    last_s = None
+    for s, (x, y, z), is_boundary in events:
+        if last_s is not None and abs(s - last_s) < 1e-9 and not is_boundary:
+            continue  # coincides with an already-emitted boundary vertex
+        target = tab_target_z(s)
+        if target is not None:
+            z = max(z, target)
+        new_ring.append((x, y, z))
+        last_s = s
+
+    tab_regions: List[TabRegion] = []
+    for sc in centers:
+        cx, cy, _ = sample_at(sc)
+        sx, sy, _ = sample_at((sc - half_w) % L)
+        ex, ey, _ = sample_at((sc + half_w) % L)
+        tab_regions.append(((cx, cy), (sx, sy), (ex, ey)))
+
+    return new_ring, tab_regions, warnings
+
+
+def apply_tabs(rings: List[List[Point]], settings: Optional[TabSettings],
+                closed_tol_mm: float = 0.05):
+    """Raise Z to leave uncut tabs at evenly-spaced points around each closed
+    ring in `rings` (same shape as compute_cutout_toolpath's full_depth_segs
+    -- one flat, full-depth closed polyline per silhouette shape).
+
+    Returns (new_rings, tab_regions, warnings):
+      new_rings   -- same length/order as `rings`, tab windows raised to
+                     z_full + settings.height_mm
+      tab_regions -- list of (center_xy, start_xy, end_xy) across all rings,
+                     for 2-D preview markers
+      warnings    -- human-readable strings (e.g. tab count clamped because
+                     a ring was too short), for the caller to surface
+
+    Rings that aren't closed (e.g. a silhouette touching the canvas edge)
+    are returned unchanged and contribute no regions/warnings.
+    """
+    if not settings or not settings.enabled or settings.count < 1:
+        return rings, [], []
+    new_rings = []
+    tab_regions: List[TabRegion] = []
+    warnings: List[str] = []
+    for ring in rings:
+        new_ring, regions, warns = _apply_tabs_to_ring(ring, settings, closed_tol_mm)
+        new_rings.append(new_ring)
+        tab_regions.extend(regions)
+        warnings.extend(warns)
+    return new_rings, tab_regions, warnings

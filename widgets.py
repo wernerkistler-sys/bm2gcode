@@ -532,15 +532,21 @@ class SettingsDialog(tk.Toplevel):
 
 
 class DressUpDialog(tk.Toplevel):
-    """Modal dialog for editing one step's G-code tool path dress-ups
-    (ramp-in, back-off, arc-rounded rapid corners). Modifies *settings*
+    """Modal dialog for editing one step's tool path dress-ups (ramp-in,
+    back-off, arc-rounded rapid corners, and tabs). Modifies *settings*
     dict in-place on OK.
 
     *z_safe* is only used to validate the arc radius against the machine's
     safe height (arc rounding sweeps laterally below z_safe).
+
+    *algorithm* is the step's current algorithm -- tabs only make sense on a
+    Cutout step's closed, full-depth ring, so the Tabs section is greyed out
+    (but its settings are still shown/persisted) whenever this isn't
+    "Cutout".
     """
 
-    def __init__(self, parent, settings, z_safe, title="Tool Path Dress-Up"):
+    def __init__(self, parent, settings, z_safe, title="Tool Path Dress-Up",
+                 algorithm=None):
         super().__init__(parent)
         self.title(title)
         self.resizable(True, True)
@@ -550,6 +556,7 @@ class DressUpDialog(tk.Toplevel):
 
         self._settings = settings
         self._z_safe   = z_safe
+        self._algorithm = algorithm
         self.confirmed = False
 
         outer = ttk.Frame(self, padding=16)
@@ -597,9 +604,47 @@ class DressUpDialog(tk.Toplevel):
                                         minval=0.0, maxval=50.0, increment=1.0)
         self._arc_radius.pack(fill=tk.X, pady=2)
 
+        ttk.Separator(du_sf).pack(fill=tk.X, pady=4)
+
+        self._tab_enabled_var = tk.BooleanVar(value=bool(settings.get('tab_enabled', False)))
+        self._tab_checkbutton = ttk.Checkbutton(
+            du_sf, text="Leave tabs (uncut bridges)",
+            variable=self._tab_enabled_var,
+            command=self._on_tab_toggle)
+        self._tab_checkbutton.pack(anchor=tk.W, pady=2)
+
+        self._tab_count = LabeledEntry(du_sf, "Tab count", "",
+                                       str(settings.get('tab_count', 4)),
+                                       minval=1, maxval=50, increment=1)
+        self._tab_count.pack(fill=tk.X, pady=2)
+
+        self._tab_width = LabeledEntry(du_sf, "Tab width", "mm",
+                                       str(settings.get('tab_width_mm', 5.0)),
+                                       minval=0.5, maxval=200.0, increment=0.5)
+        self._tab_width.pack(fill=tk.X, pady=2)
+
+        self._tab_height = LabeledEntry(
+            du_sf, "Tab height", "mm",
+            str(settings.get('tab_height_mm', 1.0)),
+            minval=0.1, maxval=50.0, increment=0.1)
+        self._tab_height.pack(fill=tk.X, pady=2)
+
+        self._tab_phase = LabeledEntry(du_sf, "Phase", "%",
+                                       str(settings.get('tab_phase_pct', 0.0)),
+                                       minval=0.0, maxval=100.0, increment=1.0)
+        self._tab_phase.pack(fill=tk.X, pady=2)
+
+        self._tab_angle = LabeledEntry(du_sf, "Tab angle", "deg",
+                                       str(settings.get('tab_angle_deg', 60.0)),
+                                       minval=5.0, maxval=90.0, increment=5.0)
+        self._tab_angle.pack(fill=tk.X, pady=2)
+
         self._on_ramp_toggle()
         self._on_backoff_toggle()
         self._on_arc_toggle()
+        self._on_tab_toggle()
+        if self._algorithm is not None and self._algorithm != "Cutout":
+            self._tab_checkbutton.config(state=tk.DISABLED)
 
         # ── Buttons ───────────────────────────────────────────────────
         btn_row = ttk.Frame(outer)
@@ -626,12 +671,26 @@ class DressUpDialog(tk.Toplevel):
     def _on_arc_toggle(self):
         self._arc_radius.set_state(tk.NORMAL if self._arc_enabled_var.get() else tk.DISABLED)
 
+    def _on_tab_toggle(self):
+        applicable = self._algorithm is None or self._algorithm == "Cutout"
+        state = tk.NORMAL if (applicable and self._tab_enabled_var.get()) else tk.DISABLED
+        self._tab_count.set_state(state)
+        self._tab_width.set_state(state)
+        self._tab_height.set_state(state)
+        self._tab_phase.set_state(state)
+        self._tab_angle.set_state(state)
+
     def _confirm(self):
         try:
-            ramp_angle   = float(self._ramp_angle.get())
-            ramp_length  = float(self._ramp_length.get())
-            backoff_dist = float(self._backoff_dist.get())
-            arc_radius   = float(self._arc_radius.get())
+            ramp_angle    = float(self._ramp_angle.get())
+            ramp_length   = float(self._ramp_length.get())
+            backoff_dist  = float(self._backoff_dist.get())
+            arc_radius    = float(self._arc_radius.get())
+            tab_count     = int(float(self._tab_count.get()))
+            tab_width     = float(self._tab_width.get())
+            tab_height    = float(self._tab_height.get())
+            tab_phase     = float(self._tab_phase.get())
+            tab_angle     = float(self._tab_angle.get())
         except ValueError:
             messagebox.showerror("Invalid input",
                                  "The dress-up parameters must be numbers.",
@@ -666,6 +725,31 @@ class DressUpDialog(tk.Toplevel):
                                  "clearance below z_safe.",
                                  parent=self)
             return
+        if tab_count < 1:
+            messagebox.showerror("Invalid input",
+                                 "Tab count must be at least 1.",
+                                 parent=self)
+            return
+        if tab_width <= 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Tab width must be positive.",
+                                 parent=self)
+            return
+        if tab_height <= 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Tab height must be positive.",
+                                 parent=self)
+            return
+        if not (0.0 <= tab_phase < 100.0):
+            messagebox.showerror("Invalid input",
+                                 "Tab phase must be between 0 and 100 percent.",
+                                 parent=self)
+            return
+        if not (0.0 < tab_angle <= 90.0):
+            messagebox.showerror("Invalid input",
+                                 "Tab angle must be between 0 and 90 degrees.",
+                                 parent=self)
+            return
 
         self._settings['ramp_in_enabled']     = self._ramp_enabled_var.get()
         self._settings['ramp_angle_deg']      = ramp_angle
@@ -674,6 +758,12 @@ class DressUpDialog(tk.Toplevel):
         self._settings['backoff_distance_mm'] = backoff_dist
         self._settings['arc_rapids_enabled']  = self._arc_enabled_var.get()
         self._settings['arc_radius_mm']       = arc_radius
+        self._settings['tab_enabled']    = self._tab_enabled_var.get()
+        self._settings['tab_count']      = tab_count
+        self._settings['tab_width_mm']   = tab_width
+        self._settings['tab_height_mm']  = tab_height
+        self._settings['tab_phase_pct']  = tab_phase
+        self._settings['tab_angle_deg']  = tab_angle
         self.confirmed = True
         self.grab_release()
         self.destroy()

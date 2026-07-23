@@ -4,7 +4,7 @@ bm2gcode converts a depth map into CNC G-code for relief carving. The depth map 
 
 The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces, then a V-bit to cut fine details that the ball bit could not reach, and finally a Cutout pass to free the finished part from the surrounding stock. Each step can also choose which sources on the canvas it sees, so different steps can carve different subsets of the same composition.
 
-Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, and arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid. Each step has its own dress-up settings, configured via the **Dress-up…** button on that step's tab; a newly added step inherits the dress-up settings of the step it was added after.
+Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid, and — for Cutout steps only — tabs leave short uncut bridges around the perimeter so the finished part stays attached to the surrounding stock. Each step has its own dress-up settings, configured via the **Dress-up…** button on that step's tab; a newly added step inherits the dress-up settings of the step it was added after.
 
 A set of visualization modes supports strategy planning. In addition to the 3D toolpath preview, available views include the simulated surface after each step, the material not removed by a step, regions inaccessible to the tool geometry, and a binary processing mask showing which areas the current gating configuration will cut. These views, together with the estimated machining time for each step, allow users to optimize the cutting strategy for a particular depth map.
 
@@ -224,7 +224,7 @@ its own Cut depth and Boundary offset fields — see
 
 #### Step / Dress-up
 
-The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings — three optional, off-by-default G-code refinements. They only change how the tool travels between cuts; the cut geometry itself is unaffected. See [G-code generation](#g-code-generation) for how they fit into path emission. Dress-up settings are per-step: a step added with **Add Step After** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
+The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add Step After** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
 
 **Ramp-in** — replaces a straight vertical plunge with a zig-zag ramp for the portion of the descent that lies inside the stock (below the surface, z < 0). Any travel above the surface remains a plain vertical plunge. The ramp retraces the upcoming cut path's own footprint — so it never cuts outside it — and never rises above the depth the final pass leaves at that position.
 
@@ -244,6 +244,18 @@ The **Dress-up…** button on each step's tab opens that step's tool path dress-
 | Parameter | Description |
 |---|---|
 | Arc radius | Requested corner radius, in mm. Automatically reduced when there isn't enough room — e.g. a shallow cut, a short rapid, or a small safe height — and never exceeds the safe height (a global machine parameter, set under File → Settings), since a corner's lateral sweep is only safe above the stock surface. |
+
+**Tabs** — leaves short, uncut bridges around the perimeter of a Cutout step's closed cutting loop, so the finished part stays attached to the surrounding stock. Unlike the three dress-ups above, tabs change the cut geometry itself rather than just how the tool travels between cuts — see [Cutout Pipeline](#cutout-pipeline). Available only for Cutout steps; greyed out (but still editable/persisted) for every other algorithm.
+
+| Parameter | Description |
+|---|---|
+| Tab count | Number of tabs, evenly spaced around each closed loop's perimeter. A step whose silhouette has several disjoint shapes (e.g. separate letters) gives each shape its own full set of tabs. |
+| Tab width | Each tab's footprint along the cut path, in mm. |
+| Tab height | How much material each tab leaves uncut, in mm — within a tab, the tool stops this far short of full depth, however many passes that takes (see [Cutout Pipeline](#cutout-pipeline)). |
+| Phase | Shifts every tab together, as a percentage of the spacing between two adjacent tabs. Useful for nudging a tab off an unwanted spot (e.g. a sharp corner). |
+| Tab angle | Wall angle of the tab's taper, from horizontal, in degrees. 90° is a vertical, rectangular-walled tab (the tool steps straight up onto it); lower values taper the tab into a trapezoid instead, so the tool ramps onto and off it. |
+
+Being a Z-only change, a tab doesn't alter the toolpath's outline, so it's otherwise invisible in the 2D preview. Each tab is instead marked there with a filled circle sized to its width, toggled together with cut moves and rapids — see [View Menu](#view-menu).
 
 ---
 
@@ -300,7 +312,7 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 #### View Menu
 
-All visualization modes show data for the currently active step. Cut moves and rapid moves can be toggled in any mode with **C** and **R**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves.
+All visualization modes show data for the currently active step. Cut moves, rapid moves, and tab markers can be toggled in any mode with **C**, **R**, and **T**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature.
 
 | Mode | Hotkey | Shows |
 |---|---|---|
@@ -410,11 +422,11 @@ Cutout doesn't share Raster/Contour/V-Carving's kernel + accessibility (morpholo
 
 1. **Silhouette mask** — Splits the depth map into "object" and "background" at Z-threshold. Because depth map polarity — whether the object is the deeply-cut region or the shallow/uncarved region left standing proud of a deeply-recessed background — depends on how the source was authored, both split directions (`<=` and `>=` the threshold) are tried; whichever produces a workable mask (neither empty nor spanning the entire canvas) is used. A Z-threshold of 0 is treated as "not set" and auto-splits at the midpoint of the depth map's own value range instead. Interior holes are then filled — keeping only the outer perimeter of each shape — and the result is dilated outward by the tool radius plus Boundary offset, so the traced boundary already accounts for the tool's own width.
 2. **Contour extraction** — `skimage.find_contours` traces the outer boundary of the dilated mask. If Cut direction is Climb or Conventional, every contour is reversed (or not) by the same single global rule Contour uses (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
-3. **Depth-slicing (multi-pass)** — Every point of every traced loop targets the same full-depth Z (Cut depth) — unlike the other algorithms' per-pixel varying depth — so Max step-down / Final step-down simply produce a sequence of identical loops at progressively deeper ceilings.
+3. **Tabs (optional) + depth-slicing (multi-pass)** — If the Tabs dress-up is enabled (see [Step / Dress-up](#step--dress-up)), each traced loop's Z is first raised to Tab height for a Tab width-wide, optionally tapered (Tab angle) stretch around each of Tab count evenly-spaced points, before depth-slicing runs. Every other point of every traced loop targets the same full-depth Z (Cut depth) — unlike the other algorithms' per-pixel varying depth — so Max step-down / Final step-down normally just produce a sequence of identical loops at progressively deeper ceilings; with tabs, a roughing pass instead stops short wherever a tab's raised Z has already been reached, so a tab is respected by every pass it would otherwise be cut through by, not just the final one — the same per-point "stop once the target depth is reached" mechanism as the [Raster Scan pipeline](#raster-scan-pipeline)'s depth-slicing step, which handles per-pixel varying depth there.
 4. **Ordering** — Greedy nearest-endpoint ordering per pass, with support for closed-loop rotation; optional 2-opt. No terrain linking: unlike Raster/Contour, there's no surface underneath to route a gap-bridging move along, since this is a flat through-cut, so gaps become a plain retract → rapid → plunge instead.
 5. **Simplification + result simulation** — Same as Raster.
 
-Because Cut depth is typically deeper than Max cut depth, a genuine through-cut clips to the same depth-map value (1.0) as ordinary full-depth relief carving elsewhere in the project — the two would otherwise be indistinguishable in the Step Result view. To keep them distinguishable, the result carries a second, separate channel recording exactly which pixels were actually cut all the way through (only when Cut depth exceeds Max cut depth — a shallower Cutout pass is just an ordinary partial cut, not a hole, and needs no special marking); the Step Result view renders those pixels fully transparent, showing a distinct highlight colour through instead of the ordinary depth grayscale.
+Because Cut depth is typically deeper than Max cut depth, a genuine through-cut clips to the same depth-map value (1.0) as ordinary full-depth relief carving elsewhere in the project — the two would otherwise be indistinguishable in the Step Result view. To keep them distinguishable, the result carries a second, separate channel recording exactly which pixels were actually cut all the way through (deeper than Max cut depth — a shallower Cutout pass is just an ordinary partial cut, not a hole, and needs no special marking); the Step Result view renders those pixels fully transparent, showing a distinct highlight colour through instead of the ordinary depth grayscale. A tab only counts as "cut all the way through" once its own raised Z has actually reached Max cut depth or deeper — a tab shallower than that renders as an ordinary partial-depth grey in the Step Result view, not a hole.
 
 ---
 
@@ -477,6 +489,8 @@ Iterates over the ordered segments. Consecutive segments whose endpoints touch a
 - **Ramp-in** replaces the plunge below the stock surface (z < 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
 - **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract.
 - **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius.
+
+The fourth per-step dress-up, **Tabs**, isn't part of this stage at all — it modifies the cut geometry itself, earlier in the Cutout pipeline (see [Cutout Pipeline](#cutout-pipeline)), so by the time G-code generation runs, a tab is already just an ordinary Z change baked into the segments like any other.
 
 The preamble and postamble are injected verbatim. A comment header records tool profile, work area dimensions, estimated run time, cut distance, and rapid distance.
 
