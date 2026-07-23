@@ -7,7 +7,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)",
                      "Cutout"]
-BLEND_MODES       = ["Replace", "Add", "Subtract", "Max", "Min"]
+BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
 DEFAULT_PREAMBLE = (
     "G21         ; units = mm\n"

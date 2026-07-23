@@ -79,26 +79,26 @@ print("blend modes")
 # hand-computed and compared bit-exactly without any polarity conversion.
 SURFACE = "black"
 
-base_add = make_layer(np.array([[0.3, 0.9]], dtype=np.float32))
-top_add  = make_layer(np.array([[0.4, 0.4]], dtype=np.float32), blend_mode="Add")
-out = composite([base_add, top_add], (1, 2), 1.0, 1.0, SURFACE)
-check("Add sums depths and clips at full depth",
+base_sub = make_layer(np.array([[0.3, 0.9]], dtype=np.float32))
+top_sub  = make_layer(np.array([[0.4, 0.4]], dtype=np.float32), blend_mode="Subtract")
+out = composite([base_sub, top_sub], (1, 2), 1.0, 1.0, SURFACE)
+check("Subtract sums depths (deepens) and clips at full depth",
       np.allclose(out, [[0.7, 1.0]]))
 
-base_sub = make_layer(np.array([[0.9, 0.3]], dtype=np.float32))
-top_sub  = make_layer(np.array([[0.4, 0.5]], dtype=np.float32), blend_mode="Subtract")
-out = composite([base_sub, top_sub], (1, 2), 1.0, 1.0, SURFACE)
-check("Subtract subtracts depths and clips at zero",
+base_add = make_layer(np.array([[0.9, 0.3]], dtype=np.float32))
+top_add  = make_layer(np.array([[0.4, 0.5]], dtype=np.float32), blend_mode="Add")
+out = composite([base_add, top_add], (1, 2), 1.0, 1.0, SURFACE)
+check("Add subtracts depths (raises the surface) and clips at zero",
       np.allclose(out, [[0.5, 0.0]]))
 
 base_mm = make_layer(np.array([[0.5, 0.5]], dtype=np.float32))
-top_max = make_layer(np.array([[0.3, 0.7]], dtype=np.float32), blend_mode="Max")
-out = composite([base_mm, top_max], (1, 2), 1.0, 1.0, SURFACE)
-check("Max keeps the deeper of the two", np.allclose(out, [[0.5, 0.7]]))
+top_mlow = make_layer(np.array([[0.3, 0.7]], dtype=np.float32), blend_mode="Merge low")
+out = composite([base_mm, top_mlow], (1, 2), 1.0, 1.0, SURFACE)
+check("Merge low keeps the deeper of the two", np.allclose(out, [[0.5, 0.7]]))
 
-top_min = make_layer(np.array([[0.3, 0.7]], dtype=np.float32), blend_mode="Min")
-out = composite([base_mm, top_min], (1, 2), 1.0, 1.0, SURFACE)
-check("Min keeps the shallower of the two", np.allclose(out, [[0.3, 0.5]]))
+top_mhigh = make_layer(np.array([[0.3, 0.7]], dtype=np.float32), blend_mode="Merge high")
+out = composite([base_mm, top_mhigh], (1, 2), 1.0, 1.0, SURFACE)
+check("Merge high keeps the shallower of the two", np.allclose(out, [[0.3, 0.5]]))
 
 base_normal = make_layer(np.array([[1.0, 1.0]], dtype=np.float32))
 top_normal  = make_layer(np.array([[0.9, 0.1]], dtype=np.float32), blend_mode="Replace")
@@ -108,21 +108,21 @@ check("Replace fully replaces the base wherever it has coverage",
 
 
 # --------------------------------------------------------------------------
-# invisible layer contributes nothing, even for Subtract/Min against a
+# invisible layer contributes nothing, even for Add/Merge high against a
 # zero-depth base -- this is the failure mode a missing "Replace" default
 # blend mode would otherwise hit for a lone visible layer.
 # --------------------------------------------------------------------------
 print("visibility")
 
 zero_base = make_layer(np.ones((2, 2), dtype=np.float32))   # white polarity -> depth 0 everywhere
-hidden_sub = make_layer(np.zeros((2, 2), dtype=np.float32), blend_mode="Subtract", visible=False)
-out = composite([zero_base, hidden_sub], (2, 2), 1.0, 1.0, "white")
-check("an invisible layer (even Subtract) leaves the composite unchanged",
+hidden_add = make_layer(np.zeros((2, 2), dtype=np.float32), blend_mode="Add", visible=False)
+out = composite([zero_base, hidden_add], (2, 2), 1.0, 1.0, "white")
+check("an invisible layer (even Add) leaves the composite unchanged",
       np.array_equal(out, zero_base.raw))
 
-hidden_min = make_layer(np.zeros((2, 2), dtype=np.float32), blend_mode="Min", visible=False)
-out = composite([zero_base, hidden_min], (2, 2), 1.0, 1.0, "white")
-check("an invisible Min layer leaves the composite unchanged",
+hidden_mhigh = make_layer(np.zeros((2, 2), dtype=np.float32), blend_mode="Merge high", visible=False)
+out = composite([zero_base, hidden_mhigh], (2, 2), 1.0, 1.0, "white")
+check("an invisible Merge high layer leaves the composite unchanged",
       np.array_equal(out, zero_base.raw))
 
 
@@ -239,24 +239,24 @@ check("max_depth_pct < min_depth_pct flips the layer's polarity",
 # --------------------------------------------------------------------------
 # base layer (index 0) is always forced to Replace, regardless of its own
 # stored blend_mode -- the direct regression test for the original
-# Subtract/Min-against-an-empty-canvas footgun, now fixed structurally.
+# Add/Merge high-against-an-empty-canvas footgun, now fixed structurally.
 # --------------------------------------------------------------------------
 print("base layer forced to Replace")
 
 bg = 0.4
 base_vals = np.array([[0.9, 0.9]], dtype=np.float32)
-out_subtract_at_base = composite([make_layer(base_vals.copy(), blend_mode="Subtract")],
-                                 (1, 2), 1.0, 1.0, "black", background_depth=bg)
-out_min_at_base = composite([make_layer(base_vals.copy(), blend_mode="Min")],
+out_add_at_base = composite([make_layer(base_vals.copy(), blend_mode="Add")],
                             (1, 2), 1.0, 1.0, "black", background_depth=bg)
+out_mhigh_at_base = composite([make_layer(base_vals.copy(), blend_mode="Merge high")],
+                              (1, 2), 1.0, 1.0, "black", background_depth=bg)
 out_replace_at_base = composite([make_layer(base_vals.copy(), blend_mode="Replace")],
                                 (1, 2), 1.0, 1.0, "black", background_depth=bg)
-check("a stored Subtract blend_mode at index 0 is structurally ignored (forced to Replace)",
-      np.array_equal(out_subtract_at_base, out_replace_at_base))
-check("a stored Min blend_mode at index 0 is structurally ignored (forced to Replace)",
-      np.array_equal(out_min_at_base, out_replace_at_base))
-check("...and does not actually subtract from the background",
-      not np.allclose(out_subtract_at_base, np.clip(bg - base_vals, 0.0, 1.0)))
+check("a stored Add blend_mode at index 0 is structurally ignored (forced to Replace)",
+      np.array_equal(out_add_at_base, out_replace_at_base))
+check("a stored Merge high blend_mode at index 0 is structurally ignored (forced to Replace)",
+      np.array_equal(out_mhigh_at_base, out_replace_at_base))
+check("...and does not actually apply the Add math (bg - base_vals) against the background",
+      not np.allclose(out_add_at_base, np.clip(bg - base_vals, 0.0, 1.0)))
 
 
 # --------------------------------------------------------------------------
@@ -271,8 +271,8 @@ check("background_depth fills canvas area no layer covers",
 
 
 # --------------------------------------------------------------------------
-# alpha-driven coverage: the case Add/Max can already fake via zero-valued
-# content but Replace and Min structurally cannot.
+# alpha-driven coverage: the case Subtract/Merge low can already fake via
+# zero-valued content but Replace and Merge high structurally cannot.
 # --------------------------------------------------------------------------
 print("alpha-driven coverage")
 
@@ -291,12 +291,12 @@ expected[1, 1] = 0.9
 check("Replace with alpha coverage only overrides the opaque pixel (identity-placement path)",
       np.allclose(out, expected))
 
-min_layer = make_layer(np.zeros(canvas_shape, dtype=np.float32),
-                       alpha=alpha_mask.copy(), blend_mode="Min")
-out2 = composite([base_layer, min_layer], canvas_shape, 1.0, 1.0, "black")
+mhigh_layer = make_layer(np.zeros(canvas_shape, dtype=np.float32),
+                         alpha=alpha_mask.copy(), blend_mode="Merge high")
+out2 = composite([base_layer, mhigh_layer], canvas_shape, 1.0, 1.0, "black")
 expected2 = np.full(canvas_shape, base_val, dtype=np.float32)
 expected2[1, 1] = 0.0
-check("Min with alpha coverage only affects the opaque pixel, not the rest (identity-placement path)",
+check("Merge high with alpha coverage only affects the opaque pixel, not the rest (identity-placement path)",
       np.allclose(out2, expected2))
 
 # General (non-identity) affine path: an offset placement must still fold

@@ -191,12 +191,12 @@ def _blend_op(mode: str, base: np.ndarray, layer_depth: np.ndarray) -> np.ndarra
     if mode == "Replace":
         return layer_depth
     if mode == "Add":
-        return base + layer_depth
-    if mode == "Subtract":
         return base - layer_depth
-    if mode == "Max":
+    if mode == "Subtract":
+        return base + layer_depth
+    if mode == "Merge low":
         return np.maximum(base, layer_depth)
-    if mode == "Min":
+    if mode == "Merge high":
         return np.minimum(base, layer_depth)
     raise ValueError(f"Unknown blend mode: {mode!r}")
 
@@ -214,7 +214,7 @@ def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
     background_depth (canonical [0,1], 0 = no cut) fills any canvas pixel no
     layer covers. The bottom-most layer (index 0) is always treated as
     "Replace" regardless of its own stored blend_mode -- there's nothing
-    beneath it but the background, so Subtract/Min there would otherwise
+    beneath it but the background, so Add/Merge high there would otherwise
     corrupt the result; this is enforced structurally here rather than by
     mutating the layer's stored data, since layers can be reordered.
 

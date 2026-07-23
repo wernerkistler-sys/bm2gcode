@@ -78,11 +78,11 @@ Each source — an opened image or imported STL — gets its own tab in the note
 
 | Mode | Result |
 |---|---|
-| Replace | This source's depth value outright. |
-| Add | Base depth + this source's depth. |
-| Subtract | Base depth − this source's depth. |
-| Max | The deeper of the two. |
-| Min | The shallower of the two. |
+| Replace | This source's surface (depth value) outright. |
+| Merge high | The higher of the two (whichever surface is shallower). |
+| Merge low | The deeper of the two (whichever surface is deeper). |
+| Add | Base depth − this source's depth (raises the surface). |
+| Subtract | Base depth + this source's depth (deepens the surface). |
 
 Each source tab also has **Duplicate** (clones the source and inserts the copy right after it), **Add Source** (inserts a newly opened source immediately after this one in the stack), and **Remove this source** (removes it — including the last remaining source, which leaves the canvas empty until a new one is added; canvas settings are unaffected).
 
