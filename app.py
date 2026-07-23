@@ -3593,7 +3593,14 @@ class GCodeGeneratorApp:
         self.ax.cla()
         self.ax.set_visible(True)
         has_holes = img_alpha is not None and np.any(img_alpha <= 0.0)
-        self.ax.set_facecolor(_HOLE_FACECOLOR if has_holes else "#2b2b2b")
+        hole_color = _HOLE_FACECOLOR if has_holes else "#2b2b2b"
+        self.ax.set_facecolor(hole_color)
+        # ax.axis("off") below disables the Axes' own background patch, so
+        # whatever's behind a transparent (alpha=0, "hole") pixel is really
+        # the *figure's* patch, not the axes' facecolor set above -- without
+        # this, a hole always showed the figure's plain dark background
+        # instead of the intended highlight colour.
+        self.fig.patch.set_facecolor(hole_color)
         self.ax.imshow(img, interpolation="none", aspect="equal",
                        cmap=cmap, vmin=vmin, vmax=vmax, alpha=img_alpha)
         self._overlay_toolpath_2d(img, step_idx)
