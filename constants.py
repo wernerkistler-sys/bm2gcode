@@ -5,7 +5,8 @@ CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
 ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
-                     "V-Carving (Feature Width)"]
+                     "V-Carving (Feature Width)",
+                     "Cutout"]
 BLEND_MODES       = ["Replace", "Add", "Subtract", "Max", "Min"]
 
 DEFAULT_PREAMBLE = (
@@ -75,6 +76,11 @@ DEFAULTS = {
     "step_contour_z_increment":   "0.2", # Z increment between contour levels (mm)
     "step_contour_adaptive":      "0",   # 0 = fixed levels, 1 = adaptive CDF levels
     "step_contour_lateral_tol":   "0.0", # lateral tolerance for redundancy pruning (mm); 0 = disabled
+    # Cutout-specific defaults
+    "step_cutout_depth":          "10.0", # absolute total cut-through depth (mm); typically > max_depth
+    "step_cutout_stepdown":       "3.0",  # max step-down per roughing pass (mm); 0 = single pass
+    "step_cutout_final_stepdown": "0.0",  # final finishing pass depth (mm); 0 = none
+    "step_cutout_extra_offset":   "0.0",  # lateral-only outward push (mm); 0 = tool tangent to silhouette edge
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     # Per-step G-code dress-ups (see dressup.py) — all opt-in, disabled by default

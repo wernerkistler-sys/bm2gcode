@@ -2428,3 +2428,392 @@ def compute_contour_toolpath(
     )
     progress(100, "Contour tool path computation complete!")
     return tp
+
+
+def compute_cutout_toolpath(
+    depth_map, n_grey_levels,
+    tool, cutout_depth_mm, max_depth,
+    width_mm, height_mm,
+    origin="Bottom-Left",
+    feed_rate=800.0,
+    threshold_mm=0.0,
+    stepdown_mm=0.0,
+    final_stepdown_mm=0.0,
+    extra_offset_mm=0.0,
+    cut_direction="Either",
+    prior_accessible=None,
+    previous_result=None,
+    previous_alpha=None,
+    use_2opt=False,
+    z_safe=5.0,
+    feed_rapid=3000.0,
+    progress=None,
+):
+    """Compute an outer-silhouette cutout tool path.
+
+    Traces the outer perimeter of every connected region of *depth_map* at
+    or above *threshold_mm*, offsets it outward by the tool radius (plus
+    *extra_offset_mm*), and cuts a uniform-depth closed loop through the
+    full stock thickness (*cutout_depth_mm*), stepping down in Z across
+    however many passes *stepdown_mm*/*final_stepdown_mm* require.
+
+    Unlike compute_raster_toolpath/compute_vcarve_toolpath/
+    compute_contour_toolpath this is a flat, straight-wall cut -- tool.profile
+    is expected to be "End Mill" (enforced by the UI, not re-validated here)
+    -- with no depth-shaping kernel: only the tool's lateral radius matters,
+    so there is no grey_erosion/grey_dilation achievable-depth surface stage
+    and no erosion_cache.
+
+    Interior holes in the silhouette (e.g. a letter's counter) are always
+    filled before contour tracing -- v1 cuts the outer perimeter of each
+    shape only; cutting interior holes is not supported yet.
+
+    Known limitation: if the silhouette touches the edge of the canvas,
+    find_contours may return an open polyline running along the border
+    rather than a closed ring (marching squares does not synthesize a
+    boundary at the array edge). Keep a margin between artwork and the
+    canvas edge to avoid this.
+
+    Parameters
+    ----------
+    depth_map : 2-D float32 array, values in [0, 1]
+        Normalised depth map; 1.0 = canvas max_depth.
+    n_grey_levels : int
+        Unused -- present only for call-signature parity with the other
+        compute_*_toolpath functions (their RDP tolerance uses it; a flat
+        boundary loop has no grey-level concept).
+    tool : Tool
+        Expected profile "End Mill".
+    cutout_depth_mm : float
+        Total absolute cut depth in mm, independent of and typically larger
+        than *max_depth* (must cut through the full stock thickness). Not
+        used to renormalise depth_map or any kernel; flows only into
+        _plan_passes/make_multipass (which take plain mm).
+    max_depth : float
+        Canvas's shared max cut depth in mm. Used only to (a) interpret
+        threshold_mm as a normalised fraction of depth_map and (b)
+        normalise the simulated result/accessible arrays into the canvas's
+        shared [0, 1] space.
+    width_mm, height_mm : float
+        Physical dimensions of the work area in mm.
+    origin : str
+        G-code origin convention ("Bottom-Left", "Top-Left", etc.).
+    feed_rate : float
+        Cutting feed rate in mm/min.
+    threshold_mm : float
+        Depth (mm, as a fraction of max_depth) used to split "inside the
+        object silhouette" from "background"; threshold_norm = threshold_mm
+        / max_depth. Which side of the threshold is "the object" depends on
+        how the source was authored (a carved object against a shallow
+        background vs. an uncarved object standing proud of a deeply
+        recessed background) and isn't knowable from depth_map alone, so
+        both directions are tried -- see Stage 2 below and the
+        'mask_direction' metadata key ('<=' or '>=') for which one won.
+    stepdown_mm, final_stepdown_mm : float
+        As in the sibling algorithms -- passed straight to
+        make_multipass(segments, cutout_depth_mm, stepdown_mm,
+        final_stepdown_mm).
+    extra_offset_mm : float
+        Lateral-only outward push of the tool-centre path beyond the
+        minimum tool-radius clearance; 0 = tool tangent to the (filled)
+        silhouette edge. Implemented as a single binary_dilation of the
+        filled silhouette mask by a disk of radius
+        (tool.diameter_mm/2 + extra_offset_mm), in pixels.
+    cut_direction : "Either" | "Climb" | "Conventional"
+        Same find_contours-orientation convention as
+        compute_contour_toolpath (reverse_contours =
+        cut_direction == "Conventional").
+    prior_accessible, previous_result : 2-D float32 array or None
+        Cumulative accessible/result surfaces from the previous step
+        (ToolPath.accessible/.result). Unconditionally unioned into this
+        step's own accessible/result.
+    previous_alpha : 2-D float32 array or None
+        Cumulative hole-visibility surface from the previous step
+        (ToolPath.alpha). 1.0 = material present, 0.0 = a real hole. None
+        means no prior step has flagged any holes.
+    use_2opt : bool
+        Optional 2-opt travel-order refinement across the loops within
+        each depth pass.
+    z_safe, feed_rapid : float
+        Used only to seed per-rapid overhead in the optional 2-opt cost
+        model.
+    progress : callable(pct, message)
+        Thread-safe progress reporter.
+
+    Returns
+    -------
+    ToolPath
+    """
+    from scipy.ndimage import binary_fill_holes, binary_dilation
+    from skimage.morphology import disk
+    from skimage.measure import find_contours
+
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
+    H, W = depth_map.shape
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        if previous_result is not None:
+            previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
+        if prior_accessible is not None:
+            prior_accessible = _zoom(prior_accessible, (zy, zx), order=1).astype(np.float32)
+        if previous_alpha is not None:
+            previous_alpha = _zoom(previous_alpha, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
+
+    W_mm = (W - 1) / px_per_mm
+    H_mm = (H - 1) / px_per_mm
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm / 2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm / 2}.get(origin, 0)
+
+    # ── Stage 1 · Build tool kernel (0–10 %) ──────────────────────────────
+    # Only used for the final material-removal simulation (Stage 5) -- a
+    # straight-wall cutout has no depth-shaping kernel of its own, so
+    # _planning_kernel/erosion_cache (used by the other algorithms to plan a
+    # depth-shaped achievable surface) don't apply here.
+    progress(0, "Building tool geometry kernel…")
+    kernel_cutout, footprint_cutout = _build_kernel(tool, px_per_mm, max_depth)
+    ksize = kernel_cutout.shape[0]
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
+
+    def _empty_result(message):
+        progress(100, message)
+        return ToolPath(
+            segments=[],
+            result=(previous_result.copy() if previous_result is not None
+                    else np.zeros_like(depth_map, dtype=np.float32)),
+            accessible=(prior_accessible.copy() if prior_accessible is not None
+                        else np.zeros_like(depth_map, dtype=np.float32)),
+            alpha=(previous_alpha.copy() if previous_alpha is not None else None),
+            metadata={'algorithm': 'Cutout', 'profile': tool.profile,
+                      'max_depth': max_depth, 'cutout_depth_mm': cutout_depth_mm,
+                      'threshold_mm': threshold_mm}
+        )
+
+    # ── Stage 2 · Silhouette mask: threshold → fill holes → dilate (10–35 %)
+    # Whether "the object" is the deeply-cut region (dark-background source,
+    # background left at/near the surface) or the shallow/uncarved region
+    # (background carved away deeply so the object stands proud in relief)
+    # depends on how the source was authored -- depth_map alone doesn't say
+    # which. Try object = "at or below threshold" first (an object standing
+    # proud of a deeply-recessed background); if that yields nothing usable
+    # (empty, or -- once holes are filled -- the entire canvas, e.g. because
+    # it actually picked out the *background* and binary_fill_holes closed
+    # over the object as an enclosed "hole" in it), retry with object = "at
+    # or above threshold" instead (a carved object against a shallow/uncut
+    # background). This only disambiguates correctly when the object doesn't
+    # itself touch the canvas edge -- same margin caveat as the open-contour
+    # limitation noted above.
+    progress(10, "Building silhouette mask…")
+    threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+
+    r_px = max(1, int(round((tool.diameter_mm / 2.0 + extra_offset_mm) * px_per_mm)))
+
+    def _try_mask(cmp):
+        raw = (depth_map < threshold_norm) if cmp == '<=' else (depth_map >= threshold_norm)
+        if not np.any(raw):
+            return None
+        # v1: interior holes are always filled before contour tracing --
+        # only the outer perimeter of each connected shape is ever cut.
+        filled = binary_fill_holes(raw)
+        dilated = binary_dilation(filled, structure=disk(r_px))
+        if np.all(dilated):
+            return None
+        return dilated
+
+    mask_cutout = _try_mask('<=')
+    mask_direction = '<='
+    if mask_cutout is None:
+        mask_cutout = _try_mask('>=')
+        mask_direction = '>='
+    if mask_cutout is None:
+        return _empty_result(
+            "No usable silhouette boundary found (tried both depth-threshold "
+            "directions) — nothing to cut.")
+    progress(35, f"Silhouette mask ready ({np.count_nonzero(mask_cutout)} px, "
+                 f"object = depth {mask_direction} threshold).")
+
+    # ── Stage 3 · Contour extraction (35–45 %) ────────────────────────────
+    progress(35, "Extracting outer silhouette contour…")
+    # Same global winding-direction convention as compute_contour_toolpath --
+    # find_contours' marching-squares orientation guarantee already keeps
+    # uncut material consistently on one side, so no per-contour
+    # inside/outside analysis is needed.
+    reverse_contours = (cut_direction == "Conventional")
+    lock_direction    = cut_direction in ("Climb", "Conventional")
+    rings = [c for c in find_contours(mask_cutout.astype(np.float64), 0.5) if len(c) >= 3]
+    if reverse_contours:
+        rings = [c[::-1] for c in rings]
+    if not rings:
+        return _empty_result("No closed silhouette boundary found — nothing to cut.")
+    progress(45, f"{len(rings)} outer boundary loop{'s' if len(rings) != 1 else ''} found.")
+
+    # ── Stage 4 · Multipass + ordering + simplify (45–75 %) ───────────────
+    # Every ring gets the exact same full-depth Z -- there is only one
+    # cutout_depth_mm for the whole tool path, so (unlike compute_contour_
+    # toolpath's per-level Z jumps) no z-jump weighting is ever needed
+    # below: every point of every ring in a given pass shares one Z.
+    full_depth_segs = [
+        [(col / px_per_mm - _ox, (H - 1 - row) / px_per_mm - _oy, -cutout_depth_mm)
+         for row, col in ring]
+        for ring in rings
+    ]
+    pass_list = make_multipass(full_depth_segs, cutout_depth_mm, stepdown_mm, final_stepdown_mm)
+    n_passes = len(pass_list)
+
+    all_segments = []
+    current_pos  = np.array([0.0, 0.0])
+    link_threshold_mm = tool.diameter_mm
+    closed_tol_mm = 1.5 / px_per_mm
+
+    for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
+        if not pass_segs:
+            continue
+        progress(45 + 30 * pi // max(n_passes, 1),
+                 f"Ordering pass {pi + 1}/{n_passes} ({len(pass_segs)} loop(s))…")
+
+        remaining = [np.asarray(seg, dtype=np.float64) for seg in pass_segs]
+        pass_ordered = []
+        while remaining:
+            best_idx  = 0
+            best_flip = False
+            best_rot  = 0
+            best_cost = float('inf')
+            for i, c in enumerate(remaining):
+                n = len(c)
+                is_closed = np.hypot(c[0, 0] - c[-1, 0], c[0, 1] - c[-1, 1]) < closed_tol_mm
+                rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
+                flip_cands = (False,) if lock_direction else (False, True)
+                for flip in flip_cands:
+                    orient = c[::-1] if flip else c
+                    for j in rot_cands:
+                        dx = orient[j, 0] - current_pos[0]
+                        dy = orient[j, 1] - current_pos[1]
+                        d = (dx * dx + dy * dy) ** 0.5
+                        if d < best_cost:
+                            best_cost = d
+                            best_idx, best_flip, best_rot = i, flip, j
+
+            c_chosen = remaining.pop(best_idx)
+            is_closed = np.hypot(c_chosen[0, 0] - c_chosen[-1, 0],
+                                 c_chosen[0, 1] - c_chosen[-1, 1]) < closed_tol_mm
+            if best_flip:
+                c_chosen = c_chosen[::-1]
+            if best_rot > 0:
+                c_chosen = np.roll(c_chosen, -best_rot, axis=0)
+            if is_closed:
+                c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
+
+            points = [tuple(p) for p in c_chosen]
+            if len(points) < 2:
+                continue
+            pass_ordered.append(points)
+            current_pos[0], current_pos[1] = points[-1][0], points[-1][1]
+
+        if not pass_ordered:
+            continue
+
+        # Optional 2-opt reorder within the pass. Skipped when locked, since
+        # its block-reversal move would undo the forced climb/conventional
+        # direction. No z_jump term -- every loop in this pass shares one Z.
+        if use_2opt and len(pass_ordered) >= 3 and not lock_direction:
+            ent_xy = [(s[0][0],  s[0][1])  for s in pass_ordered]
+            ext_xy = [(s[-1][0], s[-1][1]) for s in pass_ordered]
+            order, flips = _two_opt_reorder(
+                ent_xy, ext_xy,
+                origin=(float(all_segments[-1][-1][0]) if all_segments else 0.0,
+                        float(all_segments[-1][-1][1]) if all_segments else 0.0),
+                link_threshold=link_threshold_mm,
+                per_rapid_overhead=2.0 * z_safe)
+            pass_ordered = [
+                list(reversed(pass_ordered[i])) if flips[k] else pass_ordered[i]
+                for k, i in enumerate(order)
+            ]
+
+        all_segments.extend(pass_ordered)
+        last = pass_ordered[-1][-1]
+        current_pos[0], current_pos[1] = last[0], last[1]
+
+    progress(75, f"Ordering complete ({len(all_segments)} segments across {n_passes} pass(es)).")
+
+    # No terrain-link stage -- unlike compute_contour_toolpath's
+    # _geodesic_link (which bridges gaps along the surface being cut),
+    # Cutout has no terrain (flat stock); gaps between loops/passes become
+    # plain retract/rapid/plunge via ToolPath.iter_moves's own gap
+    # detection. This is an intentional simplification.
+    rdp_tol = 1.0 / px_per_mm
+    all_segments = [simplify_line(pts, rdp_tol) for pts in all_segments]
+
+    # ── Stage 5 · Simulate result/accessible/alpha (75–90 %) ──────────────
+    progress(75, "Simulating tool-swept removal surface…")
+    material_removed_cutout = simulate_toolpath_result(
+        ToolPath(segments=all_segments),
+        (H, W), px_per_mm, px_per_mm, _ox, _oy,
+        max_depth, kernel_cutout, footprint_cutout,
+    )
+    result = np.maximum(
+        previous_result if previous_result is not None else 0.0,
+        material_removed_cutout).astype(np.float32)
+    accessible = np.maximum(
+        prior_accessible if prior_accessible is not None else 0.0,
+        material_removed_cutout).astype(np.float32)
+
+    # alpha: the new hole-visibility channel. Never participates in any
+    # depth/residual arithmetic -- it exists solely so the result preview
+    # can tell "reached full relief depth" apart from "this is a real hole".
+    # Only actually a hole when cutout_depth_mm exceeds max_depth -- if the
+    # user set a shallower cut depth (<= max_depth), this pass is just an
+    # ordinary partial-depth cut like any other algorithm's, and result's
+    # own grey level (< 1.0) already represents it correctly; no pixel here
+    # has been clipped to 1.0 by simulate_toolpath_result, so there is
+    # nothing to flag.
+    if cutout_depth_mm > max_depth:
+        kerf_mask = material_removed_cutout > 1e-6
+        alpha = np.minimum(
+            previous_alpha if previous_alpha is not None else 1.0,
+            np.where(kerf_mask, 0.0, 1.0)).astype(np.float32)
+    else:
+        alpha = previous_alpha.copy() if previous_alpha is not None else None
+    progress(90, "Result computed.")
+
+    # ── Stage 6 · Assemble ToolPath (90–100 %) ────────────────────────────
+    progress(90, "Assembling tool path…")
+    tp = ToolPath(
+        segments=all_segments,
+        result=result,
+        accessible=accessible,
+        alpha=alpha,
+        metadata={
+            'algorithm':         'Cutout',
+            'profile':           tool.profile,
+            'radius_mm':         tool.diameter_mm / 2,
+            'max_depth':         max_depth,
+            'cutout_depth_mm':   cutout_depth_mm,
+            'stepdown_mm':       stepdown_mm,
+            'final_stepdown_mm': final_stepdown_mm,
+            'extra_offset_mm':   extra_offset_mm,
+            'threshold_mm':      threshold_mm,
+            'mask_direction':    mask_direction,
+            'cut_direction':     cut_direction,
+            'use_2opt':          use_2opt,
+            'n_passes':          n_passes,
+            'width_mm':          width_mm,
+            'height_mm':         height_mm,
+            'rdp_tolerance':     rdp_tol,
+        }
+    )
+    progress(100, "Cutout tool path computation complete!")
+    return tp

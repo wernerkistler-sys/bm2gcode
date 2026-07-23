@@ -22,6 +22,12 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
     ])
 )
 
+# Distinct, saturated facecolor shown through wherever a ToolPath.alpha
+# array marks a pixel as physically cut through (a real hole) -- the
+# ordinary grayscale "Step Result" colormap never produces a saturated hue,
+# so this always reads clearly as "this is a hole," not a depth value.
+_HOLE_FACECOLOR = "#d9534f"
+
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
@@ -34,7 +40,8 @@ from widgets import (ProgressDialog, LabeledEntry,
                      SettingsDialog, DressUpDialog, ExportToolpathDialog,
                      ImportSTLDialog, _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
-                        compute_contour_toolpath, compute_vcarve_mask)
+                        compute_contour_toolpath, compute_vcarve_mask,
+                        compute_cutout_toolpath)
 from tool import Tool
 from dressup import RampSettings, BackoffSettings, ArcSettings
 import layers as layers_mod
@@ -832,6 +839,7 @@ class GCodeGeneratorApp:
         for key in ('diameter', 'stepover', 'raster_offset', 'stepdown', 'raster_final_stepdown',
                     'extra_offset',
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
+                    'cutout_depth', 'cutout_stepdown', 'cutout_final_stepdown', 'cutout_extra_offset',
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
                     'min_fw', 'max_fw'):
             dst[key].set(src[key].get())
@@ -981,6 +989,7 @@ class GCodeGeneratorApp:
 
         region_row = ttk.Frame(gating_frame)
         region_row.pack(fill=tk.X, pady=(0, 4))
+        step['gating_region_row'] = region_row
         ttk.Label(region_row, text="Process region:").pack(side=tk.LEFT)
         gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
         step['gating_mode_var'] = gating_var
@@ -1070,6 +1079,35 @@ class GCodeGeneratorApp:
         vcarve_final_stepdown.pack(fill=tk.X, pady=2)
         step['vcarve_final_stepdown'] = vcarve_final_stepdown
 
+        # ── Cutout-only controls (hidden unless Algorithm == Cutout) ──
+        cutout_frame = ttk.Frame(tool_lf)
+        step['cutout_frame'] = cutout_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        cutout_depth = LabeledEntry(cutout_frame, "Cut depth", "mm",
+                                    DEFAULTS["step_cutout_depth"],
+                                    minval=0.01, maxval=500.0, increment=0.5)
+        cutout_depth.pack(fill=tk.X, pady=2)
+        step['cutout_depth'] = cutout_depth
+
+        cutout_stepdown = LabeledEntry(cutout_frame, "Max step-down", "mm",
+                                       DEFAULTS["step_cutout_stepdown"],
+                                       minval=0.0, maxval=50.0, increment=0.1)
+        cutout_stepdown.pack(fill=tk.X, pady=2)
+        step['cutout_stepdown'] = cutout_stepdown
+
+        cutout_final_stepdown = LabeledEntry(cutout_frame, "Final step-down", "mm",
+                                             DEFAULTS["step_cutout_final_stepdown"],
+                                             minval=0.0, maxval=50.0, increment=0.1)
+        cutout_final_stepdown.pack(fill=tk.X, pady=2)
+        step['cutout_final_stepdown'] = cutout_final_stepdown
+
+        cutout_extra_offset = LabeledEntry(cutout_frame, "Extra offset", "mm",
+                                           DEFAULTS["step_cutout_extra_offset"],
+                                           minval=0.0, maxval=50.0, increment=0.1)
+        cutout_extra_offset.pack(fill=tk.X, pady=2)
+        step['cutout_extra_offset'] = cutout_extra_offset
+
         feed = LabeledEntry(tool_lf, "Feed rate", "mm/min", DEFAULTS["step_feed_rate"],
                             minval=1.0, maxval=30000.0, increment=50.0)
         feed.pack(fill=tk.X, pady=2)
@@ -1078,6 +1116,7 @@ class GCodeGeneratorApp:
         # ── Wire up algorithm / profile toggle ────────────────────────
         _VCARVE_PROFILES  = ["V-Bit", "Ball"]
         _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
+        _CUTOUT_PROFILES  = ["End Mill"]
 
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
@@ -1094,6 +1133,7 @@ class GCodeGeneratorApp:
                 step['min_fw'].pack(fill=tk.X, pady=2)
                 step['max_fw'].pack(fill=tk.X, pady=2)
                 step['gating_frame'].pack(fill=tk.X)
+                step['gating_region_row'].pack(fill=tk.X, pady=(0, 4), before=step['threshold'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
@@ -1101,6 +1141,7 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state(
                     "disabled" if profile == "Ball" else "normal")
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['vcarve_frame'])
+                step['cutout_frame'].pack_forget()
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
@@ -1122,13 +1163,38 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['contour_frame'])
                 step['vbit_angle'].set_state("normal")
+                step['cutout_frame'].pack_forget()
+            elif alg == "Cutout":
+                step['raster_frame'].pack_forget()
+                step['vcarve_frame'].pack_forget()
+                step['contour_frame'].pack_forget()
+                step['vbit_frame'].pack_forget()
+                step['stepdown'].pack_forget()
+                step['raster_final_stepdown'].pack_forget()
+                step['extra_offset'].pack_forget()   # Cutout uses cutout_extra_offset instead
+                step['min_fw'].pack_forget()
+                step['max_fw'].pack_forget()
+                step['gating_frame'].pack(fill=tk.X)
+                step['gating_region_row'].pack_forget()   # Cutout always reads
+                                                           # prior_accessible/previous_result
+                                                           # unconditionally, mirroring Contour --
+                                                           # only the Z-threshold field is used.
+                step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
+                step['profile_cb'].config(state="readonly", values=_CUTOUT_PROFILES)
+                if profile not in _CUTOUT_PROFILES:
+                    step['profile_var'].set("End Mill")
+                step['vbit_angle'].set_state("disabled")
+                step['cutout_frame'].pack(fill=tk.X, after=step['diameter'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['alg_row'])
             else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack(fill=tk.X)
+                step['gating_region_row'].pack(fill=tk.X, pady=(0, 4), before=step['threshold'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
+                step['cutout_frame'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
                 if profile not in _RASTER_PROFILES:
                     step['profile_var'].set("Ball")
@@ -1217,6 +1283,10 @@ class GCodeGeneratorApp:
         step['max_fw'].set(DEFAULTS["step_max_fw"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
+        step['cutout_depth'].set(DEFAULTS["step_cutout_depth"])
+        step['cutout_stepdown'].set(DEFAULTS["step_cutout_stepdown"])
+        step['cutout_final_stepdown'].set(DEFAULTS["step_cutout_final_stepdown"])
+        step['cutout_extra_offset'].set(DEFAULTS["step_cutout_extra_offset"])
         step['contour_z_increment'].set(DEFAULTS["step_contour_z_increment"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
@@ -1839,6 +1909,10 @@ class GCodeGeneratorApp:
             'vbit_angle':           step['vbit_angle'].get(),
             'vcarve_stepdown':      step['vcarve_stepdown'].get(),
             'vcarve_final_stepdown': step['vcarve_final_stepdown'].get(),
+            'cutout_depth':          step['cutout_depth'].get(),
+            'cutout_stepdown':       step['cutout_stepdown'].get(),
+            'cutout_final_stepdown': step['cutout_final_stepdown'].get(),
+            'cutout_extra_offset':   step['cutout_extra_offset'].get(),
             'contour_z_increment':  step['contour_z_increment'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
@@ -1876,6 +1950,10 @@ class GCodeGeneratorApp:
         step['vbit_angle'].set(d.get('vbit_angle', DEFAULTS['step_vbit_angle']))
         step['vcarve_stepdown'].set(d.get('vcarve_stepdown', DEFAULTS['step_vcarve_stepdown']))
         step['vcarve_final_stepdown'].set(d.get('vcarve_final_stepdown', DEFAULTS['step_vcarve_final_stepdown']))
+        step['cutout_depth'].set(d.get('cutout_depth', DEFAULTS['step_cutout_depth']))
+        step['cutout_stepdown'].set(d.get('cutout_stepdown', DEFAULTS['step_cutout_stepdown']))
+        step['cutout_final_stepdown'].set(d.get('cutout_final_stepdown', DEFAULTS['step_cutout_final_stepdown']))
+        step['cutout_extra_offset'].set(d.get('cutout_extra_offset', DEFAULTS['step_cutout_extra_offset']))
         step['contour_z_increment'].set(d.get('contour_z_increment', DEFAULTS['step_contour_z_increment']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
@@ -2406,6 +2484,17 @@ class GCodeGeneratorApp:
                 'contour_max_step_down': float(step['stepdown'].get()),
                 'cut_direction':       step['cut_dir_var'].get(),
             })
+        elif algorithm == "Cutout":
+            tool = Tool("End Mill", float(step['diameter'].get()), 90.0)
+            params.update({
+                'tool':                     tool,
+                'cutout_depth_mm':          float(step['cutout_depth'].get()),
+                'cutout_stepdown_mm':       float(step['cutout_stepdown'].get()),
+                'cutout_final_stepdown_mm': float(step['cutout_final_stepdown'].get()),
+                'cutout_extra_offset_mm':   float(step['cutout_extra_offset'].get()),
+                'cut_direction':            step['cut_dir_var'].get(),
+                'use_2opt':                 step['tsp_2opt_var'].get(),
+            })
         else:  # Raster
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
@@ -2510,6 +2599,30 @@ class GCodeGeneratorApp:
                 extra_offset_mm    = params['extra_offset_mm'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
+            )
+        elif algorithm == "Cutout":
+            return compute_cutout_toolpath(
+                depth_map          = depth_map,
+                n_grey_levels      = n_grey_levels,
+                tool               = params['tool'],
+                cutout_depth_mm    = params['cutout_depth_mm'],
+                max_depth          = params['max_depth'],
+                width_mm           = params['eff_width_mm'],
+                height_mm          = params['eff_height_mm'],
+                origin             = params['origin'],
+                feed_rate          = params['feed_rate'],
+                threshold_mm       = params['threshold_mm'],
+                stepdown_mm        = params['cutout_stepdown_mm'],
+                final_stepdown_mm  = params['cutout_final_stepdown_mm'],
+                extra_offset_mm    = params['cutout_extra_offset_mm'],
+                cut_direction      = params['cut_direction'],
+                prior_accessible   = prev_tp.accessible if prev_tp is not None else None,
+                previous_result    = prev_tp.result     if prev_tp is not None else None,
+                previous_alpha     = prev_tp.alpha      if prev_tp is not None else None,
+                use_2opt           = params['use_2opt'],
+                z_safe             = self._settings['z_safe'],
+                feed_rapid         = self._settings['feed_rapid'],
+                progress           = progress_fn,
             )
         else:  # Raster
             gating_mode = params['gating_mode']
@@ -2639,7 +2752,20 @@ class GCodeGeneratorApp:
         prev_tp   = self.toolpaths[idx - 1] if idx > 0 else None
         algorithm = params['algorithm']
 
-        if algorithm != "Contour":
+        if algorithm == "Contour":
+            if idx > 0 and prev_tp is None:
+                if not messagebox.askyesno(
+                        "Previous step not computed",
+                        f"Step {idx} has not been computed yet.\n\n"
+                        "Without its result this step will treat the entire "
+                        "depth map as unfinished.\n\nContinue anyway?"):
+                    return
+        elif algorithm == "Cutout":
+            pass  # Cutout cuts based on its own depth_map threshold regardless
+                  # of any prior step -- a missing prev_tp only affects this
+                  # step's own result/accessible/alpha bookkeeping, not which
+                  # pixels get cut, so there is nothing to warn about here.
+        else:
             gating_mode = params['gating_mode']
             if gating_mode != "Full depth map" and idx > 0 and prev_tp is None:
                 surf_name = ("accessible surface"
@@ -2651,14 +2777,6 @@ class GCodeGeneratorApp:
                         f"Step {idx} has not been computed yet.\n\n"
                         f"Without its {surf_name} this step will process the "
                         f"full depth map.\n\nContinue anyway?"):
-                    return
-        else:
-            if idx > 0 and prev_tp is None:
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        "Without its result this step will treat the entire "
-                        "depth map as unfinished.\n\nContinue anyway?"):
                     return
 
         feed_rate = params['feed_rate']
@@ -3207,6 +3325,9 @@ class GCodeGeneratorApp:
             self.ax.set_facecolor("#2b2b2b")
 
         vmin, vmax = 0.0, 1.0
+        img_alpha = None   # per-pixel matplotlib alpha array; set only when
+                           # the displayed ToolPath flags physically-removed
+                           # (cut-through) pixels -- see DISPLAY_STEP_RESULT
 
         if mode == DISPLAY_STEP_RES:
             tp = (self.toolpaths[step_idx]
@@ -3227,6 +3348,14 @@ class GCodeGeneratorApp:
                 # Invert so that deeper cuts appear darker when z=0 is white
                 cmap  = "gray_r" if self.surface.get() == "white" else "gray"
                 title = f"Step {step_idx + 1} Result"
+                # A cutout kerf clips to the same 1.0 as ordinary full-depth
+                # relief carving in `result`, so the two are indistinguishable
+                # through this grayscale ramp alone. `alpha` flags pixels that
+                # are physically cut through (a real hole) -- render those
+                # fully transparent so the axes' hole-indicator facecolor
+                # (set below, at the imshow call) shows through instead.
+                if tp.alpha is not None:
+                    img_alpha = tp.alpha
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
@@ -3357,8 +3486,10 @@ class GCodeGeneratorApp:
         self._displayed_array = img
         self.ax.cla()
         self.ax.set_visible(True)
+        has_holes = img_alpha is not None and np.any(img_alpha <= 0.0)
+        self.ax.set_facecolor(_HOLE_FACECOLOR if has_holes else "#2b2b2b")
         self.ax.imshow(img, interpolation="none", aspect="equal",
-                       cmap=cmap, vmin=vmin, vmax=vmax)
+                       cmap=cmap, vmin=vmin, vmax=vmax, alpha=img_alpha)
         self._overlay_toolpath_2d(img, step_idx)
         self.ax.axis("off")
         if title:

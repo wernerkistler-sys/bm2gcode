@@ -66,6 +66,18 @@ class ToolPath:
     # V-carve passes.
     accessible: np.ndarray = None
 
+    # 2-D float32 array (same shape as depth_map), populated only by the
+    # Cutout algorithm: 1.0 = material still present, 0.0 = physically cut
+    # all the way through the stock (a real hole).  None (the default, and
+    # what every other algorithm leaves it as) means no step has flagged any
+    # holes.  Deliberately orthogonal to `result`/`accessible` -- a cutout
+    # kerf clips to 1.0 in those (same value ordinary relief carving reaches
+    # at its deepest points), so this is the only place "physically removed"
+    # is distinguishable from "carved to full depth". Never participates in
+    # any depth/residual arithmetic; consumed only by the result preview to
+    # render holes in a distinct colour.
+    alpha: np.ndarray = None
+
     metadata: dict = field(default_factory=dict)
 
     def resample(self, spacing_mm: float) -> 'np.ndarray':
