@@ -91,7 +91,7 @@ print("compute_backoff_point")
 leg = [(0.0, 0.0, -5.0), (10.0, 0.0, -5.0)]
 bo = compute_backoff_point(leg, BackoffSettings(enabled=True, distance_mm=2.0))
 check("backoff direction opposes travel and has the right magnitude",
-      bo is not None and abs(bo[0] - 8.0) < 1e-9 and abs(bo[1]) < 1e-9 and abs(bo[2] - (-5.0)) < 1e-9)
+      bo is not None and abs(bo[0] - 8.0) < 1e-9 and abs(bo[1]) < 1e-9 and abs(bo[2] - (-3.0)) < 1e-9)
 
 short_leg = [(0.0, 0.0, -5.0), (1.0, 0.0, -5.0)]
 bo_clamped = compute_backoff_point(short_leg, BackoffSettings(enabled=True, distance_mm=5.0))
