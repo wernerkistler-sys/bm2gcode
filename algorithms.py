@@ -421,6 +421,35 @@ def _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     return passes
 
 
+def _insert_ceiling_crossings(seg, thresholds):
+    """Insert points where seg's z crosses each (t_mm, pass_idx) in
+    *thresholds*, tagging the inserted point with the pass index whose
+    entry it marks. Original points are tagged None.
+
+    Without this, a pass whose sub-segment begins mid-line (the terrain
+    dips below that pass's ceiling somewhere between two stored points)
+    would start at the next stored point instead of at the true crossing,
+    leaving a gap between where the previous pass's cut actually reached
+    its ceiling and where the next pass picks up.
+    """
+    if not thresholds or len(seg) < 2:
+        return [(x, y, z, None) for x, y, z in seg]
+    out = [(seg[0][0], seg[0][1], seg[0][2], None)]
+    for (x0, y0, z0), (x1, y1, z1) in zip(seg, seg[1:]):
+        crossings = []
+        if z1 != z0:
+            for t_mm, pass_idx in thresholds:
+                lo, hi = (z0, z1) if z0 < z1 else (z1, z0)
+                if lo < t_mm < hi:
+                    frac = (t_mm - z0) / (z1 - z0)
+                    crossings.append((frac, t_mm, pass_idx))
+        crossings.sort(key=lambda c: c[0])
+        for frac, t_mm, pass_idx in crossings:
+            out.append((x0 + frac * (x1 - x0), y0 + frac * (y1 - y0), t_mm, pass_idx))
+        out.append((x1, y1, z1, None))
+    return out
+
+
 def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     """Depth-slice full-depth segments into per-pass segments.
 
@@ -453,6 +482,14 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     its true full depth. If final_stepdown_mm == 0, there is no finishing
     pass, so the first roughing pass covers every point of the line instead,
     including points whose full depth is 0 (no cut needed).
+
+    A roughing pass's set of kept points can start or end mid-segment,
+    wherever the line's z crosses that pass's entry depth (the previous
+    pass's ceiling, offset by the reserve). Since segments may be RDP-
+    simplified before reaching here, that crossing can fall well short of
+    the next stored point, so each segment is pre-split with an exact
+    interpolated point at every such crossing (see
+    _insert_ceiling_crossings) before the per-pass keep/drop logic runs.
     """
     if stepdown_mm <= 0.0 and final_stepdown_mm <= 0.0:
         return [(max_depth_mm, True, list(segments))]
@@ -461,24 +498,36 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     EPS = 1e-6
     n_passes = len(pass_ceilings)
     has_dedicated_final = final_stepdown_mm > 0.0
+    n_rough = n_passes - 1 if has_dedicated_final else n_passes
 
     def rough_target(z_full, ceil_mm):
         return max(min(z_full + final_stepdown_mm, 0.0), -ceil_mm)
+
+    thresholds = []
+    for k in range(n_rough):
+        if k == 0 and not has_dedicated_final:
+            continue   # first roughing pass with no reserve keeps every point already
+        prev_ceil = pass_ceilings[k - 1] if k > 0 else 0.0
+        thresholds.append((-prev_ceil - final_stepdown_mm, k))
+
+    aug_segments = [_insert_ceiling_crossings(seg, thresholds) for seg in segments]
 
     result = []
     for pi, ceil_mm in enumerate(pass_ceilings):
         is_final = (pi == n_passes - 1)
         is_dedicated_final = is_final and has_dedicated_final
         pass_segs = []
-        for seg in segments:
+        for seg in aug_segments:
             sub = []
-            for x, y, z_full in seg:
+            for x, y, z_full, boundary_pi in seg:
                 if is_dedicated_final:
                     z_target = z_full
                     keep = True
                 else:
                     z_target = rough_target(z_full, ceil_mm)
-                    if pi == 0:
+                    if boundary_pi == pi:
+                        keep = True   # exact entry crossing — force it in despite the EPS margin below
+                    elif pi == 0:
                         keep = True if not has_dedicated_final else (z_target < -EPS)
                     else:
                         prev_target = rough_target(z_full, pass_ceilings[pi - 1])
