@@ -315,6 +315,60 @@ def _planning_kernel(tool, px_per_mm, max_depth, extra_offset_mm,
     return _build_kernel(inflated, px_per_mm, max_depth)
 
 
+def _vbit_cone_reach_check(tool, stepdown_mm):
+    """Return a warning string if a V-bit's cone can't reach one stepdown_mm
+    increment before its own diameter clips it, else None.
+
+    Only meaningful for tool.profile == 'V-Bit'. The hybrid skeleton_mode's
+    skeleton pass assigns depth from the inscribed-circle formula alone
+    (independent of the real tool's radius — see the 'inscribed'-mode depth
+    calc above), so in wide areas it can call for a deeper cut than the REAL
+    tool's cone can deliver before its own diameter/shank takes over —  a
+    radius limitation that make_multipass's step-down splitting doesn't fix,
+    since it only limits how much depth is removed per pass, not how far
+    the tool can reach sideways at any given depth.
+    """
+    if tool.profile != "V-Bit":
+        return None
+    from math import radians, tan
+    tan_half = tan(radians(tool.vbit_angle_deg / 2.0))
+    required_diam_mm = 2.0 * stepdown_mm * tan_half
+    if tool.diameter_mm < required_diam_mm:
+        return (f"Warning: V-bit diameter ({tool.diameter_mm:.2f} mm) is smaller "
+                f"than the {required_diam_mm:.2f} mm needed for its "
+                f"{tool.vbit_angle_deg:.0f}° cone to reach a single {stepdown_mm:.2f} mm "
+                f"step-down without the shank interfering. Deep skeleton cuts in "
+                f"wide areas may not be a clean V-taper past that depth.")
+    return None
+
+
+def _find_compatible_vbit_erosion(erosion_cache, base_key, min_diameter_mm):
+    """Search erosion_cache for a cached V-Bit achievable-depth surface with
+    base_key's angle/max_depth/dims/extra_offset/source_visibility but a
+    diameter_mm >= min_diameter_mm.
+
+    Such an entry's grey-erosion result is byte-identical to one computed
+    with exactly min_diameter_mm, since _build_kernel's cone_reach_mm
+    saturates at max_depth*tan_half once R_mm reaches that value — the
+    kernel/footprint stop changing for any bigger diameter. Returns the
+    cached center_depth_contour array, or None if nothing qualifies.
+
+    base_key : the (profile, diameter_mm, vbit_angle_deg, max_depth, ...)
+               erosion_cache_key tuple for the CURRENT call, used to match
+               every field except diameter (which is relaxed to >=).
+    """
+    if erosion_cache is None or base_key is None or base_key[0] != "V-Bit":
+        return None
+    _, _, angle, *rest = base_key
+    candidates = [(key, val) for key, val in erosion_cache.items()
+                  if key[0] == "V-Bit" and key[2] == angle
+                  and list(key[3:]) == rest and key[1] >= min_diameter_mm]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda kv: kv[0][1])   # prefer the smallest sufficient match
+    return candidates[0][1][0]                  # (center_depth_contour, accessible) -> center_depth_contour
+
+
 def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
                               max_depth_mm, kernel, footprint, resample_spacing_px=0.5):
     """Rasterize a toolpath's swept volume and return the material-removal surface.
@@ -798,7 +852,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             subtract_unaccessible=False,
                             raster_offset_pct=0.0,
                             use_2opt=False,
-                            cut_direction="Either",
+                            cut_direction="Climb",
                             final_stepdown_mm=0.0,
                             extra_offset_mm=0.0,
                             progress=None,
@@ -1260,6 +1314,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             prior_reference=None, previous_result=None,
                             subtract_unaccessible=False,
                             use_2opt=False,
+                            cut_direction="Climb",
                             extra_offset_mm=0.0,
                             progress=None,
                             erosion_cache=None,
@@ -1288,7 +1343,21 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             the tool is treated as 2*extra_offset_mm larger when
                             computing the achievable-depth surface. Vertically,
                             that surface is lowered by extra_offset_mm. 0 = none.
-    skeleton_mode         : "medial_axis" | "voronoi" | "inscribed"
+    skeleton_mode         : "medial_axis" | "voronoi" | "inscribed" | "hybrid"
+                            "hybrid" combines the full, unpruned "inscribed"
+                            skeleton (capturing sharp corners/fine detail at
+                            every depth) with waterline contour rings from
+                            stepdown_mm to max_depth, added alongside it to
+                            also clear mask regions wider than the tool's
+                            cone can reach in a single skeleton pass.
+                            Requires stepdown_mm > 0 and
+                            tool.profile == 'V-Bit'.
+    cut_direction         : "Either" | "Climb" | "Conventional" — only used by
+                            "hybrid" mode's deep-layer contour rings (see
+                            compute_contour_toolpath's cut_direction docs);
+                            ignored by the other skeleton_mode values, whose
+                            single medial-axis engraving line has no
+                            inside/outside to keep on a particular side.
     prior_reference       : optional 2-D float32 [0,1] reference surface from a
                             prior step, subtracted from depth_map to obtain the
                             region the V-carve operates on.  Pass
@@ -1319,7 +1388,21 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     _alg_name = ('V-Carving (Sub-pixel)'    if skeleton_mode == 'voronoi'
                  else 'V-Carving (Feature Width)' if skeleton_mode == 'inscribed'
+                 else 'V-Carving (Hybrid)' if skeleton_mode == 'hybrid'
                  else 'V-Carving (Depth Map)')
+
+    _cone_reach_warning = None
+    if skeleton_mode == 'hybrid':
+        if tool.profile != 'V-Bit':
+            raise ValueError("skeleton_mode='hybrid' currently supports only "
+                             "V-Bit tools.")
+        if stepdown_mm <= 0.0:
+            raise ValueError("skeleton_mode='hybrid' requires stepdown_mm > 0 "
+                             "(it sets both the multipass step-down increment "
+                             "and the depth of the first waterline contour ring).")
+        _cone_reach_warning = _vbit_cone_reach_check(tool, stepdown_mm)
+        if _cone_reach_warning:
+            progress(0, _cone_reach_warning)
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
@@ -1421,7 +1504,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(45, f"V-carving mask: {np.count_nonzero(mask_vcarve)} pixels.")
 
     # ── Stage 3 · Medial axis (45–60 %) ───────────────────────────
-    if skeleton_mode in ('voronoi', 'inscribed'):
+    if skeleton_mode in ('voronoi', 'inscribed', 'hybrid'):
         progress(45, "Computing Voronoi skeleton…")
         from scipy.spatial import Voronoi as _Voronoi
         from skimage.measure import find_contours as _find_contours
@@ -1526,8 +1609,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         skeleton, _ = medial_axis(mask_vcarve, return_distance=True)
         skeleton = skeleton & (center_depth_contour_vcarve > 0)
 
-    # ── Inscribed-circle depth map (for 'inscribed' mode only) ───────────────
-    if skeleton_mode == 'inscribed':
+    # ── Inscribed-circle depth map (for 'inscribed' and 'hybrid' modes) ──────
+    if skeleton_mode in ('inscribed', 'hybrid'):
         from math import radians, tan
         if tool.profile == 'V-Bit':
             _tan_half = tan(radians(tool.vbit_angle_deg / 2.0))
@@ -1544,7 +1627,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             inscribed_depth_norm = center_depth_contour_vcarve
         inscribed_depth_norm = np.clip(inscribed_depth_norm, 0.0, 1.0)
 
-    _depth_norm = (inscribed_depth_norm if skeleton_mode == 'inscribed'
+    _depth_norm = (inscribed_depth_norm if skeleton_mode in ('inscribed', 'hybrid')
                    else center_depth_contour_vcarve)
 
     if not np.any(skeleton):
@@ -1764,7 +1847,94 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     def _depth_single(r, c):
         return -_depth_norm[r, c] * max_depth
     full_depth_segs = _build_pass_segments(ordered_branches, _depth_single)
-    full_depth_segs = _two_opt_pass(full_depth_segs, _pass_origin(all_segments))
+
+    if skeleton_mode == 'hybrid':
+        # Skeleton: the full, unpruned inscribed-depth path (capturing sharp
+        # corners/fine detail at every depth, not just a shallow top layer).
+        # 2-opt is applied to it alone (rather than to the combined list
+        # below) since a combined-list 2-opt works purely on XY proximity
+        # and would freely interleave skeleton strokes with deep contour
+        # rings, undoing the Z-aware ordering the contour stage already
+        # applied internally.
+        skeleton_segs = _two_opt_pass(full_depth_segs, _pass_origin(all_segments))
+
+        # Waterline contour rings from stepdown_mm to max_depth, added
+        # alongside the skeleton to also clear mask regions wider than the
+        # tool's cone can reach in a single skeleton pass —
+        # reusing compute_contour_toolpath's extraction/ordering helpers.
+        contour_segs = []
+        if stepdown_mm < max_depth:
+            from math import radians, tan
+            tan_half   = tan(radians(tool.vbit_angle_deg / 2.0))
+            synth_diam = 2.0 * max_depth * tan_half * (1.0 + 1e-6)
+
+            # The deep contour rings need an achievable-depth surface that
+            # always tapers to a point at max_depth (see
+            # _find_compatible_vbit_erosion's docstring) — build it with an
+            # idealized, "just large enough" V-bit rather than the real
+            # tool, reusing any compatible cached erosion first since it can
+            # be expensive to recompute.
+            center_depth_contour_synth = _find_compatible_vbit_erosion(
+                erosion_cache, erosion_cache_key, synth_diam)
+            if center_depth_contour_synth is None:
+                synth_tool = dataclasses.replace(tool, diameter_mm=synth_diam)
+                kernel_synth, footprint_synth = _build_kernel(
+                    synth_tool, px_per_mm, max_depth)
+                kernel_synth_plan, footprint_synth_plan = _planning_kernel(
+                    synth_tool, px_per_mm, max_depth, extra_offset_mm,
+                    kernel_synth, footprint_synth)
+                center_depth_contour_synth = grey_erosion(
+                    depth_map.astype(np.float64),
+                    footprint=footprint_synth_plan,
+                    structure=-kernel_synth_plan.astype(np.float64),
+                ).astype(np.float32)
+                center_depth_contour_synth = np.clip(center_depth_contour_synth, 0.0, 1.0)
+                if erosion_cache is not None and erosion_cache_key is not None:
+                    synth_key = (tool.profile, synth_diam, *erosion_cache_key[2:])
+                    erosion_cache[synth_key] = (center_depth_contour_synth,
+                                                 center_depth_contour_synth)
+
+            if extra_offset_mm > 0.0:
+                # Mirror Stage 2b's vertical stock-to-leave adjustment,
+                # applied here regardless of whether the surface above came
+                # from cache or was just computed (cache always stores the
+                # pre-adjustment surface — see Stage 2b).
+                off_norm = extra_offset_mm / max_depth
+                center_depth_contour_synth = np.clip(
+                    center_depth_contour_synth - off_norm, 0.0, 1.0)
+
+            deep_levels_norm = [c / max_depth for c in
+                                 _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)]
+            all_z_contours = _extract_z_contours(
+                center_depth_contour_synth, deep_levels_norm, n_grey_levels,
+                cut_direction=cut_direction)
+            all_z_contours = _clip_contours_to_mask(all_z_contours, mask_vcarve)
+            contour_segs, _ = _order_contours_windowed(
+                all_z_contours, deep_levels_norm,
+                max_depth=max_depth, z_increment_mm=stepdown_mm,
+                max_step_down_mm=stepdown_mm,
+                px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
+                link_threshold_mm=tool.diameter_mm,
+                use_2opt=use_2opt,
+                lock_direction=cut_direction in ("Climb", "Conventional"),
+                current_pos=(0.0, 0.0),
+                progress=progress, progress_lo=80, progress_hi=88)
+
+        full_depth_segs = skeleton_segs + contour_segs
+    else:
+        full_depth_segs = _two_opt_pass(full_depth_segs, _pass_origin(all_segments))
+
+    # Simplify the full-depth path before multipass depth-slicing. RDP's
+    # "distance from chord" is measured in the full (x, y, z) space, so
+    # simplifying beforehand means every pass make_multipass produces below
+    # shares the same XY vertex sequence — only Z differs between passes —
+    # keeping their footprints perfectly aligned when viewed from above.
+    progress(88, "Simplifying tool path (RDP)…")
+    rdp_tol = max(
+        1.0 / px_per_mm,
+        max_depth / (n_grey_levels - 1),
+    )
+    full_depth_segs = [simplify_line(pts, rdp_tol) for pts in full_depth_segs]
 
     # Phases 2–3: depth-slice + per-pass 2-opt reorder
     for _, _, pass_segs in make_multipass(
@@ -1774,24 +1944,17 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
 
     progress(90, f"Generated {len(all_segments)} segments across all passes.")
 
-    # ── Stage 6 · Simplify, simulate result, Simplify and assemble ToolPath (90–100 %) ───────
-    progress(90, "Simplifying tool path (RDP)…")
-    rdp_tol = max(
-        1.0 / px_per_mm,
-        max_depth / (n_grey_levels - 1),
-    )
-    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
-
+    # ── Stage 6 · Simulate result, assemble ToolPath (90–100 %) ───────
     progress(93, "Simulating tool-swept removal surface…")
     vcarve_result = simulate_toolpath_result(
-        ToolPath(segments=simplified),
+        ToolPath(segments=all_segments),
         (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_vcarve, footprint_vcarve,
     )
 
     progress(97, "Creating ToolPath object…")
     toolpath = ToolPath(
-        segments=simplified,
+        segments=all_segments,
         result=np.maximum(
             previous_result if previous_result is not None else 0.0,
             vcarve_result).astype(np.float32),
@@ -1811,6 +1974,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'height_mm':       height_mm,
             'n_branches':      n_branches,
             'rdp_tolerance':   rdp_tol,
+            'cone_reach_warning': _cone_reach_warning,
+            'cut_direction':   cut_direction,
         }
     )
     progress(100, "V-carve tool path computation complete!")
@@ -1973,6 +2138,244 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
     return pruned
 
 
+def _clip_contours_to_mask(all_z_contours, mask, min_pts=3):
+    """Restrict each contour ring to the portion inside `mask`.
+
+    Splits each (row, col) pixel-space polyline at mask-boundary crossings,
+    dropping runs entirely outside the mask and runs shorter than min_pts
+    points. Used to restrict hybrid V-carving's deep-layer waterline
+    contours — extracted from an unmasked achievable-depth surface, see
+    compute_vcarve_toolpath's 'hybrid' branch — to the region
+    compute_vcarve_mask actually flagged as needing V-carving, without
+    inventing spurious geometry at the mask boundary (which zeroing the
+    surface outside the mask before extraction would do).
+
+    Returns a dict with the same keys as all_z_contours.
+    """
+    H, W = mask.shape
+    clipped = {}
+    for z_norm, contours in all_z_contours.items():
+        kept = []
+        for c in contours:
+            n = len(c)
+            rows = np.round(c[:, 0]).astype(int).clip(0, H - 1)
+            cols = np.round(c[:, 1]).astype(int).clip(0, W - 1)
+            keep_mask = mask[rows, cols]
+            if not keep_mask.any():
+                continue
+            if keep_mask.all():
+                kept.append(c)
+                continue
+
+            is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
+            if is_closed:
+                start = next((i for i in range(n)
+                              if keep_mask[i] and not keep_mask[(i - 1) % n]), 0)
+                indices = [(start + i) % n for i in range(n)]
+            else:
+                indices = list(range(n))
+
+            run = []
+            for idx in indices:
+                if keep_mask[idx]:
+                    run.append(c[idx])
+                else:
+                    if len(run) >= min_pts:
+                        kept.append(np.array(run))
+                    run = []
+            if len(run) >= min_pts:
+                kept.append(np.array(run))
+        clipped[z_norm] = kept
+    return clipped
+
+
+def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb"):
+    """Extract raw iso-depth contour polylines at each Z-level.
+
+    surface       : 2-D float32 achievable-depth array, normalised [0, 1]
+    z_levels      : iterable of normalised depths (ascending, in (0, 1])
+    n_grey_levels : sizes the half-grey-level find_contours threshold epsilon
+    cut_direction : "Either" | "Climb" | "Conventional" — "Conventional"
+                    reverses every contour's vertex order (see
+                    compute_contour_toolpath's cut_direction docs)
+
+    Returns dict[z_norm] -> list of (row, col) Nx2 pixel-space polylines
+    (>= 3 points each), in find_contours' native orientation (or reversed
+    if cut_direction == "Conventional").
+    """
+    from skimage.measure import find_contours
+
+    # Half a grey-level step in normalised units.  Subtracting this from the
+    # find_contours threshold keeps flat-region pixels firmly "inside" even
+    # when z_norm lands at or just above their exact value (e.g. from CDF
+    # quantile rounding).  Without it the contour jumps to the inner wall of
+    # a flat step and the tool cuts air above the neighbouring deeper region.
+    _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
+
+    # find_contours keeps uncut material consistently on the right of the
+    # direction of travel (see compute_raster_toolpath's cut_direction docs
+    # for the clockwise-spindle convention), so a single global reversal
+    # rule suffices — no per-contour inside/outside analysis needed.
+    reverse_contours = (cut_direction == "Conventional")
+    all_z_contours = {}
+    for z_norm in z_levels:
+        raw = find_contours(surface, max(z_norm - _contour_eps, 0.0))
+        kept = [c for c in raw if len(c) >= 3]
+        if reverse_contours:
+            kept = [c[::-1] for c in kept]
+        all_z_contours[z_norm] = kept
+    return all_z_contours
+
+
+def _order_contours_windowed(all_z_contours, z_levels, *,
+                              max_depth, z_increment_mm, max_step_down_mm,
+                              px_per_mm, H, ox, oy,
+                              link_threshold_mm,
+                              use_2opt, lock_direction,
+                              current_pos,
+                              z_safe=5.0,
+                              progress=None, progress_lo=55, progress_hi=80):
+    """Greedy nearest-neighbour ordering of per-level contour rings.
+
+    A contour's climb/conventional correctness comes entirely from
+    find_contours' own per-contour orientation guarantee, independent of
+    visiting order or Z-level — unlike raster, where correctness depends on
+    visiting adjacent lines in sequence. So the greedy step may freely draw
+    candidates from anywhere in the max_step_down_mm window regardless of
+    lock state; only 2-opt (which reverses segments/blocks) needs to stay
+    gated by not lock_direction.
+
+    Levels are grouped into windows of
+    max(1, round(max_step_down_mm / z_increment_mm)) consecutive z_levels
+    (or one window covering everything if max_step_down_mm is None/<=0 or
+    z_increment_mm<=0), bounding how far apart in Z the greedy/2-opt passes
+    may mix contours — this only affects travel efficiency, not validity.
+
+    current_pos : (x, y) tool position before the first segment.
+
+    Returns
+    -------
+    (segments, new_pos)
+      segments : List[List[(x_mm, y_mm, z_mm)]] in visiting order
+      new_pos  : (x, y) tool position after the last segment
+    """
+    if progress is None:
+        progress = lambda pct, msg: None
+
+    all_segments      = []
+    current_pos       = np.array(current_pos, dtype=float)
+    z_jump_weight_mm  = z_increment_mm * 1.5
+    _msd = max_step_down_mm if (max_step_down_mm is not None
+                                 and max_step_down_mm > 0) else None
+    win_size     = (max(1, round(_msd / z_increment_mm))
+                     if _msd and z_increment_mm > 0 else len(z_levels))
+    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
+
+    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
+        win_levels = z_levels[win_start : win_start + win_size]
+        remaining  = [(c, -z_norm * max_depth)
+                      for z_norm in win_levels
+                      for c in all_z_contours.get(z_norm, [])]
+        if not remaining:
+            continue
+        progress(progress_lo + (progress_hi - progress_lo) * win_idx // n_windows,
+                 f"Ordering window {win_idx + 1}/{n_windows} "
+                 f"({len(remaining)} contour(s))…")
+
+        # Shallowest Z in this window: once a candidate requires a real rapid
+        # anyway (d >= link_threshold_mm), prefer whichever is closest to
+        # this depth, so forced long jumps still trend top-to-bottom instead
+        # of landing at an arbitrary depth. Short hops stay pure-XY.
+        win_z_top = -win_levels[0] * max_depth
+
+        # Greedy nearest-neighbour ordering across every contour in the
+        # window. For closed contours any rotation of the loop is valid, so
+        # we sample candidate start points; for open contours only the two
+        # endpoints are considered (flip=True covers the other end).
+        # Segments are collected into win_segs so that optional 2-opt can
+        # reorder them before they are committed to all_segments.
+        win_cur  = current_pos.copy()
+        win_segs = []
+        while remaining:
+            best_idx  = 0
+            best_flip = False
+            best_rot  = 0
+            best_cost = float('inf')
+
+            for i, (c, z_mm) in enumerate(remaining):
+                n         = len(c)
+                is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
+                rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
+                flip_cands = (False,) if lock_direction else (False, True)
+                for flip in flip_cands:
+                    orient = c[::-1] if flip else c
+                    for j in rot_cands:
+                        row0, col0 = orient[j]
+                        x0 = col0 / px_per_mm - ox
+                        y0 = (H - 1 - row0) / px_per_mm - oy
+                        dx, dy = x0 - win_cur[0], y0 - win_cur[1]
+                        d = (dx * dx + dy * dy) ** 0.5
+                        cost = d if d < link_threshold_mm else (
+                            d + z_jump_weight_mm * (win_z_top - z_mm))
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_idx  = i
+                            best_flip = flip
+                            best_rot  = j
+
+            c_chosen, z_mm = remaining.pop(best_idx)
+            is_closed = np.linalg.norm(c_chosen[0] - c_chosen[-1]) < 1.5
+            if best_flip:
+                c_chosen = c_chosen[::-1]
+            if best_rot > 0:
+                c_chosen = np.roll(c_chosen, -best_rot, axis=0)
+            if is_closed:
+                c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
+
+            points = [(col / px_per_mm - ox,
+                       (H - 1 - row) / px_per_mm - oy,
+                       z_mm)
+                      for row, col in c_chosen]
+            if len(points) < 2:
+                continue
+
+            win_segs.append(points)
+            last = points[-1]
+            win_cur[0] = last[0]
+            win_cur[1] = last[1]
+
+        if not win_segs:
+            continue
+
+        # Optional 2-opt reorder across the whole window, guided by a
+        # z-jump penalty to discourage rapids that straddle levels more
+        # than necessary. Skipped when locked, since its block-reversal
+        # move would undo the forced direction.
+        if use_2opt and len(win_segs) >= 3 and not lock_direction:
+            win_z  = [s[0][2] for s in win_segs]
+            ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
+            ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
+            order, flips = _two_opt_reorder(
+                ent_xy, ext_xy,
+                origin=(float(current_pos[0]), float(current_pos[1])),
+                link_threshold=link_threshold_mm,
+                per_rapid_overhead=2.0 * z_safe,
+                seg_z=win_z,
+                z_jump_weight=z_jump_weight_mm)
+            win_segs = [
+                list(reversed(win_segs[i])) if flips[k] else win_segs[i]
+                for k, i in enumerate(order)
+            ]
+
+        all_segments.extend(win_segs)
+        last = win_segs[-1][-1]
+        current_pos[0] = last[0]
+        current_pos[1] = last[1]
+
+    progress(progress_hi, f"Ordering complete ({len(all_segments)} segments).")
+    return all_segments, (float(current_pos[0]), float(current_pos[1]))
+
+
 def compute_contour_toolpath(
     depth_map, n_grey_levels,
     tool, z_increment_mm, max_depth,
@@ -1987,7 +2390,7 @@ def compute_contour_toolpath(
     z_safe=5.0,
     feed_rapid=3000.0,
     use_2opt=False,
-    cut_direction="Either",
+    cut_direction="Climb",
     max_step_down_mm=None,
     extra_offset_mm=0.0,
     erosion_cache=None,
@@ -2188,28 +2591,11 @@ def compute_contour_toolpath(
     rdp_tol = max(1.0 / px_per_mm,
                   max_depth / (n_grey_levels - 1))
 
-    # Half a grey-level step in normalised units.  Subtracting this from the
-    # find_contours threshold keeps flat-region pixels firmly "inside" even
-    # when z_norm lands at or just above their exact value (e.g. from CDF
-    # quantile rounding).  Without it the contour jumps to the inner wall of
-    # a flat step and the tool cuts air above the neighbouring deeper region.
-    _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
-
     # ── Stage 4a · Extract raw contours for every Z-level ─────────────────
     progress(40, "Extracting contours for all Z-levels…")
-    # find_contours keeps uncut material consistently on the right of the
-    # direction of travel (see compute_raster_toolpath's cut_direction docs
-    # for the clockwise-spindle convention), so a single global reversal
-    # rule suffices — no per-contour inside/outside analysis needed.
-    reverse_contours = (cut_direction == "Conventional")
-    lock_direction    = cut_direction in ("Climb", "Conventional")
-    all_z_contours = {}
-    for z_norm in z_levels:
-        raw = find_contours(center_depth_contour, max(z_norm - _contour_eps, 0.0))
-        kept = [c for c in raw if len(c) >= 3]
-        if reverse_contours:
-            kept = [c[::-1] for c in kept]
-        all_z_contours[z_norm] = kept
+    lock_direction = cut_direction in ("Climb", "Conventional")
+    all_z_contours = _extract_z_contours(center_depth_contour, z_levels,
+                                          n_grey_levels, cut_direction)
 
     # ── Stage 4b · Prune laterally-redundant segments ─────────────────────
     if lateral_tol_mm > 0.0:
@@ -2225,124 +2611,17 @@ def compute_contour_toolpath(
             max_step_down_mm=_msd)
 
     # ── Stage 4c · Ordering — greedy per max_step_down window, optional 2-opt
-    # A contour's climb/conventional correctness comes entirely from
-    # find_contours' own per-contour orientation guarantee (see the
-    # cut_direction docs above), independent of visiting order or Z-level —
-    # unlike raster, where correctness depends on visiting adjacent lines in
-    # sequence. So the greedy step may freely draw candidates from anywhere
-    # in the max_step_down_mm window regardless of lock state; only 2-opt
-    # (which reverses segments/blocks) needs to stay gated by
-    # not lock_direction.
-    all_segments      = []
-    current_pos       = np.array([0.0, 0.0])
     link_threshold_mm = tool.diameter_mm
-    z_jump_weight_mm  = z_increment_mm * 1.5
-    win_size     = (max(1, round(_msd / z_increment_mm))
-                     if _msd and z_increment_mm > 0 else len(z_levels))
-    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
-
-    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
-        win_levels = z_levels[win_start : win_start + win_size]
-        remaining  = [(c, -z_norm * max_depth)
-                      for z_norm in win_levels
-                      for c in all_z_contours.get(z_norm, [])]
-        if not remaining:
-            continue
-        progress(55 + 25 * win_idx // n_windows,
-                 f"Ordering window {win_idx + 1}/{n_windows} "
-                 f"({len(remaining)} contour(s))…")
-
-        # Shallowest Z in this window: once a candidate requires a real rapid
-        # anyway (d >= link_threshold_mm), prefer whichever is closest to
-        # this depth, so forced long jumps still trend top-to-bottom instead
-        # of landing at an arbitrary depth. Short hops stay pure-XY.
-        win_z_top = -win_levels[0] * max_depth
-
-        # Greedy nearest-neighbour ordering across every contour in the
-        # window. For closed contours any rotation of the loop is valid, so
-        # we sample candidate start points; for open contours only the two
-        # endpoints are considered (flip=True covers the other end).
-        # Segments are collected into win_segs so that optional 2-opt can
-        # reorder them before they are committed to all_segments.
-        win_cur  = current_pos.copy()
-        win_segs = []
-        while remaining:
-            best_idx  = 0
-            best_flip = False
-            best_rot  = 0
-            best_cost = float('inf')
-
-            for i, (c, z_mm) in enumerate(remaining):
-                n         = len(c)
-                is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
-                rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
-                flip_cands = (False,) if lock_direction else (False, True)
-                for flip in flip_cands:
-                    orient = c[::-1] if flip else c
-                    for j in rot_cands:
-                        row0, col0 = orient[j]
-                        x0 = col0 / px_per_mm - _ox
-                        y0 = (H - 1 - row0) / px_per_mm - _oy
-                        dx, dy = x0 - win_cur[0], y0 - win_cur[1]
-                        d = (dx * dx + dy * dy) ** 0.5
-                        cost = d if d < link_threshold_mm else (
-                            d + z_jump_weight_mm * (win_z_top - z_mm))
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_idx  = i
-                            best_flip = flip
-                            best_rot  = j
-
-            c_chosen, z_mm = remaining.pop(best_idx)
-            is_closed = np.linalg.norm(c_chosen[0] - c_chosen[-1]) < 1.5
-            if best_flip:
-                c_chosen = c_chosen[::-1]
-            if best_rot > 0:
-                c_chosen = np.roll(c_chosen, -best_rot, axis=0)
-            if is_closed:
-                c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
-
-            points = [(col / px_per_mm - _ox,
-                       (H - 1 - row) / px_per_mm - _oy,
-                       z_mm)
-                      for row, col in c_chosen]
-            if len(points) < 2:
-                continue
-
-            win_segs.append(points)
-            last = points[-1]
-            win_cur[0] = last[0]
-            win_cur[1] = last[1]
-
-        if not win_segs:
-            continue
-
-        # Optional 2-opt reorder across the whole window, guided by a
-        # z-jump penalty to discourage rapids that straddle levels more
-        # than necessary. Skipped when locked, since its block-reversal
-        # move would undo the forced direction.
-        if use_2opt and len(win_segs) >= 3 and not lock_direction:
-            win_z  = [s[0][2] for s in win_segs]
-            ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
-            ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
-            order, flips = _two_opt_reorder(
-                ent_xy, ext_xy,
-                origin=(float(current_pos[0]), float(current_pos[1])),
-                link_threshold=link_threshold_mm,
-                per_rapid_overhead=2.0 * z_safe,
-                seg_z=win_z,
-                z_jump_weight=z_jump_weight_mm)
-            win_segs = [
-                list(reversed(win_segs[i])) if flips[k] else win_segs[i]
-                for k, i in enumerate(order)
-            ]
-
-        all_segments.extend(win_segs)
-        last = win_segs[-1][-1]
-        current_pos[0] = last[0]
-        current_pos[1] = last[1]
-
-    progress(80, f"Ordering complete ({len(all_segments)} segments).")
+    all_segments, _ = _order_contours_windowed(
+        all_z_contours, z_levels,
+        max_depth=max_depth, z_increment_mm=z_increment_mm,
+        max_step_down_mm=_msd,
+        px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
+        link_threshold_mm=link_threshold_mm,
+        use_2opt=use_2opt, lock_direction=lock_direction,
+        current_pos=(0.0, 0.0),
+        z_safe=z_safe,
+        progress=progress, progress_lo=55, progress_hi=80)
 
     # ── Stage 4d · Terrain-link insertion ──────────────────────────────────
     # Walk all_segments once and splice geodesic links wherever consecutive
@@ -2441,7 +2720,7 @@ def compute_cutout_toolpath(
     stepdown_mm=0.0,
     final_stepdown_mm=0.0,
     extra_offset_mm=0.0,
-    cut_direction="Either",
+    cut_direction="Climb",
     prior_accessible=None,
     previous_result=None,
     previous_alpha=None,
@@ -2600,7 +2879,7 @@ def _compute_cutout_rings(
     origin="Bottom-Left",
     threshold_mm=0.0,
     extra_offset_mm=0.0,
-    cut_direction="Either",
+    cut_direction="Climb",
     prior_accessible=None,
     previous_result=None,
     previous_alpha=None,
@@ -2738,7 +3017,7 @@ def _compute_cutout_from_rings(
     stepdown_mm=0.0,
     final_stepdown_mm=0.0,
     extra_offset_mm=0.0,
-    cut_direction="Either",
+    cut_direction="Climb",
     use_2opt=False,
     z_safe=5.0,
     feed_rapid=3000.0,

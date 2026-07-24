@@ -6,6 +6,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)",
+                     "V-Carving (Hybrid)",
                      "Cutout"]
 BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
@@ -62,7 +63,7 @@ DEFAULTS = {
     "step_extra_offset":          "0.0", # stock-to-leave allowance, lateral+vertical (mm); 0 = none
     "step_feed_rate":    "800",
     "step_raster_dir":   "Vertical",
-    "step_cut_direction": "Either",
+    "step_cut_direction": "Climb",
     "step_threshold":    "0",    # mm; 0 = visit all pixels
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # see ALGORITHMS list

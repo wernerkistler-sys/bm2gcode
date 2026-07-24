@@ -1147,7 +1147,6 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
                 step['raster_final_stepdown'].pack_forget()
-                step['cut_dir_row'].pack_forget()
                 step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['vcarve_frame'].pack(fill=tk.X, after=step['vbit_frame'])
                 step['min_fw'].pack(fill=tk.X, pady=2)
@@ -1155,6 +1154,13 @@ class GCodeGeneratorApp:
                 step['gating_frame'].pack(fill=tk.X)
                 step['gating_region_row'].pack(fill=tk.X, pady=(0, 4), before=step['threshold'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
+                if alg == "V-Carving (Hybrid)":
+                    # Only the hybrid mode's deep-layer waterline contours
+                    # respect cut direction — the medial-axis skeleton used
+                    # by the other V-Carving modes has no inside/outside.
+                    step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['tsp_frame'])
+                else:
+                    step['cut_dir_row'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
                 if profile not in _VCARVE_PROFILES:
                     step['profile_var'].set("V-Bit")
@@ -1232,7 +1238,8 @@ class GCodeGeneratorApp:
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
 
-            locked = not alg.startswith("V-Carving") and step['cut_dir_var'].get() != "Either"
+            locked = ((not alg.startswith("V-Carving")) or alg == "V-Carving (Hybrid)") \
+                     and step['cut_dir_var'].get() != "Either"
             step['tsp_2opt_cb'].config(state="disabled" if locked else "normal")
 
             if hasattr(self, '_view_menu'):
@@ -2555,7 +2562,9 @@ class GCodeGeneratorApp:
                 'use_2opt':                 step['tsp_2opt_var'].get(),
                 'skeleton_mode':            ("voronoi"    if algorithm == "V-Carving (Sub-pixel)"
                                              else "inscribed" if algorithm == "V-Carving (Feature Width)"
+                                             else "hybrid" if algorithm == "V-Carving (Hybrid)"
                                              else "medial_axis"),
+                'cut_direction':            step['cut_dir_var'].get(),
                 'gating_mode':              step['gating_mode_var'].get(),
             })
         elif algorithm == "Contour":
@@ -2659,6 +2668,7 @@ class GCodeGeneratorApp:
                 extra_offset_mm      = params['extra_offset_mm'],
                 skeleton_mode        = params['skeleton_mode'],
                 use_2opt             = params['use_2opt'],
+                cut_direction        = params['cut_direction'],
                 progress             = progress_fn,
                 erosion_cache        = self._erosion_cache,
                 erosion_cache_key    = erosion_cache_key,
