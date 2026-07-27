@@ -221,7 +221,7 @@ TabRegion = Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]
 
 
 def _apply_tabs_to_ring(ring: List[Point], settings: TabSettings,
-                         closed_tol_mm: float):
+                         tool_diameter_mm: float, closed_tol_mm: float):
     """Raise Z to leave uncut, trapezoid-profiled tabs at evenly-spaced
     points around one closed, flat ring -- tapered walls (angle set by
     settings.tab_angle_deg, measured from horizontal like RampSettings'
@@ -246,7 +246,16 @@ def _apply_tabs_to_ring(ring: List[Point], settings: TabSettings,
     z_full = ring[0][2]
     climb_mm = settings.height_mm
     tab_top_z = z_full + climb_mm
-    half_w = min(settings.width_mm / 2.0, L / 2.0 - 1e-9)
+    # settings.width_mm is the tab's footprint left standing in the material
+    # (README: "Each tab's footprint along the cut path"). The centerline
+    # lift window has to be wider than that: right up to the edge of the
+    # lift window the tool is still cutting at full engagement, and its
+    # radius sweeps tool_diameter_mm/2 further into the would-be tab on
+    # each side, eating into the bridge. Widening the window by the tool's
+    # diameter cancels that bleed so the standing bridge comes out to the
+    # requested width_mm.
+    window_width_mm = settings.width_mm + tool_diameter_mm
+    half_w = min(window_width_mm / 2.0, L / 2.0 - 1e-9)
     if half_w <= 1e-9:
         return ring, [], []
 
@@ -268,7 +277,7 @@ def _apply_tabs_to_ring(ring: List[Point], settings: TabSettings,
 
     warnings: List[str] = []
     count = max(1, int(settings.count))
-    max_count = max(1, int(L // max(settings.width_mm, 1e-6)))
+    max_count = max(1, int(L // max(window_width_mm, 1e-6)))
     if count > max_count:
         warnings.append(
             f"Tab count reduced from {count} to {max_count} "
@@ -361,10 +370,15 @@ def _apply_tabs_to_ring(ring: List[Point], settings: TabSettings,
 
 
 def apply_tabs(rings: List[List[Point]], settings: Optional[TabSettings],
-                closed_tol_mm: float = 0.05):
+                tool_diameter_mm: float, closed_tol_mm: float = 0.05):
     """Raise Z to leave uncut tabs at evenly-spaced points around each closed
     ring in `rings` (same shape as compute_cutout_toolpath's full_depth_segs
     -- one flat, full-depth closed polyline per silhouette shape).
+
+    `tool_diameter_mm` widens the centerline Z-lift window beyond
+    settings.width_mm so the tab standing in the material -- not just the
+    toolpath's lift window -- comes out to the requested width; see
+    _apply_tabs_to_ring.
 
     Returns (new_rings, tab_regions, warnings):
       new_rings   -- same length/order as `rings`, tab windows raised to
@@ -383,7 +397,8 @@ def apply_tabs(rings: List[List[Point]], settings: Optional[TabSettings],
     tab_regions: List[TabRegion] = []
     warnings: List[str] = []
     for ring in rings:
-        new_ring, regions, warns = _apply_tabs_to_ring(ring, settings, closed_tol_mm)
+        new_ring, regions, warns = _apply_tabs_to_ring(
+            ring, settings, tool_diameter_mm, closed_tol_mm)
         new_rings.append(new_ring)
         tab_regions.extend(regions)
         warnings.extend(warns)

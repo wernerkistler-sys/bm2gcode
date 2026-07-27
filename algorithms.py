@@ -3120,7 +3120,8 @@ def _compute_cutout_from_rings(
     tab_regions = []
     if tab_settings is not None and tab_settings.enabled:
         full_depth_segs, tab_regions, tab_warnings = apply_tabs(
-            full_depth_segs, tab_settings, closed_tol_mm=1.5 / px_per_mm)
+            full_depth_segs, tab_settings, tool.diameter_mm,
+            closed_tol_mm=1.5 / px_per_mm)
         for warning in tab_warnings:
             progress(45, warning)
 
