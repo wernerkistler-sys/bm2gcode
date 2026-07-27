@@ -42,7 +42,7 @@ from widgets import (ProgressDialog, LabeledEntry,
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask,
                         compute_cutout_toolpath, _compute_cutout_rings,
-                        _compute_cutout_from_rings)
+                        _compute_cutout_from_rings, compute_pocket_toolpath)
 from tool import Tool
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
@@ -848,7 +848,7 @@ class GCodeGeneratorApp:
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'cutout_depth', 'cutout_stepdown', 'cutout_final_stepdown', 'cutout_extra_offset',
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
-                    'min_fw', 'max_fw'):
+                    'min_fw', 'max_fw', 'pocket_target_z'):
             dst[key].set(src[key].get())
             if dst[key].auto_var is not None and src[key].auto_var is not None:
                 dst[key].auto_var.set(src[key].auto_var.get())
@@ -991,6 +991,18 @@ class GCodeGeneratorApp:
                                            minval=0.0, maxval=50.0, increment=0.05)
         contour_lateral_tol.pack(fill=tk.X, pady=2)
         step['contour_lateral_tol'] = contour_lateral_tol
+
+        # ── Pocket-only op controls (hidden unless Algorithm == Pocket) ─
+        pocket_frame = ttk.Frame(operation_lf)
+        step['pocket_frame'] = pocket_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        pocket_target_z = LabeledEntry(pocket_frame, "Target depth", "mm",
+                                       DEFAULTS["step_pocket_target_z"],
+                                       auto_label="Auto",
+                                       minval=0.01, maxval=200.0, increment=0.1)
+        pocket_target_z.pack(fill=tk.X, pady=2)
+        step['pocket_target_z'] = pocket_target_z
 
         tsp_frame = ttk.Frame(operation_lf)
         step['tsp_frame'] = tsp_frame
@@ -1220,9 +1232,36 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state("disabled")
                 step['cutout_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['alg_row'])
+            elif alg == "Pocket":
+                step['vcarve_frame'].pack_forget()
+                step['contour_frame'].pack_forget()
+                step['cutout_frame'].pack_forget()
+                step['min_fw'].pack_forget()
+                step['max_fw'].pack_forget()
+                step['gating_frame'].pack(fill=tk.X)
+                step['gating_region_row'].pack(fill=tk.X, pady=(0, 4), before=step['threshold'])
+                step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
+                step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
+                if profile not in _RASTER_PROFILES:
+                    step['profile_var'].set("Ball")
+                if profile == "V-Bit":
+                    step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['vbit_frame'])
+                else:
+                    step['vbit_frame'].pack_forget()
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['raster_final_stepdown'].pack(fill=tk.X, pady=2,
+                                                   after=step['stepdown'])
+                step['extra_offset'].pack(fill=tk.X, pady=2,
+                                          after=step['raster_final_stepdown'])
+                step['pocket_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['raster_frame'].pack(fill=tk.X, after=step['pocket_frame'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
+                step['vbit_angle'].set_state("normal")
             else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
+                step['pocket_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack(fill=tk.X)
@@ -1293,6 +1332,20 @@ class GCodeGeneratorApp:
         step['diameter'].committed_var.trace_add("write", _update_auto_max_fw)
         self.max_depth.committed_var.trace_add("write", _update_auto_max_fw)
 
+        def _update_auto_pocket_target_z(*_):
+            if not pocket_target_z.auto_var.get():
+                return
+            try:
+                max_depth = float(self.max_depth.get())
+            except (ValueError, AttributeError):
+                return
+            pocket_target_z.set(f"{max_depth:.3f}")
+
+        pocket_target_z.auto_var.trace_add("write", _update_auto_pocket_target_z)
+        self.max_depth.committed_var.trace_add("write", _update_auto_pocket_target_z)
+        if bool(int(DEFAULTS["step_pocket_target_z_auto"])):
+            pocket_target_z.auto_var.set(True)
+
         threshold.committed_var.trace_add("write", _on_mask_param_changed)
         min_fw.committed_var.trace_add("write", _on_mask_param_changed)
         max_fw.committed_var.trace_add("write", _on_mask_param_changed)
@@ -1316,6 +1369,8 @@ class GCodeGeneratorApp:
         step['min_fw'].set(DEFAULTS["step_min_fw"])
         step['max_fw'].auto_var.set(False)
         step['max_fw'].set(DEFAULTS["step_max_fw"])
+        step['pocket_target_z'].set(DEFAULTS["step_pocket_target_z"])
+        step['pocket_target_z'].auto_var.set(bool(int(DEFAULTS["step_pocket_target_z_auto"])))
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['cutout_depth'].set(DEFAULTS["step_cutout_depth"])
@@ -2009,6 +2064,8 @@ class GCodeGeneratorApp:
             'min_fw':               step['min_fw'].get(),
             'max_fw':               step['max_fw'].get(),
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
+            'pocket_target_z':      step['pocket_target_z'].get(),
+            'pocket_target_z_auto': bool(step['pocket_target_z'].auto_var.get()),
             'gating_mode':          step['gating_mode_var'].get(),
             'ramp_in_enabled':      step['ramp_in_enabled_var'].get(),
             'ramp_angle_deg':       step['ramp_angle_deg_var'].get(),
@@ -2057,6 +2114,9 @@ class GCodeGeneratorApp:
         step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
         step['max_fw'].auto_var.set(bool(d.get('max_fw_auto', False)))
         step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
+        step['pocket_target_z'].auto_var.set(bool(d.get(
+            'pocket_target_z_auto', bool(int(DEFAULTS['step_pocket_target_z_auto'])))))
+        step['pocket_target_z'].set(d.get('pocket_target_z', DEFAULTS['step_pocket_target_z']))
         step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
         step['ramp_in_enabled_var'].set(bool(d.get(
             'ramp_in_enabled', bool(int(DEFAULTS['step_ramp_in_enabled'])))))
@@ -2606,6 +2666,24 @@ class GCodeGeneratorApp:
                 'use_2opt':                 step['tsp_2opt_var'].get(),
                 'tab_settings':             self._tab_settings(step),
             })
+        elif algorithm == "Pocket":
+            _profile    = step['profile_var'].get()
+            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
+            tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            stepover = float(step['stepover'].get())
+            params.update({
+                'tool':                     tool,
+                'step_mm':                  tool.diameter_mm * stepover / 100.0,
+                'raster_offset_pct':        float(step['raster_offset'].get()),
+                'pocket_stepdown_mm':       float(step['stepdown'].get()),
+                'pocket_final_stepdown_mm': float(step['raster_final_stepdown'].get()),
+                'use_2opt':                 step['tsp_2opt_var'].get(),
+                'raster_dir':               step['raster_dir_var'].get(),
+                'cut_direction':            step['cut_dir_var'].get(),
+                'gating_mode':              step['gating_mode_var'].get(),
+                'pocket_target_z_mm':       float(step['pocket_target_z'].get()),
+                'work_surface_tol':         threshold_mm / max_depth if max_depth else 0.0,
+            })
         else:  # Raster
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
@@ -2764,6 +2842,49 @@ class GCodeGeneratorApp:
                 feed_rapid         = self._settings['feed_rapid'],
                 tab_settings       = params['tab_settings'],
                 progress           = progress_fn,
+            )
+        elif algorithm == "Pocket":
+            gating_mode = params['gating_mode']
+            if gating_mode == "Residual from prior step":
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = False
+            elif gating_mode == "Inaccessible by prior tool":
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = False
+            elif gating_mode == "Reachable residual":
+                prior_reference       = prev_tp.result    if prev_tp is not None else None
+                subtract_unaccessible = True
+            elif gating_mode == "Reachable inaccessible":
+                prior_reference       = prev_tp.accessible if prev_tp is not None else None
+                subtract_unaccessible = True
+            else:
+                prior_reference       = None
+                subtract_unaccessible = False
+            return compute_pocket_toolpath(
+                depth_map             = depth_map,
+                n_grey_levels         = n_grey_levels,
+                tool                  = params['tool'],
+                step_mm               = params['step_mm'],
+                stepdown_mm           = params['pocket_stepdown_mm'],
+                final_stepdown_mm     = params['pocket_final_stepdown_mm'],
+                extra_offset_mm       = params['extra_offset_mm'],
+                max_depth             = params['max_depth'],
+                width_mm              = params['eff_width_mm'],
+                height_mm             = params['eff_height_mm'],
+                raster_dir            = params['raster_dir'],
+                target_z_mm           = params['pocket_target_z_mm'],
+                origin                = params['origin'],
+                work_surface_tol      = params['work_surface_tol'],
+                previous_result       = prev_tp.result if prev_tp is not None else None,
+                prior_reference       = prior_reference,
+                subtract_unaccessible = subtract_unaccessible,
+                raster_offset_pct = params['raster_offset_pct'],
+                feed_rate         = params['feed_rate'],
+                use_2opt          = params['use_2opt'],
+                cut_direction     = params['cut_direction'],
+                progress          = progress_fn,
+                erosion_cache     = self._erosion_cache,
+                erosion_cache_key = erosion_cache_key,
             )
         else:  # Raster
             gating_mode = params['gating_mode']

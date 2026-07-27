@@ -1320,6 +1320,345 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     return toolpath
 
 
+def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
+                             step_mm, stepdown_mm, max_depth,
+                             width_mm, height_mm, raster_dir,
+                             target_z_mm=None,
+                             origin="Bottom-Left",
+                             feed_rate=800.0,
+                             work_surface_tol=None,
+                             previous_result=None,
+                             prior_reference=None,
+                             subtract_unaccessible=False,
+                             raster_offset_pct=0.0,
+                             use_2opt=False,
+                             cut_direction="Climb",
+                             final_stepdown_mm=0.0,
+                             extra_offset_mm=0.0,
+                             progress=None,
+                             erosion_cache=None,
+                             erosion_cache_key=None):
+    """Compute a flat-bottomed pocket toolpath: clear the interior of the
+    depth map's target-Z iso-depth region with a raster-style infill.
+
+    Every pixel whose achievable depth is at least target_z_mm is treated as
+    pocket interior; that interior is cleared flat at target_z_mm using the
+    same scan-line/spiral infill machinery as compute_raster_toolpath, one
+    tool-accessibility-bounded connected region at a time so a Spiral pattern
+    forms a coil centred on and sized to each pocket rather than the stock.
+
+    Parameters
+    ----------
+    depth_map         : 2-D float32 [0, 1]  — 1.0 = max cut depth (intaglio)
+    n_grey_levels     : number of grey levels in source image (e.g. 256)
+    tool              : Tool — encapsulates profile, diameter_mm, vbit_angle_deg
+    step_mm           : lateral step-over in mm
+    stepdown_mm       : max depth increment per roughing z-pass in mm
+    max_depth         : total maximum cut depth in mm (depth map's own scale)
+    width_mm          : physical image width in mm
+    height_mm         : physical image height in mm
+    raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
+                        "Spiral (Inside-Out)" — same meaning as
+                        compute_raster_toolpath's raster_dir, applied
+                        independently within each pocket region.
+    target_z_mm       : depth (mm) defining the pocket floor and which pixels
+                        count as pocket interior (achievable depth >= this).
+                        None defaults to max_depth (the deepest region of the
+                        depth map). Clipped to (0, max_depth].
+    raster_offset_pct : percentage [0, 100) to shift infill lines relative to
+                        the step-over distance, same meaning as Raster.
+    cut_direction     : "Either" | "Climb" | "Conventional" — forces every
+                        infill line/leg onto a fixed travel direction, same
+                        semantics as compute_raster_toolpath.
+    origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
+    feed_rate         : cutting feed rate in mm/min
+    work_surface_tol  : threshold (normalised [0,1]) applied to the gate built
+                        from prior_reference — only meaningful when
+                        prior_reference is supplied; skips residual gaps
+                        shallower than this instead of recutting any nonzero
+                        gap. None/0 (default) recuts any residual at or above
+                        one grey-level. Has no effect when prior_reference is
+                        None, since target_z_mm alone already defines the
+                        region in that case.
+    previous_result   : optional 2-D float32 [0,1] cumulative result from a
+                        prior step (ToolPath.result), unioned into this
+                        step's result.
+    prior_reference   : optional 2-D float32 [0,1] reference surface from a
+                        prior step; when supplied, only the part of the
+                        pocket interior still outstanding against this
+                        reference is cut (Process Region gating), composed
+                        with (not replacing) the target-Z interior mask.
+    subtract_unaccessible : when True with prior_reference set, gates against
+                        (accessible − prior_reference) instead of
+                        (depth_map − prior_reference).
+    final_stepdown_mm : depth (mm) reserved for a dedicated finishing pass at
+                        the pocket floor. 0 = no reservation.
+    extra_offset_mm   : stock-to-leave allowance (mm), same meaning as
+                        compute_raster_toolpath.
+    progress          : callable(pct, subtask) — thread-safe progress reporter
+    erosion_cache     : optional dict memoising the grey-erosion/grey-dilation
+                        achievable-depth surface, keyed by erosion_cache_key.
+    erosion_cache_key : hashable key identifying the (tool, px_per_mm,
+                        max_depth) combination for erosion_cache lookups.
+
+    Returns
+    -------
+    ToolPath
+
+    Note: this does not cut a wall-finishing pass around the pocket
+    perimeter — only the interior infill described above. The infill's
+    outermost line leaves the same stair-stepped boundary edge Raster
+    already leaves at any masked boundary.
+    """
+    from scipy.ndimage import grey_erosion, grey_dilation, label, find_objects
+
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
+    H, W = depth_map.shape
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        if prior_reference is not None:
+            prior_reference = _zoom(prior_reference, (zy, zx), order=1).astype(np.float32)
+        if previous_result is not None:
+            previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
+
+    W_mm = (W - 1) / px_per_mm
+    H_mm = (H - 1) / px_per_mm
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm/2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm/2}.get(origin, 0)
+
+    # ── Stage 1 · Build tool kernel (0–10 %) ─────────────────────────────
+    progress(0, "Building tool geometry kernel…")
+    kernel_pocket, footprint_pocket = _build_kernel(tool, px_per_mm, max_depth)
+    kernel_plan, footprint_plan = _planning_kernel(
+        tool, px_per_mm, max_depth, extra_offset_mm, kernel_pocket, footprint_pocket)
+    ksize = kernel_pocket.shape[0]
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
+
+    # ── Stage 2 · Compute achievable depth surface (10–35 %) ─────────────
+    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
+    if cached is not None and cached[0].shape == depth_map.shape:
+        center_depth_contour_pocket, accessible_pocket = cached
+        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
+    else:
+        progress(10, "Computing achievable depth surface (morphological opening)…")
+        structure = -kernel_plan.astype(np.float64)
+        center_depth_contour_pocket = grey_erosion(depth_map.astype(np.float64),
+                                  footprint=footprint_plan,
+                                  structure=structure).astype(np.float32)
+        center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
+        accessible_pocket = grey_dilation(center_depth_contour_pocket.astype(np.float64),
+                                   footprint=footprint_plan,
+                                   structure=structure).astype(np.float32)
+        accessible_pocket = np.clip(accessible_pocket, 0.0, 1.0)
+        progress(35, "Achievable depth surface computed.")
+        if erosion_cache is not None:
+            erosion_cache[erosion_cache_key] = (center_depth_contour_pocket, accessible_pocket)
+
+    if extra_offset_mm > 0.0:
+        off_norm = extra_offset_mm / max_depth
+        center_depth_contour_pocket = np.clip(center_depth_contour_pocket - off_norm, 0.0, 1.0)
+        accessible_pocket = np.clip(accessible_pocket - off_norm, 0.0, 1.0)
+
+    # ── Stage 3 · Target-Z interior mask (35–40 %) ───────────────────────
+    progress(35, "Computing pocket interior mask…")
+    if target_z_mm is None:
+        target_z_mm = max_depth
+    target_z_norm = float(np.clip(target_z_mm / max_depth, 1e-6, 1.0))
+    pocket_depth_mm = target_z_norm * max_depth
+    contour_eps = 0.5 / max(n_grey_levels - 1, 1)
+    pocket_mask = accessible_pocket >= (target_z_norm - contour_eps)
+
+    resid_tol = (work_surface_tol if work_surface_tol
+                 else 1.0 / (n_grey_levels - 1))
+    if prior_reference is not None:
+        if subtract_unaccessible:
+            gate = np.clip(accessible_pocket - prior_reference, 0.0, 1.0)
+        else:
+            gate = np.clip(depth_map - prior_reference, 0.0, 1.0)
+        pocket_mask = pocket_mask & (gate >= resid_tol)
+
+    n_pocket_px = int(np.sum(pocket_mask))
+    progress(40, f"Target depth {pocket_depth_mm:.2f} mm: "
+                 f"{n_pocket_px}/{H*W} pixels in pocket interior.")
+
+    if n_pocket_px == 0:
+        progress(100, "No pixels reach the target depth — nothing to cut.")
+        return ToolPath(
+            segments=[],
+            result=(previous_result.copy() if previous_result is not None
+                     else np.zeros((H, W), dtype=np.float32)),
+            accessible=accessible_pocket,
+            metadata={'algorithm': 'Pocket', 'target_z_mm': pocket_depth_mm,
+                      'step_mm': step_mm, 'n_regions': 0},
+        )
+
+    # ── Stage 4 · Per-region infill generation (40–70 %) ─────────────────
+    # Each connected pocket region gets its own grid/coil, sized and centred
+    # on that region's own bounding box rather than the full stock, so a
+    # Spiral pattern forms a coil concentric with the pocket, not the
+    # canvas. Gating uses the region's own label mask (not the pooled
+    # pocket_mask) so two disjoint regions with overlapping bounding boxes
+    # never double-generate a line over each other's pixels.
+    flat_depth = np.where(pocket_mask, target_z_norm, 0.0).astype(np.float32)
+    mask_resid_tol = target_z_norm * 0.5   # (flat_depth * region_mask) is 0 or target_z_norm
+
+    IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
+    direction = None if IS_SPIRAL else ("X" if raster_dir == "Horizontal" else "Y")
+
+    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
+                      "Conventional": {"X": True,  "Y": False}}
+    SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
+    lock_direction = cut_direction in FORCE_REVERSE
+
+    labeled_regions, n_regions = label(pocket_mask)
+    region_boxes = find_objects(labeled_regions)
+    progress(40, f"Phase 1: generating infill for {n_regions} pocket region(s)…")
+
+    full_depth_segs = []
+    for region_id, box in enumerate(region_boxes, start=1):
+        if box is None:
+            continue
+        r_lo, r_hi = box[0].start, box[0].stop - 1
+        c_lo, c_hi = box[1].start, box[1].stop - 1
+        region_mask_f = (labeled_regions == region_id).astype(np.float32)
+
+        if IS_SPIRAL:
+            local_row_ids, _ = _grid_line_ids(r_hi - r_lo, px_per_mm, step_mm, raster_offset_pct)
+            local_col_ids, _ = _grid_line_ids(c_hi - c_lo, px_per_mm, step_mm, raster_offset_pct)
+            row_ids = [r + r_lo for r in local_row_ids]
+            col_ids = [c + c_lo for c in local_col_ids]
+            sense = SPIRAL_OUTSIDE_IN_SENSE[cut_direction]
+            legs = _spiral_legs(row_ids, col_ids, sense)
+            if raster_dir == "Spiral (Inside-Out)":
+                legs = [(axis, fixed, e, s) for axis, fixed, s, e in reversed(legs)]
+            for axis, fixed_idx, start_idx, end_idx in legs:
+                lo, hi = (start_idx, end_idx) if start_idx <= end_idx else (end_idx, start_idx)
+                full_depth_segs.extend(
+                    _line_points(axis, fixed_idx, lo, hi, start_idx > end_idx,
+                                 flat_depth, region_mask_f, mask_resid_tol,
+                                 px_per_mm, H, _ox, _oy, max_depth))
+        else:
+            if direction == "X":
+                spacing_lo, spacing_hi = r_lo, r_hi
+                span_lo,    span_hi    = c_lo, c_hi
+            else:
+                spacing_lo, spacing_hi = c_lo, c_hi
+                span_lo,    span_hi    = r_lo, r_hi
+            local_line_ids, _ = _grid_line_ids(spacing_hi - spacing_lo, px_per_mm,
+                                               step_mm, raster_offset_pct)
+            line_ids = [i + spacing_lo for i in local_line_ids]
+            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
+            for line_idx in line_ids:
+                full_depth_segs.extend(
+                    _line_points(direction, line_idx, span_lo, span_hi, reverse,
+                                 flat_depth, region_mask_f, mask_resid_tol,
+                                 px_per_mm, H, _ox, _oy, max_depth))
+
+    progress(70, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s) "
+                 f"across {n_regions} region(s).")
+
+    # ── Stage 5 · Depth-slice the flat floor into per-pass segments ──────
+    pass_list = make_multipass(full_depth_segs, pocket_depth_mm, stepdown_mm,
+                               final_stepdown_mm)
+    n_passes = len(pass_list)
+    link_threshold_mm = 2.0 * step_mm   # 2-opt's own "free stitch" cost-model distance
+
+    # ── Stage 6 · Per-pass ordering (no terrain linking) ─────────────────
+    # The pocket floor is flat and uniform, so unlike Raster/Contour there
+    # is no varying terrain to route a gap-bridging move along — a gap
+    # between two spans of the same flat floor is exactly a retract, rapid,
+    # and plunge, so ToolPath.iter_moves handles it with no extra segment
+    # needed, the same simplification Cutout already relies on.
+    all_segments = []
+    tool_pos = np.array([0.0, 0.0])
+    total_segs = 0
+    for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
+        if not pass_segs:
+            continue
+        progress(70 + 15 * pi / n_passes,
+                 f"Pass {pi+1}/{n_passes} at z={ceil_mm:.3f} mm "
+                 f"({'final' if is_final else 'roughing'}): "
+                 f"{len(pass_segs)} segment(s).")
+        cur = (float(tool_pos[0]), float(tool_pos[1]))
+        if lock_direction and IS_SPIRAL:
+            ordered_segs = pass_segs
+        elif lock_direction:
+            ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
+        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
+            ordered_segs = pass_segs
+        else:
+            ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
+                                                    link_threshold_mm)
+        for seg in ordered_segs:
+            all_segments.append(seg)
+            total_segs += 1
+            tool_pos = np.array([seg[-1][0], seg[-1][1]])
+
+    progress(85, f"Pocket complete — {total_segs} cut segments across "
+                 f"{n_passes} pass(es).")
+
+    # ── Stage 7 · Simplify, simulate result, create ToolPath (85–100 %) ──
+    progress(85, "Simplifying tool path…")
+    rdp_tol = max(
+        1.0 / px_per_mm,
+        max_depth / (n_grey_levels - 1),
+    )
+    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
+
+    progress(90, "Simulating tool-swept removal surface…")
+    material_removed_pocket = simulate_toolpath_result(
+        ToolPath(segments=simplified),
+        (H, W), px_per_mm, px_per_mm, _ox, _oy,
+        max_depth, kernel_pocket, footprint_pocket,
+    )
+    pocket_result = np.minimum(
+        np.maximum(material_removed_pocket,
+                   previous_result if previous_result is not None else 0.0),
+        depth_map).astype(np.float32)
+
+    progress(95, "Creating ToolPath object...")
+    toolpath = ToolPath(
+        segments=simplified,
+        result=pocket_result,
+        accessible=accessible_pocket,
+        metadata={
+            'algorithm': 'Pocket',
+            'profile': tool.profile,
+            'radius_mm': tool.diameter_mm / 2,
+            'step_mm': step_mm,
+            'stepdown_mm': stepdown_mm,
+            'final_stepdown_mm': final_stepdown_mm,
+            'extra_offset_mm': extra_offset_mm,
+            'target_z_mm': pocket_depth_mm,
+            'max_depth': max_depth,
+            'width_mm': width_mm,
+            'height_mm': height_mm,
+            'n_passes': n_passes,
+            'n_regions': n_regions,
+            'rdp_tolerance': rdp_tol,
+        }
+    )
+
+    progress(100, "Tool path computation complete!")
+
+    return toolpath
+
+
 def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
                         max_feature_width_mm=0.0):
     """Return (filtered_ref, mask) for V-carve mask computation.

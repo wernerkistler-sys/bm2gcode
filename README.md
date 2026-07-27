@@ -149,7 +149,7 @@ Uses a V-bit or ball-nose bit whose effective cutting width varies with depth to
 
 ##### Step / Operation / Cutout
 
-Traces the outer perimeter of the depth map's silhouette and cuts straight down through the full stock thickness, freeing the finished part from the surrounding waste material — unlike the other three algorithms, which all follow the depth map's own relief detail. Restricted to an End Mill tool, since a straight vertical wall only makes sense with a flat-bottomed bit. Interior holes in the silhouette (e.g. the counter of a letter "O") are always filled before tracing, so only the outer perimeter of each shape is cut; cutting interior holes is not supported yet.
+Traces the outer perimeter of the depth map's silhouette and cuts straight down through the full stock thickness, freeing the finished part from the surrounding waste material — unlike Raster Scan, Contour, and V-Carving, which all follow the depth map's own relief detail. Restricted to an End Mill tool, since a straight vertical wall only makes sense with a flat-bottomed bit. Interior holes in the silhouette (e.g. the counter of a letter "O") are always filled before tracing, so only the outer perimeter of each shape is cut; cutting interior holes is not supported yet.
 
 | Parameter | Description |
 |---|---|
@@ -160,6 +160,20 @@ Traces the outer perimeter of the depth map's silhouette and cuts straight down 
 | Cut direction | Climb or Conventional forces the perimeter cut to travel in one consistent direction relative to the spindle rotation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained. |
 
 There's no Process Region selector for Cutout — **Split level** is always applied to the full depth map, never to a prior step's residual or accessible surface, so what any prior step accomplished has no bearing on which pixels get cut. Split level is the depth-map split point between "the object" and "the background", in mm. Since depth map polarity — whether the object is the deeply-cut region or the shallow/uncarved region — depends on how the source was authored, both split directions are tried automatically; see [Cutout Pipeline](#cutout-pipeline) below.
+
+---
+
+##### Step / Operation / Pocket
+
+Clears a flat-bottomed recess: every point of the depth map at least as deep as Target depth is treated as the pocket's interior, and that interior is cleared flat at Target depth using the same scan-line/spiral infill as Raster Scan. Unlike Raster Scan, Contour, and V-Carving, the pocket floor is flat rather than following the depth map's own relief detail, and unlike Cutout, only the interior is cleared — no wall-finishing pass is cut around the pocket boundary, so the boundary is left with the same stair-stepped edge Raster Scan already leaves at any masked boundary. When the depth map contains more than one disjoint region at or beyond Target depth, each region is cleared independently, with its own infill grid or spiral coil sized and centred on that region rather than on the stock as a whole.
+
+| Parameter | Description |
+|---|---|
+| Target depth | Depth (mm) defining the pocket floor and which pixels count as pocket interior (at least this deep). "Auto" uses Max cut depth. |
+| Step-over | Lateral spacing between infill lines, as a percentage of tool diameter. |
+| Line offset | Shifts alternate infill lines by this percentage, so that the in-between lines can be cut in a separate step with a different setting. |
+| Scan direction | Horizontal or Vertical scan in parallel lines. Spiral (Outside-In) or Spiral (Inside-Out) instead traces each pocket region as one continuous coil of shrinking (or growing) concentric rectangles, sized and centred on that region — see [Spiral raster pattern](#spiral-raster-pattern). |
+| Cut direction | Climb or Conventional forces every infill line to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained. For a Spiral scan direction, Climb/Conventional instead pick which way each region's coil winds. |
 
 ---
 
@@ -428,6 +442,22 @@ Cutout doesn't share Raster/Contour/V-Carving's kernel + accessibility (morpholo
 5. **Simplification + result simulation** — Same as Raster.
 
 Because Cut depth is typically deeper than Max cut depth, a genuine through-cut clips to the same depth-map value (1.0) as ordinary full-depth relief carving elsewhere in the project — the two would otherwise be indistinguishable in the Step Result view. To keep them distinguishable, the result carries a second, separate channel recording exactly which pixels were actually cut all the way through (deeper than Max cut depth — a shallower Cutout pass is just an ordinary partial cut, not a hole, and needs no special marking); the Step Result view renders those pixels fully transparent, showing a distinct highlight colour through instead of the ordinary depth grayscale. A tab only counts as "cut all the way through" once its own raised Z has actually reached Max cut depth or deeper — a tab shallower than that renders as an ordinary partial-depth grey in the Step Result view, not a hole.
+
+---
+
+### Pocket Pipeline
+
+Pocket shares Raster's kernel + accessibility (morphological opening) stage, but replaces Raster's per-pixel varying depth with a single flat floor at Target depth, and — like Cutout — has no terrain underneath to link gaps along.
+
+1. **Kernel + accessibility map** — Identical to Raster (steps 1–2).
+2. **Target-Z interior mask** — Every pixel whose achievable depth is at least Target depth (normalised, with the same half-grey-level epsilon Contour uses so flat regions land firmly inside the mask rather than teetering on a quantisation boundary) is pocket interior. If Process Region gating is active, the gate is combined with (not replaced by) this mask, using Z-threshold as the residual tolerance exactly as Raster does.
+3. **Per-region infill generation** — The interior mask is split into connected regions (`scipy.ndimage.label`). Each region gets its own scan-line grid or spiral coil, sized and centred on that region's own bounding box rather than the full stock, so a Spiral pattern forms a coil concentric with the pocket rather than fragments of a coil centred on the canvas. Gating uses each region's own label mask, so two disjoint regions with overlapping bounding boxes never double-cut each other's pixels. See [Climb / conventional cut direction](#climb--conventional-cut-direction) for what Climb/Conventional/Either mean for each scan direction, applied independently within each region.
+4. **Depth-slicing (multi-pass)** — Since every pocket point targets the same flat floor Z, this slices a constant depth rather than Raster's per-pixel terrain, the same mechanism Cutout uses for its own constant Cut depth.
+5. **Path ordering** — Same greedy/2-opt/locked-direction machinery as Raster, operating across all regions' segments together.
+6. **No terrain linking** — The pocket floor is flat and uniform, so unlike Raster/Contour there is no varying terrain to route a gap-bridging move along; gaps become a plain retract → rapid → plunge instead, the same simplification Cutout relies on for its own flat through-cut.
+7. **Simplification + result simulation** — Same as Raster.
+
+Pocket only clears the interior — it does not cut a wall-finishing pass around the pocket boundary, so the boundary is left with the same stair-stepped edge Raster already leaves at any masked boundary.
 
 ---
 

@@ -7,7 +7,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
-                     "Cutout"]
+                     "Cutout", "Pocket"]
 BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
 DEFAULT_PREAMBLE = (
@@ -82,6 +82,9 @@ DEFAULTS = {
     "step_cutout_stepdown":       "3.0",  # max step-down per roughing pass (mm); 0 = single pass
     "step_cutout_final_stepdown": "0.0",  # final finishing pass depth (mm); 0 = none
     "step_cutout_extra_offset":   "0.0",  # lateral-only outward push (mm); 0 = tool tangent to silhouette edge
+    # Pocket-specific defaults
+    "step_pocket_target_z":       "0.0",  # target depth (mm) defining the pocket floor/interior
+    "step_pocket_target_z_auto":  "1",    # 1 = use max_depth instead of step_pocket_target_z
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     # Per-step G-code dress-ups (see dressup.py) — all opt-in, disabled by default
