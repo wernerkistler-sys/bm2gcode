@@ -1144,6 +1144,12 @@ class GCodeGeneratorApp:
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
 
+            # Cutout reuses the same field to split "object" from
+            # "background" rather than gate on depth, a different enough
+            # concept that it gets its own label.
+            step['threshold'].set_label(
+                "Split level" if alg == "Cutout" else "Z-threshold")
+
             if alg.startswith("V-Carving"):
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
@@ -1206,7 +1212,7 @@ class GCodeGeneratorApp:
                 step['gating_region_row'].pack_forget()   # Cutout always reads
                                                            # prior_accessible/previous_result
                                                            # unconditionally, mirroring Contour --
-                                                           # only the Z-threshold field is used.
+                                                           # only the Split level field is used.
                 step['tsp_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['profile_cb'].config(state="readonly", values=_CUTOUT_PROFILES)
                 if profile not in _CUTOUT_PROFILES:

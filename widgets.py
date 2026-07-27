@@ -189,7 +189,8 @@ class LabeledEntry(ttk.Frame):
         super().__init__(parent, **kw)
         self._minval = minval
         self._maxval = maxval
-        ttk.Label(self, text=label).pack(side=tk.LEFT)
+        self._label_widget = ttk.Label(self, text=label)
+        self._label_widget.pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
         self.entry = ttk.Spinbox(self, textvariable=self.var, width=width,
                                  from_=minval, to=maxval, increment=increment)
@@ -300,6 +301,9 @@ class LabeledEntry(ttk.Frame):
 
     def set_state(self, state):
         self.entry.config(state=state)
+
+    def set_label(self, text):
+        self._label_widget.config(text=text)
 
 
 class SectionFrame(ttk.LabelFrame):

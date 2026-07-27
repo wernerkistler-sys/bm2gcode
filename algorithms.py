@@ -1381,7 +1381,12 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     origin                : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate             : cutting feed rate in mm/min
     threshold_mm          : minimum fine-detail depth in mm; regions shallower
-                            than this are skipped
+                            than this are skipped. 0 (the default) means
+                            "auto": split at the midpoint of the uncut
+                            depth's own value range instead, since that
+                            depth's floor is always 0 and a literal 0
+                            threshold would keep the flat background in the
+                            mask along with the artwork.
     min_feature_width_mm  : features narrower than this (mm) are skipped
     stepdown_mm           : max depth increment per z-pass in mm; 0 = single pass
     final_stepdown_mm     : depth increment for the finishing pass
@@ -1530,7 +1535,16 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         uncut_depth = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
-    threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+    if threshold_mm > 0.0:
+        threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+    else:
+        # 0 (or unset) means "auto": split at the midpoint of uncut_depth's
+        # own value range rather than at depth 0. uncut_depth's floor is
+        # always 0 (background/already-cut material), so a literal 0
+        # threshold would keep every pixel -- including the flat
+        # background -- turning stage 3's skeleton into the medial axis of
+        # the whole canvas rectangle instead of the actual artwork.
+        threshold_norm = float(uncut_depth.min() + uncut_depth.max()) / 2.0
 
     uncut_depth_filtered, mask_vcarve = compute_vcarve_mask(
         uncut_depth, threshold_norm, min_feature_width_mm, px_per_mm,
@@ -2839,9 +2853,12 @@ def compute_cutout_toolpath(
     threshold_mm : float
         Depth (mm, as a fraction of max_depth) used to split "inside the
         object silhouette" from "background"; threshold_norm = threshold_mm
-        / max_depth. Which side of the threshold is "the object" depends on
-        how the source was authored (a carved object against a shallow
-        background vs. an uncarved object standing proud of a deeply
+        / max_depth. 0 (the default) means "auto": split at the midpoint of
+        depth_map's own value range instead, since depth_map's floor is
+        always 0 and a literal 0 threshold would put every pixel on the same
+        side of the split. Which side of the threshold is "the object"
+        depends on how the source was authored (a carved object against a
+        shallow background vs. an uncarved object standing proud of a deeply
         recessed background) and isn't knowable from depth_map alone, so
         both directions are tried -- see Stage 2 below and the
         'mask_direction' metadata key ('<=' or '>=') for which one won.
@@ -3009,7 +3026,15 @@ def _compute_cutout_rings(
     # itself touch the canvas edge -- same margin caveat as the open-contour
     # limitation noted above.
     progress(10, "Building silhouette mask…")
-    threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+    if threshold_mm > 0.0:
+        threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+    else:
+        # 0 (or unset) means "auto": split at the midpoint of the depth
+        # map's own value range rather than at depth 0, since the depth
+        # map's floor is always 0 -- a literal 0 threshold would put every
+        # pixel on the same side of the split, both directions, guaranteeing
+        # "no usable silhouette boundary" below.
+        threshold_norm = float(depth_map.min() + depth_map.max()) / 2.0
 
     r_px = max(1, int(round((tool.diameter_mm / 2.0 + extra_offset_mm) * px_per_mm)))
 

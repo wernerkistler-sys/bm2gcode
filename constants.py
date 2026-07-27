@@ -64,7 +64,7 @@ DEFAULTS = {
     "step_feed_rate":    "800",
     "step_raster_dir":   "Vertical",
     "step_cut_direction": "Climb",
-    "step_threshold":    "0",    # mm; 0 = visit all pixels
+    "step_threshold":    "0",    # mm; 0 = visit all pixels (V-Carving/Cutout: 0 = auto-split at depth-map midpoint)
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # see ALGORITHMS list
     "step_gating_mode": "Full depth map",  # initial default; overridden per-algorithm by _refresh_layout
