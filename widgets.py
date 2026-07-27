@@ -604,6 +604,11 @@ class DressUpDialog(tk.Toplevel):
                                         minval=0.0, maxval=50.0, increment=1.0)
         self._arc_radius.pack(fill=tk.X, pady=2)
 
+        self._arc_feed = LabeledEntry(du_sf, "Arc feed", "mm/min",
+                                      str(settings.get('arc_feed_mm_min', 1500.0)),
+                                      minval=1.0, maxval=30000.0, increment=100.0)
+        self._arc_feed.pack(fill=tk.X, pady=2)
+
         ttk.Separator(du_sf).pack(fill=tk.X, pady=4)
 
         self._tab_enabled_var = tk.BooleanVar(value=bool(settings.get('tab_enabled', False)))
@@ -669,7 +674,9 @@ class DressUpDialog(tk.Toplevel):
         self._backoff_dist.set_state(tk.NORMAL if self._backoff_enabled_var.get() else tk.DISABLED)
 
     def _on_arc_toggle(self):
-        self._arc_radius.set_state(tk.NORMAL if self._arc_enabled_var.get() else tk.DISABLED)
+        state = tk.NORMAL if self._arc_enabled_var.get() else tk.DISABLED
+        self._arc_radius.set_state(state)
+        self._arc_feed.set_state(state)
 
     def _on_tab_toggle(self):
         applicable = self._algorithm is None or self._algorithm == "Cutout"
@@ -686,6 +693,7 @@ class DressUpDialog(tk.Toplevel):
             ramp_length   = float(self._ramp_length.get())
             backoff_dist  = float(self._backoff_dist.get())
             arc_radius    = float(self._arc_radius.get())
+            arc_feed      = float(self._arc_feed.get())
             tab_count     = int(float(self._tab_count.get()))
             tab_width     = float(self._tab_width.get())
             tab_height    = float(self._tab_height.get())
@@ -725,6 +733,11 @@ class DressUpDialog(tk.Toplevel):
                                  "clearance below z_safe.",
                                  parent=self)
             return
+        if arc_feed <= 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Arc feed must be positive.",
+                                 parent=self)
+            return
         if tab_count < 1:
             messagebox.showerror("Invalid input",
                                  "Tab count must be at least 1.",
@@ -758,6 +771,7 @@ class DressUpDialog(tk.Toplevel):
         self._settings['backoff_distance_mm'] = backoff_dist
         self._settings['arc_rapids_enabled']  = self._arc_enabled_var.get()
         self._settings['arc_radius_mm']       = arc_radius
+        self._settings['arc_feed_mm_min']     = arc_feed
         self._settings['tab_enabled']    = self._tab_enabled_var.get()
         self._settings['tab_count']      = tab_count
         self._settings['tab_width_mm']   = tab_width

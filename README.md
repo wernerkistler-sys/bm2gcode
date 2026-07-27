@@ -239,11 +239,12 @@ The **Dress-up…** button on each step's tab opens that step's tool path dress-
 |---|---|
 | Back-off distance | How far to back away before retracting, in mm. |
 
-**Arc-round rapid corners** — rounds the two sharp 90° turns of a rapid move (retract → traverse → plunge) into tangent arcs, so the tool can carry speed through the corner instead of coming to a full stop twice. Both corners always share the same radius.
+**Arc-round rapid corners** — rounds the two sharp 90° turns of a rapid move (retract → traverse → plunge) into tangent arcs, so the tool can carry speed through the corner instead of coming to a full stop twice. Both corners always share the same radius. Unlike the plain rapid it replaces, the arc is emitted as coordinated G1 motion (see [G-code generation](#g-code-generation)), so it needs its own literal feedrate rather than reusing the Rapid feed setting (which is time-estimate only and never appears in the G-code).
 
 | Parameter | Description |
 |---|---|
 | Arc radius | Requested corner radius, in mm. Automatically reduced when there isn't enough room — e.g. a shallow cut, a short rapid, or a small safe height — and never exceeds the safe height (a global machine parameter, set under File → Settings), since a corner's lateral sweep is only safe above the stock surface. |
+| Arc feed | Literal feedrate commanded on the arc's G1 moves, in mm/min. |
 
 **Tabs** — leaves short, uncut bridges around the perimeter of a Cutout step's closed cutting loop, so the finished part stays attached to the surrounding stock. Unlike the three dress-ups above, tabs change the cut geometry itself rather than just how the tool travels between cuts — see [Cutout Pipeline](#cutout-pipeline). Available only for Cutout steps; greyed out (but still editable/persisted) for every other algorithm.
 
@@ -488,7 +489,7 @@ Iterates over the ordered segments. Consecutive segments whose endpoints touch a
 
 - **Ramp-in** replaces the plunge below the stock surface (z < 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
 - **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract.
-- **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius.
+- **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius. The arc's waypoints are emitted as G1 moves at its own configured feed (rather than G0), since G0 doesn't guarantee coordinated linear interpolation between waypoints on every controller — G1 is what makes the polyline actually trace the intended arc instead of a per-axis independent rapid.
 
 The fourth per-step dress-up, **Tabs**, isn't part of this stage at all — it modifies the cut geometry itself, earlier in the Cutout pipeline (see [Cutout Pipeline](#cutout-pipeline)), so by the time G-code generation runs, a tab is already just an ordinary Z change baked into the segments like any other.
 

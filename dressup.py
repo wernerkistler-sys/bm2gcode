@@ -39,6 +39,7 @@ class BackoffSettings:
 class ArcSettings:
     enabled: bool = False
     radius_mm: float = 3.0
+    feed_mm_min: float = 1500.0   # literal G1 feedrate commanded on the arc segments
     n_segments: int = 8           # polyline segments per quarter-circle, internal
 
 

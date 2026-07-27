@@ -904,6 +904,8 @@ class GCodeGeneratorApp:
             value=bool(int(DEFAULTS['step_arc_rapids_enabled'])))
         step['arc_radius_mm_var']       = tk.DoubleVar(
             value=float(DEFAULTS['step_arc_radius_mm']))
+        step['arc_feed_mm_min_var']     = tk.DoubleVar(
+            value=float(DEFAULTS['step_arc_feed_mm_min']))
         step['tab_enabled_var']         = tk.BooleanVar(
             value=bool(int(DEFAULTS['step_tab_enabled'])))
         step['tab_count_var']           = tk.IntVar(
@@ -1877,6 +1879,7 @@ class GCodeGeneratorApp:
             'backoff_distance_mm': step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':  step['arc_rapids_enabled_var'].get(),
             'arc_radius_mm':       step['arc_radius_mm_var'].get(),
+            'arc_feed_mm_min':     step['arc_feed_mm_min_var'].get(),
             'tab_enabled':         step['tab_enabled_var'].get(),
             'tab_count':           step['tab_count_var'].get(),
             'tab_width_mm':        step['tab_width_mm_var'].get(),
@@ -1898,6 +1901,7 @@ class GCodeGeneratorApp:
             step['backoff_distance_mm_var'].set(settings['backoff_distance_mm'])
             step['arc_rapids_enabled_var'].set(settings['arc_rapids_enabled'])
             step['arc_radius_mm_var'].set(settings['arc_radius_mm'])
+            step['arc_feed_mm_min_var'].set(settings['arc_feed_mm_min'])
             step['tab_enabled_var'].set(settings['tab_enabled'])
             step['tab_count_var'].set(settings['tab_count'])
             step['tab_width_mm_var'].set(settings['tab_width_mm'])
@@ -1956,7 +1960,8 @@ class GCodeGeneratorApp:
 
     def _arc_settings(self, step):
         return ArcSettings(enabled=step['arc_rapids_enabled_var'].get(),
-                            radius_mm=step['arc_radius_mm_var'].get())
+                            radius_mm=step['arc_radius_mm_var'].get(),
+                            feed_mm_min=step['arc_feed_mm_min_var'].get())
 
     def _tab_settings(self, step):
         return TabSettings(
@@ -2006,6 +2011,7 @@ class GCodeGeneratorApp:
             'backoff_distance_mm':  step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':   step['arc_rapids_enabled_var'].get(),
             'arc_radius_mm':        step['arc_radius_mm_var'].get(),
+            'arc_feed_mm_min':      step['arc_feed_mm_min_var'].get(),
             'tab_enabled':          step['tab_enabled_var'].get(),
             'tab_count':            step['tab_count_var'].get(),
             'tab_width_mm':         step['tab_width_mm_var'].get(),
@@ -2060,6 +2066,8 @@ class GCodeGeneratorApp:
             'arc_rapids_enabled', bool(int(DEFAULTS['step_arc_rapids_enabled'])))))
         step['arc_radius_mm_var'].set(d.get(
             'arc_radius_mm', DEFAULTS['step_arc_radius_mm']))
+        step['arc_feed_mm_min_var'].set(d.get(
+            'arc_feed_mm_min', DEFAULTS['step_arc_feed_mm_min']))
         step['tab_enabled_var'].set(bool(d.get(
             'tab_enabled', bool(int(DEFAULTS['step_tab_enabled'])))))
         step['tab_count_var'].set(d.get(

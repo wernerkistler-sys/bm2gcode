@@ -264,9 +264,15 @@ class ToolPath:
             motions.append((length, vmax, (dx/length, dy/length, dz/length)))
 
         rapid_kinds = ('rapid_retract', 'rapid_traverse', 'arc')
+        arc_feed_s = max(arc.feed_mm_min, 1.0) / 60.0 if arc is not None else feed_rapid_s
 
         for kind, pts in self.iter_moves(z_safe=z_safe, ramp=ramp, backoff=backoff, arc=arc):
-            vmax = feed_rapid_s if kind in rapid_kinds else feed_rate_s
+            if kind == 'arc':
+                vmax = arc_feed_s
+            elif kind in rapid_kinds:
+                vmax = feed_rapid_s
+            else:
+                vmax = feed_rate_s
             for i in range(len(pts) - 1):
                 p0, p1 = pts[i], pts[i + 1]
                 d = ((p1[0]-p0[0])**2 + (p1[1]-p0[1])**2 + (p1[2]-p0[2])**2) ** 0.5
@@ -386,7 +392,7 @@ class ToolPath:
                 lines.append(f"G1 X{x:.3f} Y{y:.3f} F{feed_rate}  ; back off before retract")
             elif kind == 'arc':
                 for x, y, z in pts[1:]:
-                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rapid}  ; arc")
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{arc.feed_mm_min}  ; arc")
             elif kind == 'ramp':
                 for x, y, z in pts[1:]:
                     lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}  ; ramp")
