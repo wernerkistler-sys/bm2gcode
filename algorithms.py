@@ -1864,7 +1864,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             stepdown_mm to max_depth, added alongside it to
                             also clear mask regions wider than the tool's
                             cone can reach in a single skeleton pass.
-                            Requires stepdown_mm > 0 and
+                            stepdown_mm=0 collapses this to a single ring
+                            at max_depth (see _plan_passes). Requires
                             tool.profile == 'V-Bit'.
     cut_direction         : "Either" | "Climb" | "Conventional" — only used by
                             "hybrid" mode's deep-layer contour rings (see
@@ -1910,11 +1911,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         if tool.profile != 'V-Bit':
             raise ValueError("skeleton_mode='hybrid' currently supports only "
                              "V-Bit tools.")
-        if stepdown_mm <= 0.0:
-            raise ValueError("skeleton_mode='hybrid' requires stepdown_mm > 0 "
-                             "(it sets both the multipass step-down increment "
-                             "and the depth of the first waterline contour ring).")
-        _cone_reach_warning = _vbit_cone_reach_check(tool, stepdown_mm)
+        # stepdown_mm=0 means a single roughing step at full depth (see
+        # _plan_passes), so the cone only needs to reach max_depth in that
+        # one step rather than the (nonexistent) 0 mm increment.
+        _cone_reach_warning = _vbit_cone_reach_check(
+            tool, stepdown_mm if stepdown_mm > 0.0 else max_depth)
         if _cone_reach_warning:
             progress(0, _cone_reach_warning)
 
