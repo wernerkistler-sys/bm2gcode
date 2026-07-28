@@ -1276,10 +1276,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_raster, footprint_raster,
     )
-    raster_result = np.minimum(
-        np.maximum(material_removed_raster,
-                   previous_result if previous_result is not None else 0.0),
-        depth_map).astype(np.float32)
+    raster_result = np.maximum(
+        material_removed_raster,
+        previous_result if previous_result is not None else 0.0).astype(np.float32)
 
     n_skip   = int(np.sum(material_removed_raster >= center_depth_contour_raster - resid_tol))
     pct_done = 100.0 * n_skip / max(1, H * W)

@@ -3596,8 +3596,16 @@ class GCodeGeneratorApp:
                   if 0 <= step_idx < len(self.toolpaths) else None)
             if tp is not None and tp.result is not None:
                 depth_map, _ = self._get_depth_map()
-                img   = np.clip(depth_map - tp.result, 0.0, 1.0).astype(np.float32)
-                cmap  = "hot"
+                # Unclipped, like the other diff views (DISPLAY_DIFF_RES_UNCUT
+                # etc.) -- clipping negative values to 0 would make an
+                # over-cut (result deeper than depth_map calls for) render
+                # identically to "exactly finished," silently hiding it.
+                # Positive (still needs cutting) renders on the same warm
+                # ramp as before; negative (over-cut) renders on the cold
+                # half of _DIFF_CMAP instead of disappearing.
+                img   = (depth_map - tp.result).astype(np.float32)
+                cmap  = _DIFF_CMAP
+                vmin, vmax = -1.0, 1.0
                 title = f"Step {step_idx + 1} Residual"
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
