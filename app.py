@@ -848,7 +848,7 @@ class GCodeGeneratorApp:
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'cutout_depth', 'cutout_stepdown', 'cutout_final_stepdown', 'cutout_extra_offset',
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
-                    'min_fw', 'max_fw', 'pocket_target_z'):
+                    'min_fw', 'max_fw', 'pocket_target_z', 'pocket_boundary_offset'):
             dst[key].set(src[key].get())
             if dst[key].auto_var is not None and src[key].auto_var is not None:
                 dst[key].auto_var.set(src[key].auto_var.get())
@@ -1088,6 +1088,16 @@ class GCodeGeneratorApp:
         extra_offset.pack(fill=tk.X, pady=2)
         step['extra_offset'] = extra_offset
 
+        # Pocket's own lateral-only boundary push -- unlike Extra offset
+        # above (lateral+vertical stock-to-leave), a pocket's cut depth is
+        # already fixed independently by Target depth, so it gets its own
+        # field, same as Cutout's Boundary offset.
+        pocket_boundary_offset = LabeledEntry(tool_lf, "Boundary offset", "mm",
+                                              DEFAULTS["step_pocket_boundary_offset"],
+                                              minval=0.0, maxval=50.0, increment=0.1)
+        step['pocket_boundary_offset'] = pocket_boundary_offset
+        # (not packed initially — shown on demand by _refresh_layout, Pocket only)
+
         # ── V-bit angle (shown whenever V-Bit profile is active) ──────
         vbit_frame = ttk.Frame(tool_lf)
         step['vbit_frame'] = vbit_frame
@@ -1187,6 +1197,7 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state(
                     "disabled" if profile == "Ball" else "normal")
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['vcarve_frame'])
+                step['pocket_boundary_offset'].pack_forget()
                 step['cutout_frame'].pack_forget()
             elif alg == "Contour":
                 step['raster_frame'].pack_forget()
@@ -1206,6 +1217,7 @@ class GCodeGeneratorApp:
                     step['vbit_frame'].pack_forget()
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
+                step['pocket_boundary_offset'].pack_forget()
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['contour_frame'])
                 step['vbit_angle'].set_state("normal")
@@ -1218,6 +1230,7 @@ class GCodeGeneratorApp:
                 step['stepdown'].pack_forget()
                 step['raster_final_stepdown'].pack_forget()
                 step['extra_offset'].pack_forget()   # Cutout uses cutout_extra_offset instead
+                step['pocket_boundary_offset'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
                 step['gating_frame'].pack(fill=tk.X)
@@ -1252,7 +1265,8 @@ class GCodeGeneratorApp:
                     step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
                 step['raster_final_stepdown'].pack(fill=tk.X, pady=2,
                                                    after=step['stepdown'])
-                step['extra_offset'].pack(fill=tk.X, pady=2,
+                step['extra_offset'].pack_forget()   # Pocket uses pocket_boundary_offset instead
+                step['pocket_boundary_offset'].pack(fill=tk.X, pady=2,
                                           after=step['raster_final_stepdown'])
                 step['pocket_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['raster_frame'].pack(fill=tk.X, after=step['pocket_frame'])
@@ -1281,6 +1295,7 @@ class GCodeGeneratorApp:
                                                    after=step['stepdown'])
                 step['extra_offset'].pack(fill=tk.X, pady=2,
                                           after=step['raster_final_stepdown'])
+                step['pocket_boundary_offset'].pack_forget()
                 step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
@@ -1371,6 +1386,7 @@ class GCodeGeneratorApp:
         step['max_fw'].set(DEFAULTS["step_max_fw"])
         step['pocket_target_z'].set(DEFAULTS["step_pocket_target_z"])
         step['pocket_target_z'].auto_var.set(bool(int(DEFAULTS["step_pocket_target_z_auto"])))
+        step['pocket_boundary_offset'].set(DEFAULTS["step_pocket_boundary_offset"])
         step['vcarve_stepdown'].set(DEFAULTS["step_vcarve_stepdown"])
         step['vcarve_final_stepdown'].set(DEFAULTS["step_vcarve_final_stepdown"])
         step['cutout_depth'].set(DEFAULTS["step_cutout_depth"])
@@ -2066,6 +2082,7 @@ class GCodeGeneratorApp:
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
             'pocket_target_z':      step['pocket_target_z'].get(),
             'pocket_target_z_auto': bool(step['pocket_target_z'].auto_var.get()),
+            'pocket_boundary_offset': step['pocket_boundary_offset'].get(),
             'gating_mode':          step['gating_mode_var'].get(),
             'ramp_in_enabled':      step['ramp_in_enabled_var'].get(),
             'ramp_angle_deg':       step['ramp_angle_deg_var'].get(),
@@ -2117,6 +2134,8 @@ class GCodeGeneratorApp:
         step['pocket_target_z'].auto_var.set(bool(d.get(
             'pocket_target_z_auto', bool(int(DEFAULTS['step_pocket_target_z_auto'])))))
         step['pocket_target_z'].set(d.get('pocket_target_z', DEFAULTS['step_pocket_target_z']))
+        step['pocket_boundary_offset'].set(d.get(
+            'pocket_boundary_offset', DEFAULTS['step_pocket_boundary_offset']))
         step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
         step['ramp_in_enabled_var'].set(bool(d.get(
             'ramp_in_enabled', bool(int(DEFAULTS['step_ramp_in_enabled'])))))
@@ -2682,6 +2701,7 @@ class GCodeGeneratorApp:
                 'cut_direction':            step['cut_dir_var'].get(),
                 'gating_mode':              step['gating_mode_var'].get(),
                 'pocket_target_z_mm':       float(step['pocket_target_z'].get()),
+                'pocket_boundary_offset_mm': float(step['pocket_boundary_offset'].get()),
                 'work_surface_tol':         threshold_mm / max_depth if max_depth else 0.0,
             })
         else:  # Raster
@@ -2821,7 +2841,7 @@ class GCodeGeneratorApp:
                     height_mm          = params['eff_height_mm'],
                     origin             = params['origin'],
                     threshold_mm       = params['threshold_mm'],
-                    extra_offset_mm    = params['cutout_extra_offset_mm'],
+                    boundary_offset_mm = params['cutout_extra_offset_mm'],
                     cut_direction      = params['cut_direction'],
                     prior_accessible   = prev_tp.accessible if prev_tp is not None else None,
                     previous_result    = prev_tp.result     if prev_tp is not None else None,
@@ -2835,7 +2855,7 @@ class GCodeGeneratorApp:
                 threshold_mm       = params['threshold_mm'],
                 stepdown_mm        = params['cutout_stepdown_mm'],
                 final_stepdown_mm  = params['cutout_final_stepdown_mm'],
-                extra_offset_mm    = params['cutout_extra_offset_mm'],
+                boundary_offset_mm = params['cutout_extra_offset_mm'],
                 cut_direction      = params['cut_direction'],
                 use_2opt           = params['use_2opt'],
                 z_safe             = self._settings['z_safe'],
@@ -2860,6 +2880,15 @@ class GCodeGeneratorApp:
             else:
                 prior_reference       = None
                 subtract_unaccessible = False
+            # Pocket's own boundary_offset_mm is a lateral-only mask push
+            # applied after the achievable-depth surface is computed (see
+            # compute_pocket_toolpath), so -- unlike extra_offset_mm for
+            # Raster/Contour/V-Carving -- it plays no part in that surface
+            # and must not be baked into its cache key.
+            pocket_erosion_cache_key = (
+                tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
+                params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
+                params['source_visibility'])
             return compute_pocket_toolpath(
                 depth_map             = depth_map,
                 n_grey_levels         = n_grey_levels,
@@ -2867,7 +2896,7 @@ class GCodeGeneratorApp:
                 step_mm               = params['step_mm'],
                 stepdown_mm           = params['pocket_stepdown_mm'],
                 final_stepdown_mm     = params['pocket_final_stepdown_mm'],
-                extra_offset_mm       = params['extra_offset_mm'],
+                boundary_offset_mm    = params['pocket_boundary_offset_mm'],
                 max_depth             = params['max_depth'],
                 width_mm              = params['eff_width_mm'],
                 height_mm             = params['eff_height_mm'],
@@ -2884,7 +2913,7 @@ class GCodeGeneratorApp:
                 cut_direction     = params['cut_direction'],
                 progress          = progress_fn,
                 erosion_cache     = self._erosion_cache,
-                erosion_cache_key = erosion_cache_key,
+                erosion_cache_key = pocket_erosion_cache_key,
             )
         else:  # Raster
             gating_mode = params['gating_mode']

@@ -1333,7 +1333,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                              use_2opt=False,
                              cut_direction="Climb",
                              final_stepdown_mm=0.0,
-                             extra_offset_mm=0.0,
+                             boundary_offset_mm=0.0,
                              progress=None,
                              erosion_cache=None,
                              erosion_cache_key=None):
@@ -1396,8 +1396,23 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         (depth_map − prior_reference).
     final_stepdown_mm : depth (mm) reserved for a dedicated finishing pass at
                         the pocket floor. 0 = no reservation.
-    extra_offset_mm   : stock-to-leave allowance (mm), same meaning as
-                        compute_raster_toolpath.
+    boundary_offset_mm : lateral-only push of the tool-centre path away from
+                        the pocket wall, beyond the minimum tool-radius
+                        clearance, in mm; 0 = tool tangent to the wall (the
+                        plain tool-centre-erosion boundary). Implemented as
+                        a binary erosion of the pocket interior mask, so
+                        positive values retreat the tool centre further from
+                        the wall (leaving more material uncut near the
+                        boundary) rather than pushing it toward/into the
+                        wall. Same "away from the boundary" direction as
+                        compute_cutout_toolpath's own boundary_offset_mm,
+                        which dilates the silhouette mask instead since
+                        there the boundary sits on the opposite side (the
+                        object) of the mask. Unlike compute_raster_toolpath's
+                        extra_offset_mm, this has no vertical component:
+                        Pocket's cut depth is controlled independently by
+                        target_z_mm, so there is nothing for a Z-offset to
+                        mean here.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     erosion_cache     : optional dict memoising the grey-erosion/grey-dilation
                         achievable-depth surface, keyed by erosion_cache_key.
@@ -1413,7 +1428,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     outermost line leaves the same stair-stepped boundary edge Raster
     already leaves at any masked boundary.
     """
-    from scipy.ndimage import grey_erosion, grey_dilation, label, find_objects
+    from scipy.ndimage import grey_erosion, grey_dilation, binary_erosion, label, find_objects
+    from skimage.morphology import disk
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
@@ -1447,8 +1463,6 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     # ── Stage 1 · Build tool kernel (0–10 %) ─────────────────────────────
     progress(0, "Building tool geometry kernel…")
     kernel_pocket, footprint_pocket = _build_kernel(tool, px_per_mm, max_depth)
-    kernel_plan, footprint_plan = _planning_kernel(
-        tool, px_per_mm, max_depth, extra_offset_mm, kernel_pocket, footprint_pocket)
     ksize = kernel_pocket.shape[0]
     progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
 
@@ -1459,23 +1473,18 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
-        structure = -kernel_plan.astype(np.float64)
+        structure = -kernel_pocket.astype(np.float64)
         center_depth_contour_pocket = grey_erosion(depth_map.astype(np.float64),
-                                  footprint=footprint_plan,
+                                  footprint=footprint_pocket,
                                   structure=structure).astype(np.float32)
         center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
         accessible_pocket = grey_dilation(center_depth_contour_pocket.astype(np.float64),
-                                   footprint=footprint_plan,
+                                   footprint=footprint_pocket,
                                    structure=structure).astype(np.float32)
         accessible_pocket = np.clip(accessible_pocket, 0.0, 1.0)
         progress(35, "Achievable depth surface computed.")
         if erosion_cache is not None:
             erosion_cache[erosion_cache_key] = (center_depth_contour_pocket, accessible_pocket)
-
-    if extra_offset_mm > 0.0:
-        off_norm = extra_offset_mm / max_depth
-        center_depth_contour_pocket = np.clip(center_depth_contour_pocket - off_norm, 0.0, 1.0)
-        accessible_pocket = np.clip(accessible_pocket - off_norm, 0.0, 1.0)
 
     # ── Stage 3 · Target-Z interior mask (35–40 %) ───────────────────────
     progress(35, "Computing pocket interior mask…")
@@ -1497,6 +1506,18 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     # position, cutting full depth where the tool's own edge overhangs past
     # where material should remain.
     pocket_mask = center_depth_contour_pocket >= (target_z_norm - contour_eps)
+
+    # boundary_offset_mm retreats this tool-centre-safe mask further away
+    # from the pocket wall by a plain lateral erosion -- the same
+    # lateral-only push compute_cutout_toolpath applies (there as a dilation
+    # of the object silhouette, since positive there also means "away from
+    # the boundary", just on the opposite side of it) -- rather than reusing
+    # the depth-shaped kernel inflation the other algorithms' extra_offset_mm
+    # relies on, since Pocket's cut depth is already fixed independently by
+    # target_z_mm.
+    if boundary_offset_mm > 0.0:
+        boundary_px = max(1, int(round(boundary_offset_mm * px_per_mm)))
+        pocket_mask = binary_erosion(pocket_mask, structure=disk(boundary_px))
 
     resid_tol = (work_surface_tol if work_surface_tol
                  else 1.0 / (n_grey_levels - 1))
@@ -1703,7 +1724,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             'step_mm': step_mm,
             'stepdown_mm': stepdown_mm,
             'final_stepdown_mm': final_stepdown_mm,
-            'extra_offset_mm': extra_offset_mm,
+            'boundary_offset_mm': boundary_offset_mm,
             'target_z_mm': pocket_depth_mm,
             'max_depth': max_depth,
             'width_mm': width_mm,
@@ -3184,7 +3205,7 @@ def compute_cutout_toolpath(
     threshold_mm=0.0,
     stepdown_mm=0.0,
     final_stepdown_mm=0.0,
-    extra_offset_mm=0.0,
+    boundary_offset_mm=0.0,
     cut_direction="Climb",
     prior_accessible=None,
     previous_result=None,
@@ -3205,7 +3226,7 @@ def compute_cutout_toolpath(
 
     Traces the outer perimeter of every connected region of *depth_map* at
     or above *threshold_mm*, offsets it outward by the tool radius (plus
-    *extra_offset_mm*), and cuts a uniform-depth closed loop through the
+    *boundary_offset_mm*), and cuts a uniform-depth closed loop through the
     full stock thickness (*cutout_depth_mm*), stepping down in Z across
     however many passes *stepdown_mm*/*final_stepdown_mm* require.
 
@@ -3268,12 +3289,12 @@ def compute_cutout_toolpath(
         As in the sibling algorithms -- passed straight to
         make_multipass(segments, cutout_depth_mm, stepdown_mm,
         final_stepdown_mm).
-    extra_offset_mm : float
+    boundary_offset_mm : float
         Lateral-only outward push of the tool-centre path beyond the
         minimum tool-radius clearance; 0 = tool tangent to the (filled)
         silhouette edge. Implemented as a single binary_dilation of the
         filled silhouette mask by a disk of radius
-        (tool.diameter_mm/2 + extra_offset_mm), in pixels.
+        (tool.diameter_mm/2 + boundary_offset_mm), in pixels.
     cut_direction : "Either" | "Climb" | "Conventional"
         Same find_contours-orientation convention as
         compute_contour_toolpath (reverse_contours =
@@ -3305,7 +3326,7 @@ def compute_cutout_toolpath(
     """
     rings_cache = _compute_cutout_rings(
         depth_map, tool, max_depth, width_mm, height_mm,
-        origin=origin, threshold_mm=threshold_mm, extra_offset_mm=extra_offset_mm,
+        origin=origin, threshold_mm=threshold_mm, boundary_offset_mm=boundary_offset_mm,
         cut_direction=cut_direction,
         prior_accessible=prior_accessible, previous_result=previous_result,
         previous_alpha=previous_alpha, progress=progress,
@@ -3313,7 +3334,7 @@ def compute_cutout_toolpath(
     return _compute_cutout_from_rings(
         rings_cache, tool, cutout_depth_mm, max_depth, width_mm, height_mm,
         threshold_mm=threshold_mm, stepdown_mm=stepdown_mm,
-        final_stepdown_mm=final_stepdown_mm, extra_offset_mm=extra_offset_mm,
+        final_stepdown_mm=final_stepdown_mm, boundary_offset_mm=boundary_offset_mm,
         cut_direction=cut_direction, use_2opt=use_2opt, z_safe=z_safe,
         feed_rapid=feed_rapid, tab_settings=tab_settings, progress=progress,
     )
@@ -3346,7 +3367,7 @@ def _compute_cutout_rings(
     depth_map, tool, max_depth, width_mm, height_mm,
     origin="Bottom-Left",
     threshold_mm=0.0,
-    extra_offset_mm=0.0,
+    boundary_offset_mm=0.0,
     cut_direction="Climb",
     prior_accessible=None,
     previous_result=None,
@@ -3438,7 +3459,7 @@ def _compute_cutout_rings(
         # "no usable silhouette boundary" below.
         threshold_norm = float(depth_map.min() + depth_map.max()) / 2.0
 
-    r_px = max(1, int(round((tool.diameter_mm / 2.0 + extra_offset_mm) * px_per_mm)))
+    r_px = max(1, int(round((tool.diameter_mm / 2.0 + boundary_offset_mm) * px_per_mm)))
 
     def _try_mask(cmp):
         raw = (depth_map < threshold_norm) if cmp == '<=' else (depth_map >= threshold_norm)
@@ -3492,7 +3513,7 @@ def _compute_cutout_from_rings(
     threshold_mm=0.0,
     stepdown_mm=0.0,
     final_stepdown_mm=0.0,
-    extra_offset_mm=0.0,
+    boundary_offset_mm=0.0,
     cut_direction="Climb",
     use_2opt=False,
     z_safe=5.0,
@@ -3691,7 +3712,7 @@ def _compute_cutout_from_rings(
         'cutout_depth_mm':   cutout_depth_mm,
         'stepdown_mm':       stepdown_mm,
         'final_stepdown_mm': final_stepdown_mm,
-        'extra_offset_mm':   extra_offset_mm,
+        'boundary_offset_mm': boundary_offset_mm,
         'threshold_mm':      threshold_mm,
         'mask_direction':    rings_cache.mask_direction,
         'cut_direction':     cut_direction,

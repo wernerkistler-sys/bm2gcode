@@ -85,6 +85,7 @@ DEFAULTS = {
     # Pocket-specific defaults
     "step_pocket_target_z":       "0.0",  # target depth (mm) defining the pocket floor/interior
     "step_pocket_target_z_auto":  "1",    # 1 = use max_depth instead of step_pocket_target_z
+    "step_pocket_boundary_offset": "0.0", # lateral-only outward push (mm); 0 = tool tangent to pocket wall
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     # Per-step G-code dress-ups (see dressup.py) — all opt-in, disabled by default
