@@ -602,6 +602,39 @@ def _order_free_raster_pass(pass_segs, origin, use_2opt, link_threshold_mm):
     ]
 
 
+def _order_fixed_orientation_pass(pass_segs, origin):
+    """Greedy nearest-neighbour ordering of pass_segs that only reorders
+    which segment is visited when -- never reverses a segment's own point
+    order, unlike _order_free_raster_pass. Used for Onion Skin, where
+    each segment is one region's whole ring chain: reversing it would
+    silently swap that region's Outside-In/Inside-Out winding (a
+    deliberate per-toolpath choice) whenever the chain's far end happens
+    to be closer to the current tool position than its own start, which
+    _order_free_raster_pass's nearest-endpoint search would otherwise do
+    without restriction. No 2-opt refinement is applied here -- unlike
+    reversible segments, improving a fixed-orientation visiting order by
+    block reversal also requires recomputing the reversed block's own
+    internal connections rather than a simple swap, so this stays a plain
+    greedy pass; pocket region counts are small enough that this has
+    little travel-time cost.
+    """
+    n = len(pass_segs)
+    unvisited = list(range(n))
+    order = []
+    cur = origin
+    while unvisited:
+        best_ui, best_dist = 0, float('inf')
+        for ui, si in enumerate(unvisited):
+            x0, y0 = pass_segs[si][0][0], pass_segs[si][0][1]
+            d = ((x0 - cur[0]) ** 2 + (y0 - cur[1]) ** 2) ** 0.5
+            if d < best_dist:
+                best_ui, best_dist = ui, d
+        si = unvisited.pop(best_ui)
+        order.append(si)
+        cur = (pass_segs[si][-1][0], pass_segs[si][-1][1])
+    return [pass_segs[si] for si in order]
+
+
 def _order_locked_raster_pass(pass_segs, direction, cur):
     """Order one depth-pass's segments for a locked Climb/Conventional
     direction, keeping consecutive cuts on the same or an adjacent raster
@@ -888,6 +921,142 @@ def _is_contiguous_chain(segs, tol_mm=1e-6):
         if (x1 - x0) ** 2 + (y1 - y0) ** 2 > tol_mm * tol_mm:
             return False
     return True
+
+
+def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
+    """Concentric-ring toolpath chain(s) clearing one connected pocket
+    region: repeatedly binary_erosion's region_mask by disk(step_px),
+    extracting each ring's boundary via find_contours, and stitching
+    consecutive rings into one continuous chain by starting each new ring
+    at whichever of its points is nearest the previous ring's endpoint.
+    Every ring is emitted the moment its mask is non-empty (before the
+    area/erosion check below), so a region smaller than one step_px still
+    gets its own single perimeter ring rather than nothing.
+
+    reverse_rings reverses every ring's own point order right after
+    find_contours (same "uncut material stays on the tool's right of
+    travel" convention as _extract_z_contours' reverse_contours), so the
+    climb/conventional winding sense of the whole chain is decided once
+    here, before nearest-point stitching -- stitching order itself never
+    changes a ring's winding, only which of its points the chain enters
+    on.
+
+    If an erosion iteration's connected-component count rises above 1 (a
+    dumbbell-shaped neck has been fully eroded away), the branch built so
+    far is closed off and each new component continues as its own
+    independent branch -- no attempt is made to bridge across the split,
+    since that would re-cross material the tool has already cleared. A
+    split component smaller than min_area_px is dropped rather than
+    spawned as a branch, since it is more likely a stray fragment eroded
+    off a concave cusp of the boundary than a genuine second lobe, and
+    would otherwise become its own tiny standalone toolpath segment.
+    Sibling branches spawned from the same split are advanced one erosion
+    round at a time in lockstep (rather than fully finishing one branch's
+    entire remaining descent before even starting its sibling's), so a
+    branch that happens to erode away quickly cannot leave a much deeper
+    sibling branch's rings stranded behind it in cut order.
+
+    region_mask is padded by one False pixel on every side before any
+    processing (compensated for in the returned coordinates), since the
+    caller crops each region to its tight bounding box, which touches the
+    mask on every side by definition: find_contours needs at least a 2x2
+    array (a region only 1 pixel tall or wide would otherwise crash it),
+    and even for a larger region, without the margin the outermost ring
+    would be clipped into an open contour at the crop edge instead of the
+    true closed boundary.
+
+    Returns
+    -------
+    list of Nx2 (row, col) float pixel-space polylines, one per undivided
+    island, each already in final chain-visiting order (outside-in), in
+    region_mask's own (unpadded) coordinate frame.
+    """
+    from scipy.ndimage import binary_erosion, label
+    from skimage.morphology import disk
+    from skimage.measure import find_contours
+
+    structure = disk(step_px)
+    chains = []
+
+    padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
+    branches = [{'mask': padded, 'points': [], 'prev_end': None}]
+
+    while branches:
+        next_round = []
+        for br in branches:
+            cur, points, prev_end = br['mask'], br['points'], br['prev_end']
+
+            rings = [r for r in find_contours(cur.astype(np.float32), 0.5) if len(r) >= 3]
+            if not rings:
+                if points:
+                    chains.append(np.array(points))
+                continue
+            if reverse_rings:
+                rings = [r[::-1] for r in rings]
+
+            remaining = list(rings)
+            while remaining:
+                best_i = best_k = 0
+                best_d = float('inf')
+                for i, ring in enumerate(remaining):
+                    is_closed = np.linalg.norm(ring[0] - ring[-1]) < 1.5
+                    body = ring[:-1] if is_closed else ring
+                    n = len(body)
+                    cands = range(0, n, max(1, n // 20)) if is_closed else (0, n - 1)
+                    for k in cands:
+                        d = 0.0 if prev_end is None else float(np.hypot(*(body[k] - prev_end)))
+                        if d < best_d:
+                            best_d, best_i, best_k = d, i, k
+
+                ring = remaining.pop(best_i)
+                is_closed = np.linalg.norm(ring[0] - ring[-1]) < 1.5
+                body = ring[:-1] if is_closed else ring
+                if is_closed:
+                    ordered = np.vstack([np.roll(body, -best_k, axis=0), body[best_k:best_k + 1]])
+                else:
+                    ordered = body if best_k == 0 else body[::-1]
+                points.extend(ordered.tolist())
+                prev_end = np.asarray(ordered[-1])
+
+            if np.sum(cur) < min_area_px:
+                chains.append(np.array(points))
+                continue
+            nxt = binary_erosion(cur, structure=structure)
+            if not np.any(nxt):
+                chains.append(np.array(points))
+                continue
+            labeled, n_comp = label(nxt)
+            if n_comp <= 1:
+                next_round.append({'mask': nxt, 'points': points, 'prev_end': prev_end})
+            else:
+                chains.append(np.array(points))
+                # A split can throw off a stray fragment of just a few
+                # pixels -- erosion detaching a sliver at a concave cusp of
+                # the boundary rather than a genuine second lobe. Such a
+                # fragment is smaller than one ring's worth of material and
+                # would otherwise become its own tiny standalone segment,
+                # so it is dropped rather than spawned as a new branch; the
+                # surrounding rings already cut through that same area.
+                for comp_id in range(1, n_comp + 1):
+                    comp_mask = labeled == comp_id
+                    if np.sum(comp_mask) < min_area_px:
+                        continue
+                    next_round.append({'mask': comp_mask, 'points': [], 'prev_end': None})
+        branches = next_round
+
+    return [c - 1.0 for c in chains]
+
+
+def _ring_chain_to_points(chain_px, z_mm, px_per_mm, H, _ox, _oy):
+    """Convert one onion-skin pixel-space chain (row, col) to
+    [(x_mm, y_mm, -z_mm), ...] at the pocket's flat floor depth. Every
+    point of an onion-skin chain already lies inside the pocket mask by
+    construction (it comes from repeatedly eroding that same mask), so no
+    mask_spans clipping is needed the way _line_points needs it for
+    straight raster/spiral lines.
+    """
+    return [(col / px_per_mm - _ox, (H - 1 - row) / px_per_mm - _oy, -z_mm)
+            for row, col in chain_px]
 
 
 def compute_raster_gate_mask(residual, work_surface_tol, prior_reference,
@@ -1459,7 +1628,13 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
                         "Spiral (Inside-Out)" — same meaning as
                         compute_raster_toolpath's raster_dir, applied
-                        independently within each pocket region.
+                        independently within each pocket region. Also
+                        accepts "Onion Skin (Outside-In)"/"(Inside-Out)":
+                        concentric rings offset inward from each region's
+                        own boundary by step_mm, stitched into one
+                        continuous chain per undivided island instead of a
+                        rectangular scan-line/coil, so the pattern follows
+                        the pocket's actual silhouette.
     target_z_mm       : depth (mm) defining the pocket floor and which tool-
                         centre positions count as pocket interior (tool-centre
                         erosion >= this, i.e. the tool's own footprint must
@@ -1575,7 +1750,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     mask_resid_tol = target_z_norm * 0.5   # (flat_depth * region_mask) is 0 or target_z_norm
 
     IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
-    direction = None if IS_SPIRAL else ("X" if raster_dir == "Horizontal" else "Y")
+    IS_ONION  = raster_dir in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)")
+    direction = None if (IS_SPIRAL or IS_ONION) else ("X" if raster_dir == "Horizontal" else "Y")
 
     FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
                       "Conventional": {"X": True,  "Y": False}}
@@ -1609,6 +1785,26 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                     _line_points(axis, fixed_idx, lo, hi, start_idx > end_idx,
                                  flat_depth, region_mask_f, mask_resid_tol,
                                  px_per_mm, H, _ox, _oy, max_depth))
+        elif IS_ONION:
+            step_px = max(1, int(round(step_mm * px_per_mm)))
+            min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
+            local_mask = labeled_regions[box] == region_id
+            chains = _onion_skin_chains(local_mask, step_px, min_area_px,
+                                        reverse_rings=(cut_direction == "Conventional"))
+            if raster_dir == "Onion Skin (Inside-Out)":
+                # Reverses both which chain is visited first (so a chain
+                # that finished deeper -- i.e. later in erosion order -- is
+                # visited before a shallower sibling chain from the same
+                # split) and each chain's own point order (so within a
+                # chain, cutting starts at its own deepest ring and works
+                # back out) -- same "reverse the whole path, order and
+                # direction together" idea as Spiral's Inside-Out.
+                chains = [c[::-1] for c in reversed(chains)]
+            offset = np.array([r_lo, c_lo])
+            for chain in chains:
+                full_depth_segs.append(
+                    _ring_chain_to_points(chain + offset, pocket_depth_mm,
+                                         px_per_mm, H, _ox, _oy))
         else:
             if direction == "X":
                 spacing_lo, spacing_hi = r_lo, r_hi
@@ -1660,12 +1856,14 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                  f"{len(pass_segs)} segment(s).")
         ceil_norm = ceil_mm / max_depth
         cur = (float(tool_pos[0]), float(tool_pos[1]))
-        if lock_direction and IS_SPIRAL:
+        if lock_direction and (IS_SPIRAL or IS_ONION):
             ordered_segs = pass_segs
         elif lock_direction:
             ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
-        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
+        elif (IS_SPIRAL or IS_ONION) and _is_contiguous_chain(pass_segs):
             ordered_segs = pass_segs
+        elif IS_ONION:
+            ordered_segs = _order_fixed_orientation_pass(pass_segs, cur)
         else:
             ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
                                                     link_threshold_mm)

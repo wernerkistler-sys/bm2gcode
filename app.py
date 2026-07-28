@@ -29,7 +29,7 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 _HOLE_FACECOLOR = "#d9534f"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
@@ -957,9 +957,10 @@ class GCodeGeneratorApp:
         ttk.Label(dir_row, text="Scan direction:").pack(side=tk.LEFT)
         dir_var = tk.StringVar(value=DEFAULTS["step_raster_dir"])
         step['raster_dir_var'] = dir_var
-        ttk.Combobox(dir_row, textvariable=dir_var,
-                     values=RASTER_DIRECTIONS, state="readonly", width=22
-                     ).pack(side=tk.RIGHT)
+        raster_dir_cb = ttk.Combobox(dir_row, textvariable=dir_var,
+                                     values=RASTER_DIRECTIONS, state="readonly", width=22)
+        raster_dir_cb.pack(side=tk.RIGHT)
+        step['raster_dir_cb'] = raster_dir_cb
 
         cut_dir_row = ttk.Frame(operation_lf)
         cut_dir_row.pack(fill=tk.X, pady=2, after=raster_frame)   # initially shown (default = Raster Scan)
@@ -1265,6 +1266,9 @@ class GCodeGeneratorApp:
                 step['extra_offset'].pack_forget()   # Pocket uses pocket_boundary_offset instead
                 step['pocket_boundary_offset'].pack(fill=tk.X, pady=2,
                                           after=step['raster_final_stepdown'])
+                step['raster_dir_cb'].config(values=POCKET_PATTERNS)
+                if step['raster_dir_var'].get() not in POCKET_PATTERNS:
+                    step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
                 step['raster_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])
@@ -1292,6 +1296,9 @@ class GCodeGeneratorApp:
                 step['extra_offset'].pack(fill=tk.X, pady=2,
                                           after=step['raster_final_stepdown'])
                 step['pocket_boundary_offset'].pack_forget()
+                step['raster_dir_cb'].config(values=RASTER_DIRECTIONS)
+                if step['raster_dir_var'].get() not in RASTER_DIRECTIONS:
+                    step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
                 step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
