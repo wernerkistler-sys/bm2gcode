@@ -1341,7 +1341,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     """Compute a flat-bottomed pocket toolpath: clear the interior of the
     depth map's target-Z iso-depth region with a raster-style infill.
 
-    Every pixel whose achievable depth is at least target_z_mm is treated as
+    Every position where the tool can be centred and still reach target_z_mm
+    without its footprint overhanging shallower material (i.e. the tool-
+    centre erosion, not the dilated/opened accessible surface) is treated as
     pocket interior; that interior is cleared flat at target_z_mm using the
     same scan-line/spiral infill machinery as compute_raster_toolpath, one
     tool-accessibility-bounded connected region at a time so a Spiral pattern
@@ -1361,9 +1363,11 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         "Spiral (Inside-Out)" — same meaning as
                         compute_raster_toolpath's raster_dir, applied
                         independently within each pocket region.
-    target_z_mm       : depth (mm) defining the pocket floor and which pixels
-                        count as pocket interior (achievable depth >= this).
-                        None defaults to max_depth (the deepest region of the
+    target_z_mm       : depth (mm) defining the pocket floor and which tool-
+                        centre positions count as pocket interior (tool-centre
+                        erosion >= this, i.e. the tool's own footprint must
+                        clear shallower material at that depth). None
+                        defaults to max_depth (the deepest region of the
                         depth map). Clipped to (0, max_depth].
     raster_offset_pct : percentage [0, 100) to shift infill lines relative to
                         the step-over distance, same meaning as Raster.
@@ -1481,7 +1485,19 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     target_z_norm = float(np.clip(target_z_mm / max_depth, 1e-6, 1.0))
     pocket_depth_mm = target_z_norm * max_depth
     contour_eps = 0.5 / max(n_grey_levels - 1, 1)
-    pocket_mask = accessible_pocket >= (target_z_norm - contour_eps)
+    # Gates on the EROSION (tool-centre-safe depth), not the dilated/opened
+    # accessible surface: accessible_pocket tells us which MATERIAL points
+    # can be reached by *some* nearby tool-centre position, which is the
+    # right question for "did this get cut" (ToolPath.accessible / Process
+    # Region), but the wrong one for "where can the tool be centred" -- the
+    # toolpath itself must only visit centre positions whose full footprint
+    # clears shallower material, exactly what the erosion already encodes
+    # (the same surface Contour extracts its iso-depth contours from).
+    # Using the dilated surface here would let the tool centre travel right
+    # up to (or past) a boundary that's only reachable via a NEARBY centre
+    # position, cutting full depth where the tool's own edge overhangs past
+    # where material should remain.
+    pocket_mask = center_depth_contour_pocket >= (target_z_norm - contour_eps)
 
     resid_tol = (work_surface_tol if work_surface_tol
                  else 1.0 / (n_grey_levels - 1))
@@ -1578,15 +1594,22 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     n_passes = len(pass_list)
     link_threshold_mm = 2.0 * step_mm   # 2-opt's own "free stitch" cost-model distance
 
-    # ── Stage 6 · Per-pass ordering (no terrain linking) ─────────────────
-    # The pocket floor is flat and uniform, so unlike Raster/Contour there
-    # is no varying terrain to route a gap-bridging move along — a gap
-    # between two spans of the same flat floor is exactly a retract, rapid,
-    # and plunge, so ToolPath.iter_moves handles it with no extra segment
-    # needed, the same simplification Cutout already relies on.
+    # ── Stage 6 · Per-pass ordering + terrain link insertion ─────────────
+    # Mirrors compute_raster_toolpath's own terrain linking (_geodesic_link),
+    # but the cost/Z surface is flat_depth -- the flat pocket-floor
+    # abstraction built in Stage 4 -- rather than the real achievable-depth
+    # surface. Within the mask flat_depth is constant, so a short gap
+    # between two infill lines/legs is bridged by a level G1 move at the
+    # current pass's ceiling instead of a full retract/rapid/plunge; a gap
+    # that must cross outside the mask rises only to the surface (Z=0), it
+    # never dips to match whatever relief the real depth map happens to
+    # have there, since the pocket floor isn't cutting to that relief.
+    final_norm = final_stepdown_mm / max_depth
     all_segments = []
     tool_pos = np.array([0.0, 0.0])
     total_segs = 0
+    n_links_inserted = 0
+    n_links = 0
     for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
         if not pass_segs:
             continue
@@ -1594,6 +1617,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                  f"Pass {pi+1}/{n_passes} at z={ceil_mm:.3f} mm "
                  f"({'final' if is_final else 'roughing'}): "
                  f"{len(pass_segs)} segment(s).")
+        ceil_norm = ceil_mm / max_depth
         cur = (float(tool_pos[0]), float(tool_pos[1]))
         if lock_direction and IS_SPIRAL:
             ordered_segs = pass_segs
@@ -1604,13 +1628,51 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         else:
             ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
                                                     link_threshold_mm)
-        for seg in ordered_segs:
+
+        for i, seg in enumerate(ordered_segs):
             all_segments.append(seg)
             total_segs += 1
             tool_pos = np.array([seg[-1][0], seg[-1][1]])
 
-    progress(85, f"Pocket complete — {total_segs} cut segments across "
-                 f"{n_passes} pass(es).")
+            if i + 1 < len(ordered_segs):
+                nxt = ordered_segs[i + 1]
+                x_entry, y_entry = nxt[0][0], nxt[0][1]
+                nxt_dist = np.hypot(x_entry - tool_pos[0],
+                                    y_entry - tool_pos[1])
+
+                if 1e-6 < nxt_dist < link_threshold_mm:
+                    x_exit = float(tool_pos[0])
+                    y_exit = float(tool_pos[1])
+                    c0_px = int(round((x_exit  + _ox) * px_per_mm))
+                    r0_px = int(round((H - 1) - (y_exit  + _oy) * px_per_mm))
+                    c1_px = int(round((x_entry + _ox) * px_per_mm))
+                    r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm))
+
+                    fn = 0.0 if is_final else final_norm
+                    link_pixels = _geodesic_link(
+                        r0_px, c0_px, r1_px, c1_px, ceil_norm,
+                        flat_depth, H, W,
+                        px_per_mm, px_per_mm, max_depth, fn)
+                    link_points = [seg[-1]]
+                    for row_l, col_l in link_pixels[1:-1]:
+                        terrain = float(flat_depth[row_l, col_l])
+                        if is_final:
+                            z_link = min(terrain, ceil_norm)
+                        else:
+                            z_link = min(max(terrain - final_norm, 0.0), ceil_norm)
+                        x_lmm = col_l / px_per_mm - _ox
+                        y_lmm = (H - 1 - row_l) / px_per_mm - _oy
+                        link_points.append((x_lmm, y_lmm, -z_link * max_depth))
+                    link_points.append(nxt[0])
+
+                    if len(link_points) >= 2:
+                        all_segments.append(link_points)
+                        n_links_inserted += 1
+
+                n_links += 1
+
+    progress(85, f"Pocket complete — {total_segs} cut segments, "
+                 f"{n_links_inserted} terrain links across all passes.")
 
     # ── Stage 7 · Simplify, simulate result, create ToolPath (85–100 %) ──
     progress(85, "Simplifying tool path…")
@@ -1626,10 +1688,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         (H, W), px_per_mm, px_per_mm, _ox, _oy,
         max_depth, kernel_pocket, footprint_pocket,
     )
-    pocket_result = np.minimum(
-        np.maximum(material_removed_pocket,
-                   previous_result if previous_result is not None else 0.0),
-        depth_map).astype(np.float32)
+    pocket_result = np.maximum(
+        material_removed_pocket,
+        previous_result if previous_result is not None else 0.0).astype(np.float32)
 
     progress(95, "Creating ToolPath object...")
     toolpath = ToolPath(
@@ -1651,6 +1712,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             'n_passes': n_passes,
             'n_regions': n_regions,
             'rdp_tolerance': rdp_tol,
+            'link_threshold_mm': link_threshold_mm,
+            'n_links_inserted': n_links_inserted,
+            'n_links_total': n_links,
         }
     )
 
