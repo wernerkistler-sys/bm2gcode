@@ -64,7 +64,7 @@ DEFAULTS = {
     "step_feed_rate":    "800",
     "step_raster_dir":   "Vertical",
     "step_cut_direction": "Climb",
-    "step_threshold":    "0",    # mm; 0 = visit all pixels (V-Carving/Cutout: 0 = auto-split at depth-map midpoint)
+    "step_threshold":    "0",    # mm; 0 = visit all pixels (V-Carving/Cutout: 0 = auto-split at depth-map midpoint; Pocket: 0 = auto, uses Max cut depth)
     # V-carving-specific defaults
     "step_algorithm":    "Raster Scan",  # see ALGORITHMS list
     "step_gating_mode": "Full depth map",  # initial default; overridden per-algorithm by _refresh_layout
@@ -82,9 +82,7 @@ DEFAULTS = {
     "step_cutout_stepdown":       "3.0",  # max step-down per roughing pass (mm); 0 = single pass
     "step_cutout_final_stepdown": "0.0",  # final finishing pass depth (mm); 0 = none
     "step_cutout_extra_offset":   "0.0",  # lateral-only outward push (mm); 0 = tool tangent to silhouette edge
-    # Pocket-specific defaults
-    "step_pocket_target_z":       "0.0",  # target depth (mm) defining the pocket floor/interior
-    "step_pocket_target_z_auto":  "1",    # 1 = use max_depth instead of step_pocket_target_z
+    # Pocket-specific defaults (target depth reuses step_threshold, relabeled "Target depth")
     "step_pocket_boundary_offset": "0.0", # lateral-only outward push (mm); 0 = tool tangent to pocket wall
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass

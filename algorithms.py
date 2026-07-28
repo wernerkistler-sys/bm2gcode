@@ -890,6 +890,28 @@ def _is_contiguous_chain(segs, tol_mm=1e-6):
     return True
 
 
+def compute_raster_gate_mask(residual, work_surface_tol, prior_reference,
+                              subtract_unaccessible, accessible, footprint):
+    """Build the Process Region gate mask for a raster-style pass, or None
+    if ungated.
+
+    work_surface_tol <= 0 (the default) means "no gate" -- every pixel is
+    visited regardless of residual/accessible depth, so this returns None
+    (the caller then treats the full line/leg as active, unmasked).
+    Otherwise the gate is dilated by *footprint* (the tool's own kernel
+    footprint) so a masked line's active span extends a full tool-radius
+    past the qualifying pixels, same as the achievable-depth surface itself.
+    """
+    if work_surface_tol <= 0.0:
+        return None
+    from scipy.ndimage import binary_dilation
+    if subtract_unaccessible and prior_reference is not None:
+        gate = np.clip(accessible - prior_reference, 0.0, 1.0)
+    else:
+        gate = residual
+    return binary_dilation(gate >= work_surface_tol, structure=footprint).astype(np.float32)
+
+
 def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             step_mm, stepdown_mm, max_depth,
                             width_mm, height_mm, raster_dir,
@@ -1094,20 +1116,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 4 · 4-phase raster (40–80 %) ────────────────────────
 
-    if work_surface_tol > 0.0:
-        from scipy.ndimage import binary_dilation
-        if subtract_unaccessible and prior_reference is not None:
-            _gate = np.clip(accessible_raster - prior_reference, 0.0, 1.0)
-        else:
-            _gate = residual
-        prior_mask = binary_dilation(
-                         _gate >= work_surface_tol,
-                         structure=footprint_raster,
-                     ).astype(np.float32)
+    prior_mask = compute_raster_gate_mask(
+        residual, work_surface_tol, prior_reference, subtract_unaccessible,
+        accessible_raster, footprint_raster)
+    if prior_mask is not None:
         progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
                      f"{int(np.sum(prior_mask))}/{H*W} pixels in mask.")
-    else:
-        prior_mask = None
 
     all_segments     = []
     tool_pos         = np.array([0.0, 0.0])
@@ -1319,16 +1333,100 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     return toolpath
 
 
+def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
+                         n_grey_levels, boundary_offset_mm=0.0,
+                         erosion_cache=None, erosion_cache_key=None,
+                         progress=None):
+    """Resolve target_z_mm and build the pocket-interior mask: every
+    position where *tool*, centred there, can still reach target_z_mm
+    without its footprint overhanging shallower material.
+
+    target_z_mm > 0 is used literally; None or <= 0 means "auto": use
+    max_depth (the deepest region of the depth map), mirroring
+    resolve_vcarve_threshold_norm/compute_cutout_silhouette_mask's own
+    "0 (or unset) means auto" convention -- a literal 0 target depth is
+    otherwise a degenerate, always-empty pocket.
+
+    Gates on the EROSION (tool-centre-safe depth), not the dilated/opened
+    accessible surface: the accessible surface tells us which MATERIAL
+    points can be reached by *some* nearby tool-centre position, which is
+    the right question for "did this get cut" (ToolPath.accessible), but
+    the wrong one for "where can the tool be centred" -- the toolpath
+    itself must only visit centre positions whose full footprint clears
+    shallower material, exactly what the erosion already encodes (the same
+    surface Contour extracts its iso-depth contours from). Using the
+    dilated surface here would let the tool centre travel right up to (or
+    past) a boundary that's only reachable via a NEARBY centre position,
+    cutting full depth where the tool's own edge overhangs past where
+    material should remain.
+
+    boundary_offset_mm retreats this tool-centre-safe mask further away
+    from the pocket wall by a plain lateral erosion -- the same
+    lateral-only push compute_cutout_toolpath applies (there as a dilation
+    of the object silhouette, since positive there also means "away from
+    the boundary", just on the opposite side of it) -- rather than reusing
+    the depth-shaped kernel inflation the other algorithms' extra_offset_mm
+    relies on, since Pocket's cut depth is already fixed independently of
+    the achievable-depth surface by target_z_mm.
+
+    Returns (pocket_mask, center_depth_contour_pocket, accessible_pocket,
+    target_z_norm, kernel_pocket, footprint_pocket).
+    """
+    from scipy.ndimage import grey_erosion, grey_dilation, binary_erosion
+    from skimage.morphology import disk
+
+    if progress is None:
+        progress = lambda pct, msg: None
+
+    # ── Build tool kernel ─────────────────────────────────────────────────
+    progress(0, "Building tool geometry kernel…")
+    kernel_pocket, footprint_pocket = _build_kernel(tool, px_per_mm, max_depth)
+    ksize = kernel_pocket.shape[0]
+    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
+
+    # ── Compute achievable depth surface ───────────────────────────────────
+    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
+    if cached is not None and cached[0].shape == depth_map.shape:
+        center_depth_contour_pocket, accessible_pocket = cached
+        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
+    else:
+        progress(10, "Computing achievable depth surface (morphological opening)…")
+        structure = -kernel_pocket.astype(np.float64)
+        center_depth_contour_pocket = grey_erosion(depth_map.astype(np.float64),
+                                  footprint=footprint_pocket,
+                                  structure=structure).astype(np.float32)
+        center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
+        accessible_pocket = grey_dilation(center_depth_contour_pocket.astype(np.float64),
+                                   footprint=footprint_pocket,
+                                   structure=structure).astype(np.float32)
+        accessible_pocket = np.clip(accessible_pocket, 0.0, 1.0)
+        progress(35, "Achievable depth surface computed.")
+        if erosion_cache is not None:
+            erosion_cache[erosion_cache_key] = (center_depth_contour_pocket, accessible_pocket)
+
+    # ── Target-Z interior mask ──────────────────────────────────────────────
+    progress(35, "Computing pocket interior mask…")
+    if target_z_mm is None or target_z_mm <= 0.0:
+        target_z_mm = max_depth
+    target_z_norm = float(np.clip(target_z_mm / max_depth, 1e-6, 1.0))
+    contour_eps = 0.5 / max(n_grey_levels - 1, 1)
+    pocket_mask = center_depth_contour_pocket >= (target_z_norm - contour_eps)
+
+    if boundary_offset_mm > 0.0:
+        boundary_px = max(1, int(round(boundary_offset_mm * px_per_mm)))
+        pocket_mask = binary_erosion(pocket_mask, structure=disk(boundary_px))
+
+    return (pocket_mask, center_depth_contour_pocket, accessible_pocket,
+            target_z_norm, kernel_pocket, footprint_pocket)
+
+
 def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                              step_mm, stepdown_mm, max_depth,
                              width_mm, height_mm, raster_dir,
                              target_z_mm=None,
                              origin="Bottom-Left",
                              feed_rate=800.0,
-                             work_surface_tol=None,
                              previous_result=None,
-                             prior_reference=None,
-                             subtract_unaccessible=False,
                              raster_offset_pct=0.0,
                              use_2opt=False,
                              cut_direction="Climb",
@@ -1375,25 +1473,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         semantics as compute_raster_toolpath.
     origin            : G-code origin convention ("Bottom-Left", "Top-Left", …)
     feed_rate         : cutting feed rate in mm/min
-    work_surface_tol  : threshold (normalised [0,1]) applied to the gate built
-                        from prior_reference — only meaningful when
-                        prior_reference is supplied; skips residual gaps
-                        shallower than this instead of recutting any nonzero
-                        gap. None/0 (default) recuts any residual at or above
-                        one grey-level. Has no effect when prior_reference is
-                        None, since target_z_mm alone already defines the
-                        region in that case.
     previous_result   : optional 2-D float32 [0,1] cumulative result from a
                         prior step (ToolPath.result), unioned into this
                         step's result.
-    prior_reference   : optional 2-D float32 [0,1] reference surface from a
-                        prior step; when supplied, only the part of the
-                        pocket interior still outstanding against this
-                        reference is cut (Process Region gating), composed
-                        with (not replacing) the target-Z interior mask.
-    subtract_unaccessible : when True with prior_reference set, gates against
-                        (accessible − prior_reference) instead of
-                        (depth_map − prior_reference).
     final_stepdown_mm : depth (mm) reserved for a dedicated finishing pass at
                         the pocket floor. 0 = no reservation.
     boundary_offset_mm : lateral-only push of the tool-centre path away from
@@ -1428,8 +1510,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     outermost line leaves the same stair-stepped boundary edge Raster
     already leaves at any masked boundary.
     """
-    from scipy.ndimage import grey_erosion, grey_dilation, binary_erosion, label, find_objects
-    from skimage.morphology import disk
+    from scipy.ndimage import label, find_objects
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
@@ -1443,8 +1524,6 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         progress(0, f"Resampling depth map to square pixels "
                     f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
         depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
-        if prior_reference is not None:
-            prior_reference = _zoom(prior_reference, (zy, zx), order=1).astype(np.float32)
         if previous_result is not None:
             previous_result = _zoom(previous_result, (zy, zx), order=1).astype(np.float32)
         H, W = depth_map.shape
@@ -1460,73 +1539,15 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
            "Top-Left":    H_mm,    "Top-Right":    H_mm,
            "Center":      H_mm/2}.get(origin, 0)
 
-    # ── Stage 1 · Build tool kernel (0–10 %) ─────────────────────────────
-    progress(0, "Building tool geometry kernel…")
-    kernel_pocket, footprint_pocket = _build_kernel(tool, px_per_mm, max_depth)
-    ksize = kernel_pocket.shape[0]
-    progress(10, f"Kernel ready  ({ksize}×{ksize} px, profile: {tool.profile}).")
-
-    # ── Stage 2 · Compute achievable depth surface (10–35 %) ─────────────
-    cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
-    if cached is not None and cached[0].shape == depth_map.shape:
-        center_depth_contour_pocket, accessible_pocket = cached
-        progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
-    else:
-        progress(10, "Computing achievable depth surface (morphological opening)…")
-        structure = -kernel_pocket.astype(np.float64)
-        center_depth_contour_pocket = grey_erosion(depth_map.astype(np.float64),
-                                  footprint=footprint_pocket,
-                                  structure=structure).astype(np.float32)
-        center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
-        accessible_pocket = grey_dilation(center_depth_contour_pocket.astype(np.float64),
-                                   footprint=footprint_pocket,
-                                   structure=structure).astype(np.float32)
-        accessible_pocket = np.clip(accessible_pocket, 0.0, 1.0)
-        progress(35, "Achievable depth surface computed.")
-        if erosion_cache is not None:
-            erosion_cache[erosion_cache_key] = (center_depth_contour_pocket, accessible_pocket)
-
-    # ── Stage 3 · Target-Z interior mask (35–40 %) ───────────────────────
-    progress(35, "Computing pocket interior mask…")
-    if target_z_mm is None:
-        target_z_mm = max_depth
-    target_z_norm = float(np.clip(target_z_mm / max_depth, 1e-6, 1.0))
+    # ── Stages 1–3 · Kernel, achievable depth surface, pocket interior mask ─
+    (pocket_mask, center_depth_contour_pocket, accessible_pocket, target_z_norm,
+     kernel_pocket, footprint_pocket) = compute_pocket_mask(
+        depth_map, tool, px_per_mm, max_depth, target_z_mm, n_grey_levels,
+        boundary_offset_mm=boundary_offset_mm,
+        erosion_cache=erosion_cache, erosion_cache_key=erosion_cache_key,
+        progress=progress,
+    )
     pocket_depth_mm = target_z_norm * max_depth
-    contour_eps = 0.5 / max(n_grey_levels - 1, 1)
-    # Gates on the EROSION (tool-centre-safe depth), not the dilated/opened
-    # accessible surface: accessible_pocket tells us which MATERIAL points
-    # can be reached by *some* nearby tool-centre position, which is the
-    # right question for "did this get cut" (ToolPath.accessible / Process
-    # Region), but the wrong one for "where can the tool be centred" -- the
-    # toolpath itself must only visit centre positions whose full footprint
-    # clears shallower material, exactly what the erosion already encodes
-    # (the same surface Contour extracts its iso-depth contours from).
-    # Using the dilated surface here would let the tool centre travel right
-    # up to (or past) a boundary that's only reachable via a NEARBY centre
-    # position, cutting full depth where the tool's own edge overhangs past
-    # where material should remain.
-    pocket_mask = center_depth_contour_pocket >= (target_z_norm - contour_eps)
-
-    # boundary_offset_mm retreats this tool-centre-safe mask further away
-    # from the pocket wall by a plain lateral erosion -- the same
-    # lateral-only push compute_cutout_toolpath applies (there as a dilation
-    # of the object silhouette, since positive there also means "away from
-    # the boundary", just on the opposite side of it) -- rather than reusing
-    # the depth-shaped kernel inflation the other algorithms' extra_offset_mm
-    # relies on, since Pocket's cut depth is already fixed independently by
-    # target_z_mm.
-    if boundary_offset_mm > 0.0:
-        boundary_px = max(1, int(round(boundary_offset_mm * px_per_mm)))
-        pocket_mask = binary_erosion(pocket_mask, structure=disk(boundary_px))
-
-    resid_tol = (work_surface_tol if work_surface_tol
-                 else 1.0 / (n_grey_levels - 1))
-    if prior_reference is not None:
-        if subtract_unaccessible:
-            gate = np.clip(accessible_pocket - prior_reference, 0.0, 1.0)
-        else:
-            gate = np.clip(depth_map - prior_reference, 0.0, 1.0)
-        pocket_mask = pocket_mask & (gate >= resid_tol)
 
     n_pocket_px = int(np.sum(pocket_mask))
     progress(40, f"Target depth {pocket_depth_mm:.2f} mm: "
@@ -1773,6 +1794,22 @@ def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
     return filtered, mask
 
 
+def resolve_vcarve_threshold_norm(ref, threshold_mm, max_depth):
+    """Resolve threshold_mm (mm) to a normalised [0,1] split point against
+    *ref*'s own value range.
+
+    threshold_mm > 0 is used literally; 0 (or unset) means "auto": split at
+    the midpoint of ref's own value range rather than at depth 0. ref's
+    floor is always 0 (background/already-cut material), so a literal 0
+    threshold would keep every pixel -- including the flat background --
+    turning the V-carving skeleton into the medial axis of the whole canvas
+    rectangle instead of the actual artwork.
+    """
+    if threshold_mm > 0.0:
+        return threshold_mm / max_depth if max_depth else 0.0
+    return float(ref.min() + ref.max()) / 2.0
+
+
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             tool, max_depth,
                             width_mm, height_mm,
@@ -1958,16 +1995,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         uncut_depth = np.clip(depth_map - prior_reference, 0.0, 1.0)
 
-    if threshold_mm > 0.0:
-        threshold_norm = threshold_mm / max_depth if max_depth else 0.0
-    else:
-        # 0 (or unset) means "auto": split at the midpoint of uncut_depth's
-        # own value range rather than at depth 0. uncut_depth's floor is
-        # always 0 (background/already-cut material), so a literal 0
-        # threshold would keep every pixel -- including the flat
-        # background -- turning stage 3's skeleton into the medial axis of
-        # the whole canvas rectangle instead of the actual artwork.
-        threshold_norm = float(uncut_depth.min() + uncut_depth.max()) / 2.0
+    threshold_norm = resolve_vcarve_threshold_norm(uncut_depth, threshold_mm, max_depth)
 
     uncut_depth_filtered, mask_vcarve = compute_vcarve_mask(
         uncut_depth, threshold_norm, min_feature_width_mm, px_per_mm,
@@ -3340,6 +3368,62 @@ def compute_cutout_toolpath(
     )
 
 
+def compute_cutout_silhouette_mask(depth_map, threshold_mm, max_depth, r_px):
+    """Resolve threshold_mm to a silhouette mask of "the object".
+
+    threshold_mm > 0 is used literally, as a normalised split point;
+    0 (or unset) means "auto": split at the midpoint of the depth map's own
+    value range rather than at depth 0, since the depth map's floor is
+    always 0 -- a literal 0 threshold would put every pixel on the same
+    side of the split, both directions, guaranteeing "no usable silhouette
+    boundary" below.
+
+    Whether "the object" is the deeply-cut region (dark-background source,
+    background left at/near the surface) or the shallow/uncarved region
+    (background carved away deeply so the object stands proud in relief)
+    depends on how the source was authored -- depth_map alone doesn't say
+    which. Try object = "at or below threshold" first (an object standing
+    proud of a deeply-recessed background); if that yields nothing usable
+    (empty, or -- once holes are filled -- the entire canvas, e.g. because
+    it actually picked out the *background* and binary_fill_holes closed
+    over the object as an enclosed "hole" in it), retry with object = "at
+    or above threshold" instead (a carved object against a shallow/uncut
+    background). This only disambiguates correctly when the object doesn't
+    itself touch the canvas edge.
+
+    Returns (mask, mask_direction, threshold_norm); mask is None (with
+    mask_direction None) if neither direction yields a usable silhouette.
+    """
+    from scipy.ndimage import binary_fill_holes, binary_dilation
+    from skimage.morphology import disk
+
+    if threshold_mm > 0.0:
+        threshold_norm = threshold_mm / max_depth if max_depth else 0.0
+    else:
+        threshold_norm = float(depth_map.min() + depth_map.max()) / 2.0
+
+    def _try_mask(cmp):
+        raw = (depth_map < threshold_norm) if cmp == '<=' else (depth_map >= threshold_norm)
+        if not np.any(raw):
+            return None
+        # v1: interior holes are always filled before contour tracing --
+        # only the outer perimeter of each connected shape is ever cut.
+        filled = binary_fill_holes(raw)
+        dilated = binary_dilation(filled, structure=disk(r_px))
+        if np.all(dilated):
+            return None
+        return dilated
+
+    mask = _try_mask('<=')
+    mask_direction = '<='
+    if mask is None:
+        mask = _try_mask('>=')
+        mask_direction = '>='
+    if mask is None:
+        mask_direction = None
+    return mask, mask_direction, threshold_norm
+
+
 @dataclasses.dataclass
 class _CutoutRings:
     """Phase-A output of compute_cutout_toolpath: everything Phase B
@@ -3377,8 +3461,6 @@ def _compute_cutout_rings(
     """Phase A of compute_cutout_toolpath: silhouette mask + outer contour
     extraction. See compute_cutout_toolpath for full parameter docs.
     """
-    from scipy.ndimage import binary_fill_holes, binary_dilation
-    from skimage.morphology import disk
     from skimage.measure import find_contours
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
@@ -3435,49 +3517,10 @@ def _compute_cutout_rings(
         )
 
     # ── Stage 2 · Silhouette mask: threshold → fill holes → dilate (10–35 %)
-    # Whether "the object" is the deeply-cut region (dark-background source,
-    # background left at/near the surface) or the shallow/uncarved region
-    # (background carved away deeply so the object stands proud in relief)
-    # depends on how the source was authored -- depth_map alone doesn't say
-    # which. Try object = "at or below threshold" first (an object standing
-    # proud of a deeply-recessed background); if that yields nothing usable
-    # (empty, or -- once holes are filled -- the entire canvas, e.g. because
-    # it actually picked out the *background* and binary_fill_holes closed
-    # over the object as an enclosed "hole" in it), retry with object = "at
-    # or above threshold" instead (a carved object against a shallow/uncut
-    # background). This only disambiguates correctly when the object doesn't
-    # itself touch the canvas edge -- same margin caveat as the open-contour
-    # limitation noted above.
     progress(10, "Building silhouette mask…")
-    if threshold_mm > 0.0:
-        threshold_norm = threshold_mm / max_depth if max_depth else 0.0
-    else:
-        # 0 (or unset) means "auto": split at the midpoint of the depth
-        # map's own value range rather than at depth 0, since the depth
-        # map's floor is always 0 -- a literal 0 threshold would put every
-        # pixel on the same side of the split, both directions, guaranteeing
-        # "no usable silhouette boundary" below.
-        threshold_norm = float(depth_map.min() + depth_map.max()) / 2.0
-
     r_px = max(1, int(round((tool.diameter_mm / 2.0 + boundary_offset_mm) * px_per_mm)))
-
-    def _try_mask(cmp):
-        raw = (depth_map < threshold_norm) if cmp == '<=' else (depth_map >= threshold_norm)
-        if not np.any(raw):
-            return None
-        # v1: interior holes are always filled before contour tracing --
-        # only the outer perimeter of each connected shape is ever cut.
-        filled = binary_fill_holes(raw)
-        dilated = binary_dilation(filled, structure=disk(r_px))
-        if np.all(dilated):
-            return None
-        return dilated
-
-    mask_cutout = _try_mask('<=')
-    mask_direction = '<='
-    if mask_cutout is None:
-        mask_cutout = _try_mask('>=')
-        mask_direction = '>='
+    mask_cutout, mask_direction, threshold_norm = compute_cutout_silhouette_mask(
+        depth_map, threshold_mm, max_depth, r_px)
     if mask_cutout is None:
         return _empty(
             "No usable silhouette boundary found (tried both depth-threshold "

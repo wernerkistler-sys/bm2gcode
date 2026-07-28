@@ -169,12 +169,14 @@ Clears a flat-bottomed recess: every position where the tool can be centred and 
 
 | Parameter | Description |
 |---|---|
-| Target depth | Depth (mm) defining the pocket floor and which positions count as pocket interior — the tool must be able to centre there and still reach this depth without its footprint overhanging shallower material. "Auto" uses Max cut depth. |
+| Target depth | Depth (mm) defining the pocket floor and which positions count as pocket interior — the tool must be able to centre there and still reach this depth without its footprint overhanging shallower material. 0 (default) means auto: use Max cut depth. |
 | Step-over | Lateral spacing between infill lines, as a percentage of tool diameter. |
 | Line offset | Shifts alternate infill lines by this percentage, so that the in-between lines can be cut in a separate step with a different setting. |
 | Scan direction | Horizontal or Vertical scan in parallel lines. Spiral (Outside-In) or Spiral (Inside-Out) instead traces each pocket region as one continuous coil of shrinking (or growing) concentric rectangles, sized and centred on that region — see [Spiral raster pattern](#spiral-raster-pattern). |
 | Cut direction | Climb or Conventional forces every infill line to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained. For a Spiral scan direction, Climb/Conventional instead pick which way each region's coil winds. |
 | Boundary offset | Lateral-only push of the tool-centre path away from the pocket wall, beyond the minimum tool-radius clearance, in mm. 0 = tool tangent to that wall; larger values retreat the tool centre further from the wall, leaving more material uncut near the boundary. Same "away from the boundary" direction as Cutout's own Boundary offset field — see [Step / Operation / Cutout](#step--operation--cutout) — but with no vertical component, since Pocket's cut depth is already fixed independently by Target depth. Shown here instead of the shared Extra offset field under [Step / Tool](#step--tool). |
+
+There's no Process Region selector for Pocket, either — Target depth is always applied to the full depth map, never to a prior step's residual or accessible surface, so what any prior step accomplished has no bearing on which pixels count as pocket interior.
 
 ---
 
@@ -193,6 +195,8 @@ The **Process Region** selector is the adaptive gating mechanism. It defines whi
 Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
 
 **Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth) exceeds this value, skipping areas that deviate from the reference by less than this amount.
+
+Cutout's **Split level** and Pocket's **Target depth** are the same underlying field, relabeled — each reuses its "0 = auto" convention for a purpose specific to that algorithm rather than Process Region gating; see their own sections above.
 
 ---
 
