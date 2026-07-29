@@ -602,12 +602,13 @@ def _order_free_raster_pass(pass_segs, origin, use_2opt, link_threshold_mm):
     ]
 
 
-def _order_fixed_orientation_pass(pass_segs, origin):
+def _order_fixed_orientation_pass(pass_segs, origin, group_ids=None):
     """Greedy nearest-neighbour ordering of pass_segs that only reorders
     which segment is visited when -- never reverses a segment's own point
     order, unlike _order_free_raster_pass. Used for Onion Skin, where
-    each segment is one region's whole ring chain: reversing it would
-    silently swap that region's Outside-In/Inside-Out winding (a
+    each segment is one region's whole ring chain (or one of several, if
+    that region's own erosion forked into sibling branches): reversing it
+    would silently swap that region's Outside-In/Inside-Out winding (a
     deliberate per-toolpath choice) whenever the chain's far end happens
     to be closer to the current tool position than its own start, which
     _order_free_raster_pass's nearest-endpoint search would otherwise do
@@ -617,22 +618,45 @@ def _order_fixed_orientation_pass(pass_segs, origin):
     internal connections rather than a simple swap, so this stays a plain
     greedy pass; pocket region counts are small enough that this has
     little travel-time cost.
+
+    group_ids, if given (one id per pass_segs entry, same length),
+    reorders whole groups rather than individual segments: every segment
+    sharing a group id is kept together and in its original relative
+    order, so a group is entered at its first segment's own start and
+    exited at its last segment's own end, and reordering only ever moves
+    a whole group as one unit. This is what lets several onion-skin
+    chains produced by the same pocket region stay adjacent and keep
+    their deliberate depth sequence, while still letting genuinely
+    separate pockets be visited in whichever order minimises travel.
+    Omitting group_ids (or passing None) is equivalent to giving every
+    segment its own distinct group -- the original ungrouped behaviour.
     """
-    n = len(pass_segs)
-    unvisited = list(range(n))
+    if group_ids is None:
+        groups = [[i] for i in range(len(pass_segs))]
+    else:
+        groups = []
+        group_index = {}
+        for i, gid in enumerate(group_ids):
+            if gid not in group_index:
+                group_index[gid] = len(groups)
+                groups.append([])
+            groups[group_index[gid]].append(i)
+
+    unvisited = list(range(len(groups)))
     order = []
     cur = origin
     while unvisited:
         best_ui, best_dist = 0, float('inf')
-        for ui, si in enumerate(unvisited):
-            x0, y0 = pass_segs[si][0][0], pass_segs[si][0][1]
-            d = ((x0 - cur[0]) ** 2 + (y0 - cur[1]) ** 2) ** 0.5
+        for ui, gi in enumerate(unvisited):
+            first = pass_segs[groups[gi][0]]
+            d = ((first[0][0] - cur[0]) ** 2 + (first[0][1] - cur[1]) ** 2) ** 0.5
             if d < best_dist:
                 best_ui, best_dist = ui, d
-        si = unvisited.pop(best_ui)
-        order.append(si)
-        cur = (pass_segs[si][-1][0], pass_segs[si][-1][1])
-    return [pass_segs[si] for si in order]
+        gi = unvisited.pop(best_ui)
+        order.append(gi)
+        last = pass_segs[groups[gi][-1]]
+        cur = (last[-1][0], last[-1][1])
+    return [pass_segs[i] for gi in order for i in groups[gi]]
 
 
 def _order_locked_raster_pass(pass_segs, direction, cur):
@@ -941,15 +965,19 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     changes a ring's winding, only which of its points the chain enters
     on.
 
-    If an erosion iteration's connected-component count rises above 1 (a
-    dumbbell-shaped neck has been fully eroded away), the branch built so
-    far is closed off and each new component continues as its own
+    If an erosion iteration's connected-component count rises above 1, any
+    component smaller than min_area_px is first discarded as a stray
+    fragment -- erosion detaching a sliver at a concave cusp of the
+    boundary rather than a genuine second lobe -- since it would otherwise
+    become its own tiny standalone toolpath segment. Only once that leaves
+    more than one substantial component does this count as a genuine fork
+    (a dumbbell-shaped neck fully eroded away): the branch built so far is
+    closed off and each surviving component continues as its own
     independent branch -- no attempt is made to bridge across the split,
-    since that would re-cross material the tool has already cleared. A
-    split component smaller than min_area_px is dropped rather than
-    spawned as a branch, since it is more likely a stray fragment eroded
-    off a concave cusp of the boundary than a genuine second lobe, and
-    would otherwise become its own tiny standalone toolpath segment.
+    since that would re-cross material the tool has already cleared. If
+    filtering leaves at most one substantial component, the branch simply
+    continues with it (its chain is not closed off), so shedding a stray
+    fragment never splits an otherwise-ordinary lobe's chain in two.
     Sibling branches spawned from the same split are advanced one erosion
     round at a time in lockstep (rather than fully finishing one branch's
     entire remaining descent before even starting its sibling's), so a
@@ -1029,19 +1057,26 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
             if n_comp <= 1:
                 next_round.append({'mask': nxt, 'points': points, 'prev_end': prev_end})
             else:
-                chains.append(np.array(points))
                 # A split can throw off a stray fragment of just a few
                 # pixels -- erosion detaching a sliver at a concave cusp of
-                # the boundary rather than a genuine second lobe. Such a
-                # fragment is smaller than one ring's worth of material and
-                # would otherwise become its own tiny standalone segment,
-                # so it is dropped rather than spawned as a new branch; the
-                # surrounding rings already cut through that same area.
-                for comp_id in range(1, n_comp + 1):
-                    comp_mask = labeled == comp_id
-                    if np.sum(comp_mask) < min_area_px:
-                        continue
-                    next_round.append({'mask': comp_mask, 'points': [], 'prev_end': None})
+                # the boundary rather than a genuine second lobe. Filter
+                # those out *before* deciding whether this erosion step is
+                # a genuine fork: discarding noise must not, by itself,
+                # force this branch's chain to close off and restart, or a
+                # single ordinary lobe that merely sheds a stray pixel
+                # would get split into two chains for no real reason.
+                surviving = [labeled == cid for cid in range(1, n_comp + 1)
+                            if np.sum(labeled == cid) >= min_area_px]
+                if len(surviving) <= 1:
+                    if surviving:
+                        next_round.append({'mask': surviving[0], 'points': points,
+                                          'prev_end': prev_end})
+                    else:
+                        chains.append(np.array(points))
+                else:
+                    chains.append(np.array(points))
+                    for comp_mask in surviving:
+                        next_round.append({'mask': comp_mask, 'points': [], 'prev_end': None})
         branches = next_round
 
     return [c - 1.0 for c in chains]
@@ -1763,6 +1798,14 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     progress(40, f"Phase 1: generating infill for {n_regions} pocket region(s)…")
 
     full_depth_segs = []
+    # Parallel to full_depth_segs, one entry per onion-skin chain, recording
+    # which pocket region it came from -- so Stage 6 ordering can permute
+    # which *pocket* is visited when for travel efficiency, without ever
+    # separating one pocket's own chains (e.g. produced when its erosion
+    # forked into sibling branches) from each other or disturbing their
+    # deliberate Outside-In/Inside-Out depth sequence. Unused by the other
+    # scan directions.
+    chain_group_ids = []
     for region_id, box in enumerate(region_boxes, start=1):
         if box is None:
             continue
@@ -1805,6 +1848,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                 full_depth_segs.append(
                     _ring_chain_to_points(chain + offset, pocket_depth_mm,
                                          px_per_mm, H, _ox, _oy))
+                chain_group_ids.append(region_id)
         else:
             if direction == "X":
                 spacing_lo, spacing_hi = r_lo, r_hi
@@ -1856,14 +1900,29 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                  f"{len(pass_segs)} segment(s).")
         ceil_norm = ceil_mm / max_depth
         cur = (float(tool_pos[0]), float(tool_pos[1]))
-        if lock_direction and (IS_SPIRAL or IS_ONION):
+        # Onion Skin's own correctness (winding sense, Outside-In vs.
+        # Inside-Out) is fully decided at generation time (algorithms.py's
+        # IS_ONION branch above), never by visiting order -- so, unlike
+        # Horizontal/Vertical/Spiral, its ordering is independent of
+        # lock_direction: a chain is only ever left untouched or permuted
+        # by _order_fixed_orientation_pass, never reversed, in both cases.
+        if IS_ONION and _is_contiguous_chain(pass_segs):
+            ordered_segs = pass_segs
+        elif IS_ONION:
+            # pass_segs is guaranteed to reproduce full_depth_segs (hence
+            # chain_group_ids) unchanged in count and order whenever
+            # non-empty: every onion-skin point across every region shares
+            # the one uniform target_z_norm, so make_multipass's per-pass
+            # keep/drop decision is identical for every chain in a given
+            # pass -- a pass never keeps some chains and drops others.
+            ordered_segs = _order_fixed_orientation_pass(pass_segs, cur,
+                                                          group_ids=chain_group_ids)
+        elif lock_direction and IS_SPIRAL:
             ordered_segs = pass_segs
         elif lock_direction:
             ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
-        elif (IS_SPIRAL or IS_ONION) and _is_contiguous_chain(pass_segs):
+        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
             ordered_segs = pass_segs
-        elif IS_ONION:
-            ordered_segs = _order_fixed_orientation_pass(pass_segs, cur)
         else:
             ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
                                                     link_threshold_mm)

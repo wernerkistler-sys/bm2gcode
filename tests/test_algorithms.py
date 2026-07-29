@@ -165,7 +165,14 @@ check("the small lobe's chain is not stranded after the big lobe's entire "
 # (connected to the main body only by a thin bridge that vanishes on the
 # very first erosion) must be dropped rather than spawned as its own tiny
 # standalone chain/toolpath segment. The fragment (a 4-pixel remnant) sits
-# well under min_area_px, unlike a genuine second lobe.
+# well under min_area_px, unlike a genuine second lobe. Discarding it must
+# also not, by itself, count as a fork: the main lobe -- the only
+# substantial survivor -- must continue as ONE unbroken chain rather than
+# being closed off and restarted the moment the split is detected, which
+# would silently break an ordinary, non-forking pocket's ring sequence into
+# two chains for no real reason (and let downstream ordering interleave
+# them with an unrelated pocket in between, since ordering has no idea
+# they were ever the same pocket).
 # --------------------------------------------------------------------------
 print("stray erosion fragment at a cusp is dropped (regression)")
 
@@ -185,6 +192,9 @@ check("no chain is a tiny standalone ring stranded at the stray fragment's locat
       not any(len(c) < min_area_px3 * 2 and dist_from(c, wart_c).max() < 6 for c in chains3))
 check("the main lobe still gets its own full chain covering its own interior",
       any(dist_from(c, main_c).min() < 5 for c in chains3))
+check("discarding the stray fragment is not itself treated as a fork -- "
+      "the main lobe stays exactly one continuous chain, not two",
+      len(chains3) == 1)
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +303,95 @@ check("cutting starts at a deep point (near a lobe's own centre), not the outer 
       first_start_depth < 5.0)
 check("cutting ends at a shallow point (near the outer boundary), not a lobe's centre",
       last_end_depth > big_r4 - 5.0)
+
+
+# --------------------------------------------------------------------------
+# regression test: even under a locked cut direction, visiting order between
+# *separate* pockets should still minimise travel -- a locked direction only
+# needs each chain's own point order left untouched (its winding is decided
+# at generation time), not the pockets themselves visited in whatever
+# arbitrary order scipy.ndimage.label happened to discover them in. The
+# "far" pocket is placed so label discovers it FIRST (small row index, top
+# of the image) even though it is geometrically far from the tool's actual
+# (0,0) mm start under a Bottom-Left origin; the "near" pocket is discovered
+# SECOND (large row index) despite sitting right next to the start.
+# --------------------------------------------------------------------------
+print("cross-pocket travel order survives a locked cut direction (regression)")
+
+shape5 = (100, 100)
+far_c5, near_c5 = (5, 90), (95, 5)
+depth5 = np.zeros(shape5, dtype=np.float32)
+depth5[disk_mask(shape5, far_c5, 10)] = 1.0
+depth5[disk_mask(shape5, near_c5, 10)] = 1.0
+
+tool5 = Tool(profile="End Mill", diameter_mm=1.0, vbit_angle_deg=90.0)
+px_per_mm5 = shape5[1] / 100.0
+
+
+def _mm5(rc):
+    row, col = rc
+    return (col / px_per_mm5, (shape5[0] - 1 - row) / px_per_mm5)
+
+
+far_mm5, near_mm5 = _mm5(far_c5), _mm5(near_c5)
+
+tp5 = compute_pocket_toolpath(
+    depth_map=depth5, n_grey_levels=256, tool=tool5,
+    step_mm=0.5, stepdown_mm=0.0, max_depth=3.0,
+    width_mm=100.0, height_mm=100.0, raster_dir="Onion Skin (Outside-In)",
+    target_z_mm=3.0, feed_rate=800.0, cut_direction="Climb", origin="Bottom-Left",
+    progress=lambda pct, msg: None,
+)
+check("exactly two chains (one per separate pocket)", len(tp5.segments) == 2)
+first_pt = tp5.segments[0][0]
+d_near = ((first_pt[0] - near_mm5[0]) ** 2 + (first_pt[1] - near_mm5[1]) ** 2) ** 0.5
+d_far = ((first_pt[0] - far_mm5[0]) ** 2 + (first_pt[1] - far_mm5[1]) ** 2) ** 0.5
+check("the pocket nearest the tool's actual start is visited first, "
+      "not whichever pocket label() happened to discover first",
+      d_near < d_far)
+
+
+# --------------------------------------------------------------------------
+# regression test: the original reported bug, combined -- one pocket whose
+# own erosion forks into sibling lobes, alongside a second, wholly separate
+# pocket. The forked pocket's own chains (parent + each lobe) must all stay
+# adjacent, in one contiguous run, never interleaved with the unrelated
+# pocket's chain in between.
+# --------------------------------------------------------------------------
+print("a forked pocket's chains never interleave with an unrelated pocket (regression)")
+
+shape6 = (100, 300)
+big_c6, small_c6, third_c6 = (50, 50), (50, 190), (10, 280)
+depth6 = np.zeros(shape6, dtype=np.float32)
+depth6[disk_mask(shape6, big_c6, 45)] = 1.0
+depth6[disk_mask(shape6, small_c6, 12)] = 1.0
+depth6[47:53, 50:190] = 1.0   # neck joining big_c6 and small_c6 into one forking pocket
+depth6[disk_mask(shape6, third_c6, 10)] = 1.0   # unrelated, separate pocket
+
+tool6 = Tool(profile="End Mill", diameter_mm=1.0, vbit_angle_deg=90.0)
+tp6 = compute_pocket_toolpath(
+    depth_map=depth6, n_grey_levels=256, tool=tool6,
+    step_mm=0.5, stepdown_mm=0.0, max_depth=3.0,
+    width_mm=300.0, height_mm=100.0, raster_dir="Onion Skin (Outside-In)",
+    target_z_mm=3.0, feed_rate=800.0, cut_direction="Climb",
+    progress=lambda pct, msg: None,
+)
+px_per_mm6 = shape6[1] / 300.0
+
+
+def _mm6(rc):
+    row, col = rc
+    return (col / px_per_mm6, (shape6[0] - 1 - row) / px_per_mm6)
+
+
+third_mm6 = _mm6(third_c6)
+is_third = [dist_from(np.array(seg), third_mm6).min() < 15 for seg in tp6.segments]
+check("the unrelated pocket contributes exactly one chain",
+      sum(is_third) == 1)
+forked_indices = [i for i, v in enumerate(is_third) if not v]
+check("the forked pocket's chains form one contiguous run "
+      "(no unrelated-pocket chain sandwiched in between)",
+      forked_indices == list(range(min(forked_indices), max(forked_indices) + 1)))
 
 
 print()
