@@ -31,7 +31,8 @@ DEFAULT_POSTAMBLE = (
 DEFAULTS = {
     "width_mm":          "100.0",
     "height_mm":         "100.0",
-    "precision_mm":      "0.2",
+    "min_px_per_mm":     "5.0",
+    "max_megapixels":    "16.0",
     "max_depth":         "5.0",
     "margin_mm":         "0.0",
     "margin_depth_pct":  "0.0",

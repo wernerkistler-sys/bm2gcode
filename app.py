@@ -73,9 +73,10 @@ class GCodeGeneratorApp:
         self.n_grey_levels   = 256
         self.layers = []   # list[layers_mod.Layer]; layers[0] = bottom/base source
         self._next_layer_id = 1   # monotonically increasing, for stable Layer ids
-        self._last_precision_mm = float(DEFAULTS["precision_mm"])   # see _on_precision_changed
         self._last_width_mm  = float(DEFAULTS["width_mm"])          # see _on_canvas_size_changed
         self._last_height_mm = float(DEFAULTS["height_mm"])
+        self._last_min_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _on_min_px_per_mm_changed
+        self._last_effective_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _auto_px_per_mm
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
@@ -150,6 +151,10 @@ class GCodeGeneratorApp:
             label="Compute All Steps",
             accelerator="F6",
             command=self._compute_all_steps)
+        compute_menu.add_separator()
+        compute_menu.add_command(
+            label="Recompute Canvas Resolution",
+            command=self._recompute_auto_resolution)
         menubar.add_cascade(label="Compute", menu=compute_menu)
 
         self._view_menu = tk.Menu(menubar, tearoff=0)
@@ -358,10 +363,22 @@ class GCodeGeneratorApp:
                         command=self._on_aspect_lock_toggle
                         ).pack(side=tk.RIGHT, padx=(0, 4))
 
-        self.precision_mm = LabeledEntry(
-            tab, "Precision", "mm", DEFAULTS["precision_mm"],
-            minval=0.01, maxval=50.0, increment=0.1)
-        self.precision_mm.pack(fill=tk.X, pady=2)
+        self.min_px_per_mm = LabeledEntry(
+            tab, "Min. px/mm", "px/mm", DEFAULTS["min_px_per_mm"],
+            minval=0.02, maxval=100.0, increment=0.5)
+        self.min_px_per_mm.pack(fill=tk.X, pady=2)
+
+        self.max_megapixels = LabeledEntry(
+            tab, "Max Megapixels", "MP", DEFAULTS["max_megapixels"],
+            minval=0.1, maxval=500.0, increment=1.0)
+        self.max_megapixels.pack(fill=tk.X, pady=2)
+
+        eff_row = ttk.Frame(tab)
+        eff_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(eff_row, text="Effective resolution:").pack(side=tk.LEFT)
+        self.effective_resolution_var = tk.StringVar(value="—")
+        ttk.Label(eff_row, textvariable=self.effective_resolution_var,
+                  foreground="#666666").pack(side=tk.RIGHT)
 
         self.max_depth = LabeledEntry(tab, "Max cut depth", "mm", DEFAULTS["max_depth"],
                                       minval=0.01, maxval=200.0, increment=1.0)
@@ -379,7 +396,8 @@ class GCodeGeneratorApp:
 
         self.width_mm.committed_var.trace_add("write", self._on_width_changed)
         self.height_mm.committed_var.trace_add("write", self._on_height_changed)
-        self.precision_mm.committed_var.trace_add("write", self._on_precision_changed)
+        self.min_px_per_mm.committed_var.trace_add("write", self._on_min_px_per_mm_changed)
+        self.max_megapixels.committed_var.trace_add("write", self._on_max_megapixels_changed)
         self.max_depth.committed_var.trace_add("write", lambda *_: self._render())
         self.margin_mm.committed_var.trace_add("write", lambda *_: self._render())
         self.margin_depth_pct.committed_var.trace_add("write", self._on_depth_map_content_changed)
@@ -404,74 +422,161 @@ class GCodeGeneratorApp:
                              "Top-Left", "Top-Right", "Center"],
                      state="readonly", width=22).pack(side=tk.RIGHT)
 
+    def _contain_footprint_mm(self, native_aspect, width_mm, height_mm, scale_pct):
+        """Physical (footprint_w_mm, footprint_h_mm) a source occupies on
+        the canvas at the given Scale-%, aspect-preserving 'contain': at
+        scale_pct=100 the source is inscribed in the canvas rectangle along
+        whichever axis its own aspect ratio (native_aspect = width/height,
+        in any consistent unit -- source pixels or source mm, only the
+        ratio matters) binds. This is the mm-only geometry shared by both
+        Scale-%'s meaning (see layers._affine_params) and by how a
+        bitmap's own native resolution is recovered (_native_px_per_mm) --
+        it depends only on the canvas's physical size and Scale-%, never on
+        canvas pixel density."""
+        canvas_aspect = width_mm / max(height_mm, 1e-9)
+        s = max(scale_pct, 1e-6) / 100.0
+        if native_aspect >= canvas_aspect:
+            footprint_w_mm = width_mm * s
+            return footprint_w_mm, footprint_w_mm / native_aspect
+        footprint_h_mm = height_mm * s
+        return footprint_h_mm * native_aspect, footprint_h_mm
+
+    def _native_px_per_mm(self, layer, width_mm, height_mm):
+        """A bitmap layer's own native resolution, expressed in canvas-
+        physical px/mm -- how finely its native pixels are actually
+        packed onto the stock, given where Scale-% currently places it."""
+        H_l, W_l = layer.raw.shape
+        footprint_w_mm, _ = self._contain_footprint_mm(
+            W_l / H_l, width_mm, height_mm, layer.scale_pct)
+        return W_l / max(footprint_w_mm, 1e-9)
+
+    def _auto_px_per_mm(self, width_mm, height_mm):
+        """Canvas pixel density (px/mm), auto-chosen between the Min.
+        px/mm floor and the Max Megapixels ceiling: with no bitmap source
+        present the floor is used as-is; otherwise the finest bitmap's own
+        native px/mm (_native_px_per_mm) drives it, still bounded by the
+        floor/ceiling. If the floor alone already exceeds the ceiling for
+        this physical size, the floor wins uncapped -- that combination can
+        only arise from editing Width/Height/Min. px/mm/Max Megapixels,
+        each of which gates the change through _confirm_canvas_shape before
+        committing, so by the time this runs it's already something the
+        user explicitly chose to allow."""
+        try:
+            floor_density = float(self.min_px_per_mm.get())
+        except ValueError:
+            floor_density = float(DEFAULTS["min_px_per_mm"])
+        if floor_density <= 1e-9:
+            floor_density = float(DEFAULTS["min_px_per_mm"])
+
+        bitmap_layers = [l for l in self.layers if l.source_kind == "image"]
+        if not bitmap_layers:
+            candidate = floor_density
+        else:
+            candidate = max(self._native_px_per_mm(l, width_mm, height_mm)
+                             for l in bitmap_layers)
+
+        try:
+            max_mp = float(self.max_megapixels.get())
+        except ValueError:
+            max_mp = float(DEFAULTS["max_megapixels"])
+        if max_mp <= 1e-9:
+            max_mp = float(DEFAULTS["max_megapixels"])
+        cap_density = float(np.sqrt(max_mp * 1e6 / max(width_mm * height_mm, 1e-9)))
+
+        if floor_density > cap_density:
+            return max(candidate, floor_density)
+        return min(max(candidate, floor_density), cap_density)
+
+    def _effective_px_per_mm(self):
+        """The canvas density the last recompute settled on -- used by STL
+        rasterization/staleness checks, which need a concrete density to
+        target rather than re-deriving one live."""
+        return self._last_effective_px_per_mm
+
     def _canvas_shape_px(self):
-        """Canvas pixel shape (W, H), derived from physical size and
-        Precision -- the single source of truth for how big the depth map
-        is, replacing the old 'whichever source was imported first' rule."""
+        """Canvas pixel shape (W, H), derived from physical size and the
+        auto-chosen density (_auto_px_per_mm) -- the single source of truth
+        for how big the depth map is."""
         try:
             width_mm  = float(self.width_mm.get())
             height_mm = float(self.height_mm.get())
         except ValueError:
             width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
-        try:
-            precision_mm = float(self.precision_mm.get())
-        except ValueError:
-            precision_mm = float(DEFAULTS["precision_mm"])
-        if precision_mm <= 1e-9:
-            precision_mm = float(DEFAULTS["precision_mm"])
-        W = max(2, round(width_mm / precision_mm))
-        H = max(2, round(height_mm / precision_mm))
+        density = self._auto_px_per_mm(width_mm, height_mm)
+        W = max(2, round(width_mm * density))
+        H = max(2, round(height_mm * density))
         return W, H
 
-    def _fit_scale_pct(self, native_w_px, native_h_px):
-        """Scale-% that makes a *native_w_px* x *native_h_px* image fit
-        entirely within the current canvas (preserving the image's own
-        aspect ratio -- 'contain', not stretch/crop). At scale_pct=100, one
-        image pixel maps to exactly one canvas pixel (see
-        layers._affine_params), so an image whose native resolution has no
-        relation to the canvas's Precision-driven pixel density would
-        otherwise appear cropped to a tiny corner or absurdly oversized;
-        this makes a freshly added image appear at a sensible size by
-        default regardless of its native resolution."""
-        if native_w_px <= 0 or native_h_px <= 0:
-            return 100.0
-        canvas_w_px, canvas_h_px = self._canvas_shape_px()
-        scale = min(canvas_w_px / native_w_px, canvas_h_px / native_h_px)
-        return max(1.0, scale * 100.0)
-
-    _MAX_CANVAS_PX = 16_000_000
+    def _settle_auto_resolution(self):
+        """Re-evaluate _auto_px_per_mm() against current widget/layer
+        state, update the effective-resolution readout and the settled-
+        density cache (_last_effective_px_per_mm, read by
+        _effective_px_per_mm for STL rasterization), and -- only if density
+        actually moved -- offer to re-rasterize any STL source whose detail
+        no longer matches it (rather than waiting for the next Compute).
+        Deliberately does NOT recomposite/re-render on its own: callers that
+        need the canvas to visibly update call _on_canvas_shape_changed
+        instead; callers like _compute_step that are about to recomposite
+        moments later anyway (via _get_depth_map_for_step, which always
+        reads live state) just need the settled density to be fresh first."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+        density = self._auto_px_per_mm(width_mm, height_mm)
+        W = max(2, round(width_mm * density))
+        H = max(2, round(height_mm * density))
+        self.effective_resolution_var.set(f"{W}x{H} px  ({density:.3g} px/mm)")
+        density_changed = abs(density - self._last_effective_px_per_mm) > 1e-9
+        self._last_effective_px_per_mm = density
+        try:
+            max_mp = float(self.max_megapixels.get())
+        except ValueError:
+            max_mp = float(DEFAULTS["max_megapixels"])
+        if W * H > max_mp * 1e6:
+            self.status_var.set(
+                f"Canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
+                "this may be slow.")
+        if density_changed:
+            self._confirm_stale_stl_sources()
 
     def _on_canvas_shape_changed(self, *_):
         """Shared tail once canvas pixel shape and/or every source's
         placement has already been reconciled with whatever just changed
-        (Width/Height via _on_canvas_size_changed, Precision via
-        _on_precision_changed) -- both already gated the change itself on
-        _confirm_canvas_shape, so by the time we get here a huge canvas is
-        something the user explicitly chose to proceed with. Note it in the
-        status line, then treat this as a structural change like add/remove
-        -- invalidate caches and recomposite every source onto the new grid."""
-        W, H = self._canvas_shape_px()
-        if W * H > self._MAX_CANVAS_PX:
-            self.status_var.set(
-                f"Canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
-                "this may be slow.")
+        (Width/Height via _on_canvas_size_changed, Min. px/mm/Max
+        Megapixels via their own handlers, a new source via import) -- all
+        of them already gated the change itself on _confirm_canvas_shape,
+        so by the time we get here a huge canvas is something the user
+        explicitly chose to proceed with. Settle the auto-resolution, then
+        treat this as a structural change like add/remove -- invalidate
+        caches and recomposite every source onto the new grid so the
+        change is visible immediately."""
+        self._settle_auto_resolution()
         self._on_layers_structure_changed()
 
-    def _confirm_canvas_shape(self, width_mm, height_mm, precision_mm):
-        """Ask before committing to a Width/Height/Precision combination
-        that would make the canvas huge -- W*H drives every per-pixel pass
-        (compositing, rasterizing, toolpath generation), so a multi-hundred-
-        megapixel canvas doesn't error out, it just makes the app sit there
-        looking hung for however long that pass takes. A status-line
-        warning printed *after* the shape already changed doesn't help,
-        since by the time it's on screen the expensive work triggered by
-        that same change is already queued -- the gate has to sit in front
-        of the change, not after it."""
-        if precision_mm <= 1e-9:
-            precision_mm = float(DEFAULTS["precision_mm"])
-        W = max(2, round(width_mm / precision_mm))
-        H = max(2, round(height_mm / precision_mm))
-        if W * H <= self._MAX_CANVAS_PX:
+    def _confirm_canvas_shape(self, width_mm, height_mm, density, max_mp=None):
+        """Ask before committing to a Width/Height/Min.-px/mm/Max-Megapixels
+        combination whose Min. px/mm floor alone -- ignoring any bitmap --
+        would already exceed the Max Megapixels ceiling for this physical
+        size. W*H drives every per-pixel pass (compositing, rasterizing,
+        toolpath generation), so a multi-hundred-megapixel canvas doesn't
+        error out, it just makes the app sit there looking hung for however
+        long that pass takes. A status-line warning printed *after* the
+        shape already changed doesn't help, since by the time it's on
+        screen the expensive work triggered by that same change is already
+        queued -- the gate has to sit in front of the change, not after
+        it."""
+        if max_mp is None:
+            try:
+                max_mp = float(self.max_megapixels.get())
+            except ValueError:
+                max_mp = float(DEFAULTS["max_megapixels"])
+        if density <= 1e-9:
+            density = float(DEFAULTS["min_px_per_mm"])
+        W = max(2, round(width_mm * density))
+        H = max(2, round(height_mm * density))
+        if W * H <= max_mp * 1e6:
             return True
         return messagebox.askyesno(
             "Large canvas",
@@ -481,27 +586,27 @@ class GCodeGeneratorApp:
             "Proceed anyway?")
 
     def _on_canvas_size_changed(self, *_):
-        """Width/Height changed. The canvas's pixel *density* is set solely
-        by Precision (_canvas_shape_px's W/width_mm ratio is always
-        ~1/Precision, independent of width_mm) -- but its *extent* just
-        changed, and every source's placement (Scale-%, Offset X/Y) is
-        stored either in raw pixel-space terms or in absolute mm, neither
-        of which moves with the canvas's own size. Left alone, resizing the
-        board would silently shrink/grow every source's size and position
-        RELATIVE TO THE CANVAS, discarding a layout the user already tuned
-        by hand. Rescale every source's Offset X/Y and Scale-% by the ratio
-        each canvas dimension changed by, so the whole composition simply
-        scales together with the board -- the user's relative layout
-        survives a Width/Height edit untouched; only the absolute physical
-        size of the whole carving changes."""
+        """Width/Height changed. Scale-% is canvas-size-relative (see
+        layers._affine_params), so every source's physical footprint
+        already survives a Width/Height edit on its own -- nothing to
+        rescale there. Offset X/Y, however, is an absolute mm distance from
+        the canvas center, and the center's own position just moved, so
+        left alone the whole composition would drift relative to the
+        board. Rescale every source's Offset X/Y by the ratio each canvas
+        dimension changed by, so the user's relative layout survives
+        untouched; only the absolute physical size of the whole carving
+        changes."""
         try:
             new_width_mm  = float(self.width_mm.get())
             new_height_mm = float(self.height_mm.get())
         except ValueError:
             return
         if new_width_mm > 1e-9 and new_height_mm > 1e-9:
-            if not self._confirm_canvas_shape(new_width_mm, new_height_mm,
-                                               float(self.precision_mm.get())):
+            try:
+                floor_density = float(self.min_px_per_mm.get())
+            except ValueError:
+                floor_density = float(DEFAULTS["min_px_per_mm"])
+            if not self._confirm_canvas_shape(new_width_mm, new_height_mm, floor_density):
                 self.width_mm.set(str(self._last_width_mm))
                 self.height_mm.set(str(self._last_height_mm))
                 return
@@ -510,45 +615,57 @@ class GCodeGeneratorApp:
                     and (new_width_mm != old_width_mm or new_height_mm != old_height_mm)):
                 width_ratio  = new_width_mm / old_width_mm
                 height_ratio = new_height_mm / old_height_mm
-                # Scale-% is a single pixel-space factor shared by both axes
-                # (layers._affine_params has one 's', not sx/sy), so when
-                # width/height didn't change by the same ratio (aspect lock
-                # off), the geometric mean is the closest a uniform factor
-                # can get to matching both axes at once.
-                scale_ratio = float(np.sqrt(width_ratio * height_ratio))
                 for layer in self.layers:
                     layer.offset_x_mm *= width_ratio
                     layer.offset_y_mm *= height_ratio
-                    layer.scale_pct = min(1000.0, max(1.0, layer.scale_pct * scale_ratio))
             self._last_width_mm, self._last_height_mm = new_width_mm, new_height_mm
         self._on_canvas_shape_changed()
 
-    def _on_precision_changed(self, *_):
-        """Precision changed -- unlike Width/Height, this DOES change canvas
-        pixel density (1/Precision), and Scale-% is a pixel-space factor
-        (layers._affine_params' scale matrix has no mm/px_per_mm term at
-        all -- only the offset does), so a fixed Scale-% would otherwise
-        render at a different physical size purely because Precision moved.
-        Rescale every source's Scale-% by the same ratio the density
-        changed by, so each source's physical footprint on the stock --
-        the user's actual design decision -- survives untouched; only the
-        internal detail/resolution changes."""
+    def _on_min_px_per_mm_changed(self, *_):
+        """Min. px/mm changed -- since Scale-% is canvas-size-relative
+        (layers._affine_params), no source needs rescaling: physical
+        footprints never depended on pixel density to begin with. Just
+        re-gate against Max Megapixels and let the shared tail recompute
+        the (possibly auto-finer) density and re-resample."""
         try:
-            new_precision_mm = float(self.precision_mm.get())
+            new_floor = float(self.min_px_per_mm.get())
         except ValueError:
             return
-        if new_precision_mm > 1e-9:
+        if new_floor > 1e-9:
             if not self._confirm_canvas_shape(float(self.width_mm.get()),
                                                float(self.height_mm.get()),
-                                               new_precision_mm):
-                self.precision_mm.set(str(self._last_precision_mm))
+                                               new_floor):
+                self.min_px_per_mm.set(str(self._last_min_px_per_mm))
                 return
-            old_precision_mm = self._last_precision_mm
-            if old_precision_mm > 1e-9 and new_precision_mm != old_precision_mm:
-                ratio = old_precision_mm / new_precision_mm
-                for layer in self.layers:
-                    layer.scale_pct = min(1000.0, max(1.0, layer.scale_pct * ratio))
-            self._last_precision_mm = new_precision_mm
+            self._last_min_px_per_mm = new_floor
+        self._on_canvas_shape_changed()
+
+    def _on_max_megapixels_changed(self, *_):
+        """Max Megapixels changed -- tightening it can newly make the Min.
+        px/mm floor alone exceed the budget, so re-gate the same way Min.
+        px/mm itself does; loosening it can only ever relax the ceiling, so
+        the gate is a no-op in that direction."""
+        try:
+            new_max_mp = float(self.max_megapixels.get())
+        except ValueError:
+            return
+        if new_max_mp > 1e-9:
+            try:
+                floor_density = float(self.min_px_per_mm.get())
+            except ValueError:
+                floor_density = float(DEFAULTS["min_px_per_mm"])
+            if not self._confirm_canvas_shape(float(self.width_mm.get()),
+                                               float(self.height_mm.get()),
+                                               floor_density, max_mp=new_max_mp):
+                return
+        self._on_canvas_shape_changed()
+
+    def _recompute_auto_resolution(self):
+        """Compute-menu action: re-evaluate the auto-chosen canvas density
+        now, without waiting for the next explicit trigger. Needed because
+        dragging a source's own Scale-%/Offset deliberately does *not*
+        recompute (avoids recompositing on every slider nudge), so this is
+        the direct way back to an optimal density after such an edit."""
         self._on_canvas_shape_changed()
 
     # ------------------------------------------------------------------ #
@@ -1469,49 +1586,55 @@ class GCodeGeneratorApp:
                                 source_kind="image", path=path,
                                 layer_id=self._new_layer_id())
 
-    def _stl_raster_px(self, mesh_w_mm, mesh_h_mm, scale_pct=100.0):
+    def _stl_raster_px(self, mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct=100.0):
         """Target (width_px, height_px) for rasterizing an STL source of the
-        given (rotated) mesh bounding-box size at the canvas's current pixel
-        density (1/Precision, independent of Width/Height mm -- see
-        _canvas_shape_px), scaled up if the source will be enlarged on the
-        canvas (scale_pct > 100) so upscaling at composite time doesn't
-        blur mesh detail that could have been rasterized at higher
-        resolution to begin with. Bounds-independent so it can be reused
+        given (rotated) mesh bounding-box size, at the canvas's settled
+        density (_effective_px_per_mm) and the source's own canvas-relative
+        Scale-% (see layers._affine_params / _contain_footprint_mm) -- i.e.
+        rasterize at exactly the pixel resolution the mesh will actually be
+        displayed at, so enlarging it doesn't blur detail that could have
+        been baked in to begin with. Bounds-independent so it can be reused
         both at import time (fresh bounds) and to re-evaluate an already-
         rasterized source's staleness (stored mesh_w_mm/mesh_h_mm)."""
-        try:
-            precision_mm = float(self.precision_mm.get())
-        except ValueError:
-            precision_mm = float(DEFAULTS["precision_mm"])
-        if precision_mm <= 1e-9:
-            precision_mm = float(DEFAULTS["precision_mm"])
-        # canvas_footprint_px = width_px * (scale_pct/100) (see
-        # layers._affine_params), so matching the canvas's own density at
-        # the ENLARGED footprint means width_px must grow WITH scale_pct,
-        # not shrink -- detail_factor = scale_pct/100, not its reciprocal.
-        detail_factor = max(scale_pct, 1.0) / 100.0
-        width_px  = max(2, round(mesh_w_mm / precision_mm * detail_factor))
-        height_px = max(2, round(mesh_h_mm / precision_mm * detail_factor))
+        footprint_w_mm, footprint_h_mm = self._contain_footprint_mm(
+            mesh_w_mm / mesh_h_mm, width_mm, height_mm, scale_pct)
+        density = self._effective_px_per_mm()
+        width_px  = max(2, round(footprint_w_mm * density))
+        height_px = max(2, round(footprint_h_mm * density))
         return width_px, height_px
 
-    def _stl_raster_dims(self, xy_bounds, z_bounds, rot_x, rot_y, rot_z, scale_pct=100.0):
-        """Compute (width_px, height_px, mesh_w_mm, mesh_h_mm) for
-        rasterizing an STL source described by *xy_bounds*/*z_bounds* at
-        rotation (0,0,0), rotated by rot_x/rot_y/rot_z first."""
+    def _stl_raster_dims(self, xy_bounds, z_bounds, rot_x, rot_y, rot_z):
+        """(mesh_w_mm, mesh_h_mm) for an STL source described by
+        *xy_bounds*/*z_bounds* at rotation (0,0,0), rotated by rot_x/rot_y/
+        rot_z first."""
         (x_min, x_max, y_min, y_max), _ = stl_mesh.rotate_bounds(
             xy_bounds, z_bounds, rot_x, rot_y, rot_z)
         mesh_w_mm = max(x_max - x_min, 1e-6)
         mesh_h_mm = max(y_max - y_min, 1e-6)
-        width_px, height_px = self._stl_raster_px(mesh_w_mm, mesh_h_mm, scale_pct)
-        return width_px, height_px, mesh_w_mm, mesh_h_mm
+        return mesh_w_mm, mesh_h_mm
 
     def _build_stl_layer(self, path, triangles, dlg, xy_bounds, z_bounds):
         """Rasterize *triangles* (already validated/loaded) per *dlg*'s
-        orientation at the canvas's current density and wrap the result as
-        a new (unattached) Layer, or show an error dialog and return None
-        on failure."""
-        width_px, height_px, mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
+        orientation and wrap the result as a new (unattached) Layer, or
+        show an error dialog and return None on failure. The new layer's
+        Scale-% is set so its footprint reproduces the mesh's true physical
+        size by default (matching the "populate from mesh bounding box"
+        intent) -- computed directly from the mesh's own mm bounding box
+        and the canvas's current physical Width/Height, independent of
+        canvas pixel density, so it's correct even before rasterizing."""
+        mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
             xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+        if mesh_w_mm / mesh_h_mm >= width_mm / max(height_mm, 1e-9):
+            scale_pct = 100.0 * mesh_w_mm / max(width_mm, 1e-9)
+        else:
+            scale_pct = 100.0 * mesh_h_mm / max(height_mm, 1e-9)
+        width_px, height_px = self._stl_raster_px(
+            mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct)
         try:
             rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
             raw     = stl_mesh.generate_heightmap(rotated, width_px, height_px)
@@ -1524,6 +1647,7 @@ class GCodeGeneratorApp:
                       'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y, 'rot_z': dlg.rot_z}
         return layers_mod.Layer(name=os.path.basename(path), raw=image, alpha=alpha,
                                 source_kind="stl", path=path, stl_params=stl_params,
+                                scale_pct=scale_pct,
                                 layer_id=self._new_layer_id())
 
     def _establish_base_image_layer(self, path):
@@ -1545,10 +1669,10 @@ class GCodeGeneratorApp:
             self._image_aspect = w / h
             self._recalc_height()
         # Recalc first (when aspect-locked) so the canvas already matches
-        # the image's own aspect ratio -- fit-to-canvas then lands on
-        # scale_x == scale_y, i.e. the image exactly fills the canvas
-        # rather than being letterboxed against a stale height.
-        layer.scale_pct = self._fit_scale_pct(w, h)
+        # the image's own aspect ratio -- the layer's Scale-% default
+        # (100%, i.e. exactly fills the canvas -- see
+        # layers._affine_params) then lands on scale_x == scale_y, rather
+        # than being letterboxed against a stale height.
         self.layers = [layer]
         # Fresh single-source project: every step now has exactly one
         # (visible) source, regardless of whatever the old stack's
@@ -1748,8 +1872,6 @@ class GCodeGeneratorApp:
         layer = self._load_image_layer(path)
         if layer is None:
             return
-        h, w = layer.raw.shape
-        layer.scale_pct = self._fit_scale_pct(w, h)
         insert_at = max(0, min(insert_at, len(self.layers)))
         self.layers.insert(insert_at, layer)
         for s in self.steps:
@@ -1884,15 +2006,20 @@ class GCodeGeneratorApp:
         self._finish_stl_import(path, triangles, dlg, xy_bounds, z_bounds)
 
     def _finish_stl_import(self, path, triangles, dlg, xy_bounds, z_bounds):
-        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
-        if layer is None:
-            return
-
-        # self.layers is assigned last (see the matching note in
+        # Width/Height must land at their FINAL values before
+        # _build_stl_layer runs: its default Scale-% reproduces the mesh's
+        # true physical size by comparing the mesh's own bounding box
+        # against the *current* Width/Height (see there), so if this import
+        # is about to change Width/Height (populate_physical) or Height
+        # alone (aspect-locked recalc), that has to happen first, or the
+        # comparison is made against the stale, about-to-be-replaced size
+        # and Scale-% ends up wrong (only 100% by coincidence).
+        #
+        # self.layers is still assigned last (see the matching note in
         # _establish_base_image_layer): the width_mm/height_mm.set() calls
         # below cascade through _on_canvas_size_changed, which must not
-        # rescale THIS brand-new, not-yet-placed layer.
-        h, w = layer.raw.shape
+        # rescale THIS brand-new, not-yet-placed layer -- _build_stl_layer
+        # only returns an unattached Layer, it doesn't touch self.layers.
         if dlg.populate_physical:
             rotated_xy, rotated_z = stl_mesh.rotate_bounds(
                 xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
@@ -1908,15 +2035,21 @@ class GCodeGeneratorApp:
             # self.layers[0], which is still the *previous* project's layer
             # at this point.)
             self._aspect_lock_var.set(True)
-            self._image_aspect = w / h
+            self._image_aspect = (x_max - x_min) / max(y_max - y_min, 1e-9)
 
             self.width_mm.set(f"{width_mm:.4f}")
             self.height_mm.set(f"{height_mm:.4f}")
             self.max_depth.set(f"{max_depth_mm:.4f}")
-        else:
-            if self._aspect_lock_var.get():
-                self._image_aspect = w / h
-                self._recalc_height()
+        elif self._aspect_lock_var.get():
+            mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
+                xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            self._image_aspect = mesh_w_mm / mesh_h_mm
+            self._recalc_height()
+
+        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
+        if layer is None:
+            return
+        h, w = layer.raw.shape
 
         self.layers = [layer]
         # Fresh single-source project: every step now has exactly one
@@ -2218,11 +2351,15 @@ class GCodeGeneratorApp:
                 rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
                 raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
                 image, alpha = stl_mesh.normalize_and_orient(raw)
+                new_stl_params = {'width_px': width_px, 'height_px': height_px,
+                                  'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z}
+                if 'mesh_w_mm' in stl_params and 'mesh_h_mm' in stl_params:
+                    new_stl_params['mesh_w_mm'] = stl_params['mesh_w_mm']
+                    new_stl_params['mesh_h_mm'] = stl_params['mesh_h_mm']
                 layer = layers_mod.Layer(
                     name=d.get('name') or os.path.basename(resolved), raw=image, alpha=alpha,
                     source_kind='stl', path=resolved,
-                    stl_params={'width_px': width_px, 'height_px': height_px,
-                                'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z},
+                    stl_params=new_stl_params,
                     layer_id=self._new_layer_id())
             else:
                 raw = mpimg.imread(resolved)
@@ -2261,7 +2398,8 @@ class GCodeGeneratorApp:
             'global': {
                 'width_mm':        self.width_mm.get(),
                 'height_mm':       self.height_mm.get(),
-                'precision_mm':    self.precision_mm.get(),
+                'min_px_per_mm':   self.min_px_per_mm.get(),
+                'max_megapixels':  self.max_megapixels.get(),
                 'max_depth':       self.max_depth.get(),
                 'margin_mm':       self.margin_mm.get(),
                 'margin_depth_pct': self.margin_depth_pct.get(),
@@ -2314,7 +2452,8 @@ class GCodeGeneratorApp:
         self._aspect_lock_var.set(True)
         self.width_mm.set(DEFAULTS['width_mm'])
         self.height_mm.set(DEFAULTS['height_mm'])
-        self.precision_mm.set(DEFAULTS['precision_mm'])
+        self.min_px_per_mm.set(DEFAULTS['min_px_per_mm'])
+        self.max_megapixels.set(DEFAULTS['max_megapixels'])
         self.max_depth.set(DEFAULTS['max_depth'])
         self.margin_mm.set(DEFAULTS['margin_mm'])
         self.margin_depth_pct.set(DEFAULTS['margin_depth_pct'])
@@ -2333,6 +2472,11 @@ class GCodeGeneratorApp:
         self._apply_step_dict(self.steps[0], {})
 
         self.layers         = []
+        self._last_width_mm  = float(DEFAULTS['width_mm'])
+        self._last_height_mm = float(DEFAULTS['height_mm'])
+        self._last_min_px_per_mm = float(DEFAULTS['min_px_per_mm'])
+        self._last_effective_px_per_mm = float(DEFAULTS['min_px_per_mm'])
+        self.effective_resolution_var.set("—")
         self.current_image  = None
         self._image_aspect  = None
         self.n_grey_levels  = 256
@@ -2372,7 +2516,7 @@ class GCodeGeneratorApp:
             d['path_rel'] = self._make_rel_path(layer.path, path)
             layers_out.append(d)
         project = {
-            'version': 3,
+            'version': 4,
             'layers': layers_out,
             'canvas': snapshot['canvas'],
             'global': snapshot['global'],
@@ -2404,7 +2548,7 @@ class GCodeGeneratorApp:
             return
 
         version = project.get('version', 1)
-        if version not in (1, 2, 3):
+        if version not in (1, 2, 3, 4):
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
@@ -2417,21 +2561,32 @@ class GCodeGeneratorApp:
         self._aspect_lock_var.set(bool(g.get('aspect_locked', True)))
         self.width_mm.set(g.get('width_mm', DEFAULTS['width_mm']))
         self.height_mm.set(g.get('height_mm', DEFAULTS['height_mm']))
-        precision_mm = g.get('precision_mm')
-        if precision_mm is None:
-            # Pre-v3 project: derive an equivalent Precision from the old
-            # base-layer-defined canvas resolution so re-opening reproduces
-            # close to the same effective detail before the user adjusts it.
+        min_px_per_mm = g.get('min_px_per_mm')
+        if min_px_per_mm is None:
+            # Pre-v4 project: no Min. px/mm field existed yet -- derive an
+            # equivalent floor from the old fixed Precision (mm/px, the
+            # exact density every source was rasterized/placed against), or
+            # if even that predates v3, from the old base-layer-defined
+            # canvas resolution, so re-opening reproduces close to the same
+            # effective detail before the user adjusts it.
+            legacy_precision_mm = g.get('precision_mm')
+            try:
+                if legacy_precision_mm is not None and float(legacy_precision_mm) > 1e-9:
+                    min_px_per_mm = 1.0 / float(legacy_precision_mm)
+            except (TypeError, ValueError):
+                pass
+        if min_px_per_mm is None:
             try:
                 width_mm_val = float(g.get('width_mm', DEFAULTS['width_mm']))
             except (TypeError, ValueError):
                 width_mm_val = float(DEFAULTS['width_mm'])
             saved_width_px = c.get('width_px')
-            if saved_width_px:
-                precision_mm = width_mm_val / saved_width_px
+            if saved_width_px and width_mm_val > 1e-9:
+                min_px_per_mm = saved_width_px / width_mm_val
             else:
-                precision_mm = DEFAULTS['precision_mm']
-        self.precision_mm.set(str(precision_mm))
+                min_px_per_mm = DEFAULTS['min_px_per_mm']
+        self.min_px_per_mm.set(str(min_px_per_mm))
+        self.max_megapixels.set(g.get('max_megapixels', DEFAULTS['max_megapixels']))
         self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
         self.margin_mm.set(g.get('margin_mm', DEFAULTS['margin_mm']))
         self.margin_depth_pct.set(g.get('margin_depth_pct', DEFAULTS['margin_depth_pct']))
@@ -2474,13 +2629,25 @@ class GCodeGeneratorApp:
             self._apply_step_dict(step, d)
 
         # ── Layers (version 2+) ───────────────────────────────────────────
-        if version in (2, 3) and 'layers' in project:
+        if version in (2, 3, 4) and 'layers' in project:
             layer_dicts = project.get('layers') or []
             resolved_layers = []
             failed = []
+            saved_w_px, saved_h_px = c.get('width_px'), c.get('height_px')
             for d in layer_dicts:
                 layer = self._layer_from_dict(d, path)
                 if layer is not None:
+                    if version < 4 and saved_w_px and saved_h_px:
+                        # Pre-v4 project: scale_pct was pixel-space (1
+                        # native px = 1 canvas px at 100%, see the old
+                        # layers._affine_params), not canvas-size-relative
+                        # -- convert in place using the canvas pixel grid
+                        # this project was saved at, so every source keeps
+                        # its previous on-screen size and position exactly.
+                        H_l, W_l = layer.raw.shape
+                        fit_ratio = min(saved_w_px / W_l, saved_h_px / H_l)
+                        if fit_ratio > 1e-9:
+                            layer.scale_pct = layer.scale_pct / fit_ratio
                     resolved_layers.append(layer)
                 else:
                     failed.append(d.get('name') or d.get('path') or d.get('path_rel') or "?")
@@ -2492,6 +2659,21 @@ class GCodeGeneratorApp:
                 self._image_aspect = w / h
                 self._recalc_height()
             self._on_layers_structure_changed()
+            # Settle the density readout/cache against the now-final layer
+            # set without treating the load itself as an auto-resolution
+            # trigger -- no proactive STL-staleness prompt on every open;
+            # that check still runs lazily at the next Compute Step.
+            try:
+                width_mm_now  = float(self.width_mm.get())
+                height_mm_now = float(self.height_mm.get())
+            except ValueError:
+                width_mm_now  = float(DEFAULTS['width_mm'])
+                height_mm_now = float(DEFAULTS['height_mm'])
+            density = self._auto_px_per_mm(width_mm_now, height_mm_now)
+            self._last_effective_px_per_mm = density
+            W_disp = max(2, round(width_mm_now * density))
+            H_disp = max(2, round(height_mm_now * density))
+            self.effective_resolution_var.set(f"{W_disp}x{H_disp} px  ({density:.3g} px/mm)")
             if failed:
                 messagebox.showwarning(
                     "Source Load Warning",
@@ -2928,9 +3110,14 @@ class GCodeGeneratorApp:
 
     def _stale_stl_sources(self):
         """STL sources whose rasterized detail no longer matches what the
-        canvas's current Precision and the source's own Scale call for --
-        e.g. Precision was tightened, or Scale was increased, since the
-        source was last (re)rasterized from its mesh."""
+        canvas's current density and the source's own Scale-% call for --
+        e.g. Min. px/mm/Max Megapixels changed, or Scale was increased,
+        since the source was last (re)rasterized from its mesh."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
         stale = []
         for layer in self.layers:
             if layer.source_kind != 'stl' or not layer.stl_params:
@@ -2940,7 +3127,7 @@ class GCodeGeneratorApp:
             if mesh_w_mm is None or mesh_h_mm is None:
                 continue   # legacy project file predates this bookkeeping
             target_w, target_h = self._stl_raster_px(
-                mesh_w_mm, mesh_h_mm, scale_pct=layer.scale_pct)
+                mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct=layer.scale_pct)
             cur_w = layer.stl_params.get('width_px', target_w)
             cur_h = layer.stl_params.get('height_px', target_h)
             if (abs(target_w - cur_w) > 0.05 * max(target_w, 1)
@@ -2990,6 +3177,11 @@ class GCodeGeneratorApp:
             messagebox.showinfo("No image", "Please open an image first.")
             return
 
+        # Compute Step is an explicit auto-resolution trigger too, so a
+        # step is never computed against a density gone stale purely
+        # because a source's Scale-% was dragged since the last of the
+        # other triggers -- see _settle_auto_resolution.
+        self._settle_auto_resolution()
         if not self._confirm_stale_stl_sources():
             return
 

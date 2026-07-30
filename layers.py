@@ -129,12 +129,22 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
     mm so placement survives a change of canvas resolution — before landing
     on the canvas relative to the canvas center. Row axis points down, so Y
     (physical, +up) is negated against the row axis throughout.
+
+    scale_pct is canvas-size-relative, not pixel-for-pixel: at 100%, the
+    layer's own aspect ratio is inscribed in the canvas rectangle
+    (aspect-preserving "contain"), independent of the layer's native pixel
+    count or the canvas's pixel density -- so a source's on-stock physical
+    size only depends on scale_pct and the canvas's physical Width/Height,
+    never on canvas resolution. fit_ratio (canvas px per layer-native px at
+    scale_pct=100, along whichever axis the layer's aspect ratio binds)
+    converts that into the pixel-space factor the matrix below needs.
     """
     import math
 
     H, W = canvas_shape
     H_l, W_l = layer.raw.shape
-    s = max(layer.scale_pct, 1e-6) / 100.0
+    fit_ratio = min(W / W_l, H / H_l)
+    s = fit_ratio * max(layer.scale_pct, 1e-6) / 100.0
     theta = math.radians(layer.rotation_deg)
     cos_t, sin_t = math.cos(theta), math.sin(theta)
 

@@ -291,7 +291,7 @@ class LabeledEntry(ttk.Frame):
         # update both vars in lockstep rather than waiting for a commit
         # event that will never come (nothing is focused/being typed into).
         # Still re-clamped like a typed commit: a value loaded from an old
-        # or hand-edited project file (e.g. a stray precision_mm: 0) is no
+        # or hand-edited project file (e.g. a stray min_px_per_mm: 0) is no
         # more trustworthy than something typed into the box.
         clamped = self._clamped(value)
         if clamped is None:

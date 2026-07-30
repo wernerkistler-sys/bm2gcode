@@ -47,8 +47,10 @@ The Canvas tab is the notebook's permanent first tab, above the source tabs. Its
 
 | Parameter | Description |
 |---|---|
-| Width / Height | Physical size of the carving area, in mm. The **Lock** checkbox next to Height maintains the current aspect ratio when either field changes; uncheck it to set width and height independently. Changing Width/Height rescales every source's offset and scale so the composed layout is preserved, and warns first if the resulting pixel grid would be very large. |
-| Precision | The internal pixel density of the canvas's working depth-map grid, in mm per pixel — independent of Width/Height and of any source's own native resolution. Smaller values produce a finer, denser grid (more pixels, more detail, slower); larger values a coarser one. Also used as the target resolution when rasterizing an STL source. Changing Precision rescales every source's Scale so each source's physical footprint on the stock stays the same even though pixel density changed. |
+| Width / Height | Physical size of the carving area, in mm. The **Lock** checkbox next to Height maintains the current aspect ratio when either field changes; uncheck it to set width and height independently. Changing Width/Height rescales every source's offset so the composed layout is preserved (Scale needs no rescaling — see Scale below), and warns first if the resulting pixel grid would be very large. |
+| Min. px/mm | The floor on the canvas's working depth-map grid density. If no image source is present (an STL-only or empty canvas), this is the grid density, exactly. If one or more image sources are present, the canvas may automatically use a *finer* density — up to whatever the highest-resolution visible image actually offers, bounded by Max Megapixels — so imported detail isn't thrown away; it never goes coarser than this floor. See **Effective resolution** below for what was actually chosen. |
+| Max Megapixels | Upper bound on the canvas's total pixel count (Width × Height at the chosen density), so a high-resolution image (or a small physical canvas) can't blow the working grid up indefinitely. Applies whether or not an image source is present — if Min. px/mm alone would already exceed it for the current Width/Height, you're asked to confirm before proceeding. |
+| Effective resolution | Read-only: the pixel grid size and density the canvas actually settled on, between the Min. px/mm floor and the Max Megapixels ceiling. Recomputed when a source is added, when Width/Height/Min. px/mm/Max Megapixels change, via **Compute → Recompute Canvas Resolution**, or automatically before each Compute Step — not continuously while dragging a source's Scale/Offset. |
 | Max cut depth | Maximum cut depth in mm. The pixel representing full depth (black when z=0 colour = "white", white when z=0 colour = "black") is carved to this depth. |
 | Stock margin | Flat uncarved border around the canvas, in mm. |
 | Margin depth | How deep to cut the stock margin, as a percentage of Max cut depth. |
@@ -68,7 +70,7 @@ Each source — an opened image or imported STL — gets its own tab in the note
 |---|---|
 | Offset X / Offset Y | Position relative to the canvas center, in mm. +X is right, +Y is up. |
 | Rotation | Counter-clockwise rotation, in degrees. |
-| Scale | Size as a percentage of the source's native resolution mapped onto the canvas grid. |
+| Scale | Size as a percentage of the canvas's own physical size, aspect-preserving: at 100%, the source is inscribed in the canvas rectangle along whichever of its own axes binds ("contain"), independent of the source's native resolution or the canvas's pixel density. An STL source's default Scale reproduces the mesh's true physical size (see [Import STL](#import-stl)). |
 | Blend mode | How this source combines with everything beneath it — see below. The bottom-most source in the stack always reads "Replace (base source)" and can't be changed, since there's nothing under it to blend with. |
 | Opacity | How strongly this source's blended result replaces what's beneath it, as a percentage; 0 hides it. |
 | Min depth / Max depth | Remaps this source's black/white pixels into a depth range, each a percentage of the canvas's Max cut depth: white maps to Min depth and black to Max depth. Setting Max depth below Min depth flips the source's polarity. |
@@ -302,7 +304,7 @@ New Project, Open Project…, and Exit all check for unsaved changes first: if t
 | Rotate around X / Y / Z axis | Rotates the mesh by 0°, 90°, 180°, or 270° around each axis before rasterizing, applied in X → Y → Z order. A 90°/270° rotation around X or Y turns a *side* of the mesh into the top-down view, so a side profile can become the depth map, not just the mesh's native top or bottom face. |
 | Set width/height/max depth from mesh bounding box | Shown only when this STL is establishing the canvas's base source. When checked (the default), populates the Canvas tab's Width, Height, and Max cut depth from the rotated mesh's bounding box, assumed to be in millimeters — the common STL convention — and locks the aspect ratio. A live preview shows the resulting physical size as the rotation changes. |
 
-The rasterization resolution itself isn't chosen in this dialog — it follows automatically from the canvas's Precision setting and the source's own Scale.
+The rasterization resolution itself isn't chosen in this dialog — it follows automatically from the canvas's effective resolution (see Min. px/mm / Max Megapixels on the Canvas tab) and the source's own Scale, which defaults to reproducing the mesh's true physical size.
 
 Adding an STL as an additional source (via a source tab's or the Canvas tab's **Add Source** button, rather than as the very first/base source) shows the same dialog without the Physical Size section, since a non-base source must never resize the canvas.
 
@@ -370,6 +372,8 @@ This section describes how each algorithm works internally — the pipeline stag
 ### Core Concepts
 
 **Depth map.** Each source is converted to a float32 grayscale array and resampled onto the canvas's pixel grid according to its Offset, Rotation, and Scale. The visible sources for a given step (see [Per-step source visibility](#per-step-source-visibility)) are then composited bottom-to-top — using each source's Blend mode, Opacity, and Min/Max depth remap — into a single depth map for that step, where each pixel value is the desired cut depth as a fraction of Max cut depth (0 = surface, 1 = full depth). The z=0 colour setting controls overall polarity; canvas pixels not covered by any source get the Background depth.
+
+**Canvas resolution.** The canvas's pixel grid density is chosen automatically between the Min. px/mm floor and the Max Megapixels ceiling (Canvas tab): with no image source present it's exactly the floor; with one or more image sources present, it's the finest of their own native px/mm (each image's native pixel count relative to the physical footprint its Scale gives it), still bounded by the floor and ceiling. This is only re-evaluated at explicit points — adding a source, editing Width/Height/Min. px/mm/Max Megapixels, **Compute → Recompute Canvas Resolution**, or automatically just before a Compute Step runs — never live while dragging a source's own Scale/Offset. An STL source's rasterization resolution follows the same settled density.
 
 **Tool accessibility (morphological opening).** Before path planning, bm2gcode computes where the tool can physically reach. Grey-erosion of the depth map with a tool-shaped kernel gives the maximum depth achievable with the tool centred at each pixel. A subsequent grey-dilation recovers the reachable depth at each material point — because the tool can be centred nearby rather than directly above. Together these form a morphological opening and are the basis for all gating modes. The kernel shape depends on the tool profile:
 
