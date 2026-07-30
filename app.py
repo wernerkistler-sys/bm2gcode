@@ -1354,6 +1354,8 @@ class GCodeGeneratorApp:
         min_fw.committed_var.trace_add("write", _on_mask_param_changed)
         max_fw.committed_var.trace_add("write", _on_mask_param_changed)
         gating_var.trace_add("write", _on_mask_param_changed)
+        cutout_extra_offset.committed_var.trace_add("write", _on_mask_param_changed)
+        pocket_boundary_offset.committed_var.trace_add("write", _on_mask_param_changed)
 
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
