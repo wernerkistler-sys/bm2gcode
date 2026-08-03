@@ -32,7 +32,7 @@ from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
-    DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
+    DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
     DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
@@ -165,11 +165,12 @@ class GCodeGeneratorApp:
             (DISPLAY_ORIGINAL,          "1"),
             (DISPLAY_STEP_3D,           "2"),
             (DISPLAY_STEP_RESULT,       "3"),
-            (DISPLAY_STEP_RES,          "4"),
-            (DISPLAY_STEP_UNACCESSIBLE, "5"),
-            (DISPLAY_DIFF_RES_UNCUT,     "6"),
-            (DISPLAY_DIFF_UNCUT_UNCUT,  "7"),
-            (DISPLAY_PROC_MASK,         "8"),
+            (DISPLAY_STEP_SHADED,       "4"),
+            (DISPLAY_STEP_RES,          "5"),
+            (DISPLAY_STEP_UNACCESSIBLE, "6"),
+            (DISPLAY_DIFF_RES_UNCUT,     "7"),
+            (DISPLAY_DIFF_UNCUT_UNCUT,  "8"),
+            (DISPLAY_PROC_MASK,         "9"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -3550,7 +3551,7 @@ class GCodeGeneratorApp:
             m for m in DISPLAY_MODES
             if not (m == DISPLAY_PROC_MASK  and not has_step)
             and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
-            and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
+            and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
             and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
                 has_accessible
@@ -3586,6 +3587,31 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
+    def _hillshade_result(self, result, step_idx):
+        """RGBA hillshade of a step's result depth map, with vertical
+        exaggeration auto-scaled from max cut depth vs. canvas footprint --
+        real-world relief carving is typically only a few mm deep on a
+        canvas tens of cm wide, so true-to-scale shading would look flat.
+        """
+        try:
+            step   = self.steps[step_idx] if 0 <= step_idx < len(self.steps) else None
+            params = self._gather_step_params(step) if step is not None else None
+            max_depth     = params['max_depth']     if params is not None else float(self.max_depth.get())
+            eff_width_mm  = params['eff_width_mm']  if params is not None else float(self.width_mm.get())
+            eff_height_mm = params['eff_height_mm'] if params is not None else float(self.height_mm.get())
+        except (ValueError, KeyError, ZeroDivisionError, AttributeError):
+            max_depth, eff_width_mm, eff_height_mm = 5.0, float(self.width_mm.get()), float(self.height_mm.get())
+
+        H, W = result.shape
+        elevation_mm = (1.0 - result) * max_depth   # 0 = deepest cut, max_depth = uncut top surface
+        dx = eff_width_mm  / W
+        dy = eff_height_mm / H
+        span_mm = min(eff_width_mm, eff_height_mm)
+        vert_exag = float(np.clip(span_mm * 0.15 / max_depth, 1.0, 50.0)) if max_depth > 0 else 1.0
+
+        ls = mcolors.LightSource(azdeg=315, altdeg=45)
+        return ls.shade(elevation_mm, cmap=plt.cm.copper, dx=dx, dy=dy, vert_exag=vert_exag)
+
     def _pad_image(self, img):
         """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
         try:
@@ -3852,6 +3878,10 @@ class GCodeGeneratorApp:
         img_alpha = None   # per-pixel matplotlib alpha array; set only when
                            # the displayed ToolPath flags physically-removed
                            # (cut-through) pixels -- see DISPLAY_STEP_RESULT
+        display_data = None  # overrides `img` at imshow-time only (e.g. an
+                             # RGBA hillshade); self._displayed_array, the
+                             # mouse-Z readout, and _overlay_toolpath_2d's
+                             # shape lookup keep using the scalar `img`
 
         if mode == DISPLAY_STEP_RES:
             tp = (self.toolpaths[step_idx]
@@ -3888,6 +3918,19 @@ class GCodeGeneratorApp:
                 # (set below, at the imshow call) shows through instead.
                 if tp.alpha is not None:
                     img_alpha = tp.alpha
+            else:
+                mode  = DISPLAY_ORIGINAL   # fall through to original
+
+        elif mode == DISPLAY_STEP_SHADED:
+            tp = (self.toolpaths[step_idx]
+                  if 0 <= step_idx < len(self.toolpaths) else None)
+            if tp is not None and tp.result is not None:
+                img   = tp.result
+                cmap  = None   # unused -- display_data below is already RGBA
+                title = f"Step {step_idx + 1} Shaded"
+                if tp.alpha is not None:
+                    img_alpha = tp.alpha
+                display_data = self._hillshade_result(tp.result, step_idx)
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
@@ -4065,12 +4108,15 @@ class GCodeGeneratorApp:
             else:
                 mode = DISPLAY_ORIGINAL
 
-        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
+        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
                         DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
             img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
+
+        if display_data is None:
+            display_data = img
 
         saved_xlim = self._view_xlim
         saved_ylim = self._view_ylim
@@ -4087,7 +4133,7 @@ class GCodeGeneratorApp:
         # this, a hole always showed the figure's plain dark background
         # instead of the intended highlight colour.
         self.fig.patch.set_facecolor(hole_color)
-        self.ax.imshow(img, interpolation="none", aspect="equal",
+        self.ax.imshow(display_data, interpolation="none", aspect="equal",
                        cmap=cmap, vmin=vmin, vmax=vmax, alpha=img_alpha)
         self._overlay_toolpath_2d(img, step_idx)
         self.ax.axis("off")
