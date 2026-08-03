@@ -2634,63 +2634,61 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         # alongside the skeleton to also clear mask regions wider than the
         # tool's cone can reach in a single skeleton pass —
         # reusing compute_contour_toolpath's extraction/ordering helpers.
-        contour_segs = []
-        if stepdown_mm < max_depth:
-            from math import radians, tan
-            tan_half   = tan(radians(tool.vbit_angle_deg / 2.0))
-            synth_diam = 2.0 * max_depth * tan_half * (1.0 + 1e-6)
+        from math import radians, tan
+        tan_half   = tan(radians(tool.vbit_angle_deg / 2.0))
+        synth_diam = 2.0 * max_depth * tan_half * (1.0 + 1e-6)
 
-            # The deep contour rings need an achievable-depth surface that
-            # always tapers to a point at max_depth (see
-            # _find_compatible_vbit_erosion's docstring) — build it with an
-            # idealized, "just large enough" V-bit rather than the real
-            # tool, reusing any compatible cached erosion first since it can
-            # be expensive to recompute.
-            center_depth_contour_synth = _find_compatible_vbit_erosion(
-                erosion_cache, erosion_cache_key, synth_diam)
-            if center_depth_contour_synth is None:
-                synth_tool = dataclasses.replace(tool, diameter_mm=synth_diam)
-                kernel_synth, footprint_synth = _build_kernel(
-                    synth_tool, px_per_mm, max_depth)
-                kernel_synth_plan, footprint_synth_plan = _planning_kernel(
-                    synth_tool, px_per_mm, max_depth, extra_offset_mm,
-                    kernel_synth, footprint_synth)
-                center_depth_contour_synth = grey_erosion(
-                    depth_map.astype(np.float64),
-                    footprint=footprint_synth_plan,
-                    structure=-kernel_synth_plan.astype(np.float64),
-                ).astype(np.float32)
-                center_depth_contour_synth = np.clip(center_depth_contour_synth, 0.0, 1.0)
-                if erosion_cache is not None and erosion_cache_key is not None:
-                    synth_key = (tool.profile, synth_diam, *erosion_cache_key[2:])
-                    erosion_cache[synth_key] = (center_depth_contour_synth,
-                                                 center_depth_contour_synth)
+        # The deep contour rings need an achievable-depth surface that
+        # always tapers to a point at max_depth (see
+        # _find_compatible_vbit_erosion's docstring) — build it with an
+        # idealized, "just large enough" V-bit rather than the real
+        # tool, reusing any compatible cached erosion first since it can
+        # be expensive to recompute.
+        center_depth_contour_synth = _find_compatible_vbit_erosion(
+            erosion_cache, erosion_cache_key, synth_diam)
+        if center_depth_contour_synth is None:
+            synth_tool = dataclasses.replace(tool, diameter_mm=synth_diam)
+            kernel_synth, footprint_synth = _build_kernel(
+                synth_tool, px_per_mm, max_depth)
+            kernel_synth_plan, footprint_synth_plan = _planning_kernel(
+                synth_tool, px_per_mm, max_depth, extra_offset_mm,
+                kernel_synth, footprint_synth)
+            center_depth_contour_synth = grey_erosion(
+                depth_map.astype(np.float64),
+                footprint=footprint_synth_plan,
+                structure=-kernel_synth_plan.astype(np.float64),
+            ).astype(np.float32)
+            center_depth_contour_synth = np.clip(center_depth_contour_synth, 0.0, 1.0)
+            if erosion_cache is not None and erosion_cache_key is not None:
+                synth_key = (tool.profile, synth_diam, *erosion_cache_key[2:])
+                erosion_cache[synth_key] = (center_depth_contour_synth,
+                                             center_depth_contour_synth)
 
-            if extra_offset_mm > 0.0:
-                # Mirror Stage 2b's vertical stock-to-leave adjustment,
-                # applied here regardless of whether the surface above came
-                # from cache or was just computed (cache always stores the
-                # pre-adjustment surface — see Stage 2b).
-                off_norm = extra_offset_mm / max_depth
-                center_depth_contour_synth = np.clip(
-                    center_depth_contour_synth - off_norm, 0.0, 1.0)
+        if extra_offset_mm > 0.0:
+            # Mirror Stage 2b's vertical stock-to-leave adjustment,
+            # applied here regardless of whether the surface above came
+            # from cache or was just computed (cache always stores the
+            # pre-adjustment surface — see Stage 2b).
+            off_norm = extra_offset_mm / max_depth
+            center_depth_contour_synth = np.clip(
+                center_depth_contour_synth - off_norm, 0.0, 1.0)
 
-            deep_levels_norm = [c / max_depth for c in
-                                 _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)]
-            all_z_contours = _extract_z_contours(
-                center_depth_contour_synth, deep_levels_norm, n_grey_levels,
-                cut_direction=cut_direction)
-            all_z_contours = _clip_contours_to_mask(all_z_contours, mask_vcarve)
-            contour_segs, _ = _order_contours_windowed(
-                all_z_contours, deep_levels_norm,
-                max_depth=max_depth, z_increment_mm=stepdown_mm,
-                max_step_down_mm=stepdown_mm,
-                px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
-                link_threshold_mm=tool.diameter_mm,
-                use_2opt=use_2opt,
-                lock_direction=cut_direction in ("Climb", "Conventional"),
-                current_pos=(0.0, 0.0),
-                progress=progress, progress_lo=80, progress_hi=88)
+        deep_levels_norm = [c / max_depth for c in
+                             _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)]
+        all_z_contours = _extract_z_contours(
+            center_depth_contour_synth, deep_levels_norm, n_grey_levels,
+            cut_direction=cut_direction)
+        all_z_contours = _clip_contours_to_mask(all_z_contours, mask_vcarve)
+        contour_segs, _ = _order_contours_windowed(
+            all_z_contours, deep_levels_norm,
+            max_depth=max_depth, z_increment_mm=stepdown_mm,
+            max_step_down_mm=stepdown_mm,
+            px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
+            link_threshold_mm=tool.diameter_mm,
+            use_2opt=use_2opt,
+            lock_direction=cut_direction in ("Climb", "Conventional"),
+            current_pos=(0.0, 0.0),
+            progress=progress, progress_lo=80, progress_hi=88)
 
         full_depth_segs = skeleton_segs + contour_segs
     else:
