@@ -2982,11 +2982,16 @@ def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb")
     # a flat step and the tool cuts air above the neighbouring deeper region.
     _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
 
-    # find_contours keeps uncut material consistently on the right of the
-    # direction of travel (see compute_raster_toolpath's cut_direction docs
-    # for the clockwise-spindle convention), so a single global reversal
-    # rule suffices — no per-contour inside/outside analysis needed.
-    reverse_contours = (cut_direction == "Conventional")
+    # find_contours' native (unreversed) direction keeps higher surface
+    # values -- i.e. deeper-cut (valley) pixels, since surface is a depth
+    # map where 1.0 = max cut depth -- consistently on the right of the
+    # direction of travel, so uncut (mountain) pixels are on the left.
+    # Climb requires uncut material on the right (see
+    # compute_raster_toolpath's cut_direction docs for the clockwise-spindle
+    # convention), so Climb is the case that needs reversing, not
+    # Conventional. A single global reversal rule suffices — no per-contour
+    # inside/outside analysis needed.
+    reverse_contours = (cut_direction == "Climb")
     all_z_contours = {}
     for z_norm in z_levels:
         raw = find_contours(surface, max(z_norm - _contour_eps, 0.0))
