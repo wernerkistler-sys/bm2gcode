@@ -29,7 +29,8 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 _HOLE_FACECOLOR = "#d9534f"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS, DEFAULTS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS,
+    ALGORITHM_FAMILY, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
@@ -44,7 +45,8 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         resolve_vcarve_threshold_norm, compute_raster_gate_mask,
                         compute_cutout_toolpath, compute_cutout_silhouette_mask,
                         _compute_cutout_rings, _compute_cutout_from_rings,
-                        compute_pocket_toolpath, compute_pocket_mask, _build_kernel)
+                        compute_pocket_toolpath, compute_pocket_mask, _build_kernel,
+                        compute_vcarve_synth_achievable_depth)
 from tool import Tool
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
@@ -996,6 +998,7 @@ class GCodeGeneratorApp:
                 # Preserve existing computed text, just update the step number
                 txt = s['info_var'].get()
                 s['info_var'].set(f"Step {i + 1}:" + txt.split(":", 1)[1])
+
         self._update_remove_buttons()
 
     def _update_remove_buttons(self):
@@ -1273,19 +1276,24 @@ class GCodeGeneratorApp:
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
+            # V-Carving Clean-up's display name starts with "V-Carving" but
+            # its pipeline (and widget layout) is Pocket's -- dispatch on
+            # the family it actually belongs to, not the display string.
+            family  = ALGORITHM_FAMILY[alg]
 
             # Cutout reuses the same field to split "object" from
-            # "background" rather than gate on depth, and Pocket reuses it
-            # for Target depth (its own "0 = auto, use Max cut depth"
-            # sentinel, same convention as Z-threshold's own "0 = auto"
-            # meaning for V-Carving/Cutout) -- different enough concepts
-            # that each gets its own label.
+            # "background" rather than gate on depth, and Pocket (and
+            # V-Carving Clean-up, which shares Pocket's Target depth field)
+            # reuses it for Target depth (its own "0 = auto, use Max cut
+            # depth" sentinel, same convention as Z-threshold's own "0 =
+            # auto" meaning for V-Carving/Cutout) -- different enough
+            # concepts that each gets its own label.
             step['threshold'].set_label(
                 "Split level" if alg == "Cutout" else
-                "Target depth" if alg == "Pocket" else
+                "Target depth" if family == "Pocket" else
                 "Z-threshold")
 
-            if alg.startswith("V-Carving"):
+            if family == "V-Carving":
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['stepdown'].pack_forget()
@@ -1358,15 +1366,15 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state("disabled")
                 step['cutout_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['alg_row'])
-            elif alg == "Pocket":
+            elif family == "Pocket":   # Pocket, V-Carving Clean-up
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
                 step['cutout_frame'].pack_forget()
                 step['min_fw'].pack_forget()
                 step['max_fw'].pack_forget()
-                # No Process Region selector for Pocket -- like Cutout, only
-                # the (relabeled) threshold field is used, always against
-                # the full depth map.
+                # No Process Region selector for Pocket/Clean-up -- like
+                # Cutout, only the (relabeled) threshold field is used,
+                # always against the full depth map.
                 step['gating_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['gating_region_row'].pack_forget()
                 step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
@@ -1390,6 +1398,7 @@ class GCodeGeneratorApp:
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])
                 step['vbit_angle'].set_state("normal")
+                step['pocket_boundary_offset'].set_state("normal")
             else:  # Raster Scan
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
@@ -1420,7 +1429,7 @@ class GCodeGeneratorApp:
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
 
-            locked = ((not alg.startswith("V-Carving")) or alg == "V-Carving (Hybrid)") \
+            locked = ((family != "V-Carving") or alg == "V-Carving (Hybrid)") \
                      and step['cut_dir_var'].get() != "Either"
             step['tsp_2opt_cb'].config(state="disabled" if locked else "normal")
 
@@ -2774,6 +2783,39 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
     # ------------------------------------------------------------------ #
+    def _resolve_cleanup_reference(self, idx, max_depth, eff_width_mm, eff_height_mm):
+        """Gather everything V-Carving Clean-up needs, off the nearest
+        preceding V-Carving (Hybrid) step, to later erode that step's own
+        idealized-V-bit achievable-depth surface by this step's clearing
+        tool (see algorithms.compute_vcarve_synth_achievable_depth) --
+        which retreats the pocket boundary exactly as far as needed to not
+        gouge the V-bit's actual sloped wall, for any clearing tool
+        profile. Must be called on the main thread (like
+        _gather_step_params) -- _get_depth_map_for_step reads Tkinter
+        variables. Raises ValueError if no such step exists.
+        """
+        for i in range(idx - 1, -1, -1):
+            prior = self.steps[i]
+            if prior['algorithm_var'].get() == "V-Carving (Hybrid)":
+                tool = Tool(prior['profile_var'].get(),
+                            float(prior['diameter'].get()),
+                            float(prior['vbit_angle'].get()))
+                extra_offset_mm = float(prior['extra_offset'].get())
+                depth_map, n_grey_levels = self._get_depth_map_for_step(prior)
+                erosion_cache_key = (
+                    tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
+                    max_depth, eff_width_mm, eff_height_mm,
+                    extra_offset_mm, tuple(prior.get('source_visibility', ())))
+                return {
+                    'tool':              tool,
+                    'extra_offset_mm':   extra_offset_mm,
+                    'depth_map':         depth_map,
+                    'n_grey_levels':     n_grey_levels,
+                    'erosion_cache_key': erosion_cache_key,
+                }
+        raise ValueError(
+            "V-Carving Clean-up requires a preceding V-Carving (Hybrid) step.")
+
     def _gather_step_params(self, step):
         """Read and validate all parameters for one step.
 
@@ -2808,7 +2850,7 @@ class GCodeGeneratorApp:
             'source_visibility': tuple(step.get('source_visibility', ())),
         }
 
-        if algorithm.startswith("V-Carving"):
+        if ALGORITHM_FAMILY[algorithm] == "V-Carving":
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
             tool        = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
@@ -2851,7 +2893,7 @@ class GCodeGeneratorApp:
                 'use_2opt':                 step['tsp_2opt_var'].get(),
                 'tab_settings':             self._tab_settings(step),
             })
-        elif algorithm == "Pocket":
+        elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
             tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
@@ -2868,6 +2910,13 @@ class GCodeGeneratorApp:
                 'pocket_target_z_mm':       threshold_mm,
                 'pocket_boundary_offset_mm': float(step['pocket_boundary_offset'].get()),
             })
+            if algorithm == "V-Carving Clean-up":
+                # Off-thread numpy work (in _compute_step_work / the
+                # Processing Mask preview) erodes this bundle's depth_map by
+                # the source step's own tool a second time by *this* step's
+                # clearing tool -- see _resolve_cleanup_reference.
+                params['cleanup_reference'] = self._resolve_cleanup_reference(
+                    idx, max_depth, eff_width_mm, eff_height_mm)
         else:  # Raster
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
@@ -2907,7 +2956,7 @@ class GCodeGeneratorApp:
                              params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
                              params['extra_offset_mm'], params['source_visibility'])
 
-        if algorithm.startswith("V-Carving"):
+        if ALGORITHM_FAMILY[algorithm] == "V-Carving":
             gating_mode = params['gating_mode']
             if gating_mode == "Residual from prior step":
                 prior_reference       = prev_tp.result    if prev_tp is not None else None
@@ -3027,7 +3076,7 @@ class GCodeGeneratorApp:
                 tab_settings       = params['tab_settings'],
                 progress           = progress_fn,
             )
-        elif algorithm == "Pocket":
+        elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
             # Pocket's own boundary_offset_mm is a lateral-only mask push
             # applied after the achievable-depth surface is computed (see
             # compute_pocket_toolpath), so -- unlike extra_offset_mm for
@@ -3037,6 +3086,28 @@ class GCodeGeneratorApp:
                 tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
                 params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
                 params['source_visibility'])
+
+            reference_surface = None
+            if algorithm == "V-Carving Clean-up":
+                # Erode the source V-Carving (Hybrid) step's own idealized-
+                # V-bit achievable-depth surface a second time, by this
+                # step's own clearing tool, so compute_pocket_toolpath's
+                # Stage 1 retreats the boundary exactly as far as needed to
+                # not gouge the V-bit's actual sloped wall (see
+                # compute_vcarve_synth_achievable_depth). Distinguished
+                # from plain Pocket's cache key -- entries there are eroded
+                # against the raw depth_map and mean something different.
+                ref = params['cleanup_reference']
+                reference_surface = compute_vcarve_synth_achievable_depth(
+                    ref['depth_map'], ref['tool'], params['max_depth'],
+                    params['eff_width_mm'], params['eff_height_mm'],
+                    extra_offset_mm = ref['extra_offset_mm'],
+                    erosion_cache = self._erosion_cache,
+                    erosion_cache_key = ref['erosion_cache_key'],
+                    progress = progress_fn,
+                )
+                pocket_erosion_cache_key = pocket_erosion_cache_key + ('clean_up',)
+
             return compute_pocket_toolpath(
                 depth_map             = depth_map,
                 n_grey_levels         = n_grey_levels,
@@ -3045,6 +3116,7 @@ class GCodeGeneratorApp:
                 stepdown_mm           = params['pocket_stepdown_mm'],
                 final_stepdown_mm     = params['pocket_final_stepdown_mm'],
                 boundary_offset_mm    = params['pocket_boundary_offset_mm'],
+                reference_surface     = reference_surface,
                 max_depth             = params['max_depth'],
                 width_mm              = params['eff_width_mm'],
                 height_mm             = params['eff_height_mm'],
@@ -3211,12 +3283,12 @@ class GCodeGeneratorApp:
                   # of any prior step -- a missing prev_tp only affects this
                   # step's own result/accessible/alpha bookkeeping, not which
                   # pixels get cut, so there is nothing to warn about here.
-        elif algorithm == "Pocket":
-            pass  # Pocket cuts based on its own Target depth against the
-                  # depth map regardless of any prior step -- a missing
-                  # prev_tp only affects this step's own result/accessible
-                  # bookkeeping, not which pixels get cut, so there is
-                  # nothing to warn about here.
+        elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
+            pass  # Pocket/Clean-up cuts based on its own Target depth
+                  # against the depth map regardless of any prior step -- a
+                  # missing prev_tp only affects this step's own
+                  # result/accessible bookkeeping, not which pixels get cut,
+                  # so there is nothing to warn about here.
         else:
             gating_mode = params['gating_mode']
             if gating_mode != "Full depth map" and idx > 0 and prev_tp is None:
@@ -3838,15 +3910,16 @@ class GCodeGeneratorApp:
                 threshold_mm = params['threshold_mm'] if params is not None else 0.0
                 max_depth    = params['max_depth']    if params is not None else 5.0
 
-                # Cutout and Pocket both cut against the full depth map
-                # regardless of any prior step -- neither has a Process
-                # Region selector (see "Step / Operation / Cutout"/"Step /
+                # Cutout and Pocket (and V-Carving Clean-up, which shares
+                # Pocket's pipeline) all cut against the full depth map
+                # regardless of any prior step -- none has a Process Region
+                # selector (see "Step / Operation / Cutout"/"Step /
                 # Operation / Pocket" in README.md), and their own
                 # compute_*_toolpath functions never read gating_mode at
                 # all. Mirror that here instead of reading whatever stale
                 # mode the widget still holds from a different algorithm.
                 gating_mode = "Full depth map"
-                if (algorithm not in ("Cutout", "Pocket")
+                if (ALGORITHM_FAMILY[algorithm] not in ("Cutout", "Pocket")
                         and 0 <= step_idx < len(self.steps)
                         and self.steps[step_idx].get('gating_mode_var') is not None):
                     gating_mode = self.steps[step_idx]['gating_mode_var'].get()
@@ -3916,18 +3989,32 @@ class GCodeGeneratorApp:
                         depth_map, threshold_mm, max_depth, r_px)
                     if mask is None:
                         mask = np.zeros_like(depth_map, dtype=bool)
-                elif algorithm == "Pocket":
+                elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
                     cache_key = (
                         params['tool'].profile, params['tool'].diameter_mm,
                         params['tool'].vbit_angle_deg, max_depth,
                         params['eff_width_mm'], params['eff_height_mm'],
                         params['source_visibility'])
+                    reference_surface = None
+                    if algorithm == "V-Carving Clean-up":
+                        # Mirror _compute_step_work's own derivation so the
+                        # preview matches what Compute Step will actually
+                        # produce -- see compute_vcarve_synth_achievable_depth.
+                        cref = params['cleanup_reference']
+                        reference_surface = compute_vcarve_synth_achievable_depth(
+                            cref['depth_map'], cref['tool'], max_depth,
+                            params['eff_width_mm'], params['eff_height_mm'],
+                            extra_offset_mm=cref['extra_offset_mm'],
+                            erosion_cache=self._erosion_cache,
+                            erosion_cache_key=cref['erosion_cache_key'])
+                        cache_key = cache_key + ('clean_up',)
                     mask, _, _, _, _, _ = compute_pocket_mask(
                         depth_map, params['tool'], px_per_mm, max_depth, threshold_mm,
                         self.n_grey_levels,
                         boundary_offset_mm=params['pocket_boundary_offset_mm'],
+                        reference_surface=reference_surface,
                         erosion_cache=self._erosion_cache, erosion_cache_key=cache_key)
-                elif algorithm.startswith("V-Carving"):
+                elif ALGORITHM_FAMILY[algorithm] == "V-Carving":
                     threshold_norm = resolve_vcarve_threshold_norm(ref, threshold_mm, max_depth)
                     _, mask = compute_vcarve_mask(
                         ref, threshold_norm, params['min_feature_width_mm'],

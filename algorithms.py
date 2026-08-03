@@ -1539,11 +1539,22 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
 def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
                          n_grey_levels, boundary_offset_mm=0.0,
+                         reference_surface=None,
                          erosion_cache=None, erosion_cache_key=None,
                          progress=None):
     """Resolve target_z_mm and build the pocket-interior mask: every
     position where *tool*, centred there, can still reach target_z_mm
     without its footprint overhanging shallower material.
+
+    reference_surface, if given, replaces depth_map as the surface the
+    tool's achievable-depth erosion is computed against (depth_map itself
+    is otherwise unused by this function) -- used by V-Carving Clean-up to
+    erode V-Carving (Hybrid)'s own idealized-V-bit achievable-depth surface
+    a second time by the clearing tool's kernel, so the resulting mask
+    boundary retreats exactly as far as needed to not gouge the V-bit's
+    actual sloped wall, for any clearing tool profile (see
+    compute_vcarve_synth_achievable_depth). None (the default) uses
+    depth_map directly, i.e. ordinary Pocket behaviour.
 
     target_z_mm > 0 is used literally; None or <= 0 means "auto": use
     max_depth (the deepest region of the depth map), mirroring
@@ -1582,6 +1593,8 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     if progress is None:
         progress = lambda pct, msg: None
 
+    source_surface = depth_map if reference_surface is None else reference_surface
+
     # ── Build tool kernel ─────────────────────────────────────────────────
     progress(0, "Building tool geometry kernel…")
     kernel_pocket, footprint_pocket = _build_kernel(tool, px_per_mm, max_depth)
@@ -1590,13 +1603,13 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
 
     # ── Compute achievable depth surface ───────────────────────────────────
     cached = erosion_cache.get(erosion_cache_key) if erosion_cache is not None else None
-    if cached is not None and cached[0].shape == depth_map.shape:
+    if cached is not None and cached[0].shape == source_surface.shape:
         center_depth_contour_pocket, accessible_pocket = cached
         progress(35, "Reusing achievable depth surface (same tool, unchanged)…")
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
         structure = -kernel_pocket.astype(np.float64)
-        center_depth_contour_pocket = grey_erosion(depth_map.astype(np.float64),
+        center_depth_contour_pocket = grey_erosion(source_surface.astype(np.float64),
                                   footprint=footprint_pocket,
                                   structure=structure).astype(np.float32)
         center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
@@ -1636,6 +1649,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                              cut_direction="Climb",
                              final_stepdown_mm=0.0,
                              boundary_offset_mm=0.0,
+                             reference_surface=None,
                              progress=None,
                              erosion_cache=None,
                              erosion_cache_key=None):
@@ -1705,6 +1719,22 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         Pocket's cut depth is controlled independently by
                         target_z_mm, so there is nothing for a Z-offset to
                         mean here.
+    reference_surface : optional 2-D float32 [0,1] surface, same shape as
+                        depth_map after Stage 0's own resampling, replacing
+                        depth_map as the input to the tool's achievable-
+                        depth erosion (Stages 1-3 only — Stage 4 onward,
+                        including result simulation, still work from the
+                        real depth_map/tool). Used by V-Carving Clean-up to
+                        erode V-Carving (Hybrid)'s idealized-V-bit
+                        achievable-depth surface a second time by this
+                        step's own clearing tool, so the pocket boundary
+                        retreats exactly as far as needed to not gouge the
+                        V-bit's actual sloped wall, for any clearing tool
+                        profile — see compute_vcarve_synth_achievable_depth.
+                        None (the default) uses depth_map directly, i.e.
+                        ordinary Pocket behaviour. Must already be resampled
+                        to match depth_map's own post-Stage-0 grid — it is
+                        not resampled again here.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     erosion_cache     : optional dict memoising the grey-erosion/grey-dilation
                         achievable-depth surface, keyed by erosion_cache_key.
@@ -1754,6 +1784,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
      kernel_pocket, footprint_pocket) = compute_pocket_mask(
         depth_map, tool, px_per_mm, max_depth, target_z_mm, n_grey_levels,
         boundary_offset_mm=boundary_offset_mm,
+        reference_surface=reference_surface,
         erosion_cache=erosion_cache, erosion_cache_key=erosion_cache_key,
         progress=progress,
     )
@@ -2065,6 +2096,85 @@ def resolve_vcarve_threshold_norm(ref, threshold_mm, max_depth):
     if threshold_mm > 0.0:
         return threshold_mm / max_depth if max_depth else 0.0
     return float(ref.min() + ref.max()) / 2.0
+
+
+def compute_vcarve_synth_achievable_depth(depth_map, tool, max_depth,
+                                           width_mm, height_mm,
+                                           extra_offset_mm=0.0,
+                                           erosion_cache=None,
+                                           erosion_cache_key=None,
+                                           progress=None):
+    """Achievable-depth surface for an idealized ("just large enough") V-bit
+    of tool.vbit_angle_deg that always tapers to a point exactly at
+    max_depth. Used by V-Carving (Hybrid)'s own deep waterline contours, and
+    by V-Carving Clean-up, which erodes this surface a second time by its
+    own clearing tool's kernel to find the boundary it must retreat to so
+    it doesn't gouge the V-bit's actual sloped wall.
+
+    depth_map/width_mm/height_mm are the raw (not pre-resampled) inputs --
+    resampled to square pixels here exactly as every compute_*_toolpath
+    function's own Stage 0 does, so this is safe to call standalone.
+    """
+    from math import radians, tan
+    from scipy.ndimage import grey_erosion
+
+    if progress is None:
+        progress = lambda pct, msg: None
+
+    # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
+    H, W = depth_map.shape
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
+    if px_per_mm_x != px_per_mm_y:
+        from scipy.ndimage import zoom as _zoom
+        target = max(px_per_mm_x, px_per_mm_y)
+        zy = target / px_per_mm_y
+        zx = target / px_per_mm_x
+        progress(0, f"Resampling depth map to square pixels "
+                    f"({px_per_mm_x:.3f} × {px_per_mm_y:.3f} → {target:.3f} px/mm)…")
+        depth_map = _zoom(depth_map, (zy, zx), order=1).astype(np.float32)
+        H, W = depth_map.shape
+        px_per_mm_x = px_per_mm_y = target
+    px_per_mm = px_per_mm_x
+
+    tan_half   = tan(radians(tool.vbit_angle_deg / 2.0))
+    synth_diam = 2.0 * max_depth * tan_half * (1.0 + 1e-6)
+
+    # The deep contour rings need an achievable-depth surface that always
+    # tapers to a point at max_depth (see _find_compatible_vbit_erosion's
+    # docstring) — build it with an idealized, "just large enough" V-bit
+    # rather than the real tool, reusing any compatible cached erosion
+    # first since it can be expensive to recompute.
+    center_depth_contour_synth = _find_compatible_vbit_erosion(
+        erosion_cache, erosion_cache_key, synth_diam)
+    if center_depth_contour_synth is None:
+        synth_tool = dataclasses.replace(tool, diameter_mm=synth_diam)
+        kernel_synth, footprint_synth = _build_kernel(
+            synth_tool, px_per_mm, max_depth)
+        kernel_synth_plan, footprint_synth_plan = _planning_kernel(
+            synth_tool, px_per_mm, max_depth, extra_offset_mm,
+            kernel_synth, footprint_synth)
+        center_depth_contour_synth = grey_erosion(
+            depth_map.astype(np.float64),
+            footprint=footprint_synth_plan,
+            structure=-kernel_synth_plan.astype(np.float64),
+        ).astype(np.float32)
+        center_depth_contour_synth = np.clip(center_depth_contour_synth, 0.0, 1.0)
+        if erosion_cache is not None and erosion_cache_key is not None:
+            synth_key = (tool.profile, synth_diam, *erosion_cache_key[2:])
+            erosion_cache[synth_key] = (center_depth_contour_synth,
+                                         center_depth_contour_synth)
+
+    if extra_offset_mm > 0.0:
+        # Mirror Stage 2b's vertical stock-to-leave adjustment, applied
+        # here regardless of whether the surface above came from cache or
+        # was just computed (cache always stores the pre-adjustment
+        # surface).
+        off_norm = extra_offset_mm / max_depth
+        center_depth_contour_synth = np.clip(
+            center_depth_contour_synth - off_norm, 0.0, 1.0)
+
+    return center_depth_contour_synth
 
 
 def compute_vcarve_toolpath(depth_map, n_grey_levels,
@@ -2634,44 +2744,11 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         # alongside the skeleton to also clear mask regions wider than the
         # tool's cone can reach in a single skeleton pass —
         # reusing compute_contour_toolpath's extraction/ordering helpers.
-        from math import radians, tan
-        tan_half   = tan(radians(tool.vbit_angle_deg / 2.0))
-        synth_diam = 2.0 * max_depth * tan_half * (1.0 + 1e-6)
-
-        # The deep contour rings need an achievable-depth surface that
-        # always tapers to a point at max_depth (see
-        # _find_compatible_vbit_erosion's docstring) — build it with an
-        # idealized, "just large enough" V-bit rather than the real
-        # tool, reusing any compatible cached erosion first since it can
-        # be expensive to recompute.
-        center_depth_contour_synth = _find_compatible_vbit_erosion(
-            erosion_cache, erosion_cache_key, synth_diam)
-        if center_depth_contour_synth is None:
-            synth_tool = dataclasses.replace(tool, diameter_mm=synth_diam)
-            kernel_synth, footprint_synth = _build_kernel(
-                synth_tool, px_per_mm, max_depth)
-            kernel_synth_plan, footprint_synth_plan = _planning_kernel(
-                synth_tool, px_per_mm, max_depth, extra_offset_mm,
-                kernel_synth, footprint_synth)
-            center_depth_contour_synth = grey_erosion(
-                depth_map.astype(np.float64),
-                footprint=footprint_synth_plan,
-                structure=-kernel_synth_plan.astype(np.float64),
-            ).astype(np.float32)
-            center_depth_contour_synth = np.clip(center_depth_contour_synth, 0.0, 1.0)
-            if erosion_cache is not None and erosion_cache_key is not None:
-                synth_key = (tool.profile, synth_diam, *erosion_cache_key[2:])
-                erosion_cache[synth_key] = (center_depth_contour_synth,
-                                             center_depth_contour_synth)
-
-        if extra_offset_mm > 0.0:
-            # Mirror Stage 2b's vertical stock-to-leave adjustment,
-            # applied here regardless of whether the surface above came
-            # from cache or was just computed (cache always stores the
-            # pre-adjustment surface — see Stage 2b).
-            off_norm = extra_offset_mm / max_depth
-            center_depth_contour_synth = np.clip(
-                center_depth_contour_synth - off_norm, 0.0, 1.0)
+        center_depth_contour_synth = compute_vcarve_synth_achievable_depth(
+            depth_map, tool, max_depth, width_mm, height_mm,
+            extra_offset_mm=extra_offset_mm,
+            erosion_cache=erosion_cache, erosion_cache_key=erosion_cache_key,
+            progress=progress)
 
         deep_levels_norm = [c / max_depth for c in
                              _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)]

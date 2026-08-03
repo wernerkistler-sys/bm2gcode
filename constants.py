@@ -9,7 +9,26 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
+                     "V-Carving Clean-up",
                      "Cutout", "Pocket"]
+
+# Which compute_*_toolpath pipeline each Algorithm dropdown entry uses.
+# V-Carving Clean-up displays under the V-Carving group but is really a
+# Pocket operation (see algorithms.py's compute_pocket_toolpath) with its
+# Boundary offset auto-derived from a preceding V-Carving (Hybrid) step's
+# tool -- every dispatch on "is this a V-Carving step" / "is this a Pocket
+# step" must key off this instead of string-matching the display name.
+ALGORITHM_FAMILY  = {
+    "Raster Scan":               "Raster Scan",
+    "Contour":                   "Contour",
+    "V-Carving (Depth Map)":     "V-Carving",
+    "V-Carving (Sub-pixel)":     "V-Carving",
+    "V-Carving (Feature Width)": "V-Carving",
+    "V-Carving (Hybrid)":        "V-Carving",
+    "V-Carving Clean-up":        "Pocket",
+    "Cutout":                    "Cutout",
+    "Pocket":                    "Pocket",
+}
 BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
 DEFAULT_PREAMBLE = (

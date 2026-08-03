@@ -180,6 +180,20 @@ Clears a flat-bottomed recess: every position where the tool can be centred and 
 
 There's no Process Region selector for Pocket, either — Target depth is always applied to the full depth map, never to a prior step's residual or accessible surface, so what any prior step accomplished has no bearing on which pixels count as pocket interior.
 
+See also [V-Carving Clean-up](#step--operation--v-carving-clean-up), which reuses this same pipeline against a substituted reference surface instead of the raw depth map.
+
+---
+
+##### Step / Operation / V-Carving Clean-up
+
+Runs the exact [Pocket](#step--operation--pocket) pipeline described above — same parameters, same flat-floor infill — but targets the flat interior that a preceding **V-Carving (Hybrid)** step's V-bit couldn't reach: Hybrid mode traces waterline contours down to Max cut depth, but the floor inside the deepest ring, where a feature is wider than the V-bit's cone can reach at that depth, is never cleared (see [V-Carving Pipeline](#v-carving-pipeline)). Clean-up flattens exactly that leftover floor, with any tool — not necessarily the V-bit used for V-Carving.
+
+The one difference from Pocket: Stage 1's achievable-depth erosion (see [Pocket Pipeline](#pocket-pipeline)) runs against the nearest preceding V-Carving (Hybrid) step's own idealized-V-bit achievable-depth surface instead of the raw depth map — i.e. Clean-up's tool-kernel erosion is applied a *second* time, on top of the V-bit's own. This makes the resulting boundary exact for any clearing tool profile (End Mill, Ball, or V-bit, at any angle or diameter): the clearing tool retreats exactly as far as its own geometry requires to avoid gouging the V-bit's actual sloped wall, never more and never less — a plain scalar offset can't express this in general, since how far a Ball or V-bit clearing tool must retreat depends on depth the same way the original V-bit's own reach did. Computing a Clean-up step with no preceding V-Carving (Hybrid) step in the sequence raises a validation error.
+
+**Target depth** and **Boundary offset** keep their ordinary Pocket meaning and are both freely editable — Boundary offset is a genuinely optional *extra* margin layered on top of the already-exact boundary above, same as it is for Pocket.
+
+The tool used for Clean-up (profile, diameter, feed rate, etc.) is independent of the source V-Carving step's tool.
+
 ---
 
 ##### Step / Operation / Process Region
@@ -467,6 +481,8 @@ Pocket shares Raster's kernel + accessibility (morphological opening) stage, but
 7. **Simplification + result simulation** — Same as Raster.
 
 Pocket only clears the interior — it does not cut a wall-finishing pass around the pocket boundary. For Horizontal/Vertical/Spiral scan directions the interior mask's boundary leaves the same stair-stepped edge Raster already leaves at any masked boundary; for Onion Skin, the outermost ring is instead extracted via sub-pixel marching squares (`skimage.find_contours`), so it traces a smoother boundary than the per-pixel stair-step.
+
+V-Carving Clean-up runs this identical pipeline with one substitution: step 1's achievable-depth erosion runs against `compute_vcarve_synth_achievable_depth`'s output — the nearest preceding V-Carving (Hybrid) step's own idealized-V-bit achievable-depth surface (see [V-Carving Pipeline](#v-carving-pipeline)) — instead of the raw depth map, so the clearing tool's kernel is eroded against the V-bit's own achievable-depth surface rather than the flat depth map. Target depth still defaults to Max cut depth (Pocket's usual "0 = auto" convention); see [Step / Operation / V-Carving Clean-up](#step--operation--v-carving-clean-up).
 
 ---
 
