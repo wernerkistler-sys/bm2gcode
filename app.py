@@ -32,7 +32,7 @@ from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
-    DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED,
+    DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
     DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
@@ -116,6 +116,7 @@ class GCodeGeneratorApp:
         self.show_cut_moves_var = tk.BooleanVar(value=True)
         self.show_rapids_var    = tk.BooleanVar(value=True)
         self.show_tabs_var      = tk.BooleanVar(value=True)
+        self.show_shading_var   = tk.BooleanVar(value=False)
 
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -165,12 +166,11 @@ class GCodeGeneratorApp:
             (DISPLAY_ORIGINAL,          "1"),
             (DISPLAY_STEP_3D,           "2"),
             (DISPLAY_STEP_RESULT,       "3"),
-            (DISPLAY_STEP_SHADED,       "4"),
-            (DISPLAY_STEP_RES,          "5"),
-            (DISPLAY_STEP_UNACCESSIBLE, "6"),
-            (DISPLAY_DIFF_RES_UNCUT,     "7"),
-            (DISPLAY_DIFF_UNCUT_UNCUT,  "8"),
-            (DISPLAY_PROC_MASK,         "9"),
+            (DISPLAY_STEP_RES,          "4"),
+            (DISPLAY_STEP_UNACCESSIBLE, "5"),
+            (DISPLAY_DIFF_RES_UNCUT,     "6"),
+            (DISPLAY_DIFF_UNCUT_UNCUT,  "7"),
+            (DISPLAY_PROC_MASK,         "8"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -195,6 +195,10 @@ class GCodeGeneratorApp:
         self._view_menu.add_checkbutton(label="Show tabs",
                                         accelerator="T",
                                         variable=self.show_tabs_var,
+                                        command=self._on_display_mode_changed)
+        self._view_menu.add_checkbutton(label="Show shading",
+                                        accelerator="S",
+                                        variable=self.show_shading_var,
                                         command=self._on_display_mode_changed)
         self._view_menu.add_separator()
         self._view_menu.add_command(label="Reset Zoom  (double-click)",
@@ -236,6 +240,7 @@ class GCodeGeneratorApp:
         self.root.bind("<Key-c>", _make_toggle_handler(self.show_cut_moves_var))
         self.root.bind("<Key-r>", _make_toggle_handler(self.show_rapids_var))
         self.root.bind("<Key-t>", _make_toggle_handler(self.show_tabs_var))
+        self.root.bind("<Key-s>", _make_toggle_handler(self.show_shading_var))
 
     # ------------------------------------------------------------------ #
     #  Top-level layout
@@ -3551,7 +3556,7 @@ class GCodeGeneratorApp:
             m for m in DISPLAY_MODES
             if not (m == DISPLAY_PROC_MASK  and not has_step)
             and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
-            and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED, DISPLAY_STEP_3D) and not step_computed)
+            and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
             and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
                 has_accessible
@@ -3587,11 +3592,21 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
-    def _hillshade_result(self, result, step_idx):
-        """RGBA hillshade of a step's result depth map, with vertical
-        exaggeration auto-scaled from max cut depth vs. canvas footprint --
-        real-world relief carving is typically only a few mm deep on a
-        canvas tens of cm wide, so true-to-scale shading would look flat.
+    def _elevation_sign(self, mode):
+        """Sign that makes a mode's raw array values read as physically-real
+        Z in mm, matching _update_coord_display's convention: material
+        amount (residual/unaccessible/mask/diff) is positive going up, but
+        Original and Step Result read positive going down (deeper cut =
+        lower)."""
+        return -1 if mode in (DISPLAY_ORIGINAL, DISPLAY_STEP_RESULT) else 1
+
+    def _apply_shading(self, img, mode, cmap, vmin, vmax, step_idx):
+        """RGB hillshade of *img*, tinted with its own cmap/vmin/vmax (so
+        colors match the unshaded view exactly) and lit using a physically-
+        scaled elevation, with vertical exaggeration auto-scaled from max cut
+        depth vs. canvas footprint -- real-world relief carving is typically
+        only a few mm deep on a canvas tens of cm wide, so true-to-scale
+        shading would look flat.
         """
         try:
             step   = self.steps[step_idx] if 0 <= step_idx < len(self.steps) else None
@@ -3602,15 +3617,27 @@ class GCodeGeneratorApp:
         except (ValueError, KeyError, ZeroDivisionError, AttributeError):
             max_depth, eff_width_mm, eff_height_mm = 5.0, float(self.width_mm.get()), float(self.height_mm.get())
 
-        H, W = result.shape
-        elevation_mm = (1.0 - result) * max_depth   # 0 = deepest cut, max_depth = uncut top surface
+        H, W = img.shape
+        cmap_obj = cmap if isinstance(cmap, mcolors.Colormap) else plt.get_cmap(cmap)
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        base_rgb = cmap_obj(norm(img))[..., :3]
+
+        # img itself is what to colour, but for DISPLAY_ORIGINAL it's the raw
+        # composite (self.current_image), whose polarity flips with the
+        # white/black "surface" setting -- unlike every other mode's img,
+        # it does NOT follow the canonical 1.0 = deepest-cut convention that
+        # _elevation_sign assumes, so elevation must come from the canonical
+        # depth map instead (same fix _update_coord_display already applies).
+        elevation_img = self._get_depth_map()[0] if mode == DISPLAY_ORIGINAL else img
+        elevation_mm = self._elevation_sign(mode) * elevation_img.astype(np.float64) * max_depth
         dx = eff_width_mm  / W
         dy = eff_height_mm / H
         span_mm = min(eff_width_mm, eff_height_mm)
         vert_exag = float(np.clip(span_mm * 0.15 / max_depth, 1.0, 50.0)) if max_depth > 0 else 1.0
 
         ls = mcolors.LightSource(azdeg=315, altdeg=45)
-        return ls.shade(elevation_mm, cmap=plt.cm.copper, dx=dx, dy=dy, vert_exag=vert_exag)
+        return ls.shade_rgb(base_rgb, elevation_mm, blend_mode="soft",
+                            vert_exag=vert_exag, dx=dx, dy=dy)
 
     def _pad_image(self, img):
         """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
@@ -3878,10 +3905,6 @@ class GCodeGeneratorApp:
         img_alpha = None   # per-pixel matplotlib alpha array; set only when
                            # the displayed ToolPath flags physically-removed
                            # (cut-through) pixels -- see DISPLAY_STEP_RESULT
-        display_data = None  # overrides `img` at imshow-time only (e.g. an
-                             # RGBA hillshade); self._displayed_array, the
-                             # mouse-Z readout, and _overlay_toolpath_2d's
-                             # shape lookup keep using the scalar `img`
 
         if mode == DISPLAY_STEP_RES:
             tp = (self.toolpaths[step_idx]
@@ -3918,19 +3941,6 @@ class GCodeGeneratorApp:
                 # (set below, at the imshow call) shows through instead.
                 if tp.alpha is not None:
                     img_alpha = tp.alpha
-            else:
-                mode  = DISPLAY_ORIGINAL   # fall through to original
-
-        elif mode == DISPLAY_STEP_SHADED:
-            tp = (self.toolpaths[step_idx]
-                  if 0 <= step_idx < len(self.toolpaths) else None)
-            if tp is not None and tp.result is not None:
-                img   = tp.result
-                cmap  = None   # unused -- display_data below is already RGBA
-                title = f"Step {step_idx + 1} Shaded"
-                if tp.alpha is not None:
-                    img_alpha = tp.alpha
-                display_data = self._hillshade_result(tp.result, step_idx)
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
@@ -4108,15 +4118,16 @@ class GCodeGeneratorApp:
             else:
                 mode = DISPLAY_ORIGINAL
 
-        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_SHADED,
+        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
                         DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
             img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
 
-        if display_data is None:
-            display_data = img
+        display_data = img
+        if self.show_shading_var.get():
+            display_data = self._apply_shading(img, mode, cmap, vmin, vmax, step_idx)
 
         saved_xlim = self._view_xlim
         saved_ylim = self._view_ylim
@@ -4413,7 +4424,7 @@ class GCodeGeneratorApp:
                 val = float(depth_map[row, col])
             else:
                 val = float(img[row, col])
-            sign = +1 if mode in (DISPLAY_STEP_RES, DISPLAY_STEP_UNACCESSIBLE) else -1
+            sign = self._elevation_sign(mode)
             z_str = f"Z: {sign * val * max_depth:.2f} mm"
 
         self.coord_var.set(f"X: {x_mm:+.2f}  Y: {y_mm:+.2f}  {z_str}")

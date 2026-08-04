@@ -208,7 +208,7 @@ The **Process Region** selector is the adaptive gating mechanism. It defines whi
 | Reachable residual | Intersection of "this tool can reach here" AND "the prior step left residual here." |
 | Reachable inaccessible | Intersection of "this tool can reach here" AND "the prior tool could not reach here." |
 
-Use the **Processing Mask** view (hotkey 9) and the **Prev Residual − Unaccessible** view (hotkey 7) to verify the gating is configured as intended before computing.
+Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
 
 **Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth) exceeds this value, skipping areas that deviate from the reference by less than this amount.
 
@@ -350,17 +350,18 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 All visualization modes show data for the currently active step. Cut moves, rapid moves, and tab markers can be toggled in any mode with **C**, **R**, and **T**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature.
 
+**Show shading** (**S**) renders any of the 2D modes below as a hillshaded relief — simulated raking light and shadow over the mode's own colours — instead of a flat colour ramp, with vertical exaggeration auto-scaled from the max cut depth vs. the canvas footprint so shallow relief remains visible. It has no effect in Step Path (3D) mode.
+
 | Mode | Hotkey | Shows |
 |---|---|---|
 | Original | 1 | The composited depth map for the current step — every source it can see, blended together — with stock margin if configured. |
 | Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
 | Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. For a Cutout step whose Cut depth exceeds Max cut depth, pixels actually cut all the way through render as a distinct highlighted colour instead of the ordinary depth grayscale, since a through-cut clips to the same value as reaching full relief depth — see [Cutout Pipeline](#cutout-pipeline). Requires toolpath to be computed.|
-| Step Shaded | 4 | The same simulated surface as Step Result, rendered as a hillshaded relief (simulated raking light and shadow) instead of flat grayscale, with vertical exaggeration auto-scaled so shallow relief remains visible. Requires toolpath to be computed.|
-| Step Residual | 5 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
-| Step Unaccessible | 6 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
-| Prev Residual − Unaccessible | 7 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
-| Prev Unaccessible − Unaccessible | 8 | Difference between the prior step's inaccessible material and the current tool's inaccessible material. Positive (warm) values indicate regions the current tool can reach that the prior tool could not; negative (cool) values indicate the current tool is more restricted than its predecessor; cf. the "Reachable inaccessible" option for "Process region". Requires recomputation when tool parameters are changed.|
-| Processing Mask | 9 | Binary mask of which regions will be cut in this step, based on the Process Region setting. Live update when Z-threshold is changed.|
+| Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
+| Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Prev Unaccessible − Unaccessible | 7 | Difference between the prior step's inaccessible material and the current tool's inaccessible material. Positive (warm) values indicate regions the current tool can reach that the prior tool could not; negative (cool) values indicate the current tool is more restricted than its predecessor; cf. the "Reachable inaccessible" option for "Process region". Requires recomputation when tool parameters are changed.|
+| Processing Mask | 8 | Binary mask of which regions will be cut in this step, based on the Process Region setting. Live update when Z-threshold is changed.|
 
 **Canvas navigation:**
 - All modes: scroll to zoom, middle-click drag to pan, double-click to reset.
