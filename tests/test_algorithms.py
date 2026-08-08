@@ -12,7 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from algorithms import (_onion_skin_chains, _ring_chain_to_points,
-                        _order_fixed_orientation_pass, compute_pocket_toolpath)
+                        _order_fixed_orientation_pass, compute_pocket_toolpath,
+                        _diag_grid_line_ids, _diag_line_bounds, _diag_line_points,
+                        _region_contour_rings, _make_contour_ring,
+                        _nearest_ring_vertex, _ring_arc_between,
+                        _order_locked_raster_pass, _order_zigzag_pass,
+                        _order_free_region_pass)
 from tool import Tool
 
 FAILURES = []
@@ -392,6 +397,272 @@ forked_indices = [i for i, v in enumerate(is_third) if not v]
 check("the forked pocket's chains form one contiguous run "
       "(no unrelated-pocket chain sandwiched in between)",
       forked_indices == list(range(min(forked_indices), max(forked_indices) + 1)))
+
+
+# --------------------------------------------------------------------------
+# _diag_grid_line_ids / _diag_line_bounds
+# --------------------------------------------------------------------------
+print("_diag_grid_line_ids / _diag_line_bounds")
+
+H = W = 5   # rows/cols 0..4, row+col in [0,8], row-col in [-4,4]
+
+k_ids, adj_step = _diag_grid_line_ids(H, W, "D45", px_per_mm=1.0,
+                                      step_mm=1.0, raster_offset_pct=0.0)
+check("D45 k_ids span the full row+col range", k_ids[0] == 0 and k_ids[-1] == 8)
+
+k_ids135, _ = _diag_grid_line_ids(H, W, "D135", px_per_mm=1.0,
+                                  step_mm=1.0, raster_offset_pct=0.0)
+check("D135 k_ids span the full row-col range", k_ids135[0] == -4 and k_ids135[-1] == 4)
+
+check("D45 bounds on the main diagonal (k=4) span the whole box",
+      _diag_line_bounds("D45", 4, 0, 4, 0, 4) == (0, 4))
+check("D45 bounds at a corner (k=8) reduce to a single point",
+      _diag_line_bounds("D45", 8, 0, 4, 0, 4) == (4, 4))
+check("D45 bounds for a k outside the box's range return None",
+      _diag_line_bounds("D45", 20, 0, 4, 0, 4) is None)
+check("D135 bounds on the main diagonal (k=0) span the whole box",
+      _diag_line_bounds("D135", 0, 0, 4, 0, 4) == (0, 4))
+
+
+# --------------------------------------------------------------------------
+# _diag_line_points: sampling stays on the diagonal, and mask gaps split
+# a line into multiple segments the same way _line_points does.
+# --------------------------------------------------------------------------
+print("_diag_line_points")
+
+depth = np.ones((5, 5), dtype=np.float32)
+segs = _diag_line_points("D45", 4, 0, 4, False, depth, None, 0.5,
+                         px_per_mm=1.0, H=5, _ox=0.0, _oy=0.0, max_depth=1.0)
+check("D45 k=4, no mask: one segment covering all 5 points",
+      len(segs) == 1 and len(segs[0]) == 5)
+pts_rc = [(round(5 - 1 - y), round(x)) for x, y, z in segs[0]]
+check("every D45 k=4 point satisfies row+col == 4",
+      all(r + c == 4 for r, c in pts_rc))
+
+gap_mask = np.ones((5, 5), dtype=np.float32)
+gap_mask[2, 2] = 0.0   # the middle point of the k=4 diagonal (row=2,col=2)
+segs_gap = _diag_line_points("D45", 4, 0, 4, False, depth, gap_mask, 0.5,
+                             px_per_mm=1.0, H=5, _ox=0.0, _oy=0.0, max_depth=1.0)
+check("a single masked-out point splits the diagonal into 2 segments",
+      len(segs_gap) == 2)
+check("the two split segments have 2 points each (5 total minus the gap)",
+      sum(len(s) for s in segs_gap) == 4)
+
+
+# --------------------------------------------------------------------------
+# _order_locked_raster_pass: 4-way coord() key
+# --------------------------------------------------------------------------
+print("_order_locked_raster_pass 4-way grouping")
+
+seg_a = [(0.0, 0.0, 0.0)]
+seg_b = [(1.0, 1.0, 0.0)]
+for direction in ("X", "Y", "D45", "D135"):
+    ordered = _order_locked_raster_pass([seg_b, seg_a], direction, (0.0, 0.0))
+    check(f"_order_locked_raster_pass runs for direction={direction!r}",
+          len(ordered) == 2)
+
+
+# --------------------------------------------------------------------------
+# _region_contour_rings / _make_contour_ring: ring count and arc-length table
+# --------------------------------------------------------------------------
+print("_region_contour_rings / _make_contour_ring")
+
+solid = np.ones((10, 10), dtype=bool)
+rings = _region_contour_rings(solid)
+check("a solid block has exactly one boundary ring", len(rings) == 1)
+
+annulus_zz = np.ones((20, 20), dtype=bool)
+annulus_zz[8:12, 8:12] = False
+rings_annulus = _region_contour_rings(annulus_zz)
+check("an annulus (region with a hole) has exactly two rings",
+      len(rings_annulus) == 2)
+
+ring = _make_contour_ring(rings[0])
+check("_make_contour_ring drops find_contours' duplicate closing vertex",
+      not np.allclose(ring.pts_px[0], ring.pts_px[-1]))
+check("cumulative arc length is non-decreasing",
+      np.all(np.diff(ring.cum) >= -1e-9))
+check("ring perimeter L is positive and finite",
+      ring.L > 0 and np.isfinite(ring.L))
+
+
+# --------------------------------------------------------------------------
+# _nearest_ring_vertex / _ring_arc_between: the "shorter arc never leaves
+# the region" property, on a concave (C-shaped) region with a notch.
+# --------------------------------------------------------------------------
+print("_nearest_ring_vertex / _ring_arc_between")
+
+c_shape = np.zeros((30, 30), dtype=bool)
+c_shape[2:28, 2:28] = True
+c_shape[10:20, 14:28] = False   # notch cut into the right side
+ring_c = _make_contour_ring(_region_contour_rings(c_shape)[0])
+
+# Two points that sit close together in a straight line (both near the
+# notch's open right edge, on the top/bottom arm tips) but are only
+# reachable by walking the long way around the notch along the boundary.
+i_top = _nearest_ring_vertex(ring_c, row=2, col=27, tol_px=2.0)
+i_bottom = _nearest_ring_vertex(ring_c, row=27, col=27, tol_px=2.0)
+check("both notch-tip points snap onto the C-shape's ring", i_top is not None and i_bottom is not None)
+
+check("_nearest_ring_vertex returns None past its tolerance",
+      _nearest_ring_vertex(ring_c, row=15, col=20, tol_px=1.0) is None)   # inside the notch (empty space)
+
+if i_top is not None and i_bottom is not None:
+    arc = _ring_arc_between(ring_c, i_top, i_bottom)
+    arc_len = float(np.sum(np.hypot(np.diff(arc[:, 0]), np.diff(arc[:, 1]))))
+    straight_dist = float(np.hypot(arc[0, 0] - arc[-1, 0], arc[0, 1] - arc[-1, 1]))
+    check("the contour arc detours well around the notch instead of cutting across it",
+          arc_len > straight_dist * 2)
+    check("_ring_arc_between picks the shorter of the two ring directions",
+          arc_len <= ring_c.L / 2.0 + 1e-6)
+    check("every arc point is one of the ring's own vertices (never leaves the region boundary)",
+          all(any(np.allclose(p, v) for v in ring_c.pts_px) for p in arc))
+
+
+# --------------------------------------------------------------------------
+# compute_pocket_toolpath: Zig-Zag end-to-end smoke tests
+# --------------------------------------------------------------------------
+print("compute_pocket_toolpath Zig-Zag")
+
+_noop_progress = lambda pct, msg: None
+zz_tool = Tool(profile="End Mill", diameter_mm=1.0)
+
+# A concave "C"-shaped pocket: a scan line crossing the notch splits into
+# two segments, exercising contour-linking around a concave boundary.
+depth_c = np.zeros((30, 30), dtype=np.float32)
+depth_c[2:28, 2:28] = 1.0
+depth_c[10:20, 14:28] = 0.0
+
+tp_zz = compute_pocket_toolpath(
+    depth_c, n_grey_levels=256, tool=zz_tool,
+    step_mm=2.0, stepdown_mm=0.0, max_depth=5.0,
+    width_mm=30.0, height_mm=30.0, raster_dir="Zig-Zag (0°)",
+    cut_direction="Either", progress=_noop_progress,
+)
+check("Zig-Zag on a concave pocket produces a non-empty toolpath",
+      len(tp_zz.segments) > 0)
+check("Zig-Zag's contour linking fires at least once on a concave pocket",
+      tp_zz.metadata.get('n_links_contour', 0) >= 1)
+check("n_links_contour never exceeds n_links_inserted",
+      tp_zz.metadata['n_links_contour'] <= tp_zz.metadata['n_links_inserted'])
+
+# A pocket region with a hole (annulus): some gap endpoints resolve to the
+# same ring (contour link), others don't (falls back to the geodesic link).
+depth_annulus = np.zeros((30, 30), dtype=np.float32)
+depth_annulus[4:26, 4:26] = 1.0
+depth_annulus[12:18, 12:18] = 0.0
+
+tp_hole = compute_pocket_toolpath(
+    depth_annulus, n_grey_levels=256, tool=zz_tool,
+    step_mm=2.0, stepdown_mm=0.0, max_depth=5.0,
+    width_mm=30.0, height_mm=30.0, raster_dir="Zig-Zag (90°)",
+    cut_direction="Either", progress=_noop_progress,
+)
+check("Zig-Zag on a region with a hole produces a non-empty toolpath",
+      len(tp_hole.segments) > 0)
+check("the annulus is a single connected region despite its hole",
+      tp_hole.metadata['n_regions'] == 1)
+
+# Two disjoint pocket regions close enough to link across: contour-linking
+# must not fire (the two endpoints belong to different regions), so this
+# must fall back to the geodesic link without raising.
+depth_two = np.zeros((30, 30), dtype=np.float32)
+depth_two[2:10, 2:10] = 1.0
+depth_two[2:10, 13:21] = 1.0   # separated from the first block by 2 empty columns
+
+tp_two = compute_pocket_toolpath(
+    depth_two, n_grey_levels=256, tool=zz_tool,
+    step_mm=2.0, stepdown_mm=0.0, max_depth=5.0,
+    width_mm=30.0, height_mm=30.0, raster_dir="Zig-Zag (0°)",
+    cut_direction="Either", progress=_noop_progress,
+)
+check("two disjoint regions are computed without error", len(tp_two.segments) > 0)
+check("two disjoint regions are detected as such", tp_two.metadata['n_regions'] == 2)
+sides = ["A" if seg[0][0] < 11.0 else "B" for seg in tp_two.segments]
+switches = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+check("the two disjoint regions' segments are never interleaved "
+      "(one region's segments finish before the other's begin)",
+      switches <= 1)
+
+for angle in ("Zig-Zag (0°)", "Zig-Zag (45°)", "Zig-Zag (90°)", "Zig-Zag (135°)"):
+    tp_angle = compute_pocket_toolpath(
+        depth_c, n_grey_levels=256, tool=zz_tool,
+        step_mm=3.0, stepdown_mm=0.0, max_depth=5.0,
+        width_mm=30.0, height_mm=30.0, raster_dir=angle,
+        cut_direction="Climb", progress=_noop_progress,
+    )
+    check(f"{angle} under locked Climb direction produces a toolpath",
+          len(tp_angle.segments) > 0)
+
+
+# --------------------------------------------------------------------------
+# _order_zigzag_pass: never interleaves two regions, and each region's own
+# entry corner depends on the incoming tool position rather than always
+# being the same fixed corner.
+# --------------------------------------------------------------------------
+print("_order_zigzag_pass")
+
+# direction="Y": lines are vertical, grouped by constant X -- one region's
+# two "lines" (single-point segments here, for simplicity) sit at x=0 and
+# x=10; a second, disjoint region's lines sit at x=100 and x=110.
+region1 = {1: [(0.0, 0.0, 0.0)], 2: [(10.0, 0.0, 0.0)]}
+region2 = {1: [(100.0, 0.0, 0.0)], 2: [(110.0, 0.0, 0.0)]}
+pass_segs_zz = [region1[1], region1[2], region2[1], region2[2]]
+seg_region_ids_zz = [1, 1, 2, 2]
+
+ordered_zz = _order_zigzag_pass(pass_segs_zz, seg_region_ids_zz, "Y", cur=(2.0, 0.0),
+                                lock_direction=True)
+region_seq = [1 if seg[0][0] < 50.0 else 2 for seg in ordered_zz]
+check("the nearer region (region 1) is visited first",
+      region_seq[0] == 1)
+check("region 1's two segments are never separated by region 2's",
+      region_seq == [1, 1, 2, 2])
+check("region 1 enters at x=0 (nearer to cur=(2,0) than x=10)",
+      ordered_zz[0][0][0] == 0.0)
+check("region 2 enters at x=100 (nearer to region 1's exit at x=10 than x=110)",
+      ordered_zz[2][0][0] == 100.0)
+
+# Same single region's two lines, entered from opposite starting points
+# depending purely on which is nearer the incoming cur -- not always the
+# same corner.
+one_region = [(0.0, 0.0, 0.0)], [(10.0, 0.0, 0.0)]
+near_left = _order_zigzag_pass(list(one_region), [1, 1], "Y", cur=(2.0, 0.0),
+                               lock_direction=True)
+near_right = _order_zigzag_pass(list(one_region), [1, 1], "Y", cur=(8.0, 0.0),
+                                lock_direction=True)
+check("a region enters at its leftmost line when cur is nearer that end",
+      near_left[0][0][0] == 0.0)
+check("the SAME region enters at its rightmost line when cur is nearer that "
+      "end instead -- the entry corner is not fixed",
+      near_right[0][0][0] == 10.0)
+
+
+# --------------------------------------------------------------------------
+# _order_free_region_pass: under an unlocked (Either) cut direction, each
+# line must be free to flip its own entry end for a short, alternating
+# zig-zag -- regression test for a real bug where reusing the
+# locked-direction sweep for Either forced every line back to the same
+# starting side every time, turning every line-to-line gap into a full
+# return trip across the region instead of a short hop to the near end.
+# --------------------------------------------------------------------------
+print("_order_free_region_pass")
+
+# direction="X": three horizontal lines (as generation always stores them,
+# left-to-right) stacked at y=0, 2, 4, each spanning x=0..10.
+line_y0 = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+line_y2 = [(0.0, 2.0, 0.0), (10.0, 2.0, 0.0)]
+line_y4 = [(0.0, 4.0, 0.0), (10.0, 4.0, 0.0)]
+free_ordered = _order_free_region_pass([line_y0, line_y2, line_y4], "X", cur=(2.0, 0.0))
+
+check("all three lines are present in the free-ordered result",
+      len(free_ordered) == 3)
+gaps = [((free_ordered[i][-1][0] - free_ordered[i + 1][0][0]) ** 2 +
+        (free_ordered[i][-1][1] - free_ordered[i + 1][0][1]) ** 2) ** 0.5
+       for i in range(len(free_ordered) - 1)]
+check("consecutive lines are entered from alternating ends, keeping every "
+      "line-to-line gap short (a full return trip across the region would "
+      "be 10mm; a same-side alternating entry is ~2mm)",
+      all(g < 3.0 for g in gaps))
 
 
 print()

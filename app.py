@@ -29,7 +29,7 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 _HOLE_FACECOLOR = "#d9534f"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, CUT_DIRECTIONS, ALGORITHMS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, CUT_DIRECTIONS, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
@@ -1399,7 +1399,7 @@ class GCodeGeneratorApp:
                                           after=step['raster_final_stepdown'])
                 step['raster_dir_cb'].config(values=POCKET_PATTERNS)
                 if step['raster_dir_var'].get() not in POCKET_PATTERNS:
-                    step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
+                    step['raster_dir_var'].set(POCKET_ZIGZAG[0])
                 step['raster_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])

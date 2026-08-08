@@ -668,8 +668,10 @@ def _order_locked_raster_pass(pass_segs, direction, cur):
     pass_segs : list of [(x, y, z_mm)...], each already oriented for
                 ascending line index ("mode A" — set by Phase 1's
                 FORCE_REVERSE).
-    direction : "X" (horizontal lines, grouped by their constant Y) or "Y"
-                (vertical lines, grouped by their constant X).
+    direction : "X" (horizontal lines, grouped by their constant Y), "Y"
+                (vertical lines, grouped by their constant X), "D45"
+                (45-degree lines, grouped by their constant x-y), or "D135"
+                (135-degree lines, grouped by their constant x+y).
     cur       : (x, y) starting tool position.
 
     Mode A visits lines in ascending line-index order using each segment's
@@ -691,7 +693,8 @@ def _order_locked_raster_pass(pass_segs, direction, cur):
     nothing is left.
     """
     def coord(seg):
-        return -seg[0][1] if direction == "X" else seg[0][0]
+        x, y = seg[0][0], seg[0][1]
+        return {"X": -y, "Y": x, "D45": x - y, "D135": x + y}[direction]
 
     groups = {}
     for i, seg in enumerate(pass_segs):
@@ -746,6 +749,97 @@ def _order_locked_raster_pass(pass_segs, direction, cur):
                     break
                 mode = 'B' if mode == 'A' else 'A'
                 ptr = len(keys) - 1 if mode == 'B' else 0
+    return ordered
+
+
+def _order_free_region_pass(pass_segs, direction, cur):
+    """Order one pocket region's own Zig-Zag segments for an unlocked
+    (Either) cut direction: the first line entered is whichever of the
+    region's own two extreme lines (by the same coord() key
+    _order_locked_raster_pass uses) is nearer cur, entered from whichever
+    of its own two ends is nearer -- never an arbitrary interior line.
+    Every remaining line is then ordered by plain unrestricted greedy
+    nearest-endpoint search (_order_free_raster_pass), which is free to
+    enter each line from whichever end is closer. Unlike a locked sweep,
+    which must keep every line travelling the same physical direction to
+    preserve which side carries uncut material, Either has no such
+    constraint, so letting each line's own entry end flip freely is what
+    lets consecutive lines actually stay close together -- fixing every
+    line to the same direction here would mean returning to the same
+    starting side every line regardless of how close the opposite ends
+    of two consecutive lines are.
+    """
+    def coord(seg):
+        x, y = seg[0][0], seg[0][1]
+        return {"X": -y, "Y": x, "D45": x - y, "D135": x + y}[direction]
+
+    keys = sorted(set(coord(seg) for seg in pass_segs))
+    extremes = [i for i, seg in enumerate(pass_segs) if coord(seg) in (keys[0], keys[-1])]
+
+    best_i, best_rev, best_dist = extremes[0], False, float('inf')
+    for i in extremes:
+        seg = pass_segs[i]
+        for rev in (False, True):
+            x, y = (seg[-1] if rev else seg[0])[:2]
+            d = (x - cur[0]) ** 2 + (y - cur[1]) ** 2
+            if d < best_dist:
+                best_i, best_rev, best_dist = i, rev, d
+
+    first = list(reversed(pass_segs[best_i])) if best_rev else pass_segs[best_i]
+    rest = [seg for j, seg in enumerate(pass_segs) if j != best_i]
+    return [first] + _order_free_raster_pass(rest, first[-1][:2], False, 0.0)
+
+
+def _order_zigzag_pass(pass_segs, seg_region_ids, direction, cur, lock_direction):
+    """Order one Pocket pass's Zig-Zag segments so that one pocket region's
+    own sweep completes before the next region's begins -- two different
+    regions' segments are never interleaved in the visiting order, even
+    when that would shorten travel.
+
+    Each region's own segments (grouped by seg_region_ids, one entry per
+    pass_segs element -- see full_depth_segs/seg_region_ids alignment in
+    compute_pocket_toolpath's Stage 4) are ordered by
+    _order_locked_raster_pass when cut direction is locked (Climb or
+    Conventional -- needed to keep uncut material on one consistent side
+    between lines, the same guarantee it already provides for a single
+    scan area), or by _order_free_region_pass when it's Either (no such
+    correctness constraint, so lines can flip freely for shorter travel).
+    Both start from whichever of the region's own two extreme lines is
+    nearer the running tool position, rather than an arbitrary interior
+    line -- the only reason that doesn't already happen today is that
+    ordering runs across every region's segments pooled together, so a
+    single region's own two extremes aren't necessarily the pool's global
+    sweep ends. Calling either per region's own segments here is what
+    fixes that.
+
+    At each step, every not-yet-visited region's own best order (and
+    entry point) is (re)computed against the current tool position, and
+    whichever region's entry point is nearest is visited next -- so a
+    region's chosen entry corner can differ from step to step depending on
+    where the tool ends up after the previous region, same as which of a
+    single region's own two ends is nearer can differ by incoming
+    position.
+    """
+    groups = {}
+    for seg, rid in zip(pass_segs, seg_region_ids):
+        groups.setdefault(rid, []).append(seg)
+    remaining = list(groups.values())
+
+    ordered = []
+    while remaining:
+        best_i, best_order, best_dist = 0, None, float('inf')
+        for i, group_segs in enumerate(remaining):
+            if lock_direction:
+                candidate = _order_locked_raster_pass(group_segs, direction, cur)
+            else:
+                candidate = _order_free_region_pass(group_segs, direction, cur)
+            x, y = candidate[0][0][0], candidate[0][0][1]
+            d = (x - cur[0]) ** 2 + (y - cur[1]) ** 2
+            if d < best_dist:
+                best_i, best_order, best_dist = i, candidate, d
+        ordered.extend(best_order)
+        cur = best_order[-1][-1][:2]
+        remaining.pop(best_i)
     return ordered
 
 
@@ -830,6 +924,93 @@ def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
         # when the line travels hi_idx -> lo_idx, the span nearer hi_idx
         # is reached first, so the span LIST order must flip too, not
         # just each span's own point order.
+        segs = list(reversed(segs))
+    return segs
+
+
+def _diag_grid_line_ids(H, W, family, px_per_mm, step_mm, raster_offset_pct):
+    """Evenly spaced diagonal grid-line ids spanning an H x W canvas, for the
+    45-degree ("D45": row + col = k) or 135-degree ("D135": row - col = k)
+    line family, step-adjusted to fit exactly and shifted by
+    raster_offset_pct -- the diagonal counterpart of _grid_line_ids.
+
+    Consecutive diagonal lines of either family are spaced 1/sqrt(2) px
+    apart per unit of k, so this reuses _grid_line_ids unmodified: passing
+    an effective px_per_mm of px_per_mm*sqrt(2) turns its ordinary
+    pixel-index spacing into the correct real-world mm spacing between
+    diagonal lines.
+
+    Returns
+    -------
+    (k_ids, adj_step_mm) -- k_ids is a list of diagonal line constants (k =
+    row+col for D45, k = row-col for D135); adj_step_mm is the step size
+    after rounding to fit.
+    """
+    boundary_px = (H - 1) + (W - 1)
+    offset = 0 if family == "D45" else -(W - 1)
+    line_ids, adj_step_mm = _grid_line_ids(boundary_px, px_per_mm * (2 ** 0.5),
+                                           step_mm, raster_offset_pct)
+    return [i + offset for i in line_ids], adj_step_mm
+
+
+def _diag_line_bounds(family, k, r_lo, r_hi, c_lo, c_hi):
+    """Inclusive row-parameter bounds (t_lo, t_hi) for the portion of one
+    diagonal line (row+col=k for "D45", row-col=k for "D135") that lies
+    within [r_lo,r_hi] x [c_lo,c_hi], or None if the line misses the box.
+    """
+    if family == "D45":
+        t_lo, t_hi = max(r_lo, k - c_hi), min(r_hi, k - c_lo)
+    else:
+        t_lo, t_hi = max(r_lo, k + c_lo), min(r_hi, k + c_hi)
+    return (t_lo, t_hi) if t_lo <= t_hi else None
+
+
+def _diag_line_points(family, k, t_lo, t_hi, reverse,
+                      center_depth_contour_raster, prior_mask, resid_tol,
+                      px_per_mm, H, _ox, _oy, max_depth):
+    """Diagonal counterpart to _line_points: samples the 45-degree
+    ("D45": row+col=k) or 135-degree ("D135": row-col=k) line between row
+    parameters t_lo..t_hi (inclusive, t_lo <= t_hi), gated by
+    prior_mask/mask_spans exactly as _line_points, using fancy indexing
+    since both row and column vary per sample. Point spacing along the line
+    is sqrt(2) px, vs. 1 px for an axis-aligned _line_points line.
+
+    reverse   : if True, each resulting segment's points are reversed so
+                the segment travels from t_hi toward t_lo instead of
+                t_lo toward t_hi.
+
+    Returns
+    -------
+    list of point-lists -- [[(x_mm, y_mm, -z_mm), ...], ...] -- normally one
+    element, or several when prior_mask/mask_spans splits the range into
+    disjoint active sub-spans.
+    """
+    rows = np.arange(t_lo, t_hi + 1)
+    cols = (k - rows) if family == "D45" else (rows - k)
+
+    line_depth = center_depth_contour_raster[rows, cols]
+
+    if prior_mask is not None:
+        line_mask = prior_mask[rows, cols]
+        effective = (line_depth * line_mask).astype(np.float32)
+        spans = mask_spans(effective > resid_tol)
+    else:
+        spans = [(0, len(line_depth) - 1)]
+
+    segs = []
+    for s, e in spans:                       # s, e are LOCAL indices, 0-based within t_lo..t_hi
+        points = []
+        for local_px in range(s, e + 1):
+            row, col = int(rows[local_px]), int(cols[local_px])
+            z_mm = float(center_depth_contour_raster[row, col]) * max_depth
+            x_mm = col / px_per_mm - _ox
+            y_mm = (H - 1 - row) / px_per_mm - _oy
+            points.append((x_mm, y_mm, -z_mm))
+        if points:
+            if reverse:
+                points = list(reversed(points))
+            segs.append(points)
+    if reverse:
         segs = list(reversed(segs))
     return segs
 
@@ -1094,6 +1275,99 @@ def _ring_chain_to_points(chain_px, z_mm, px_per_mm, H, _ox, _oy):
             for row, col in chain_px]
 
 
+def _region_contour_rings(region_mask_local):
+    """One pocket region's own boundary contour ring(s) -- one outer ring,
+    plus one ring per interior hole/island, with no erosion (unlike
+    _onion_skin_chains, which extracts a fresh ring at every erosion step).
+
+    Same padding technique _onion_skin_chains uses (algorithms.py): pad by
+    one False pixel on every side before find_contours, since the caller
+    always crops region_mask_local to its own tight bounding box, which
+    touches the mask on every side by definition -- without the margin the
+    boundary would be clipped into an open contour at the crop edge instead
+    of the true closed ring.
+
+    Returns
+    -------
+    list of Nx2 (row, col) float pixel-space rings, in region_mask_local's
+    own (unpadded) coordinate frame.
+    """
+    from skimage.measure import find_contours
+    padded = np.pad(region_mask_local, 1, mode="constant", constant_values=False)
+    rings = [r - 1.0 for r in find_contours(padded.astype(np.float32), 0.5)
+             if len(r) >= 3]
+    return rings
+
+
+@dataclasses.dataclass
+class _ContourRing:
+    """One pocket region's boundary ring, ready for arc-length lookups
+    (Stage 6's Zig-Zag contour-linking)."""
+    pts_px: np.ndarray   # Nx2 (row, col) float, full-canvas coordinates
+    cum: np.ndarray      # cum[i] = arc length from vertex 0 to vertex i, walking
+                          # forward (increasing index); len == pts_px
+    L: float             # ring's total perimeter (px), including the closing
+                          # edge from the last vertex back to vertex 0
+
+
+def _make_contour_ring(pts_px):
+    """Build a _ContourRing from a closed (row, col) polyline as returned by
+    find_contours (ring[0] == ring[-1]): drops that duplicate closing vertex
+    so pts_px becomes a proper N-vertex cyclic array, then precomputes the
+    per-vertex forward arc length and total perimeter (including the
+    closing edge back to vertex 0) that _nearest_ring_vertex/
+    _ring_arc_between's modular arithmetic relies on."""
+    if len(pts_px) > 1 and np.hypot(*(pts_px[0] - pts_px[-1])) < 1e-6:
+        pts_px = pts_px[:-1]
+    next_pts = np.roll(pts_px, -1, axis=0)
+    edge_len = np.hypot(next_pts[:, 0] - pts_px[:, 0], next_pts[:, 1] - pts_px[:, 1])
+    cum = np.concatenate(([0.0], np.cumsum(edge_len)[:-1]))
+    return _ContourRing(pts_px=pts_px, cum=cum, L=float(np.sum(edge_len)))
+
+
+def _nearest_ring_vertex(ring, row, col, tol_px):
+    """Index of the ring vertex nearest (row, col), or None if every vertex
+    is further than tol_px away.
+
+    Snaps to the nearest existing vertex rather than projecting onto the
+    nearest edge: find_contours already emits vertices roughly 1 px apart,
+    the same resolution the rest of the pocket pipeline already works at,
+    and RDP simplification downstream absorbs a deviation of that size.
+    """
+    d2 = (ring.pts_px[:, 0] - row) ** 2 + (ring.pts_px[:, 1] - col) ** 2
+    i = int(np.argmin(d2))
+    return i if d2[i] <= tol_px * tol_px else None
+
+
+def _ring_arc_between(ring, i0, i1):
+    """The sub-arc of ring.pts_px from vertex i0 to i1, walking whichever of
+    the ring's two directions is shorter (by ring.cum/ring.L).
+
+    Every returned point is one of the ring's own vertices, so the arc can
+    never leave the region regardless of how concave its boundary is -- an
+    unbroken walk along a region's own boundary stays on that boundary
+    either direction, which is why "shorter arc" alone is a safe choice
+    even where a scan line has been split into multiple segments by a
+    concave notch.
+    """
+    n = len(ring.pts_px)
+    fwd_len = (ring.cum[i1] - ring.cum[i0]) % ring.L
+    bwd_len = (ring.cum[i0] - ring.cum[i1]) % ring.L
+    if fwd_len <= bwd_len:
+        idx = [i0]
+        i = i0
+        while i != i1:
+            i = (i + 1) % n
+            idx.append(i)
+    else:
+        idx = [i0]
+        i = i0
+        while i != i1:
+            i = (i - 1) % n
+            idx.append(i)
+    return ring.pts_px[idx]
+
+
 def compute_raster_gate_mask(residual, work_surface_tol, prior_reference,
                               subtract_unaccessible, accessible, footprint):
     """Build the Process Region gate mask for a raster-style pass, or None
@@ -1145,17 +1419,22 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     max_depth         : total maximum cut depth in mm
     width_mm          : physical image width in mm
     height_mm         : physical image height in mm
-    raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
-                        "Spiral (Inside-Out)" — Horizontal/Vertical scan in
-                        parallel lines; the Spiral patterns trace the depth
-                        map's perimeter inward in concentric rectangular
-                        rings (Outside-In) or the reverse, starting near the
-                        center (Inside-Out), without lifting the tool.
-                        Always starts at the top-left corner and uses
+    raster_dir        : "Horizontal" | "Vertical" | "Diagonal (45°)" |
+                        "Diagonal (135°)" | "Spiral (Outside-In)" |
+                        "Spiral (Inside-Out)" — Horizontal/Vertical/Diagonal
+                        scan in parallel lines at 0°/90°/45°/135°; the
+                        Spiral patterns trace the depth map's perimeter
+                        inward in concentric rectangular rings (Outside-In)
+                        or the reverse, starting near the center
+                        (Inside-Out), without lifting the tool. Horizontal/
+                        Vertical always start at the top-left corner and use
                         independent row/column step-overs, so non-square
-                        depth maps are fully covered on both axes. See
-                        cut_direction for how Climb/Conventional map onto
-                        the spiral's clockwise/counter-clockwise sense.
+                        depth maps are fully covered on both axes; Diagonal
+                        lines are similarly spaced and clipped to cover the
+                        full canvas along both diagonals. See cut_direction
+                        for how Climb/Conventional map onto each scan
+                        direction's travel sense (or the spiral's clockwise/
+                        counter-clockwise sense).
     raster_offset_pct : percentage [0, 100) to shift raster lines relative to the
                         step-over distance; e.g. 50 shifts every line by half a step,
                         useful when combining with a previous raster step at 0%.
@@ -1293,22 +1572,24 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     resid_tol_mm = max_depth / (n_grey_levels - 1)
     resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
 
+    RASTER_ANGLE_FAMILY = {"Horizontal": "X", "Vertical": "Y",
+                           "Diagonal (45°)": "D45", "Diagonal (135°)": "D135"}
     IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
-    direction = None if IS_SPIRAL else ("X" if raster_dir == "Horizontal" else "Y")
+    direction = None if IS_SPIRAL else RASTER_ANGLE_FAMILY[raster_dir]
 
     # Forces every scan line/leg onto a single fixed travel direction (climb
     # keeps uncut material on the right of travel, conventional on the
     # left, for a clockwise spindle). "Either" leaves the default pixel-scan
     # order untouched and lets the ordering pass below reverse segments
-    # freely for shorter travel. For Horizontal/Vertical this flips each
-    # line's own point order (FORCE_REVERSE); for Spiral it instead selects
-    # which rotational sense (CW/CCW) the whole spiral is generated in,
-    # which achieves the same "uncut material on a fixed side" guarantee
+    # freely for shorter travel. For Horizontal/Vertical/Diagonal this flips
+    # each line's own point order (FORCE_REVERSE); for Spiral it instead
+    # selects which rotational sense (CW/CCW) the whole spiral is generated
+    # in, which achieves the same "uncut material on a fixed side" guarantee
     # for every leg without needing a per-leg reversal (see
     # SPIRAL_OUTSIDE_IN_SENSE and _spiral_legs() in Phase 1 below;
     # Inside-Out is a whole-path reversal on top of that).
-    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
-                      "Conventional": {"X": True,  "Y": False}}
+    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True, "D45": True,  "D135": True},
+                      "Conventional": {"X": True,  "Y": False, "D45": False, "D135": False}}
     SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
     lock_direction = cut_direction in FORCE_REVERSE
 
@@ -1357,7 +1638,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 _line_points(axis, fixed_idx, lo, hi, start_idx > end_idx,
                              center_depth_contour_raster, prior_mask, resid_tol,
                              px_per_mm, H, _ox, _oy, max_depth))
-    else:
+    elif direction in ("X", "Y"):
         spacing_boundary_px = H - 1 if direction == "X" else W - 1   # axis lines are spaced along
         line_span_px        = W - 1 if direction == "X" else H - 1   # each line's own full length
         all_line_ids, adj_step_mm = _grid_line_ids(spacing_boundary_px, px_per_mm, step_mm, raster_offset_pct)
@@ -1367,6 +1648,19 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 _line_points(direction, line_idx, 0, line_span_px, reverse,
                              center_depth_contour_raster, prior_mask, resid_tol,
                              px_per_mm, H, _ox, _oy, max_depth))
+    else:
+        k_ids, adj_step_mm = _diag_grid_line_ids(H, W, direction, px_per_mm,
+                                                 step_mm, raster_offset_pct)
+        for k in k_ids:
+            bounds = _diag_line_bounds(direction, k, 0, H - 1, 0, W - 1)
+            if bounds is None:
+                continue
+            t_lo, t_hi = bounds
+            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
+            full_depth_segs.extend(
+                _diag_line_points(direction, k, t_lo, t_hi, reverse,
+                                  center_depth_contour_raster, prior_mask, resid_tol,
+                                  px_per_mm, H, _ox, _oy, max_depth))
 
     progress(55, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s).")
 
@@ -1674,16 +1968,25 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     max_depth         : total maximum cut depth in mm (depth map's own scale)
     width_mm          : physical image width in mm
     height_mm         : physical image height in mm
-    raster_dir        : "Horizontal" | "Vertical" | "Spiral (Outside-In)" |
-                        "Spiral (Inside-Out)" — same meaning as
-                        compute_raster_toolpath's raster_dir, applied
-                        independently within each pocket region. Also
-                        accepts "Onion Skin (Outside-In)"/"(Inside-Out)":
-                        concentric rings offset inward from each region's
+    raster_dir        : "Zig-Zag (0°)" | "Zig-Zag (45°)" | "Zig-Zag (90°)" |
+                        "Zig-Zag (135°)" | "Spiral (Outside-In)" |
+                        "Spiral (Inside-Out)" | "Onion Skin (Outside-In)" /
+                        "(Inside-Out)". Zig-Zag scans parallel lines at the
+                        given angle within each region, same line-generation
+                        machinery as compute_raster_toolpath's Horizontal/
+                        Vertical/Diagonal directions (applied independently
+                        within each pocket region), but bridges gaps between
+                        neighbouring lines by walking the region's own
+                        boundary contour wherever both gap endpoints lie on
+                        it, falling back to the same geodesic search Raster
+                        uses otherwise (e.g. a gap spanning two different
+                        regions). Spiral traces the region's perimeter
+                        inward in concentric rectangular rings (Outside-In)
+                        or the reverse (Inside-Out). Onion Skin instead
+                        offsets concentric rings inward from each region's
                         own boundary by step_mm, stitched into one
-                        continuous chain per undivided island instead of a
-                        rectangular scan-line/coil, so the pattern follows
-                        the pocket's actual silhouette.
+                        continuous chain per undivided island, so the
+                        pattern follows the pocket's actual silhouette.
     target_z_mm       : depth (mm) defining the pocket floor and which tool-
                         centre positions count as pocket interior (tool-centre
                         erosion >= this, i.e. the tool's own footprint must
@@ -1815,12 +2118,15 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     flat_depth = np.where(pocket_mask, target_z_norm, 0.0).astype(np.float32)
     mask_resid_tol = target_z_norm * 0.5   # (flat_depth * region_mask) is 0 or target_z_norm
 
+    POCKET_ZIGZAG_FAMILY = {"Zig-Zag (0°)": "X", "Zig-Zag (45°)": "D45",
+                            "Zig-Zag (90°)": "Y", "Zig-Zag (135°)": "D135"}
     IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
     IS_ONION  = raster_dir in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)")
-    direction = None if (IS_SPIRAL or IS_ONION) else ("X" if raster_dir == "Horizontal" else "Y")
+    IS_ZIGZAG = raster_dir in POCKET_ZIGZAG_FAMILY
+    direction = POCKET_ZIGZAG_FAMILY.get(raster_dir)   # None for Spiral/Onion Skin
 
-    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True},
-                      "Conventional": {"X": True,  "Y": False}}
+    FORCE_REVERSE = {"Climb":        {"X": False, "Y": True, "D45": True,  "D135": True},
+                      "Conventional": {"X": True,  "Y": False, "D45": False, "D135": False}}
     SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
     lock_direction = cut_direction in FORCE_REVERSE
 
@@ -1829,20 +2135,35 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     progress(40, f"Phase 1: generating infill for {n_regions} pocket region(s)…")
 
     full_depth_segs = []
-    # Parallel to full_depth_segs, one entry per onion-skin chain, recording
-    # which pocket region it came from -- so Stage 6 ordering can permute
+    # Parallel to full_depth_segs, one entry per element, recording which
+    # pocket region produced it -- so Stage 6 ordering can group and permute
     # which *pocket* is visited when for travel efficiency, without ever
-    # separating one pocket's own chains (e.g. produced when its erosion
-    # forked into sibling branches) from each other or disturbing their
-    # deliberate Outside-In/Inside-Out depth sequence. Unused by the other
-    # scan directions.
-    chain_group_ids = []
+    # separating one pocket's own segments/chains (e.g. produced when Onion
+    # Skin's erosion forked into sibling branches) from each other or
+    # disturbing their deliberate depth/visiting sequence. Populated by the
+    # IS_ONION branch (one entry per onion-skin chain) and the IS_ZIGZAG
+    # branch (one entry per zig-zag line segment); left empty for Spiral,
+    # whose own generation order already keeps each region's legs together.
+    seg_region_ids = []
+    # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
+    # per interior hole/island), used by Stage 6 to bridge gaps by walking
+    # the region's actual contour instead of a geodesic search -- see
+    # _region_contour_rings/_ContourRing.
+    region_contours = {}
     for region_id, box in enumerate(region_boxes, start=1):
         if box is None:
             continue
         r_lo, r_hi = box[0].start, box[0].stop - 1
         c_lo, c_hi = box[1].start, box[1].stop - 1
         region_mask_f = (labeled_regions == region_id).astype(np.float32)
+
+        if IS_ZIGZAG:
+            local_mask = labeled_regions[box] == region_id
+            offset = np.array([r_lo, c_lo])
+            region_contours[region_id] = [
+                _make_contour_ring(ring + offset)
+                for ring in _region_contour_rings(local_mask)
+            ]
 
         if IS_SPIRAL:
             local_row_ids, _ = _grid_line_ids(r_hi - r_lo, px_per_mm, step_mm, raster_offset_pct)
@@ -1879,8 +2200,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                 full_depth_segs.append(
                     _ring_chain_to_points(chain + offset, pocket_depth_mm,
                                          px_per_mm, H, _ox, _oy))
-                chain_group_ids.append(region_id)
-        else:
+                seg_region_ids.append(region_id)
+        elif direction in ("X", "Y"):
             if direction == "X":
                 spacing_lo, spacing_hi = r_lo, r_hi
                 span_lo,    span_hi    = c_lo, c_hi
@@ -1892,10 +2213,28 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             line_ids = [i + spacing_lo for i in local_line_ids]
             reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
             for line_idx in line_ids:
-                full_depth_segs.extend(
-                    _line_points(direction, line_idx, span_lo, span_hi, reverse,
-                                 flat_depth, region_mask_f, mask_resid_tol,
-                                 px_per_mm, H, _ox, _oy, max_depth))
+                new_segs = _line_points(direction, line_idx, span_lo, span_hi, reverse,
+                                        flat_depth, region_mask_f, mask_resid_tol,
+                                        px_per_mm, H, _ox, _oy, max_depth)
+                full_depth_segs.extend(new_segs)
+                seg_region_ids.extend([region_id] * len(new_segs))
+        else:
+            k_offset = (r_lo + c_lo) if direction == "D45" else (r_lo - c_lo)
+            local_k_ids, _ = _diag_grid_line_ids(r_hi - r_lo + 1, c_hi - c_lo + 1,
+                                                 direction, px_per_mm, step_mm,
+                                                 raster_offset_pct)
+            k_ids = [k + k_offset for k in local_k_ids]
+            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
+            for k in k_ids:
+                bounds = _diag_line_bounds(direction, k, r_lo, r_hi, c_lo, c_hi)
+                if bounds is None:
+                    continue
+                t_lo, t_hi = bounds
+                new_segs = _diag_line_points(direction, k, t_lo, t_hi, reverse,
+                                             flat_depth, region_mask_f, mask_resid_tol,
+                                             px_per_mm, H, _ox, _oy, max_depth)
+                full_depth_segs.extend(new_segs)
+                seg_region_ids.extend([region_id] * len(new_segs))
 
     progress(70, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s) "
                  f"across {n_regions} region(s).")
@@ -1907,21 +2246,32 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     link_threshold_mm = 2.0 * step_mm   # 2-opt's own "free stitch" cost-model distance
 
     # ── Stage 6 · Per-pass ordering + terrain link insertion ─────────────
-    # Mirrors compute_raster_toolpath's own terrain linking (_geodesic_link),
-    # but the cost/Z surface is flat_depth -- the flat pocket-floor
-    # abstraction built in Stage 4 -- rather than the real achievable-depth
-    # surface. Within the mask flat_depth is constant, so a short gap
-    # between two infill lines/legs is bridged by a level G1 move at the
-    # current pass's ceiling instead of a full retract/rapid/plunge; a gap
-    # that must cross outside the mask rises only to the surface (Z=0), it
-    # never dips to match whatever relief the real depth map happens to
-    # have there, since the pocket floor isn't cutting to that relief.
+    # For Zig-Zag, a short gap between two segments both belonging to the
+    # same region is bridged by walking that region's own contour ring
+    # (region_contours), whenever both gap endpoints snap onto the same
+    # ring within RING_SNAP_TOL_PX -- e.g. a scan line split by a concave
+    # notch resumes by tracing the notch's own boundary rather than cutting
+    # across it. Every other gap (any raster_dir other than Zig-Zag, or a
+    # Zig-Zag gap that doesn't resolve to one shared ring -- crossing
+    # between two different regions, or between a region's outer boundary
+    # and an interior hole/island) falls back to the same terrain linking
+    # compute_raster_toolpath uses (_geodesic_link), but against flat_depth
+    # -- the flat pocket-floor abstraction built in Stage 4 -- rather than
+    # the real achievable-depth surface. Within the mask flat_depth is
+    # constant, so a short gap between two infill lines/legs is bridged by
+    # a level G1 move at the current pass's ceiling instead of a full
+    # retract/rapid/plunge; a gap that must cross outside the mask rises
+    # only to the surface (Z=0), it never dips to match whatever relief the
+    # real depth map happens to have there, since the pocket floor isn't
+    # cutting to that relief.
     final_norm = final_stepdown_mm / max_depth
     all_segments = []
     tool_pos = np.array([0.0, 0.0])
     total_segs = 0
     n_links_inserted = 0
+    n_links_contour = 0
     n_links = 0
+    RING_SNAP_TOL_PX = 2.0   # how close a segment endpoint must sit to a region's own contour ring
     for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
         if not pass_segs:
             continue
@@ -1941,13 +2291,19 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             ordered_segs = pass_segs
         elif IS_ONION:
             # pass_segs is guaranteed to reproduce full_depth_segs (hence
-            # chain_group_ids) unchanged in count and order whenever
+            # seg_region_ids) unchanged in count and order whenever
             # non-empty: every onion-skin point across every region shares
             # the one uniform target_z_norm, so make_multipass's per-pass
             # keep/drop decision is identical for every chain in a given
             # pass -- a pass never keeps some chains and drops others.
             ordered_segs = _order_fixed_orientation_pass(pass_segs, cur,
-                                                          group_ids=chain_group_ids)
+                                                          group_ids=seg_region_ids)
+        elif IS_ZIGZAG:
+            # Same full_depth_segs/seg_region_ids alignment guarantee as
+            # IS_ONION above applies here too -- every zig-zag point across
+            # every region shares the one uniform target_z_norm.
+            ordered_segs = _order_zigzag_pass(pass_segs, seg_region_ids, direction, cur,
+                                              lock_direction)
         elif lock_direction and IS_SPIRAL:
             ordered_segs = pass_segs
         elif lock_direction:
@@ -1977,26 +2333,50 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                     c1_px = int(round((x_entry + _ox) * px_per_mm))
                     r1_px = int(round((H - 1) - (y_entry + _oy) * px_per_mm))
 
-                    fn = 0.0 if is_final else final_norm
-                    link_pixels = _geodesic_link(
-                        r0_px, c0_px, r1_px, c1_px, ceil_norm,
-                        flat_depth, H, W,
-                        px_per_mm, px_per_mm, max_depth, fn)
-                    link_points = [seg[-1]]
-                    for row_l, col_l in link_pixels[1:-1]:
-                        terrain = float(flat_depth[row_l, col_l])
-                        if is_final:
-                            z_link = min(terrain, ceil_norm)
-                        else:
-                            z_link = min(max(terrain - final_norm, 0.0), ceil_norm)
-                        x_lmm = col_l / px_per_mm - _ox
-                        y_lmm = (H - 1 - row_l) / px_per_mm - _oy
-                        link_points.append((x_lmm, y_lmm, -z_link * max_depth))
-                    link_points.append(nxt[0])
+                    contour_link_points = None
+                    if IS_ZIGZAG:
+                        rid0 = labeled_regions[r0_px, c0_px]
+                        rid1 = labeled_regions[r1_px, c1_px]
+                        if rid0 == rid1 and rid0 != 0:
+                            for ring in region_contours.get(int(rid0), []):
+                                i0 = _nearest_ring_vertex(ring, r0_px, c0_px, RING_SNAP_TOL_PX)
+                                i1 = _nearest_ring_vertex(ring, r1_px, c1_px, RING_SNAP_TOL_PX)
+                                if i0 is not None and i1 is not None:
+                                    z = seg[-1][2]
+                                    arc = _ring_arc_between(ring, i0, i1)
+                                    contour_link_points = [seg[-1]] + [
+                                        (col / px_per_mm - _ox, (H - 1 - row) / px_per_mm - _oy, z)
+                                        for row, col in arc[1:-1]
+                                    ] + [nxt[0]]
+                                    break
 
-                    if len(link_points) >= 2:
-                        all_segments.append(link_points)
-                        n_links_inserted += 1
+                    if contour_link_points is not None:
+                        link_points = contour_link_points
+                        if len(link_points) >= 2:
+                            all_segments.append(link_points)
+                            n_links_inserted += 1
+                            n_links_contour += 1
+                    else:
+                        fn = 0.0 if is_final else final_norm
+                        link_pixels = _geodesic_link(
+                            r0_px, c0_px, r1_px, c1_px, ceil_norm,
+                            flat_depth, H, W,
+                            px_per_mm, px_per_mm, max_depth, fn)
+                        link_points = [seg[-1]]
+                        for row_l, col_l in link_pixels[1:-1]:
+                            terrain = float(flat_depth[row_l, col_l])
+                            if is_final:
+                                z_link = min(terrain, ceil_norm)
+                            else:
+                                z_link = min(max(terrain - final_norm, 0.0), ceil_norm)
+                            x_lmm = col_l / px_per_mm - _ox
+                            y_lmm = (H - 1 - row_l) / px_per_mm - _oy
+                            link_points.append((x_lmm, y_lmm, -z_link * max_depth))
+                        link_points.append(nxt[0])
+
+                        if len(link_points) >= 2:
+                            all_segments.append(link_points)
+                            n_links_inserted += 1
 
                 n_links += 1
 
@@ -2043,6 +2423,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             'rdp_tolerance': rdp_tol,
             'link_threshold_mm': link_threshold_mm,
             'n_links_inserted': n_links_inserted,
+            'n_links_contour': n_links_contour,
             'n_links_total': n_links,
         }
     )

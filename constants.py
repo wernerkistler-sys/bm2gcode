@@ -1,8 +1,10 @@
 TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
-RASTER_DIRECTIONS = ["Horizontal", "Vertical",
+RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Diagonal (45°)", "Diagonal (135°)",
                      "Spiral (Outside-In)", "Spiral (Inside-Out)"]
-POCKET_PATTERNS   = RASTER_DIRECTIONS + ["Onion Skin (Outside-In)",
-                                        "Onion Skin (Inside-Out)"]
+SPIRAL_DIRECTIONS = ["Spiral (Outside-In)", "Spiral (Inside-Out)"]
+POCKET_ZIGZAG     = ["Zig-Zag (0°)", "Zig-Zag (45°)", "Zig-Zag (90°)", "Zig-Zag (135°)"]
+POCKET_PATTERNS   = POCKET_ZIGZAG + SPIRAL_DIRECTIONS + ["Onion Skin (Outside-In)",
+                                                        "Onion Skin (Inside-Out)"]
 CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
 ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",

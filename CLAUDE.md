@@ -17,6 +17,7 @@ Run tests (plain assert-based scripts, not pytest — each prints `ok`/`FAIL` pe
 ```
 python tests/test_dressup.py
 python tests/test_layers.py
+python tests/test_algorithms.py
 ```
 There is no test runner config, build step, or lint config in this repo.
 
