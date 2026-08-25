@@ -3520,7 +3520,6 @@ class GCodeGeneratorApp:
         self.display_step_var.set(selected + 1)
         self._sync_layer_visible_checkboxes()
         self._recompute_composite()
-        self._erosion_cache.clear()
         self._on_display_mode_changed()
 
     def _sync_layer_visible_checkboxes(self):
