@@ -197,11 +197,13 @@ class LabeledEntry(ttk.Frame):
         self.entry.pack(side=tk.RIGHT)
         ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
         self.auto_var = None
+        self._auto_checkbutton = None
         if auto_label is not None:
             self.auto_var = tk.BooleanVar(value=False)
             self.auto_var.trace_add("write", self._on_auto_toggle)
-            ttk.Checkbutton(self, text=auto_label,
-                            variable=self.auto_var).pack(side=tk.RIGHT, padx=(0, 4))
+            self._auto_checkbutton = ttk.Checkbutton(self, text=auto_label,
+                                                       variable=self.auto_var)
+            self._auto_checkbutton.pack(side=tk.RIGHT, padx=(0, 4))
 
         # The ttk.Spinbox class bindings already handle the mouse wheel, but
         # they don't stop the event, so it would also bubble up to whatever
@@ -304,6 +306,19 @@ class LabeledEntry(ttk.Frame):
 
     def set_label(self, text):
         self._label_widget.config(text=text)
+
+    def set_auto_visible(self, visible):
+        """Show or hide the auto checkbutton (a no-op if this entry has
+        none). Re-packing after a forget lands it back in its original
+        position -- entry and unit stay packed throughout, so it's always
+        the newest side=RIGHT slave, i.e. immediately left of the unit
+        label, as at construction."""
+        if self._auto_checkbutton is None:
+            return
+        if visible:
+            self._auto_checkbutton.pack(side=tk.RIGHT, padx=(0, 4))
+        else:
+            self._auto_checkbutton.pack_forget()
 
 
 class SectionFrame(ttk.LabelFrame):

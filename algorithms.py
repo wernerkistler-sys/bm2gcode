@@ -1850,11 +1850,14 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     compute_vcarve_synth_achievable_depth). None (the default) uses
     depth_map directly, i.e. ordinary Pocket behaviour.
 
-    target_z_mm > 0 is used literally; None or <= 0 means "auto": use
-    max_depth (the deepest region of the depth map), mirroring
-    resolve_vcarve_threshold_norm/compute_cutout_silhouette_mask's own
-    "0 (or unset) means auto" convention -- a literal 0 target depth is
-    otherwise a degenerate, always-empty pocket.
+    target_z_mm is used literally, including 0 -- a 0 target depth makes
+    the pocket interior mask cover every tool-centre position the tool can
+    occupy at all (the erosion is always >= 0), so the whole reachable
+    surface is cleared flat at (effectively) Z=0: a full-stock flattening/
+    facing pass. target_z_norm is floored just above exact 0 rather than
+    landing on it, so the resulting floor is negligibly, not exactly, 0 --
+    see the comment at its computation below. Only None (no value given)
+    falls back to max_depth (the deepest region of the depth map).
 
     Gates on the EROSION (tool-centre-safe depth), not the dilated/opened
     accessible surface: the accessible surface tells us which MATERIAL
@@ -1917,8 +1920,21 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
 
     # ── Target-Z interior mask ──────────────────────────────────────────────
     progress(35, "Computing pocket interior mask…")
-    if target_z_mm is None or target_z_mm <= 0.0:
+    if target_z_mm is None:
         target_z_mm = max_depth
+    # Floored just above 0 rather than allowed to land exactly there: Zig-Zag
+    # and Spiral (see compute_pocket_toolpath) reuse compute_raster_toolpath's
+    # own _line_points/_diag_line_points to build scan lines, which decide
+    # which pixels are active by multiplying this normalised depth by the
+    # region mask and comparing against a tolerance -- the same real
+    # depth*mask test Raster's own Z-threshold/residual gating depends on, so
+    # it can't be changed here. At target_z_norm == 0.0 that product is
+    # identically 0 both inside and outside the pocket (flat_depth is 0
+    # everywhere a flat target depth of 0 implies), so no tolerance can tell
+    # them apart and every scan line comes back empty. A 1e-6 floor keeps
+    # in-pocket pixels distinguishably (if negligibly) nonzero -- Onion Skin
+    # is unaffected, since it gates on the region mask directly rather than
+    # through this product.
     target_z_norm = float(np.clip(target_z_mm / max_depth, 1e-6, 1.0))
     contour_eps = 0.5 / max(n_grey_levels - 1, 1)
     pocket_mask = center_depth_contour_pocket >= (target_z_norm - contour_eps)
@@ -1990,9 +2006,13 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     target_z_mm       : depth (mm) defining the pocket floor and which tool-
                         centre positions count as pocket interior (tool-centre
                         erosion >= this, i.e. the tool's own footprint must
-                        clear shallower material at that depth). None
-                        defaults to max_depth (the deepest region of the
-                        depth map). Clipped to (0, max_depth].
+                        clear shallower material at that depth). Used
+                        literally, including 0 -- a 0 target depth clears
+                        the entire reachable surface flat at Z=0 (a full-
+                        stock flattening/facing pass), since every tool-
+                        centre erosion is >= 0. None defaults to max_depth
+                        (the deepest region of the depth map). Clipped to
+                        [0, max_depth].
     raster_offset_pct : percentage [0, 100) to shift infill lines relative to
                         the step-over distance, same meaning as Raster.
     cut_direction     : "Either" | "Climb" | "Conventional" — forces every

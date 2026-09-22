@@ -1155,8 +1155,11 @@ class GCodeGeneratorApp:
         step['gating_cb'] = gating_cb
 
         threshold = LabeledEntry(gating_frame, "Z-threshold", "mm", DEFAULTS["step_threshold"],
-                                 minval=0.0, maxval=200.0, increment=0.1)
+                                 auto_label="Auto", minval=0.0, maxval=200.0, increment=0.1)
         threshold.pack(fill=tk.X, pady=2)
+        threshold.set_auto_visible(False)   # only meaningful for Pocket's Target
+                                             # depth -- _refresh_layout shows it
+                                             # there and hides it everywhere else
         step['threshold'] = threshold
 
         min_fw = LabeledEntry(gating_frame, "Min feature width", "mm", DEFAULTS["step_min_fw"],
@@ -1288,16 +1291,21 @@ class GCodeGeneratorApp:
             family  = ALGORITHM_FAMILY[alg]
 
             # Cutout reuses the same field to split "object" from
-            # "background" rather than gate on depth, and Pocket (and
-            # V-Carving Clean-up, which shares Pocket's Target depth field)
-            # reuses it for Target depth (its own "0 = auto, use Max cut
-            # depth" sentinel, same convention as Z-threshold's own "0 =
-            # auto" meaning for V-Carving/Cutout) -- different enough
-            # concepts that each gets its own label.
+            # "background" rather than gate on depth (its own "0 = auto,
+            # split at the depth-map midpoint" sentinel, same convention as
+            # Z-threshold's own "0 = auto" meaning for V-Carving) -- and
+            # Pocket (and V-Carving Clean-up, which shares Pocket's Target
+            # depth field) reuses it for Target depth, taken literally
+            # (including 0, a full-stock flattening pass) with its own Auto
+            # checkbox instead -- different enough concepts that each gets
+            # its own label.
             step['threshold'].set_label(
                 "Split level" if alg == "Cutout" else
                 "Target depth" if family == "Pocket" else
                 "Z-threshold")
+            step['threshold'].set_auto_visible(family == "Pocket")
+            if family != "Pocket" and step['threshold'].auto_var is not None:
+                step['threshold'].auto_var.set(False)
 
             if family == "V-Carving":
                 step['raster_frame'].pack_forget()
@@ -1482,6 +1490,10 @@ class GCodeGeneratorApp:
         step['diameter'].committed_var.trace_add("write", _update_auto_max_fw)
         self.max_depth.committed_var.trace_add("write", _update_auto_max_fw)
 
+        threshold.auto_var.trace_add("write", lambda *_: self._sync_auto_target_depth(step))
+        self.max_depth.committed_var.trace_add(
+            "write", lambda *_: self._sync_auto_target_depth(step))
+
         threshold.committed_var.trace_add("write", _on_mask_param_changed)
         min_fw.committed_var.trace_add("write", _on_mask_param_changed)
         max_fw.committed_var.trace_add("write", _on_mask_param_changed)
@@ -1500,6 +1512,7 @@ class GCodeGeneratorApp:
         step['stepdown'].set(DEFAULTS["step_stepdown"])
         step['extra_offset'].set(DEFAULTS["step_extra_offset"])
         step['feed_rate'].set(DEFAULTS["step_feed_rate"])
+        step['threshold'].auto_var.set(False)
         step['threshold'].set(DEFAULTS["step_threshold"])
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
         step['cut_dir_var'].set(DEFAULTS["step_cut_direction"])
@@ -1770,9 +1783,11 @@ class GCodeGeneratorApp:
                 and base.raw.shape == (H, W)):
             self.current_image = base.raw
             self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
+            self._sync_auto_target_depth(step)
             return
 
         self.current_image, self.n_grey_levels = self._composite_with_visibility(visibility)
+        self._sync_auto_target_depth(step)
 
     def _on_layer_property_changed(self):
         """Live-edit callback: a source's placement/blend/visibility
@@ -2214,6 +2229,7 @@ class GCodeGeneratorApp:
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
             'threshold':            step['threshold'].get(),
+            'threshold_auto':       bool(step['threshold'].auto_var.get()),
             'min_fw':               step['min_fw'].get(),
             'max_fw':               step['max_fw'].get(),
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
@@ -2262,6 +2278,7 @@ class GCodeGeneratorApp:
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
+        step['threshold'].auto_var.set(bool(d.get('threshold_auto', False)))
         step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
         step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
         step['max_fw'].auto_var.set(bool(d.get('max_fw_auto', False)))
@@ -2831,7 +2848,6 @@ class GCodeGeneratorApp:
         idx       = self.steps.index(step)
         algorithm = step['algorithm_var'].get()
         feed_rate    = float(step['feed_rate'].get())
-        threshold_mm = float(step['threshold'].get())
         width_mm      = float(self.width_mm.get())
         height_mm     = float(self.height_mm.get())
         margin_mm     = float(self.margin_mm.get())
@@ -2839,6 +2855,16 @@ class GCodeGeneratorApp:
         eff_width_mm  = width_mm  + 2.0 * margin_mm
         eff_height_mm = height_mm + 2.0 * margin_mm
         origin       = self.origin_var.get()
+
+        threshold_mm = float(step['threshold'].get())
+        if (ALGORITHM_FAMILY[algorithm] == "Pocket"
+                and step['threshold'].auto_var is not None
+                and step['threshold'].auto_var.get()):
+            # Resolved fresh from this step's own current depth map rather
+            # than trusting the displayed value, which _sync_auto_target_depth
+            # only keeps live while this step's tab is the selected one.
+            auto_depth_map, _ = self._get_depth_map_for_step(step)
+            threshold_mm = float(np.max(auto_depth_map)) * max_depth
 
         params = {
             'idx':           idx,
@@ -3693,6 +3719,29 @@ class GCodeGeneratorApp:
             W, H = self._canvas_shape_px()
             composite_raw = np.zeros((H, W), dtype=np.float32)
         return self._finish_depth_map(composite_raw, n_grey_levels)
+
+    def _sync_auto_target_depth(self, step):
+        """If *step* is a Pocket-family step whose Target depth Auto
+        checkbox is checked, refresh the displayed value from that step's
+        own current depth map (its deepest point, in mm) -- a live-updated
+        substitute for the old "0 = auto, use Max cut depth" sentinel.
+        Cosmetic only: the authoritative value used for computing is
+        resolved fresh in _gather_step_params, so a stale display here
+        (e.g. from an edit made on a different step's tab) can't produce a
+        wrong toolpath."""
+        if step is None:
+            return
+        threshold = step.get('threshold')
+        if threshold is None or threshold.auto_var is None or not threshold.auto_var.get():
+            return
+        if ALGORITHM_FAMILY.get(step['algorithm_var'].get()) != "Pocket":
+            return
+        try:
+            max_depth = float(self.max_depth.get())
+        except ValueError:
+            return
+        depth_map, _ = self._get_depth_map_for_step(step)
+        threshold.set(f"{float(np.max(depth_map)) * max_depth:.3f}")
 
     def _is_3d_mode(self):
         return self.display_mode_var.get() in DISPLAY_3D_MODES
