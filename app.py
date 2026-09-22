@@ -29,7 +29,8 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 _HOLE_FACECOLOR = "#d9534f"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, CUT_DIRECTIONS, ALGORITHMS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, SPIRAL_DIRECTIONS,
+    CUT_DIRECTIONS, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
@@ -1445,7 +1446,16 @@ class GCodeGeneratorApp:
 
             locked = ((family != "V-Carving") or alg == "V-Carving (Hybrid)") \
                      and step['cut_dir_var'].get() != "Either"
-            step['tsp_2opt_cb'].config(state="disabled" if locked else "normal")
+            # Pocket's own per-pass ordering (see compute_pocket_toolpath's
+            # Stage 6) only ever consults use_2opt for a Spiral scan
+            # direction -- Zig-Zag and Onion Skin each use their own
+            # dedicated ordering (_order_zigzag_pass /
+            # _order_fixed_orientation_pass) that never reads it, so the
+            # checkbox has nothing to do there regardless of Cut direction.
+            pocket_2opt_moot = (family == "Pocket"
+                                 and step['raster_dir_var'].get() not in SPIRAL_DIRECTIONS)
+            step['tsp_2opt_cb'].config(
+                state="disabled" if (locked or pocket_2opt_moot) else "normal")
 
             if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()
@@ -1453,6 +1463,7 @@ class GCodeGeneratorApp:
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
         cut_dir_var.trace_add("write", _refresh_layout)
+        dir_var.trace_add("write", _refresh_layout)
 
         def _on_mask_param_changed(*_):
             if not hasattr(self, '_view_menu'):

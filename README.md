@@ -218,7 +218,7 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 
 ##### Step / Operation / Path Optimization
 
-**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments. Greyed out and has no effect when **Cut direction** is set to Climb or Conventional, since a locked direction cannot be reordered — see [Climb / conventional cut direction](#climb--conventional-cut-direction).
+**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments. Greyed out and has no effect when **Cut direction** is set to Climb or Conventional, since a locked direction cannot be reordered — see [Climb / conventional cut direction](#climb--conventional-cut-direction). For [Pocket](#step--operation--pocket), it's also greyed out whenever **Scan direction** is Zig-Zag or Onion Skin, regardless of Cut direction — both use their own dedicated ordering (region-sequential for Zig-Zag, fixed-orientation for Onion Skin — see [Pocket Pipeline](#pocket-pipeline)) that never consults 2-opt; only Spiral's ordering can fall back to it.
 
 ---
 
