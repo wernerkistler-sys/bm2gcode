@@ -1338,23 +1338,186 @@ def _is_contiguous_chain(segs, tol_mm=1e-6):
     return True
 
 
+def _link_is_inside(p, q, safe_mask_f, tol=0.1):
+    """True if the straight segment p -> q (row, col) stays inside
+    safe_mask_f: every sample taken along it at most 0.5 px apart has a
+    bilinearly-interpolated mask value of at least 0.5 - tol, the same 0.5
+    iso-level find_contours traces (tol absorbs marching squares' own
+    straight-chord approximation of that level set, so a ring vertex and
+    its neighbouring edge still count as inside).
+
+    p and q may also be (N, 2) arrays, checking N segments at once;
+    returns an (N,) bool array in that case.
+    """
+    from scipy.ndimage import map_coordinates
+    p = np.atleast_2d(np.asarray(p, dtype=float))
+    q = np.atleast_2d(np.asarray(q, dtype=float))
+    length = np.hypot(q[:, 0] - p[:, 0], q[:, 1] - p[:, 1])
+    n_samples = max(2, int(np.ceil(length.max() / 0.5)) + 1)
+    t = np.linspace(0.0, 1.0, n_samples)
+    pts = p[:, None, :] + t[None, :, None] * (q - p)[:, None, :]
+    vals = map_coordinates(safe_mask_f, pts.reshape(-1, 2).T, order=1,
+                           mode="constant", cval=0.0)
+    inside = np.all(vals.reshape(len(p), n_samples) >= 0.5 - tol, axis=1)
+    return inside if len(inside) > 1 else bool(inside[0])
+
+
+def _ring_seam_candidates(ring, spacing_px, max_cands):
+    """Seam candidates for one onion-skin ring, as (body, entry_idx,
+    exit_idx): body is the ring's own vertex array (a closed ring's
+    duplicate closing vertex dropped), and entry_idx[i]/exit_idx[i] are
+    the body indices the chain enters and leaves the ring on for its i-th
+    candidate seam.
+
+    A closed ring is entered and left on the same vertex, so its
+    candidates are vertices spaced about spacing_px apart in arc length
+    (widened so there are at most max_cands of them). An open ring can
+    only be traversed end to end, so its two candidates are its two ends,
+    each leaving on the opposite end.
+    """
+    is_closed = np.linalg.norm(ring[0] - ring[-1]) < 1.5
+    if not is_closed:
+        return ring, np.array([0, len(ring) - 1]), np.array([len(ring) - 1, 0])
+    body = ring[:-1] if np.hypot(*(ring[0] - ring[-1])) < 1e-6 else ring
+    edge = np.hypot(*np.diff(body, axis=0).T)
+    cum = np.concatenate(([0.0], np.cumsum(edge)))
+    spacing = max(spacing_px, cum[-1] / max_cands, 1e-9)
+    idx = np.unique(np.searchsorted(cum, np.arange(0.0, cum[-1] + 1e-9, spacing)))
+    idx = idx[idx < len(body)]
+    return body, idx, idx
+
+
+def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
+                        max_checked_pairs=1024):
+    """Stitch one onion-skin branch's rings (already in visiting order and
+    winding sense) into continuous chain(s), choosing every ring's seam --
+    the vertex it is entered and left on -- jointly over the whole
+    branch.
+
+    Consecutive rings are joined by a straight link from one ring's exit
+    to the next ring's entry. The seams minimise the branch's total link
+    length, solved exactly over each ring's seam candidates
+    (_ring_seam_candidates) as a shortest path through a layered graph --
+    one layer per ring, one node per candidate. A globally chosen seam
+    line routes itself along the region's straight flanks, where the gap
+    between consecutive rings is about one step_px, and away from acute
+    tips and vanished protrusions, where it opens up much wider; a greedy
+    nearest-point choice made one ring at a time cannot see that coming.
+
+    Only links that stay inside safe_mask_f (_link_is_inside) are
+    allowed. For each pair of consecutive rings, the max_checked_pairs
+    shortest candidate pairs are checked; every other pair is excluded,
+    since a pair that much longer than the shortest one is never worth
+    taking. If no pair between two rings is allowed (e.g. an outer ring
+    and a hole ring at the same erosion level with no straight line of
+    sight between them), the branch is split there into separate chains,
+    left for Stage 6 ordering and linking to join.
+
+    Returns
+    -------
+    list of Nx2 (row, col) chains, in visiting order.
+    """
+    if not rings:
+        return []
+    spacing_px = max(1.0, step_px / 4.0)
+    cands = [_ring_seam_candidates(r, spacing_px, max_cands) for r in rings]
+
+    def link_costs(j):
+        body_a, _, exit_a = cands[j]
+        body_b, entry_b, _ = cands[j + 1]
+        pa, pb = body_a[exit_a], body_b[entry_b]
+        d = np.hypot(pa[:, None, 0] - pb[None, :, 0], pa[:, None, 1] - pb[None, :, 1])
+        flat = d.ravel()
+        k = min(max_checked_pairs, flat.size)
+        shortest = np.argpartition(flat, k - 1)[:k]
+        ia, ib = np.unravel_index(shortest, d.shape)
+        ok = np.atleast_1d(_link_is_inside(pa[ia], pb[ib], safe_mask_f))
+        cost = np.full(d.shape, np.inf)
+        cost[ia[ok], ib[ok]] = d[ia[ok], ib[ok]]
+        return cost
+
+    # Forward pass. segments collects (first_ring, last_ring, backpointers)
+    # for each run of rings that stays linkable end to end.
+    segments = []
+    seg_start = 0
+    acc = np.zeros(len(cands[0][1]))
+    back = []
+    for j in range(len(rings) - 1):
+        tot = acc[:, None] + link_costs(j)
+        best = np.argmin(tot, axis=0)
+        nxt = tot[best, np.arange(tot.shape[1])]
+        if not np.any(np.isfinite(nxt)):
+            segments.append((seg_start, j, back, acc))
+            seg_start, back = j + 1, []
+            acc = np.zeros(len(cands[j + 1][1]))
+        else:
+            back.append(best)
+            acc = nxt
+    segments.append((seg_start, len(rings) - 1, back, acc))
+
+    chains = []
+    for first, last, back, acc in segments:
+        seam = [int(np.argmin(acc))]
+        for bp in reversed(back):
+            seam.append(int(bp[seam[-1]]))
+        seam.reverse()
+        parts = []
+        for j, c in zip(range(first, last + 1), seam):
+            body, entry_idx, exit_idx = cands[j]
+            e = int(entry_idx[c])
+            if exit_idx[c] == e:
+                parts.append(np.vstack([np.roll(body, -e, axis=0), body[e:e + 1]]))
+            else:
+                parts.append(body if e == 0 else body[::-1])
+        chains.append(np.vstack(parts))
+    return chains
+
+
+def _order_level_rings(rings, prev_ring):
+    """Visiting order for one erosion level's rings (its outer boundary
+    plus any hole/island rings): greedily, whichever remaining ring comes
+    closest (minimum vertex-to-vertex distance) to the ring visited just
+    before it, starting from prev_ring, the previous level's last ring.
+    With no prev_ring (a branch's first level), the first ring
+    find_contours returned goes first.
+    """
+    from scipy.spatial import cKDTree
+    remaining = list(rings)
+    ordered = []
+    while remaining:
+        if prev_ring is None:
+            i = 0
+        else:
+            tree = cKDTree(prev_ring)
+            i = int(np.argmin([tree.query(r)[0].min() for r in remaining]))
+        prev_ring = remaining.pop(i)
+        ordered.append(prev_ring)
+    return ordered
+
+
 def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     """Concentric-ring toolpath chain(s) clearing one connected pocket
     region: repeatedly binary_erosion's region_mask by disk(step_px),
     extracting each ring's boundary via find_contours, and stitching
-    consecutive rings into one continuous chain by starting each new ring
-    at whichever of its points is nearest the previous ring's endpoint.
-    Every ring is emitted the moment its mask is non-empty (before the
-    area/erosion check below), so a region smaller than one step_px still
-    gets its own single perimeter ring rather than nothing.
+    consecutive rings into one continuous chain with _stitch_onion_rings,
+    which picks every ring's seam jointly for the shortest total
+    ring-to-ring links and only ever links along a straight line that
+    stays inside region_mask. A ring on erosion level k+1 is the boundary
+    of level k's mask eroded by disk(step_px), so from every one of its
+    points a link of about step_px back to level k's ring exists and
+    lies within that disk, i.e. inside the region. Same-level rings (an
+    outer boundary plus hole/island rings) are visited in
+    _order_level_rings' nearest-ring order. Every ring is emitted the
+    moment its mask is non-empty (before the area/erosion check below),
+    so a region smaller than one step_px still gets its own single
+    perimeter ring rather than nothing.
 
     reverse_rings reverses every ring's own point order right after
     find_contours (same "uncut material stays on the tool's right of
     travel" convention as _extract_z_contours' reverse_contours), so the
     climb/conventional winding sense of the whole chain is decided once
-    here, before nearest-point stitching -- stitching order itself never
-    changes a ring's winding, only which of its points the chain enters
-    on.
+    here, before stitching -- seam selection never changes a ring's
+    winding, only which of its points the chain enters on.
 
     If an erosion iteration's connected-component count rises above 1, any
     component smaller than min_area_px is first discarded as a stray
@@ -1386,9 +1549,10 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
 
     Returns
     -------
-    list of Nx2 (row, col) float pixel-space polylines, one per undivided
-    island, each already in final chain-visiting order (outside-in), in
-    region_mask's own (unpadded) coordinate frame.
+    list of Nx2 (row, col) float pixel-space polylines, each already in
+    final chain-visiting order (outside-in), in region_mask's own
+    (unpadded) coordinate frame. An undivided island is one chain unless
+    _stitch_onion_rings had to split it where no inside link exists.
     """
     from scipy.ndimage import binary_erosion, label
     from skimage.morphology import disk
@@ -1398,55 +1562,35 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     chains = []
 
     padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
-    branches = [{'mask': padded, 'points': [], 'prev_end': None}]
+    safe_mask_f = padded.astype(np.float32)
+    branches = [{'mask': padded, 'rings': []}]
+
+    def close_branch(rings):
+        chains.extend(_stitch_onion_rings(rings, safe_mask_f, step_px))
 
     while branches:
         next_round = []
         for br in branches:
-            cur, points, prev_end = br['mask'], br['points'], br['prev_end']
+            cur, rings = br['mask'], br['rings']
 
-            rings = [r for r in find_contours(cur.astype(np.float32), 0.5) if len(r) >= 3]
-            if not rings:
-                if points:
-                    chains.append(np.array(points))
+            level = [r for r in find_contours(cur.astype(np.float32), 0.5) if len(r) >= 3]
+            if not level:
+                close_branch(rings)
                 continue
             if reverse_rings:
-                rings = [r[::-1] for r in rings]
-
-            remaining = list(rings)
-            while remaining:
-                best_i = best_k = 0
-                best_d = float('inf')
-                for i, ring in enumerate(remaining):
-                    is_closed = np.linalg.norm(ring[0] - ring[-1]) < 1.5
-                    body = ring[:-1] if is_closed else ring
-                    n = len(body)
-                    cands = range(0, n, max(1, n // 20)) if is_closed else (0, n - 1)
-                    for k in cands:
-                        d = 0.0 if prev_end is None else float(np.hypot(*(body[k] - prev_end)))
-                        if d < best_d:
-                            best_d, best_i, best_k = d, i, k
-
-                ring = remaining.pop(best_i)
-                is_closed = np.linalg.norm(ring[0] - ring[-1]) < 1.5
-                body = ring[:-1] if is_closed else ring
-                if is_closed:
-                    ordered = np.vstack([np.roll(body, -best_k, axis=0), body[best_k:best_k + 1]])
-                else:
-                    ordered = body if best_k == 0 else body[::-1]
-                points.extend(ordered.tolist())
-                prev_end = np.asarray(ordered[-1])
+                level = [r[::-1] for r in level]
+            rings.extend(_order_level_rings(level, rings[-1] if rings else None))
 
             if np.sum(cur) < min_area_px:
-                chains.append(np.array(points))
+                close_branch(rings)
                 continue
             nxt = binary_erosion(cur, structure=structure)
             if not np.any(nxt):
-                chains.append(np.array(points))
+                close_branch(rings)
                 continue
             labeled, n_comp = label(nxt)
             if n_comp <= 1:
-                next_round.append({'mask': nxt, 'points': points, 'prev_end': prev_end})
+                next_round.append({'mask': nxt, 'rings': rings})
             else:
                 # A split can throw off a stray fragment of just a few
                 # pixels -- erosion detaching a sliver at a concave cusp of
@@ -1460,14 +1604,13 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
                             if np.sum(labeled == cid) >= min_area_px]
                 if len(surviving) <= 1:
                     if surviving:
-                        next_round.append({'mask': surviving[0], 'points': points,
-                                          'prev_end': prev_end})
+                        next_round.append({'mask': surviving[0], 'rings': rings})
                     else:
-                        chains.append(np.array(points))
+                        close_branch(rings)
                 else:
-                    chains.append(np.array(points))
+                    close_branch(rings)
                     for comp_mask in surviving:
-                        next_round.append({'mask': comp_mask, 'points': [], 'prev_end': None})
+                        next_round.append({'mask': comp_mask, 'rings': []})
         branches = next_round
 
     return [c - 1.0 for c in chains]

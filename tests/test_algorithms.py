@@ -206,6 +206,84 @@ check("discarding the stray fragment is not itself treated as a fork -- "
 
 
 # --------------------------------------------------------------------------
+# ring-to-ring links: every straight move between two consecutive chain
+# points must stay inside the region (never gouging material outside a
+# concave pocket boundary), and a link between consecutive erosion levels
+# should be about one step-over long, not a long chord across a cusp.
+# "Inside" is the same 0.5 iso-level of the bilinearly-interpolated mask
+# that find_contours traces, with a small tolerance for marching squares'
+# own straight-chord approximation of that level set.
+# --------------------------------------------------------------------------
+print("ring-to-ring links stay inside the region and stay short")
+
+from scipy.ndimage import map_coordinates
+
+
+def link_jumps(chain, min_len=1.5):
+    """(p, q) pairs of consecutive chain points further apart than a
+    single find_contours edge, i.e. the links between two rings."""
+    steps = np.hypot(*(np.diff(chain, axis=0).T))
+    return [(chain[i], chain[i + 1]) for i in np.nonzero(steps > min_len)[0]]
+
+
+def segment_inside(mask, p, q, tol=0.1):
+    n = max(2, int(np.ceil(np.hypot(*(q - p)) / 0.25)) + 1)
+    t = np.linspace(0.0, 1.0, n)
+    pts = p[None, :] + t[:, None] * (q - p)[None, :]
+    vals = map_coordinates(mask.astype(np.float32), pts.T, order=1,
+                           mode="constant", cval=0.0)
+    return bool(np.all(vals >= 0.5 - tol))
+
+
+def all_links_inside(mask, chains):
+    return all(segment_inside(mask, p, q) for c in chains for p, q in link_jumps(c))
+
+
+def max_link(chains):
+    lens = [np.hypot(*(q - p)) for c in chains for p, q in link_jumps(c)]
+    return max(lens) if lens else 0.0
+
+
+rr, cc = np.mgrid[0:120, 0:120]
+u_shape = np.zeros((120, 120), dtype=bool)
+u_shape[10:110, 10:110] = True
+u_shape[10:90, 40:80] = False                     # deep notch from the top
+l_shape = np.zeros((120, 120), dtype=bool)
+l_shape[10:110, 10:45] = True
+l_shape[75:110, 10:110] = True
+crescent = disk_mask((120, 120), (60, 60), 50) & ~disk_mask((120, 120), (40, 60), 42)
+triangle = (rr >= 10) & (rr <= 110) & (np.abs(cc - 60) <= (rr - 10) * 0.25)
+rect = np.zeros((80, 120), dtype=bool)
+rect[10:70, 10:110] = True
+stub = np.zeros((60, 60), dtype=bool)
+stub[5:32, 10:45] = True
+stub[32:39, 10:14] = True                         # narrow stub off one corner, gone after one erosion
+
+for name, mask, step in (("corner stub", stub, 4), ("U shape", u_shape, 5), ("L shape", l_shape, 5),
+                         ("crescent", crescent, 4), ("acute triangle", triangle, 3),
+                         ("stray-fragment cusp", cusp_mask, step_px3),
+                         ("rectangle", rect, 5), ("disk", disk, 4)):
+    min_area = max(4, int(round(np.pi * (0.5 * step) ** 2)))
+    for rev in (False, True):
+        cs = _onion_skin_chains(mask, step_px=step, min_area_px=min_area,
+                                reverse_rings=rev)
+        tag = f"{name}{' (reversed rings)' if rev else ''}"
+        check(f"{tag}: every ring-to-ring link stays inside the region",
+              all_links_inside(mask, cs))
+        check(f"{tag}: no link is longer than about one diagonal step-over "
+              f"(max {max_link(cs):.1f} px, step {step} px)",
+              max_link(cs) <= step * np.sqrt(2) + 2.0)
+
+check("annulus: the outer-to-hole link stays inside the region",
+      all_links_inside(annulus, _onion_skin_chains(annulus, step_px=15, min_area_px=20)))
+annulus_thick = (disk_mask((120, 120), (60, 60), 55)
+                 & ~disk_mask((120, 120), (60, 60), 15))
+check("thick annulus: every ring-to-ring link stays inside the region",
+      all_links_inside(annulus_thick,
+                       _onion_skin_chains(annulus_thick, step_px=4, min_area_px=20)))
+
+
+# --------------------------------------------------------------------------
 # _ring_chain_to_points: pixel -> mm conversion matches the same
 # row/col -> y/x convention used throughout algorithms.py (row 0 = top =
 # max Y, col 0 = left = min X), at a fixed constant floor depth
