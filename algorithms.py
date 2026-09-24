@@ -185,17 +185,26 @@ def mask_spans(mask_1d):
     return list(zip(starts.tolist(), (ends - 1).tolist()))
 
 
-def simplify_line(points, tol):
+def simplify_line(points, tol, z_tol=None):
     """Ramer-Douglas-Peucker path simplification (2-D or 3-D).
 
     Removes intermediate points whose perpendicular distance from the line
     segment connecting the current endpoints is below *tol*.  Collinear or
     near-collinear runs collapse to just their two endpoints.
 
+    With *z_tol* given (3-D points only), the deviation test is anisotropic:
+    Z is scaled by tol / z_tol before measuring distances, so a removed
+    point lies within an ellipsoid of lateral semi-axis *tol* and vertical
+    semi-axis *z_tol* around its nearest point on the simplified path.  This
+    keeps the vertical error bounded independently of the XY resolution.
+
     Parameters
     ----------
     points : list of (x, y, z) tuples  **or**  numpy array of shape (N, D)
-    tol    : maximum allowed deviation (same units as the coordinates)
+    tol    : maximum allowed deviation (same units as the coordinates);
+             the lateral deviation when *z_tol* is given
+    z_tol  : maximum allowed vertical deviation, or None to measure Z with
+             the same *tol* as X/Y
 
     Returns
     -------
@@ -209,8 +218,10 @@ def simplify_line(points, tol):
     # Iterative RDP using an explicit stack to avoid Python recursion limits.
     # (Long branches / contours can have O(N) worst-case recursion depth when
     # the pivot is near one end, exceeding Python's ~1000-frame limit.)
-    pts = np.asarray(points, dtype=np.float64)  # (N, D) — works for any D
+    pts = np.array(points, dtype=np.float64)  # (N, D) — works for any D
     N   = len(pts)
+    if z_tol is not None and pts.shape[1] >= 3:
+        pts[:, 2] *= tol / max(z_tol, 1e-12)
 
     # Iterative RDP using an explicit stack to avoid Python recursion limits.
     # (Long V-carve skeleton branches can have O(N) worst-case recursion depth
@@ -252,7 +263,9 @@ def simplify_line(points, tol):
             stack.append((start, pivot))
             stack.append((pivot, end))
 
-    return pts[keep] if is_array else [points[i] for i in range(N) if keep[i]]
+    if is_array:
+        return np.asarray(points, dtype=np.float64)[keep]
+    return [points[i] for i in range(N) if keep[i]]
 
 
 def _build_kernel(tool, px_per_mm, max_depth):
@@ -1992,11 +2005,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 6 · Simplify, simulate result, create ToolPath (88–100 %) ─────
     progress(80, "Simplifying tool path…")
-    rdp_tol = max(
-        1.0 / px_per_mm,
-        max_depth / (n_grey_levels - 1),
-    )
-    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
+    rdp_tol   = 1.0 / px_per_mm
+    rdp_z_tol = max_depth / (n_grey_levels - 1)
+    simplified = [simplify_line(pts, rdp_tol, rdp_z_tol) for pts in all_segments]
 
     progress(88, "Simulating tool-swept removal surface…")
     material_removed_raster = simulate_toolpath_result(
@@ -2032,6 +2043,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'height_mm': height_mm,
             'n_passes': n_passes,
             'rdp_tolerance': rdp_tol,
+            'rdp_z_tolerance': rdp_z_tol,
             'link_threshold_mm': link_threshold_mm,
             'n_links_inserted': n_links_inserted,
             'n_links_total': n_links,
@@ -2643,11 +2655,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 7 · Simplify, simulate result, create ToolPath (85–100 %) ──
     progress(85, "Simplifying tool path…")
-    rdp_tol = max(
-        1.0 / px_per_mm,
-        max_depth / (n_grey_levels - 1),
-    )
-    simplified = [simplify_line(pts, rdp_tol) for pts in all_segments]
+    rdp_tol   = 1.0 / px_per_mm
+    rdp_z_tol = max_depth / (n_grey_levels - 1)
+    simplified = [simplify_line(pts, rdp_tol, rdp_z_tol) for pts in all_segments]
 
     progress(90, "Simulating tool-swept removal surface…")
     material_removed_pocket = simulate_toolpath_result(
@@ -2679,6 +2689,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             'n_passes': n_passes,
             'n_regions': n_regions,
             'rdp_tolerance': rdp_tol,
+            'rdp_z_tolerance': rdp_z_tol,
             'link_threshold_mm': link_threshold_mm,
             'n_links_inserted': n_links_inserted,
             'n_links_contour': n_links_contour,
@@ -3424,11 +3435,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     # shares the same XY vertex sequence — only Z differs between passes —
     # keeping their footprints perfectly aligned when viewed from above.
     progress(88, "Simplifying tool path (RDP)…")
-    rdp_tol = max(
-        1.0 / px_per_mm,
-        max_depth / (n_grey_levels - 1),
-    )
-    full_depth_segs = [simplify_line(pts, rdp_tol) for pts in full_depth_segs]
+    rdp_tol   = 1.0 / px_per_mm
+    rdp_z_tol = max_depth / (n_grey_levels - 1)
+    full_depth_segs = [simplify_line(pts, rdp_tol, rdp_z_tol) for pts in full_depth_segs]
 
     # Phases 2–3: depth-slice, drop air-cutting runs (optional), per-pass
     # 2-opt reorder
@@ -3477,6 +3486,7 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'height_mm':       height_mm,
             'n_branches':      n_branches,
             'rdp_tolerance':   rdp_tol,
+            'rdp_z_tolerance': rdp_z_tol,
             'cone_reach_warning': _cone_reach_warning,
             'cut_direction':   cut_direction,
             'air_pruned_mm':   air_pruned_mm,
@@ -4146,8 +4156,8 @@ def compute_contour_toolpath(
                      f"({z_increment_mm:.2f} mm each).")
 
     # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
-    rdp_tol = max(1.0 / px_per_mm,
-                  max_depth / (n_grey_levels - 1))
+    rdp_tol   = 1.0 / px_per_mm
+    rdp_z_tol = max_depth / (n_grey_levels - 1)
 
     # ── Stage 4a · Extract raw contours for every Z-level ─────────────────
     progress(40, "Extracting contours for all Z-levels…")
@@ -4238,7 +4248,7 @@ def compute_contour_toolpath(
     # than per-contour during ordering has no effect on entry-point choice,
     # 2-opt, or terrain-link endpoints; it just needs to happen somewhere
     # after every segment (including links, built above) exists.
-    all_segments = [simplify_line(pts, rdp_tol) for pts in all_segments]
+    all_segments = [simplify_line(pts, rdp_tol, rdp_z_tol) for pts in all_segments]
 
     # ── Stage 5 · Simulate result (80–90 %) ───────────────────────────────
     progress(80, "Simulating tool-swept removal surface…")
@@ -4274,6 +4284,7 @@ def compute_contour_toolpath(
             'width_mm':        width_mm,
             'height_mm':       height_mm,
             'rdp_tolerance':   rdp_tol,
+            'rdp_z_tolerance': rdp_z_tol,
         }
     )
     progress(100, "Contour tool path computation complete!")

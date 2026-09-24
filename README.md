@@ -537,7 +537,11 @@ Outside-In generation works ring by ring. The region's own mask is repeatedly sh
 
 Erosion continues until the mask empties out or, for a region much smaller than one Step-over, after just its own single outermost ring. If an erosion step disconnects the region into two or more pieces (a dumbbell-shaped region whose narrow neck has been fully eroded away), the chain built so far is closed off there and each new piece is chained independently from scratch, rather than attempting to bridge across the former neck — a bridge would have to re-cross material the tool already cleared when the outer rings were cut. A region with a hole (an annulus) needs no special handling: `find_contours` already returns both the outer and inner boundary of a single erosion step as separate rings, which get stitched together in the same nearest-point order as any other same-iteration rings.
 
-Reduces G-code move count while preserving path shape to within pixel resolution. Implemented iteratively (not recursively) to handle long paths without hitting Python's call-stack limit. Finds the point with the greatest perpendicular distance from the current chord; if it exceeds the tolerance, that point is kept and the chord is split there.
+#### Ramer-Douglas-Peucker simplification
+
+Reduces G-code move count while preserving path shape to within the source's resolution. Implemented iteratively (not recursively) to handle long paths without hitting Python's call-stack limit. Finds the point with the greatest deviation from the current chord; if it exceeds the tolerance, that point is kept and the chord is split there.
+
+Raster Scan, Contour, V-Carving and Pocket use independent lateral and vertical tolerances: one pixel's width (1 / px per mm) in X/Y, and one grey level's depth (Max depth / (grey levels − 1)) in Z. Z is scaled by the ratio of the two before distances are measured, so every dropped point lies within an ellipsoid of those two semi-axes around the simplified path. A coarse canvas therefore can't let the path dip a whole pixel-width below its target depth. The tradeoff is more points on curved surfaces, especially for STL sources, which count as 65536 grey levels. Cutout, whose Z comes from pass depths and tabs rather than the depth map, uses the single one-pixel tolerance in all three axes.
 
 #### Geodesic terrain linking
 

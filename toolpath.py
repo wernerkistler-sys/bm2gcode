@@ -355,8 +355,13 @@ class ToolPath:
         ]
 
         if 'rdp_tolerance' in meta:
-            lines.append(f"; RDP path-simplification tolerance: "
-                        f"{meta['rdp_tolerance']*1000:.1f} µm")
+            if 'rdp_z_tolerance' in meta:
+                lines.append(f"; RDP path-simplification tolerance: "
+                            f"{meta['rdp_tolerance']*1000:.1f} µm lateral, "
+                            f"{meta['rdp_z_tolerance']*1000:.2f} µm vertical")
+            else:
+                lines.append(f"; RDP path-simplification tolerance: "
+                            f"{meta['rdp_tolerance']*1000:.1f} µm")
         if 'link_threshold_mm' in meta:
             lines.append(f"; Link threshold (short-rapid replacement): "
                         f"{meta['link_threshold_mm']:.2f} mm")
