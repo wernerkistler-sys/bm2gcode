@@ -1338,28 +1338,132 @@ def _is_contiguous_chain(segs, tol_mm=1e-6):
     return True
 
 
+def _polylines_inside(pts, safe_mask_f, tol=0.1):
+    """(N,) bool: whether each of N sampled polylines, pts of shape
+    (N, S, 2) in (row, col) with consecutive samples at most 0.5 px apart,
+    stays inside safe_mask_f -- every sample has a bilinearly-interpolated
+    mask value of at least 0.5 - tol, the same 0.5 iso-level
+    find_contours traces (tol absorbs marching squares' own straight-chord
+    approximation of that level set, so a ring vertex and its neighbouring
+    edge still count as inside).
+    """
+    from scipy.ndimage import map_coordinates
+    n, n_samples = pts.shape[0], pts.shape[1]
+    vals = map_coordinates(safe_mask_f, pts.reshape(-1, 2).T, order=1,
+                           mode="constant", cval=0.0)
+    return np.all(vals.reshape(n, n_samples) >= 0.5 - tol, axis=1)
+
+
 def _link_is_inside(p, q, safe_mask_f, tol=0.1):
     """True if the straight segment p -> q (row, col) stays inside
-    safe_mask_f: every sample taken along it at most 0.5 px apart has a
-    bilinearly-interpolated mask value of at least 0.5 - tol, the same 0.5
-    iso-level find_contours traces (tol absorbs marching squares' own
-    straight-chord approximation of that level set, so a ring vertex and
-    its neighbouring edge still count as inside).
+    safe_mask_f, by _polylines_inside's test on samples at most 0.5 px
+    apart.
 
     p and q may also be (N, 2) arrays, checking N segments at once;
     returns an (N,) bool array in that case.
     """
-    from scipy.ndimage import map_coordinates
     p = np.atleast_2d(np.asarray(p, dtype=float))
     q = np.atleast_2d(np.asarray(q, dtype=float))
     length = np.hypot(q[:, 0] - p[:, 0], q[:, 1] - p[:, 1])
     n_samples = max(2, int(np.ceil(length.max() / 0.5)) + 1)
     t = np.linspace(0.0, 1.0, n_samples)
     pts = p[:, None, :] + t[None, :, None] * (q - p)[:, None, :]
-    vals = map_coordinates(safe_mask_f, pts.reshape(-1, 2).T, order=1,
-                           mode="constant", cval=0.0)
-    inside = np.all(vals.reshape(len(p), n_samples) >= 0.5 - tol, axis=1)
+    inside = _polylines_inside(pts, safe_mask_f, tol)
     return inside if len(inside) > 1 else bool(inside[0])
+
+
+def _cross2(a, b):
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+
+def _biarc(p0, t0, p1, t1, min_radius, max_sweep=np.radians(120.0)):
+    """Tangent-continuous two-arc link from p0 (leaving along unit tangent
+    t0) to p1 (arriving along unit tangent t1), vectorized over N pairs
+    ((N, 2) arrays, (row, col)).
+
+    Uses the equal-control-length biarc: with d the solution of
+    2(1 - t0.t1) d^2 + 2 (v.(t0 + t1)) d - v.v = 0 (v = p1 - p0), the two
+    arcs meet at J = ((p0 + d t0) + (p1 - d t1)) / 2, where both share the
+    tangent along (p1 - d t1) - (p0 + d t0). Arcs turning the opposite way
+    give an S, the same way a C; both are smooth.
+
+    A pair is valid when d > 0, the link heads forward (v.t0 > 0), each
+    arc turns by at most max_sweep, and each arc's radius is at least
+    min_radius (a straight arc, of infinite radius, always qualifies).
+
+    Returns
+    -------
+    dict of (N,) arrays: 'valid', 'length', 'joint' (N, 2), 'tj' (N, 2)
+    (the shared tangent at the joint), 'half1'/'half2' (each arc's signed
+    half sweep angle).
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return _biarc_unchecked(p0, t0, p1, t1, min_radius, max_sweep)
+
+
+def _biarc_unchecked(p0, t0, p1, t1, min_radius, max_sweep):
+    v = p1 - p0
+    c = np.sum(t0 * t1, axis=-1)
+    vt = np.sum(v * (t0 + t1), axis=-1)
+    vv = np.sum(v * v, axis=-1)
+    a = 2.0 * (1.0 - c)
+    parallel = a < 1e-9
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d_quad = (-2.0 * vt + np.sqrt(4.0 * vt * vt + 4.0 * a * vv)) / (2.0 * a)
+        d_par = vv / (4.0 * np.sum(v * t0, axis=-1))
+    d = np.where(parallel, d_par, d_quad)
+    q0 = p0 + d[:, None] * t0
+    q1 = p1 - d[:, None] * t1
+    joint = 0.5 * (q0 + q1)
+    tj = q1 - q0
+    tj_len = np.hypot(tj[:, 0], tj[:, 1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tj = tj / tj_len[:, None]
+
+    def arc(a_pt, a_tan, b_pt):
+        chord = b_pt - a_pt
+        half = np.arctan2(_cross2(a_tan, chord), np.sum(a_tan * chord, axis=-1))
+        clen = np.hypot(chord[:, 0], chord[:, 1])
+        sin_h = np.abs(np.sin(half))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            radius = np.where(sin_h > 1e-9, clen / (2.0 * sin_h), np.inf)
+            length = np.where(sin_h > 1e-9, radius * 2.0 * np.abs(half), clen)
+        return half, radius, length
+
+    half1, r1, len1 = arc(p0, t0, joint)
+    half2, r2, len2 = arc(joint, tj, p1)
+    valid = (np.isfinite(d) & (d > 1e-9) & (tj_len > 1e-9)
+             & (np.sum(v * t0, axis=-1) > 0.0)
+             & (2.0 * np.abs(half1) <= max_sweep) & (2.0 * np.abs(half2) <= max_sweep)
+             & (r1 >= min_radius) & (r2 >= min_radius))
+    return {'valid': valid, 'length': np.where(valid, len1 + len2, np.inf),
+            'joint': joint, 'tj': tj, 'half1': half1, 'half2': half2}
+
+
+def _sample_biarc(p0, t0, p1, arc, spacing=0.5):
+    """Sample the biarcs described by _biarc's result `arc` (restricted to
+    the same N pairs as p0/t0/p1) into (N, S, 2) points at most `spacing`
+    px apart, from p0 through the joint to p1 inclusive."""
+    def sample_arc(a_pt, a_tan, b_pt, half, n):
+        u = np.linspace(0.0, 1.0, n)[None, :]
+        chord = b_pt - a_pt
+        clen = np.hypot(chord[:, 0], chord[:, 1])
+        normal = np.stack([-a_tan[:, 1], a_tan[:, 0]], axis=-1)
+        straight = np.abs(half) < 1e-9
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_signed = np.where(straight, 0.0, clen / (2.0 * np.sin(half)))
+        phi = 2.0 * half[:, None] * u
+        curved = (a_pt[:, None, :]
+                  + r_signed[:, None, None] * (np.sin(phi)[..., None] * a_tan[:, None, :]
+                                               + (1.0 - np.cos(phi))[..., None] * normal[:, None, :]))
+        linear = a_pt[:, None, :] + u[..., None] * chord[:, None, :]
+        return np.where(straight[:, None, None], linear, curved)
+
+    total = np.max(np.where(np.isfinite(arc['length']), arc['length'], 0.0))
+    n = max(2, int(np.ceil(total / spacing)) + 1)
+    first = sample_arc(p0, t0, arc['joint'], arc['half1'], n)
+    second = sample_arc(arc['joint'], arc['tj'], p1, arc['half2'], n)
+    return np.concatenate([first, second[:, 1:, :]], axis=1)
 
 
 def _ring_seam_candidates(ring, spacing_px, max_cands):
@@ -1387,31 +1491,72 @@ def _ring_seam_candidates(ring, spacing_px, max_cands):
     return body, idx, idx
 
 
+def _ring_tangents(body, idx, window_px):
+    """Incoming and outgoing unit tangents of a closed ring at vertices
+    idx, as two (len(idx), 2) arrays: incoming is the chord from the
+    vertex window_px of arc length behind idx to idx (the direction the
+    chain arrives in after a full lap ending there), outgoing the chord
+    from idx to the vertex window_px ahead (the direction it sets off in).
+    Measuring over window_px rather than a single edge smooths out
+    find_contours' pixel stair-steps, and the two one-sided chords keep a
+    seam on a ring corner well defined."""
+    n = len(body)
+    nxt = np.roll(body, -1, axis=0)
+    edge = np.hypot(nxt[:, 0] - body[:, 0], nxt[:, 1] - body[:, 1])
+    perim = float(np.sum(edge))
+    window = min(window_px, 0.45 * perim)
+    cum = np.concatenate(([0.0], np.cumsum(edge)))           # len n + 1
+    tiled = np.concatenate([cum[:-1] - perim, cum[:-1], cum[:-1] + perim])
+    s = cum[idx]
+    ahead = np.searchsorted(tiled, s + window, side="left") % n
+    behind = (np.searchsorted(tiled, s - window, side="right") - 1) % n
+
+    def unit(vec):
+        length = np.hypot(vec[:, 0], vec[:, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return vec / length[:, None]
+    return unit(body[idx] - body[behind]), unit(body[ahead] - body[idx])
+
+
 def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
-                        max_checked_pairs=1024):
+                        max_checked_pairs=1024, s_links_per_exit=3):
     """Stitch one onion-skin branch's rings (already in visiting order and
     winding sense) into continuous chain(s), choosing every ring's seam --
     the vertex it is entered and left on -- jointly over the whole
     branch.
 
-    Consecutive rings are joined by a straight link from one ring's exit
-    to the next ring's entry. The seams minimise the branch's total link
-    length, solved exactly over each ring's seam candidates
-    (_ring_seam_candidates) as a shortest path through a layered graph --
-    one layer per ring, one node per candidate. A globally chosen seam
-    line routes itself along the region's straight flanks, where the gap
-    between consecutive rings is about one step_px, and away from acute
-    tips and vanished protrusions, where it opens up much wider; a greedy
-    nearest-point choice made one ring at a time cannot see that coming.
+    Every ring is traversed in full, from its seam back round to it, and
+    consecutive rings are joined by a link from one ring's exit to the
+    next ring's entry. A link is preferably an S-shaped biarc (_biarc):
+    one arc leaving the finished ring tangentially, one arriving
+    tangentially on the next, each of radius at least step_px, so the
+    tool changes ring without the two sharp turns of a straight chord.
+    Rings about one step_px apart need the entry to sit roughly
+    sqrt(3) * step_px further along the next ring than the exit, for arcs
+    of that radius. Where no such biarc fits (tangents pointing apart, a
+    ring too small for the radius, an outer ring and a hole ring at the
+    same erosion level), a straight link is used instead, at a cost
+    penalty of 8 * step_px so a biarc is always preferred where one
+    exists.
 
-    Only links that stay inside safe_mask_f (_link_is_inside) are
-    allowed. For each pair of consecutive rings, the max_checked_pairs
-    shortest candidate pairs are checked; every other pair is excluded,
-    since a pair that much longer than the shortest one is never worth
-    taking. If no pair between two rings is allowed (e.g. an outer ring
-    and a hole ring at the same erosion level with no straight line of
-    sight between them), the branch is split there into separate chains,
-    left for Stage 6 ordering and linking to join.
+    The seams minimise the branch's total link cost, solved exactly over
+    each ring's seam candidates (_ring_seam_candidates) as a shortest path
+    through a layered graph -- one layer per ring, one node per
+    candidate. A globally chosen seam line routes itself along the
+    region's straight flanks, where the gap between consecutive rings is
+    about one step_px, and away from acute tips and vanished protrusions,
+    where it opens up much wider; a greedy nearest-point choice made one
+    ring at a time cannot see that coming.
+
+    Only links that stay inside safe_mask_f (_polylines_inside) are
+    allowed. For each pair of consecutive rings, biarcs are considered
+    for pairs within 4 * step_px of each other, and the s_links_per_exit
+    shortest valid ones per exit candidate are checked; straight links
+    are considered for the max_checked_pairs shortest pairs, all checked.
+    Every other pair is excluded. If no pair between two rings is allowed
+    (e.g. an outer ring and a hole ring with no straight line of sight
+    between them), the branch is split there into separate chains, left
+    for Stage 6 ordering and linking to join.
 
     Returns
     -------
@@ -1420,49 +1565,113 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     if not rings:
         return []
     spacing_px = max(1.0, step_px / 4.0)
+    window_px = max(2.0, step_px / 2.0)
+    min_radius = float(step_px)
+    straight_penalty = 8.0 * step_px
     cands = [_ring_seam_candidates(r, spacing_px, max_cands) for r in rings]
+
+    def tangents(j):
+        body, entry_idx, exit_idx = cands[j]
+        if not np.array_equal(entry_idx, exit_idx):   # open ring: straight links only
+            nan = np.full((len(entry_idx), 2), np.nan)
+            return nan, nan
+        return _ring_tangents(body, entry_idx, window_px)
+
+    tans = [tangents(j) for j in range(len(rings))]
+
+    def s_link_pairs(j, d):
+        """Candidate (ia, ib) index pairs, and their biarc, for a biarc
+        link from ring j to ring j+1: the s_links_per_exit shortest valid
+        biarcs per exit candidate."""
+        body_a, _, exit_a = cands[j]
+        body_b, entry_b, _ = cands[j + 1]
+        ia, ib = np.nonzero(d <= 4.0 * step_px)
+        if len(ia) == 0:
+            return None
+        t_out = tans[j][0][ia]            # incoming tangent at ring j's exit
+        t_in = tans[j + 1][1][ib]         # outgoing tangent at ring j+1's entry
+        arc = _biarc(body_a[exit_a][ia], t_out, body_b[entry_b][ib], t_in, min_radius)
+        keep = np.nonzero(arc['valid'])[0]
+        if len(keep) == 0:
+            return None
+        # s_links_per_exit shortest per exit candidate ia
+        order = np.lexsort((arc['length'][keep], ia[keep]))
+        keep = keep[order]
+        rank = np.arange(len(keep)) - np.searchsorted(ia[keep], ia[keep], side="left")
+        keep = keep[rank < s_links_per_exit]
+        sub = {k: v[keep] for k, v in arc.items()}
+        return ia[keep], ib[keep], t_out[keep], sub
 
     def link_costs(j):
         body_a, _, exit_a = cands[j]
         body_b, entry_b, _ = cands[j + 1]
         pa, pb = body_a[exit_a], body_b[entry_b]
         d = np.hypot(pa[:, None, 0] - pb[None, :, 0], pa[:, None, 1] - pb[None, :, 1])
+        cost = np.full(d.shape, np.inf)
+        is_s = np.zeros(d.shape, dtype=bool)
+
         flat = d.ravel()
         k = min(max_checked_pairs, flat.size)
         shortest = np.argpartition(flat, k - 1)[:k]
         ia, ib = np.unravel_index(shortest, d.shape)
         ok = np.atleast_1d(_link_is_inside(pa[ia], pb[ib], safe_mask_f))
-        cost = np.full(d.shape, np.inf)
-        cost[ia[ok], ib[ok]] = d[ia[ok], ib[ok]]
-        return cost
+        cost[ia[ok], ib[ok]] = d[ia[ok], ib[ok]] + straight_penalty
 
-    # Forward pass. segments collects (first_ring, last_ring, backpointers)
-    # for each run of rings that stays linkable end to end.
+        s_pairs = s_link_pairs(j, d)
+        if s_pairs is not None:
+            ia, ib, t_out, arc = s_pairs
+            pts = _sample_biarc(pa[ia], t_out, pb[ib], arc)
+            ok = _polylines_inside(pts, safe_mask_f)
+            better = ok & (arc['length'] < cost[ia, ib])
+            cost[ia[better], ib[better]] = arc['length'][better]
+            is_s[ia[better], ib[better]] = True
+        return cost, is_s
+
+    def link_points(j, a, b):
+        """Interior points of the chosen biarc from ring j's exit
+        candidate a to ring j+1's entry candidate b."""
+        body_a, _, exit_a = cands[j]
+        body_b, entry_b, _ = cands[j + 1]
+        p0 = body_a[exit_a[a]][None, :]
+        p1 = body_b[entry_b[b]][None, :]
+        t0 = tans[j][0][a][None, :]
+        arc = _biarc(p0, t0, p1, tans[j + 1][1][b][None, :], min_radius)
+        return _sample_biarc(p0, t0, p1, arc)[0, 1:-1]
+
+    # Forward pass. segments collects (first_ring, last_ring, backpointers,
+    # per-link biarc flags, final accumulated costs) for each run of rings
+    # that stays linkable end to end.
     segments = []
     seg_start = 0
     acc = np.zeros(len(cands[0][1]))
-    back = []
+    back, kinds = [], []
     for j in range(len(rings) - 1):
-        tot = acc[:, None] + link_costs(j)
+        cost, is_s = link_costs(j)
+        tot = acc[:, None] + cost
         best = np.argmin(tot, axis=0)
         nxt = tot[best, np.arange(tot.shape[1])]
         if not np.any(np.isfinite(nxt)):
-            segments.append((seg_start, j, back, acc))
-            seg_start, back = j + 1, []
+            segments.append((seg_start, j, back, kinds, acc))
+            seg_start, back, kinds = j + 1, [], []
             acc = np.zeros(len(cands[j + 1][1]))
         else:
             back.append(best)
+            kinds.append(is_s)
             acc = nxt
-    segments.append((seg_start, len(rings) - 1, back, acc))
+    segments.append((seg_start, len(rings) - 1, back, kinds, acc))
 
     chains = []
-    for first, last, back, acc in segments:
+    for first, last, back, kinds, acc in segments:
         seam = [int(np.argmin(acc))]
         for bp in reversed(back):
             seam.append(int(bp[seam[-1]]))
         seam.reverse()
         parts = []
         for j, c in zip(range(first, last + 1), seam):
+            if j > first:
+                a = seam[j - first - 1]
+                if kinds[j - first - 1][a, c]:
+                    parts.append(link_points(j - 1, a, c))
             body, entry_idx, exit_idx = cands[j]
             e = int(entry_idx[c])
             if exit_idx[c] == e:
@@ -1500,9 +1709,10 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     region: repeatedly binary_erosion's region_mask by disk(step_px),
     extracting each ring's boundary via find_contours, and stitching
     consecutive rings into one continuous chain with _stitch_onion_rings,
-    which picks every ring's seam jointly for the shortest total
-    ring-to-ring links and only ever links along a straight line that
-    stays inside region_mask. A ring on erosion level k+1 is the boundary
+    which picks every ring's seam jointly for the cheapest total
+    ring-to-ring links, joins rings with a tangent-continuous S-shaped
+    biarc wherever one fits (a straight link otherwise), and only ever
+    uses a link that stays inside region_mask. A ring on erosion level k+1 is the boundary
     of level k's mask eroded by disk(step_px), so from every one of its
     points a link of about step_px back to level k's ring exists and
     lies within that disk, i.e. inside the region. Same-level rings (an

@@ -14,7 +14,7 @@ import numpy as np
 from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         _order_fixed_orientation_pass, compute_pocket_toolpath,
                         _diag_grid_line_ids, _diag_line_bounds, _diag_line_points,
-                        _region_contour_rings, _make_contour_ring,
+                        _region_contour_rings, _make_contour_ring, _biarc, _sample_biarc,
                         _nearest_ring_vertex, _ring_arc_between,
                         _order_locked_raster_pass, _order_zigzag_pass,
                         _order_free_region_pass, prune_air_segments,
@@ -206,13 +206,15 @@ check("discarding the stray fragment is not itself treated as a fork -- "
 
 
 # --------------------------------------------------------------------------
-# ring-to-ring links: every straight move between two consecutive chain
-# points must stay inside the region (never gouging material outside a
-# concave pocket boundary), and a link between consecutive erosion levels
-# should be about one step-over long, not a long chord across a cusp.
-# "Inside" is the same 0.5 iso-level of the bilinearly-interpolated mask
-# that find_contours traces, with a small tolerance for marching squares'
-# own straight-chord approximation of that level set.
+# ring-to-ring links: every move between two consecutive chain points --
+# ring edges, S-shaped biarc links, and straight fallback links alike --
+# must stay inside the region (never gouging material outside a concave
+# pocket boundary), and a straight fallback link between consecutive
+# erosion levels should be about one step-over long, not a long chord
+# across a cusp. "Inside" is the same 0.5 iso-level of the
+# bilinearly-interpolated mask that find_contours traces, with a small
+# tolerance for marching squares' own straight-chord approximation of
+# that level set.
 # --------------------------------------------------------------------------
 print("ring-to-ring links stay inside the region and stay short")
 
@@ -221,22 +223,26 @@ from scipy.ndimage import map_coordinates
 
 def link_jumps(chain, min_len=1.5):
     """(p, q) pairs of consecutive chain points further apart than a
-    single find_contours edge, i.e. the links between two rings."""
+    single find_contours edge, i.e. straight links between two rings
+    (a biarc link is sampled finely enough to never show up here)."""
     steps = np.hypot(*(np.diff(chain, axis=0).T))
     return [(chain[i], chain[i + 1]) for i in np.nonzero(steps > min_len)[0]]
 
 
-def segment_inside(mask, p, q, tol=0.1):
-    n = max(2, int(np.ceil(np.hypot(*(q - p)) / 0.25)) + 1)
-    t = np.linspace(0.0, 1.0, n)
-    pts = p[None, :] + t[:, None] * (q - p)[None, :]
-    vals = map_coordinates(mask.astype(np.float32), pts.T, order=1,
-                           mode="constant", cval=0.0)
-    return bool(np.all(vals >= 0.5 - tol))
-
-
-def all_links_inside(mask, chains):
-    return all(segment_inside(mask, p, q) for c in chains for p, q in link_jumps(c))
+def all_moves_inside(mask, chains, tol=0.1):
+    """Every straight move between consecutive points of every chain,
+    sampled at most 0.25 px apart, stays inside mask."""
+    mask_f = np.pad(mask, 1).astype(np.float32)
+    for c in chains:
+        p, q = c[:-1], c[1:]
+        n = max(2, int(np.ceil(np.hypot(*(q - p).T).max() / 0.25)) + 1)
+        t = np.linspace(0.0, 1.0, n)
+        pts = p[:, None, :] + t[None, :, None] * (q - p)[:, None, :]
+        vals = map_coordinates(mask_f, pts.reshape(-1, 2).T + 1.0, order=1,
+                               mode="constant", cval=0.0)
+        if np.any(vals < 0.5 - tol):
+            return False
+    return True
 
 
 def max_link(chains):
@@ -268,19 +274,122 @@ for name, mask, step in (("corner stub", stub, 4), ("U shape", u_shape, 5), ("L 
         cs = _onion_skin_chains(mask, step_px=step, min_area_px=min_area,
                                 reverse_rings=rev)
         tag = f"{name}{' (reversed rings)' if rev else ''}"
-        check(f"{tag}: every ring-to-ring link stays inside the region",
-              all_links_inside(mask, cs))
-        check(f"{tag}: no link is longer than about one diagonal step-over "
+        check(f"{tag}: every move of every chain stays inside the region",
+              all_moves_inside(mask, cs))
+        check(f"{tag}: no straight link is longer than about one diagonal step-over "
               f"(max {max_link(cs):.1f} px, step {step} px)",
               max_link(cs) <= step * np.sqrt(2) + 2.0)
 
-check("annulus: the outer-to-hole link stays inside the region",
-      all_links_inside(annulus, _onion_skin_chains(annulus, step_px=15, min_area_px=20)))
+check("annulus: every move stays inside the region",
+      all_moves_inside(annulus, _onion_skin_chains(annulus, step_px=15, min_area_px=20)))
 annulus_thick = (disk_mask((120, 120), (60, 60), 55)
                  & ~disk_mask((120, 120), (60, 60), 15))
-check("thick annulus: every ring-to-ring link stays inside the region",
-      all_links_inside(annulus_thick,
+check("thick annulus: every move stays inside the region",
+      all_moves_inside(annulus_thick,
                        _onion_skin_chains(annulus_thick, step_px=4, min_area_px=20)))
+
+
+# --------------------------------------------------------------------------
+# S-shaped ring transitions: wherever a ring is big enough to hold arcs of
+# one step-over radius, the chain changes ring along a tangent-continuous
+# biarc, so its heading (measured over a few px, to see past find_contours'
+# pixel stair-steps) never turns sharply. A straight chord between rings
+# turns by roughly 90 degrees twice.
+# --------------------------------------------------------------------------
+print("S-shaped ring transitions")
+
+
+def dedup(chain):
+    """chain with consecutive duplicate points dropped."""
+    return np.vstack([chain[:1], chain[1:][np.hypot(*np.diff(chain, axis=0).T) > 1e-9]])
+
+
+def smoothed_turns(chain, window=3.0):
+    """Heading change in degrees at every point of a (deduplicated) chain,
+    comparing the chord from `window` px of arc length behind with the
+    chord to `window` px ahead, plus a mask of the points far enough from
+    either end for both chords to exist."""
+    cum = np.concatenate(([0.0], np.cumsum(np.hypot(*np.diff(chain, axis=0).T))))
+    i = np.arange(len(chain))
+    behind = np.clip(np.searchsorted(cum, cum - window), 0, len(chain) - 1)
+    ahead = np.clip(np.searchsorted(cum, cum + window), 0, len(chain) - 1)
+    ok = (cum - window >= 0) & (cum + window <= cum[-1])
+    v1, v2 = chain[i] - chain[behind], chain[ahead] - chain[i]
+    ang = np.degrees(np.abs(np.arctan2(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0],
+                                       np.sum(v1 * v2, axis=1))))
+    return ang, ok
+
+
+def link_zone(chain, window=3.0):
+    """Mask of (deduplicated) chain points within `window` px of arc
+    length of a link between rings. find_contours puts every ring vertex
+    of a binary mask on a pixel edge's midpoint (one coordinate an
+    integer, the other a half integer); a biarc's sample points generally
+    aren't, and a straight link shows up as a jump longer than one ring
+    edge."""
+    is_int = np.abs(chain - np.round(chain)) < 1e-6
+    is_half = np.abs(chain - np.round(chain - 0.5) - 0.5) < 1e-6
+    on_lattice = (is_int[:, 0] & is_half[:, 1]) | (is_half[:, 0] & is_int[:, 1])
+    step = np.hypot(*np.diff(chain, axis=0).T)
+    in_link = ~on_lattice
+    jump = np.nonzero(step > 1.5)[0]
+    in_link[jump] = True
+    in_link[jump + 1] = True
+    cum = np.concatenate(([0.0], np.cumsum(step)))
+    link_s = cum[in_link]
+    if len(link_s) == 0:
+        return np.zeros(len(chain), dtype=bool)
+    idx = np.searchsorted(link_s, cum)
+    after = np.abs(link_s[np.clip(idx, 0, len(link_s) - 1)] - cum)
+    before = np.abs(link_s[np.clip(idx - 1, 0, len(link_s) - 1)] - cum)
+    return np.minimum(after, before) <= window
+
+
+big_disk = disk_mask((200, 200), (100, 100), 80)
+for step in (4, 8):
+    for rev in (False, True):
+        worst = 0.0
+        n_links = 0
+        for c in _onion_skin_chains(big_disk, step_px=step, min_area_px=20, reverse_rings=rev):
+            c = dedup(c)
+            ang, ok = smoothed_turns(c)
+            zone = link_zone(c)
+            outer = np.hypot(c[:, 0] - 100, c[:, 1] - 100) > 4 * step
+            sel = ok & zone & outer
+            n_links += int(np.sum(np.diff(zone.astype(int)) == 1))
+            if np.any(sel):
+                worst = max(worst, float(ang[sel].max()))
+        check(f"disk, step {step}{' (reversed rings)' if rev else ''}: ring-to-ring links "
+              f"were found at all ({n_links})", n_links >= 5)
+        check(f"disk, step {step}{' (reversed rings)' if rev else ''}: no sharp turn at "
+              f"any ring-to-ring link outside the innermost rings (max {worst:.0f} deg)",
+              worst < 75.0)
+
+print("_biarc")
+r = 5.0
+p0 = np.array([[0.0, 0.0]]);        t0 = np.array([[0.0, 1.0]])
+p1 = np.array([[r, np.sqrt(3) * r]]); t1 = np.array([[0.0, 1.0]])
+arc = _biarc(p0, t0, p1, t1, min_radius=r - 1e-6)
+check("parallel tangents, offset r sideways and sqrt(3) r forward: a valid S",
+      bool(arc['valid'][0]))
+check("... made of two 60 degree arcs",
+      np.allclose(np.degrees(2 * np.abs([arc['half1'][0], arc['half2'][0]])), 60.0))
+check("... of opposite turning sense",
+      np.sign(arc['half1'][0]) == -np.sign(arc['half2'][0]))
+check("... with total length 2 * r * pi / 3",
+      np.isclose(arc['length'][0], 2 * r * np.pi / 3))
+pts = _sample_biarc(p0, t0, p1, arc)[0]
+check("sampled biarc starts at p0 and ends at p1",
+      np.allclose(pts[0], p0[0]) and np.allclose(pts[-1], p1[0], atol=1e-6))
+check("sampled biarc leaves along t0 and arrives along t1",
+      np.allclose((pts[1] - pts[0]) / np.hypot(*(pts[1] - pts[0])), t0[0], atol=0.05)
+      and np.allclose((pts[-1] - pts[-2]) / np.hypot(*(pts[-1] - pts[-2])), t1[0], atol=0.05))
+check("sampled biarc points are at most 0.5 px apart",
+      np.hypot(*np.diff(pts, axis=0).T).max() <= 0.5 + 1e-9)
+check("a radius below min_radius is invalid",
+      not _biarc(p0, t0, p1, t1, min_radius=r + 0.5)['valid'][0])
+check("a target behind the start is invalid",
+      not _biarc(p0, t0, np.array([[r, -np.sqrt(3) * r]]), t1, min_radius=1.0)['valid'][0])
 
 
 # --------------------------------------------------------------------------
