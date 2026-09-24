@@ -983,6 +983,7 @@ class GCodeGeneratorApp:
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
         dst['tsp_2opt_var'].set(src['tsp_2opt_var'].get())
+        dst['avoid_air_var'].set(src['avoid_air_var'].get())
         dst['gating_mode_var'].set(src['gating_mode_var'].get())
         for key in ('ramp_in_enabled', 'ramp_angle_deg', 'ramp_max_length_mm',
                     'backoff_enabled', 'backoff_distance_mm',
@@ -1132,6 +1133,12 @@ class GCodeGeneratorApp:
         tsp_2opt_cb.pack(anchor=tk.W, pady=2)
         step['tsp_2opt_var'] = tsp_2opt_var
         step['tsp_2opt_cb'] = tsp_2opt_cb
+
+        avoid_air_var = tk.BooleanVar(
+            value=bool(int(DEFAULTS["step_avoid_air"])))
+        ttk.Checkbutton(tsp_frame, text="Avoid cutting air",
+                        variable=avoid_air_var).pack(anchor=tk.W, pady=2)
+        step['avoid_air_var'] = avoid_air_var
 
         gating_frame = ttk.Frame(operation_lf)
         gating_frame.pack(fill=tk.X)
@@ -1542,6 +1549,7 @@ class GCodeGeneratorApp:
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
+        step['avoid_air_var'].set(bool(int(DEFAULTS["step_avoid_air"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
 
     # ------------------------------------------------------------------ #
@@ -2238,6 +2246,7 @@ class GCodeGeneratorApp:
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
             'tsp_2opt':             step['tsp_2opt_var'].get(),
+            'avoid_air':            step['avoid_air_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
             'threshold':            step['threshold'].get(),
             'threshold_auto':       bool(step['threshold'].auto_var.get()),
@@ -2288,6 +2297,7 @@ class GCodeGeneratorApp:
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
+        step['avoid_air_var'].set(bool(d.get('avoid_air', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
         step['threshold'].auto_var.set(bool(d.get('threshold_auto', False)))
         step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
@@ -2887,6 +2897,7 @@ class GCodeGeneratorApp:
             'max_depth':     max_depth,
             'origin':        origin,
             'extra_offset_mm': float(step['extra_offset'].get()),
+            'avoid_air':     step['avoid_air_var'].get(),
             # Used only to key the erosion cache (see _compute_step_work) --
             # the actual depth map is precomputed on the main thread and
             # passed in separately, since it needs Tkinter reads.
@@ -3037,6 +3048,9 @@ class GCodeGeneratorApp:
                 skeleton_mode        = params['skeleton_mode'],
                 use_2opt             = params['use_2opt'],
                 cut_direction        = params['cut_direction'],
+                avoid_air            = params['avoid_air'],
+                z_safe               = self._settings['z_safe'],
+                feed_rapid           = self._settings['feed_rapid'],
                 progress             = progress_fn,
                 erosion_cache        = self._erosion_cache,
                 erosion_cache_key    = erosion_cache_key,
@@ -3063,6 +3077,7 @@ class GCodeGeneratorApp:
                 cut_direction      = params['cut_direction'],
                 max_step_down_mm   = params['contour_max_step_down'],
                 extra_offset_mm    = params['extra_offset_mm'],
+                avoid_air          = params['avoid_air'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
             )
@@ -3117,6 +3132,9 @@ class GCodeGeneratorApp:
                 z_safe             = self._settings['z_safe'],
                 feed_rapid         = self._settings['feed_rapid'],
                 tab_settings       = params['tab_settings'],
+                avoid_air          = params['avoid_air'],
+                feed_rate          = params['feed_rate'],
+                n_grey_levels      = n_grey_levels,
                 progress           = progress_fn,
             )
         elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
@@ -3171,6 +3189,9 @@ class GCodeGeneratorApp:
                 feed_rate         = params['feed_rate'],
                 use_2opt          = params['use_2opt'],
                 cut_direction     = params['cut_direction'],
+                avoid_air         = params['avoid_air'],
+                z_safe            = self._settings['z_safe'],
+                feed_rapid        = self._settings['feed_rapid'],
                 progress          = progress_fn,
                 erosion_cache     = self._erosion_cache,
                 erosion_cache_key = pocket_erosion_cache_key,
@@ -3218,6 +3239,9 @@ class GCodeGeneratorApp:
                 feed_rate         = params['feed_rate'],
                 use_2opt          = params['use_2opt'],
                 cut_direction     = params['cut_direction'],
+                avoid_air         = params['avoid_air'],
+                z_safe            = self._settings['z_safe'],
+                feed_rapid        = self._settings['feed_rapid'],
                 progress          = progress_fn,
                 erosion_cache     = self._erosion_cache,
                 erosion_cache_key = erosion_cache_key,

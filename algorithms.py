@@ -545,6 +545,203 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     return result
 
 
+def compute_air_free_depth(previous_result, kernel, footprint, shape,
+                           previous_alpha=None):
+    """Return the deepest normalised tool-tip depth at each centre pixel at
+    which the tool touches no material left by previous_result.
+
+    A tool centred at c with its tip at depth z removes material at c+d
+    down to z - kernel(d); it cuts only air there iff
+    z <= previous_result(c+d) + kernel(d) for every d in the footprint. The
+    minimum of that bound over the footprint is a grey erosion of
+    previous_result with structure -kernel -- the same operation that builds
+    the achievable-depth surface from the depth map. kernel/footprint must
+    be the real tool's (_build_kernel), not the stock-to-leave-inflated
+    planning kernel, since this is about physical contact.
+
+    previous_result None (no prior step) means untouched stock, i.e. zeros.
+    previous_alpha (ToolPath.alpha, 0.0 = a hole cut through the stock), if
+    given, marks pixels with no material at any depth: they never constrain
+    the tool, however deep it goes.
+    """
+    if previous_result is None and previous_alpha is None:
+        return np.zeros(shape, dtype=np.float32)
+    from scipy.ndimage import grey_erosion
+    removed = (previous_result.astype(np.float64) if previous_result is not None
+               else np.zeros(shape, dtype=np.float64))
+    if previous_alpha is not None:
+        removed = np.where(previous_alpha < 0.5, 1e6, removed)
+    return grey_erosion(removed, footprint=footprint,
+                        structure=-kernel.astype(np.float64)).astype(np.float32)
+
+
+def _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm):
+    """Return the feed length (mm) whose cutting time equals the extra
+    retract + plunge a split introduces at depth_mm: an air run shorter than
+    this is cheaper to feed through than to lift over."""
+    return feed_rate * 2.0 * (z_safe + depth_mm) / feed_rapid
+
+
+def _prune_air_passes(pass_list, previous_result, kernel, footprint, shape,
+                      px_per_mm, ox, oy, max_depth, tol_norm,
+                      feed_rate, feed_rapid, z_safe, parent_ids=None,
+                      previous_alpha=None):
+    """Apply prune_air_segments to every pass of a make_multipass pass list,
+    against compute_air_free_depth(previous_result, kernel, footprint, shape)
+    (optionally previous_alpha) and the retract/plunge breakeven for
+    feed_rate/feed_rapid/z_safe.
+
+    parent_ids, if given, holds one id per segment of every non-empty pass
+    (callers use it where make_multipass keeps a pass's segments one-to-one
+    with the full-depth segments, as in Pocket). Returns
+    (pruned_pass_list, per_pass_ids, air_mm): per_pass_ids[pi] holds one id
+    per segment of pruned pass pi, or is None when parent_ids is None;
+    air_mm is the total feed length removed across all passes.
+    """
+    free = compute_air_free_depth(previous_result, kernel, footprint, shape,
+                                  previous_alpha=previous_alpha)
+
+    def breakeven(depth_mm):
+        return _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm)
+
+    pruned, per_pass_ids, air_mm = [], [], 0.0
+    for ceil_mm, is_final, pass_segs in pass_list:
+        segs, ids, air = prune_air_segments(
+            pass_segs, free, px_per_mm, shape[0], ox, oy, max_depth, tol_norm,
+            breakeven_fn=breakeven,
+            parent_ids=parent_ids if (parent_ids is not None and pass_segs) else None)
+        pruned.append((ceil_mm, is_final, segs))
+        per_pass_ids.append(ids if ids is not None else ([] if parent_ids is not None else None))
+        air_mm += air
+    return pruned, per_pass_ids, air_mm
+
+
+def _true_runs(mask):
+    """Return [(start, end_exclusive), ...] for each run of True in a 1-D
+    bool array."""
+    m = np.concatenate([[False], np.asarray(mask, dtype=bool), [False]])
+    edges = np.flatnonzero(np.diff(m.astype(np.int8)))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def prune_air_segments(segments, free_depth, px_per_mm, H, ox, oy, max_depth,
+                       tol_norm, breakeven_fn=None, parent_ids=None,
+                       sample_px=0.5):
+    """Remove the portions of mm-space segments where the tool cuts only air.
+
+    Each segment [(x, y, z_mm), ...] is sampled along its edges every
+    sample_px pixels; a sample cuts material iff its depth (-z / max_depth)
+    exceeds free_depth (see compute_air_free_depth) at its nearest pixel by
+    more than tol_norm. Air runs at a segment's start or end are always
+    trimmed (that costs no extra retract). An interior air run is removed,
+    splitting the segment in two, only if its length is at least
+    breakeven_fn(deepest depth in mm along the run) -- see
+    _retract_breakeven_mm -- otherwise the tool feeds straight through it.
+    breakeven_fn None removes every interior air run.
+
+    A closed loop (first and last points within 1.5 px) is first rotated to
+    start inside its longest air run, so that run becomes the trimmed
+    start/end rather than an interior split -- the loop is entered once
+    either way.
+
+    Each kept run is widened by one sample into the adjacent air on both
+    sides, so its start/end lie at most sample_px short of the true
+    air/material crossing on the air side and every material-cutting sample
+    stays covered. Kept runs contain the segment's own vertices plus those
+    two boundary samples, never the intermediate samples, so the output
+    has the same vertex density as the input.
+
+    parent_ids, if given (one per segment), is mapped onto the output: each
+    output segment carries its source segment's id.
+
+    Returns (pruned_segments, pruned_parent_ids, air_mm) -- pruned_parent_ids
+    is None when parent_ids is None; air_mm is the total feed length removed.
+    """
+    Hf, Wf = free_depth.shape
+    out, out_ids = [], []
+    air_mm = 0.0
+    closed_tol_mm = 1.5 / px_per_mm
+    for si, seg in enumerate(segments):
+        pid = parent_ids[si] if parent_ids is not None else None
+        pts = np.asarray(seg, dtype=np.float64)
+        if len(pts) < 2:
+            out.append(seg)
+            out_ids.append(pid)
+            continue
+        is_closed = (len(pts) > 2 and
+                     np.hypot(pts[0, 0] - pts[-1, 0], pts[0, 1] - pts[-1, 1]) < closed_tol_mm)
+        if is_closed and not np.array_equal(pts[0], pts[-1]):
+            pts = np.vstack([pts, pts[:1]])
+
+        # Densify: n_e samples per edge, t = 0, 1/n_e, ... plus the last vertex.
+        d = np.diff(pts, axis=0)
+        edge_px = np.hypot(d[:, 0], d[:, 1]) * px_per_mm
+        n_e = np.maximum(1, np.ceil(edge_px / sample_px)).astype(np.intp)
+        starts = np.cumsum(n_e) - n_e
+        total = int(n_e.sum())
+        edge_of = np.repeat(np.arange(len(d)), n_e)
+        t = (np.arange(total) - np.repeat(starts, n_e)) / np.repeat(n_e, n_e)
+        dense = np.vstack([pts[edge_of] + t[:, None] * d[edge_of], pts[-1:]])
+        is_vertex = np.zeros(len(dense), dtype=bool)
+        is_vertex[starts] = True
+        is_vertex[-1] = True
+
+        cols = np.clip(np.round((dense[:, 0] + ox) * px_per_mm).astype(np.intp), 0, Wf - 1)
+        rows = np.clip(np.round((H - 1) - (dense[:, 1] + oy) * px_per_mm).astype(np.intp), 0, Hf - 1)
+        depth_norm = -dense[:, 2] / max_depth
+        cut = depth_norm > free_depth[rows, cols] + tol_norm
+
+        if cut.all():
+            out.append(seg)
+            out_ids.append(pid)
+            continue
+        step = np.hypot(np.diff(dense[:, 0]), np.diff(dense[:, 1]))
+        if not cut.any():
+            air_mm += float(step.sum())
+            continue
+
+        if is_closed:
+            # Drop the duplicated closing sample, rotate so the sequence
+            # starts at the first sample of the longest air run, then close
+            # it again by repeating that first sample at the end. The run
+            # then sits at the sequence's start, where it is trimmed.
+            dense, is_vertex, cut = dense[:-1], is_vertex[:-1], cut[:-1]
+            n = len(cut)
+            first_cut = int(np.argmax(cut))
+            order = (np.arange(n) + first_cut) % n       # starts on a cut sample
+            air_runs = _true_runs(~cut[order])
+            longest = max(air_runs, key=lambda r: r[1] - r[0])
+            order = np.roll(order, -longest[0])
+            order = np.append(order, order[0])
+            dense, cut, is_vertex = dense[order], cut[order], is_vertex[order]
+            step = np.hypot(np.diff(dense[:, 0]), np.diff(dense[:, 1]))
+
+        n = len(cut)
+        cum = np.concatenate([[0.0], np.cumsum(step)])
+        keep = cut.copy()
+        # Restore interior air runs shorter than the retract/plunge breakeven.
+        if breakeven_fn is not None:
+            for i, j in _true_runs(~cut):
+                if i > 0 and j < n:
+                    run_depth_mm = max(float(np.max(-dense[i:j, 2])), 0.0)
+                    if cum[j] - cum[i - 1] < breakeven_fn(run_depth_mm):
+                        keep[i:j] = True
+
+        # Widen every kept run by one sample on each side.
+        widened = keep.copy()
+        widened[1:] |= keep[:-1]
+        widened[:-1] |= keep[1:]
+
+        kept_len = 0.0
+        for i, j in _true_runs(widened):
+            idx = np.concatenate([[i], i + 1 + np.flatnonzero(is_vertex[i + 1:j - 1]), [j - 1]])
+            out.append([tuple(float(v) for v in dense[k]) for k in idx])
+            out_ids.append(pid)
+            kept_len += float(cum[j - 1] - cum[i])
+        air_mm += float(cum[-1]) - kept_len
+    return out, (out_ids if parent_ids is not None else None), air_mm
+
+
 def _order_free_raster_pass(pass_segs, origin, use_2opt, link_threshold_mm):
     """Greedy nearest-endpoint ordering with optional 2-opt refinement,
     for a raster pass with no forced cut direction — segments may be
@@ -1404,6 +1601,9 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             cut_direction="Climb",
                             final_stepdown_mm=0.0,
                             extra_offset_mm=0.0,
+                            avoid_air=False,
+                            z_safe=5.0,
+                            feed_rapid=3000.0,
                             progress=None,
                             erosion_cache=None,
                             erosion_cache_key=None):
@@ -1472,6 +1672,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                         the tool is treated as 2*extra_offset_mm larger when
                         computing the achievable-depth surface. Vertically,
                         that surface is lowered by extra_offset_mm. 0 = none.
+    avoid_air         : if True, remove the portions of every pass where the
+                        tool would cut only air -- material previous_result
+                        (or earlier stock surface) has already cleared -- see
+                        prune_air_segments.
+    z_safe, feed_rapid : safe height (mm) and rapid rate (mm/min), used by
+                        avoid_air's retract/plunge breakeven.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     erosion_cache     : optional dict used to memoise the grey-erosion/grey-dilation
                         achievable-depth surface (keyed by erosion_cache_key), so a
@@ -1668,6 +1874,16 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     pass_list = make_multipass(full_depth_segs, max_depth, stepdown_mm,
                                final_stepdown_mm)
 
+    # ── Phase 2b: drop air-cutting runs (optional) ────────────────
+    air_pruned_mm = 0.0
+    if avoid_air:
+        progress(55, "Removing air-cutting portions of each pass…")
+        pass_list, _, air_pruned_mm = _prune_air_passes(
+            pass_list, previous_result, kernel_raster, footprint_raster, (H, W),
+            px_per_mm, _ox, _oy, max_depth, resid_tol,
+            feed_rate, feed_rapid, z_safe)
+        progress(55, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
+
     # ── Phases 3–4: per-pass ordering + terrain link insertion ────
     for pi, (ceil_mm, is_final, pass_segs) in enumerate(pass_list):
         if not pass_segs:
@@ -1819,6 +2035,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'link_threshold_mm': link_threshold_mm,
             'n_links_inserted': n_links_inserted,
             'n_links_total': n_links,
+            'air_pruned_mm': air_pruned_mm,
         }
     )
 
@@ -1960,6 +2177,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                              final_stepdown_mm=0.0,
                              boundary_offset_mm=0.0,
                              reference_surface=None,
+                             avoid_air=False,
+                             z_safe=5.0,
+                             feed_rapid=3000.0,
                              progress=None,
                              erosion_cache=None,
                              erosion_cache_key=None):
@@ -2058,6 +2278,12 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         ordinary Pocket behaviour. Must already be resampled
                         to match depth_map's own post-Stage-0 grid — it is
                         not resampled again here.
+    avoid_air         : if True, remove the portions of every pass where the
+                        tool would cut only air -- see prune_air_segments.
+                        Splitting a segment remaps its region id so Zig-Zag/
+                        Onion Skin region grouping still holds.
+    z_safe, feed_rapid : safe height (mm) and rapid rate (mm/min), used by
+                        avoid_air's retract/plunge breakeven.
     progress          : callable(pct, subtask) — thread-safe progress reporter
     erosion_cache     : optional dict memoising the grey-erosion/grey-dilation
                         achievable-depth surface, keyed by erosion_cache_key.
@@ -2263,6 +2489,25 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     pass_list = make_multipass(full_depth_segs, pocket_depth_mm, stepdown_mm,
                                final_stepdown_mm)
     n_passes = len(pass_list)
+
+    # Every point of every region shares the one uniform target_z_norm, so
+    # make_multipass's per-pass keep/drop decision is identical for every
+    # segment in a given pass: a non-empty pass reproduces full_depth_segs
+    # (hence seg_region_ids, recorded for Zig-Zag and Onion Skin) unchanged
+    # in count and order. pass_region_ids holds each pass's own per-segment
+    # region ids, which air pruning (splitting or dropping segments) remaps.
+    pass_region_ids = [seg_region_ids] * n_passes
+    air_pruned_mm = 0.0
+    if avoid_air:
+        progress(70, "Removing air-cutting portions of each pass…")
+        pass_list, pruned_region_ids, air_pruned_mm = _prune_air_passes(
+            pass_list, previous_result, kernel_pocket, footprint_pocket, (H, W),
+            px_per_mm, _ox, _oy, max_depth, 1.0 / (n_grey_levels - 1),
+            feed_rate, feed_rapid, z_safe,
+            parent_ids=seg_region_ids if (IS_ZIGZAG or IS_ONION) else None)
+        if IS_ZIGZAG or IS_ONION:
+            pass_region_ids = pruned_region_ids
+        progress(70, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
     link_threshold_mm = 2.0 * step_mm   # 2-opt's own "free stitch" cost-model distance
 
     # ── Stage 6 · Per-pass ordering + terrain link insertion ─────────────
@@ -2310,19 +2555,12 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         if IS_ONION and _is_contiguous_chain(pass_segs):
             ordered_segs = pass_segs
         elif IS_ONION:
-            # pass_segs is guaranteed to reproduce full_depth_segs (hence
-            # seg_region_ids) unchanged in count and order whenever
-            # non-empty: every onion-skin point across every region shares
-            # the one uniform target_z_norm, so make_multipass's per-pass
-            # keep/drop decision is identical for every chain in a given
-            # pass -- a pass never keeps some chains and drops others.
+            # pass_region_ids[pi] is aligned one-to-one with pass_segs (see
+            # Stage 5).
             ordered_segs = _order_fixed_orientation_pass(pass_segs, cur,
-                                                          group_ids=seg_region_ids)
+                                                          group_ids=pass_region_ids[pi])
         elif IS_ZIGZAG:
-            # Same full_depth_segs/seg_region_ids alignment guarantee as
-            # IS_ONION above applies here too -- every zig-zag point across
-            # every region shares the one uniform target_z_norm.
-            ordered_segs = _order_zigzag_pass(pass_segs, seg_region_ids, direction, cur,
+            ordered_segs = _order_zigzag_pass(pass_segs, pass_region_ids[pi], direction, cur,
                                               lock_direction)
         elif lock_direction and IS_SPIRAL:
             ordered_segs = pass_segs
@@ -2445,6 +2683,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             'n_links_inserted': n_links_inserted,
             'n_links_contour': n_links_contour,
             'n_links_total': n_links,
+            'air_pruned_mm': air_pruned_mm,
         }
     )
 
@@ -2593,6 +2832,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             use_2opt=False,
                             cut_direction="Climb",
                             extra_offset_mm=0.0,
+                            avoid_air=False,
+                            z_safe=5.0,
+                            feed_rapid=3000.0,
                             progress=None,
                             erosion_cache=None,
                             erosion_cache_key=None):
@@ -2661,6 +2903,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
                             result of this step.  Does not gate which regions are
                             visited (that is prior_reference's job).  None treats
                             the prior removal as zero.
+    avoid_air             : if True, remove the portions of every pass where the
+                            tool would cut only air -- see prune_air_segments.
+    z_safe, feed_rapid    : safe height (mm) and rapid rate (mm/min), used by
+                            avoid_air's retract/plunge breakeven.
     progress              : callable(pct, message) — thread-safe progress reporter
 
     Returns
@@ -3184,9 +3430,18 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     )
     full_depth_segs = [simplify_line(pts, rdp_tol) for pts in full_depth_segs]
 
-    # Phases 2–3: depth-slice + per-pass 2-opt reorder
-    for _, _, pass_segs in make_multipass(
-            full_depth_segs, max_depth, stepdown_mm, final_stepdown_mm):
+    # Phases 2–3: depth-slice, drop air-cutting runs (optional), per-pass
+    # 2-opt reorder
+    pass_list = make_multipass(full_depth_segs, max_depth, stepdown_mm, final_stepdown_mm)
+    air_pruned_mm = 0.0
+    if avoid_air:
+        progress(89, "Removing air-cutting portions of each pass…")
+        pass_list, _, air_pruned_mm = _prune_air_passes(
+            pass_list, previous_result, kernel_vcarve, footprint_vcarve, (H, W),
+            px_per_mm, _ox, _oy, max_depth, 1.0 / (n_grey_levels - 1),
+            feed_rate, feed_rapid, z_safe)
+        progress(89, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
+    for _, _, pass_segs in pass_list:
         pass_segs = _two_opt_pass(pass_segs, _pass_origin(all_segments))
         all_segments.extend(pass_segs)
 
@@ -3224,10 +3479,74 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             'rdp_tolerance':   rdp_tol,
             'cone_reach_warning': _cone_reach_warning,
             'cut_direction':   cut_direction,
+            'air_pruned_mm':   air_pruned_mm,
         }
     )
     progress(100, "V-carve tool path computation complete!")
     return toolpath
+
+
+def _split_runs(c, keep_mask, min_pts=3, min_prune_arc_px=0.0):
+    """Split a pixel-space (row, col) polyline c into the runs where
+    keep_mask is True, returning a list of arrays of at least min_pts
+    points. A closed polyline (ends within 1.5 px) is split starting at
+    its first kept run, so a dropped run that wraps across the ends stays
+    one run. Dropped runs shorter than min_prune_arc_px in arc length are
+    restored before splitting (retract+plunge breakeven)."""
+    n = len(c)
+    is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
+
+    # Pass 1: restore pruned runs whose pixel-space arc length is below the
+    # retract+plunge breakeven threshold.  Splitting there would cost more
+    # in Z-travel overhead than the redundant cutting saves.
+    mask = keep_mask.copy()
+    if min_prune_arc_px > 0.0 and mask.any() and not mask.all():
+        if is_closed:
+            start = next((i for i in range(n)
+                          if mask[i] and not mask[(i - 1) % n]), 0)
+            seq = [(start + i) % n for i in range(n)]
+        else:
+            seq = list(range(n))
+        i = 0
+        while i < len(seq):
+            if not mask[seq[i]]:
+                run_idx = []
+                while i < len(seq) and not mask[seq[i]]:
+                    run_idx.append(seq[i])
+                    i += 1
+                pts = c[run_idx]
+                arc = (float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+                       if len(pts) > 1 else 0.0)
+                if arc < min_prune_arc_px:
+                    for ri in run_idx:
+                        mask[ri] = True
+            else:
+                i += 1
+
+    if not mask.any():
+        return []
+    if mask.all():
+        return [c]
+
+    # Pass 2: split on the (possibly restored) mask.
+    if is_closed:
+        start = next((i for i in range(n)
+                      if mask[i] and not mask[(i - 1) % n]), 0)
+        indices = [(start + i) % n for i in range(n)]
+    else:
+        indices = list(range(n))
+    segments = []
+    run = []
+    for idx in indices:
+        if mask[idx]:
+            run.append(c[idx])
+        else:
+            if len(run) >= min_pts:
+                segments.append(np.array(run))
+            run = []
+    if len(run) >= min_pts:
+        segments.append(np.array(run))
+    return segments
 
 
 def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
@@ -3280,62 +3599,6 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
             depth_img[img] = depth_mm
         return img
 
-    def _split_runs(c, keep_mask, min_pts=3, min_prune_arc_px=0.0):
-        n = len(c)
-        is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
-
-        # Pass 1: restore pruned runs whose pixel-space arc length is below the
-        # retract+plunge breakeven threshold.  Splitting there would cost more
-        # in Z-travel overhead than the redundant cutting saves.
-        mask = keep_mask.copy()
-        if min_prune_arc_px > 0.0 and mask.any() and not mask.all():
-            if is_closed:
-                start = next((i for i in range(n)
-                              if mask[i] and not mask[(i - 1) % n]), 0)
-                seq = [(start + i) % n for i in range(n)]
-            else:
-                seq = list(range(n))
-            i = 0
-            while i < len(seq):
-                if not mask[seq[i]]:
-                    run_idx = []
-                    while i < len(seq) and not mask[seq[i]]:
-                        run_idx.append(seq[i])
-                        i += 1
-                    pts = c[run_idx]
-                    arc = (float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-                           if len(pts) > 1 else 0.0)
-                    if arc < min_prune_arc_px:
-                        for ri in run_idx:
-                            mask[ri] = True
-                else:
-                    i += 1
-
-        if not mask.any():
-            return []
-        if mask.all():
-            return [c]
-
-        # Pass 2: split on the (possibly restored) mask.
-        if is_closed:
-            start = next((i for i in range(n)
-                          if mask[i] and not mask[(i - 1) % n]), 0)
-            indices = [(start + i) % n for i in range(n)]
-        else:
-            indices = list(range(n))
-        segments = []
-        run = []
-        for idx in indices:
-            if mask[idx]:
-                run.append(c[idx])
-            else:
-                if len(run) >= min_pts:
-                    segments.append(np.array(run))
-                run = []
-        if len(run) >= min_pts:
-            segments.append(np.array(run))
-        return segments
-
     pruned = {}
     effective_next_img = None
     effective_next_depth = None
@@ -3356,8 +3619,8 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
             continue
 
         # Retract+plunge breakeven arc length for this depth level (in pixels).
-        min_prune_arc_px = (feed_rate * 2.0 * (z_safe + z_level_mm)
-                            / feed_rapid * px_per_mm)
+        min_prune_arc_px = (_retract_breakeven_mm(feed_rate, feed_rapid, z_safe, z_level_mm)
+                            * px_per_mm)
 
         dt, nearest_idx = distance_transform_edt(~effective_next_img, return_indices=True)
 
@@ -3384,6 +3647,42 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
         # else: fully pruned — effective_next_img unchanged, propagates upward
 
     return pruned
+
+
+def _prune_air_contours(all_z_contours, free_depth, tol_norm, px_per_mm,
+                        max_depth, breakeven_fn):
+    """Air-cutting counterpart to _prune_contours for Contour's pixel-space
+    (row, col) rings: at each z-level z_norm, a point cuts material iff
+    z_norm > free_depth[row, col] + tol_norm (see compute_air_free_depth).
+    Kept runs are widened by one point into the adjacent air on both sides
+    (wrapping around a closed ring), then split with _split_runs, which
+    restores dropped runs shorter than breakeven_fn(level depth in mm).
+
+    Returns (pruned dict with the same keys, total removed length in mm).
+    """
+    Hf, Wf = free_depth.shape
+    pruned, air_px = {}, 0.0
+    for z_norm, contours in all_z_contours.items():
+        min_arc_px = breakeven_fn(z_norm * max_depth) * px_per_mm
+        kept = []
+        for c in contours:
+            rows = np.round(c[:, 0]).astype(int).clip(0, Hf - 1)
+            cols = np.round(c[:, 1]).astype(int).clip(0, Wf - 1)
+            cut = z_norm > free_depth[rows, cols] + tol_norm
+            if np.linalg.norm(c[0] - c[-1]) < 1.5:
+                keep = cut | np.roll(cut, 1) | np.roll(cut, -1)
+            else:
+                keep = cut.copy()
+                keep[1:] |= cut[:-1]
+                keep[:-1] |= cut[1:]
+            parts = _split_runs(c, keep, min_prune_arc_px=min_arc_px)
+            before = float(np.sum(np.linalg.norm(np.diff(c, axis=0), axis=1)))
+            after = sum(float(np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1)))
+                        for p in parts)
+            air_px += max(before - after, 0.0)
+            kept.extend(parts)
+        pruned[z_norm] = kept
+    return pruned, air_px / px_per_mm
 
 
 def _clip_contours_to_mask(all_z_contours, mask, min_pts=3):
@@ -3646,6 +3945,7 @@ def compute_contour_toolpath(
     cut_direction="Climb",
     max_step_down_mm=None,
     extra_offset_mm=0.0,
+    avoid_air=False,
     erosion_cache=None,
     erosion_cache_key=None,
 ):
@@ -3713,6 +4013,11 @@ def compute_contour_toolpath(
         result. Laterally, the tool is treated as 2*extra_offset_mm larger
         when computing the achievable-depth surface. Vertically, that
         surface is lowered by extra_offset_mm. 0 = none.
+    avoid_air : bool
+        If True, remove the portions of every z-level's contours where the
+        tool would cut only air -- material previous_result has already
+        cleared -- see _prune_air_contours. Uses z_safe/feed_rapid for the
+        same retract/plunge breakeven as lateral pruning.
     z_safe : float
         Safe Z height above the workpiece surface in mm.  Used with
         feed_rapid to compute the retract+plunge breakeven arc length per
@@ -3863,6 +4168,17 @@ def compute_contour_toolpath(
             max_depth=max_depth,
             max_step_down_mm=_msd)
 
+    # ── Stage 4b′ · Drop air-cutting runs (optional) ──────────────────────
+    air_pruned_mm = 0.0
+    if avoid_air:
+        progress(52, "Removing air-cutting portions of each Z-level…")
+        free = compute_air_free_depth(previous_result, kernel_contour,
+                                      footprint_contour, (H, W))
+        all_z_contours, air_pruned_mm = _prune_air_contours(
+            all_z_contours, free, 1.0 / (n_grey_levels - 1), px_per_mm, max_depth,
+            lambda depth_mm: _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm))
+        progress(52, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
+
     # ── Stage 4c · Ordering — greedy per max_step_down window, optional 2-opt
     link_threshold_mm = tool.diameter_mm
     all_segments, _ = _order_contours_windowed(
@@ -3953,6 +4269,7 @@ def compute_contour_toolpath(
             'max_step_down_mm':   _msd,
             'extra_offset_mm':    extra_offset_mm,
             'lateral_tol_mm':     lateral_tol_mm,
+            'air_pruned_mm':      air_pruned_mm,
             'n_passes':        len(z_levels),
             'width_mm':        width_mm,
             'height_mm':       height_mm,
@@ -3981,6 +4298,7 @@ def compute_cutout_toolpath(
     z_safe=5.0,
     feed_rapid=3000.0,
     tab_settings=None,
+    avoid_air=False,
     progress=None,
 ):
     """Compute an outer-silhouette cutout tool path.
@@ -4078,12 +4396,17 @@ def compute_cutout_toolpath(
         Optional 2-opt travel-order refinement across the loops within
         each depth pass.
     z_safe, feed_rapid : float
-        Used only to seed per-rapid overhead in the optional 2-opt cost
-        model.
+        Seed per-rapid overhead in the optional 2-opt cost model, and
+        avoid_air's retract/plunge breakeven.
     tab_settings : dressup.TabSettings or None
         When enabled, leaves evenly-spaced uncut bridges ("tabs") in every
         closed ring, applied to the full-depth ring geometry before
         make_multipass() depth-slices it -- see dressup.apply_tabs.
+    avoid_air : bool
+        If True, remove the portions of every pass where the tool would cut
+        only air -- material previous_result has already cleared, or a hole
+        previous_alpha marks as cut through -- see prune_air_segments. A
+        pruned closed loop becomes an open segment.
     progress : callable(pct, message)
         Thread-safe progress reporter.
 
@@ -4103,7 +4426,9 @@ def compute_cutout_toolpath(
         threshold_mm=threshold_mm, stepdown_mm=stepdown_mm,
         final_stepdown_mm=final_stepdown_mm, boundary_offset_mm=boundary_offset_mm,
         cut_direction=cut_direction, use_2opt=use_2opt, z_safe=z_safe,
-        feed_rapid=feed_rapid, tab_settings=tab_settings, progress=progress,
+        feed_rapid=feed_rapid, tab_settings=tab_settings,
+        avoid_air=avoid_air, feed_rate=feed_rate, n_grey_levels=n_grey_levels,
+        progress=progress,
     )
 
 
@@ -4301,6 +4626,9 @@ def _compute_cutout_from_rings(
     z_safe=5.0,
     feed_rapid=3000.0,
     tab_settings=None,
+    avoid_air=False,
+    feed_rate=800.0,
+    n_grey_levels=256,
     progress=None,
 ):
     """Phase B of compute_cutout_toolpath: apply tabs, depth-slice into
@@ -4357,6 +4685,15 @@ def _compute_cutout_from_rings(
 
     pass_list = make_multipass(full_depth_segs, cutout_depth_mm, stepdown_mm, final_stepdown_mm)
     n_passes = len(pass_list)
+    air_pruned_mm = 0.0
+    if avoid_air:
+        progress(45, "Removing air-cutting portions of each pass…")
+        pass_list, _, air_pruned_mm = _prune_air_passes(
+            pass_list, previous_result, rings_cache.kernel_cutout,
+            rings_cache.footprint_cutout, (H, W),
+            px_per_mm, _ox, _oy, max_depth, 1.0 / (n_grey_levels - 1),
+            feed_rate, feed_rapid, z_safe, previous_alpha=previous_alpha)
+        progress(45, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
 
     all_segments = []
     current_pos  = np.array([0.0, 0.0])
@@ -4500,6 +4837,7 @@ def _compute_cutout_from_rings(
         'cut_direction':     cut_direction,
         'use_2opt':          use_2opt,
         'n_passes':          n_passes,
+        'air_pruned_mm':     air_pruned_mm,
         'width_mm':          width_mm,
         'height_mm':         height_mm,
         'rdp_tolerance':     rdp_tol,

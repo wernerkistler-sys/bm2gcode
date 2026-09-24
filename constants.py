@@ -110,6 +110,7 @@ DEFAULTS = {
     "step_pocket_boundary_offset": "0.0", # lateral-only outward push (mm); 0 = tool tangent to pocket wall
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
+    "step_avoid_air":             "0",   # 1 = drop toolpath runs that would cut only air
     # Per-step G-code dress-ups (see dressup.py) — all opt-in, disabled by default
     "step_ramp_in_enabled":     "0",
     "step_ramp_angle_deg":      "30.0",

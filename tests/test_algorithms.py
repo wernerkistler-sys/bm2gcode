@@ -17,8 +17,11 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         _region_contour_rings, _make_contour_ring,
                         _nearest_ring_vertex, _ring_arc_between,
                         _order_locked_raster_pass, _order_zigzag_pass,
-                        _order_free_region_pass)
+                        _order_free_region_pass, prune_air_segments,
+                        compute_air_free_depth, _retract_breakeven_mm, _build_kernel,
+                        simulate_toolpath_result, compute_raster_toolpath)
 from tool import Tool
+from toolpath import ToolPath
 
 FAILURES = []
 
@@ -663,6 +666,165 @@ check("consecutive lines are entered from alternating ends, keeping every "
       "line-to-line gap short (a full return trip across the region would "
       "be 10mm; a same-side alternating entry is ~2mm)",
       all(g < 3.0 for g in gaps))
+
+
+# --------------------------------------------------------------------------
+# Air-cut pruning (prune_air_segments / compute_air_free_depth): runs where
+# the tool's tip is no deeper than what previous_result already cleared
+# under its footprint are removed; everything that touches material stays.
+# --------------------------------------------------------------------------
+print("prune_air_segments")
+
+AIR_PX = 4.0        # px/mm
+AIR_H = AIR_W = 80  # 20 x 20 mm
+AIR_MD = 5.0        # max depth mm
+AIR_TOL = 1.0 / 255
+
+
+def _air_prune(segs, free, breakeven_fn=None, parent_ids=None):
+    return prune_air_segments(segs, free, AIR_PX, AIR_H, 0.0, 0.0, AIR_MD, AIR_TOL,
+                              breakeven_fn=breakeven_fn, parent_ids=parent_ids)
+
+
+# Left half fully cleared (free depth 1.0), right half untouched stock.
+free_half = np.zeros((AIR_H, AIR_W), dtype=np.float32)
+free_half[:, :40] = 1.0
+line = [(0.0, 10.0, -2.5), (19.75, 10.0, -2.5)]
+out, _, air = _air_prune([line], free_half)
+check("a line half over cleared stock keeps exactly one piece", len(out) == 1)
+check("the kept piece starts at the cleared/uncleared boundary (within 1 px)",
+      len(out) == 1 and abs(out[0][0][0] - 40 / AIR_PX) <= 1.0 / AIR_PX)
+check("the kept piece ends at the line's own end", len(out) == 1 and out[0][-1] == line[-1])
+check("the reported air length matches what was removed (within 1 px)",
+      abs(air - 40 / AIR_PX) <= 1.0 / AIR_PX)
+
+# A narrow cleared band crossing the line: short interior air run.
+free_band = np.zeros((AIR_H, AIR_W), dtype=np.float32)
+free_band[:, 38:42] = 1.0     # 1 mm wide
+breakeven = lambda d: _retract_breakeven_mm(800.0, 3000.0, 5.0, d)   # ~4 mm at 2.5 mm deep
+out, _, _ = _air_prune([line], free_band, breakeven_fn=breakeven)
+check("an interior air run shorter than the retract breakeven is fed through, not split",
+      len(out) == 1 and out[0][0] == line[0] and out[0][-1] == line[-1])
+out, _, _ = _air_prune([line], free_band, breakeven_fn=None)
+check("without a breakeven, the same interior air run splits the line in two", len(out) == 2)
+
+# Nothing cleared: the segment comes back untouched; all cleared: dropped.
+out, _, air = _air_prune([line], np.zeros((AIR_H, AIR_W), dtype=np.float32))
+check("a segment that cuts material everywhere is returned unchanged",
+      out == [line] and air == 0.0)
+out, _, _ = _air_prune([line], np.ones((AIR_H, AIR_W), dtype=np.float32))
+check("a segment that cuts only air is dropped", out == [])
+
+# A closed square loop whose left side lies over cleared stock becomes one
+# open piece (the air run is rotated to the loop's ends), not two.
+square = [(4.0, 4.0, -2.5), (4.0, 16.0, -2.5), (16.0, 16.0, -2.5),
+          (16.0, 4.0, -2.5), (4.0, 4.0, -2.5)]
+free_left = np.zeros((AIR_H, AIR_W), dtype=np.float32)
+free_left[:, :24] = 1.0      # x < 6 mm cleared: the whole x=4 side
+out, _, _ = _air_prune([square], free_left, breakeven_fn=None)
+check("a closed loop with one air side becomes a single open piece", len(out) == 1)
+check("that piece no longer visits the cleared side",
+      len(out) == 1 and all(p[0] > 4.0 + 1e-9 for p in out[0]))
+
+# parent_ids follow their segment through splits and drops.
+seg_a = [(0.0, 5.0, -2.5), (19.75, 5.0, -2.5)]
+seg_b = [(1.0, 15.0, -2.5), (8.0, 15.0, -2.5)]      # ends short of the band: untouched
+seg_c = [(0.0, 12.0, -2.5), (19.75, 12.0, -2.5)]
+out, ids, _ = _air_prune([seg_a, seg_b, seg_c], free_band, breakeven_fn=None,
+                         parent_ids=["a", "b", "c"])
+check("parent ids are remapped one per output segment", len(ids) == len(out))
+check("each split segment's pieces keep their source id, in order",
+      ids == ["a", "a", "b", "c", "c"])
+
+# Invariant: removing the air never leaves material that the unpruned path
+# would have cut -- compared via the same swept-volume simulation used for
+# every step's result map, allowing one pixel of rim jitter (the pieces are
+# resampled from a different phase) and one grey level of depth.
+from scipy.ndimage import maximum_filter
+rng = np.random.default_rng(7)
+yy, xx = np.mgrid[0:AIR_H, 0:AIR_W]
+worst = 0.0
+for trial, tool in enumerate([Tool(profile="Ball", diameter_mm=3.0),
+                              Tool(profile="End Mill", diameter_mm=2.0),
+                              Tool(profile="V-Bit", diameter_mm=6.0, vbit_angle_deg=60)] * 3):
+    k, fp = _build_kernel(tool, AIR_PX, AIR_MD)
+    cy, cx = rng.uniform(20, 60, 2)
+    prev = np.clip(0.7 - np.hypot(yy - cy, xx - cx) / 30, 0, 1).astype(np.float32)
+    free = compute_air_free_depth(prev, k, fp, (AIR_H, AIR_W))
+    segs = []
+    for _ in range(10):
+        n = int(rng.integers(2, 7))
+        pts = np.column_stack([rng.uniform(0, (AIR_W - 1) / AIR_PX, n),
+                               rng.uniform(0, (AIR_H - 1) / AIR_PX, n),
+                               -rng.uniform(0, 0.9 * AIR_MD, n)])
+        segs.append([tuple(p) for p in pts])
+    out, _, _ = _air_prune(segs, free, breakeven_fn=breakeven)
+    sim = lambda s: simulate_toolpath_result(ToolPath(segments=s), (AIR_H, AIR_W),
+                                             AIR_PX, AIR_PX, 0.0, 0.0, AIR_MD, k, fp)
+    r_off = np.maximum(prev, sim(segs))
+    r_on = np.maximum(prev, sim(out))
+    worst = max(worst, float((r_off - maximum_filter(r_on, size=3)).max()))
+check("pruned paths remove the same material as unpruned ones (random segments, "
+      "Ball/End Mill/V-Bit)", worst <= AIR_TOL)
+
+
+print("avoid_air in compute_raster_toolpath")
+
+# A dome, with the left half already carved to its final depth by a
+# "previous step". 10 px/mm keeps the RDP tolerance small enough (0.1 mm)
+# that it can't mask a pruning error in the result comparison.
+dome_yy, dome_xx = np.mgrid[0:120, 0:120]
+dome = (np.clip(1 - np.hypot(dome_yy - 60, dome_xx - 60) / 50, 0, 1) * 0.9).astype(np.float32)
+dome_prev = np.where(dome_xx < 60, dome, 0).astype(np.float32)
+
+
+def _raster(avoid_air, raster_dir):
+    return compute_raster_toolpath(
+        dome, n_grey_levels=256, tool=Tool(profile="Ball", diameter_mm=0.6),
+        step_mm=0.2, stepdown_mm=1.0, max_depth=5.0, width_mm=12.0, height_mm=12.0,
+        raster_dir=raster_dir, previous_result=dome_prev, cut_direction="Climb",
+        avoid_air=avoid_air, progress=_noop_progress)
+
+
+def _path_len(tp):
+    return sum(float(np.hypot(*np.diff(np.asarray(s)[:, :2], axis=0).T).sum())
+               for s in tp.segments if len(s) > 1)
+
+
+for rdir in ("Horizontal", "Diagonal (45°)", "Spiral (Outside-In)"):
+    tp_off, tp_on = _raster(False, rdir), _raster(True, rdir)
+    deficit = float(np.max(np.minimum(tp_off.result, tp_off.accessible)
+                           - maximum_filter(tp_on.result, size=3)))
+    check(f"{rdir}: avoid_air removes feed length", _path_len(tp_on) < 0.7 * _path_len(tp_off))
+    check(f"{rdir}: avoid_air leaves no material the unpruned path removes",
+          deficit <= AIR_TOL)
+    check(f"{rdir}: air_pruned_mm is reported", tp_on.metadata['air_pruned_mm'] > 0.0)
+
+
+print("avoid_air in compute_pocket_toolpath")
+
+# Two disjoint pocket regions, the left one's left half already cleared to
+# the floor: splitting must keep each piece's region id so regions are
+# still never interleaved.
+for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Spiral (Outside-In)"):
+    prev_two = np.zeros((30, 30), dtype=np.float32)
+    prev_two[:, :6] = 1.0
+    tp_two_air = compute_pocket_toolpath(
+        depth_two, n_grey_levels=256, tool=zz_tool,
+        step_mm=1.0, stepdown_mm=1.0, max_depth=5.0,
+        width_mm=30.0, height_mm=30.0, raster_dir=rdir, target_z_mm=2.0,
+        previous_result=prev_two, cut_direction="Climb", avoid_air=True,
+        progress=_noop_progress,
+    )
+    check(f"{rdir}: pocket with avoid_air is computed without error",
+          len(tp_two_air.segments) > 0)
+    sides = ["A" if sg[0][0] < 11.0 else "B" for sg in tp_two_air.segments]
+    if rdir.startswith("Zig-Zag"):
+        passes_switches = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+        # stepdown 1 mm to 2 mm: two passes, each may switch region once,
+        # plus once between passes.
+        check(f"{rdir}: regions are still never interleaved within a pass",
+              passes_switches <= 3)
 
 
 print()
