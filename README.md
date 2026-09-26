@@ -71,6 +71,7 @@ Each source — an opened image or imported STL — gets its own tab in the note
 | Offset X / Offset Y | Position relative to the canvas center, in mm. +X is right, +Y is up. |
 | Rotation | Counter-clockwise rotation, in degrees. |
 | Scale | Size as a percentage of the canvas's own physical size, aspect-preserving: at 100%, the source is inscribed in the canvas rectangle along whichever of its own axes binds ("contain"), independent of the source's native resolution or the canvas's pixel density. An STL source's default Scale reproduces the mesh's true physical size (see [Import STL](#import-stl)). |
+| Mirror | Reflects the placed source across one of the stock flip axes used by the [Registration Holes](#step--operation--registration-holes) step, for setting up the back side of a two-sided job: **Vertical axis** or **Horizontal axis** (the stock's centre lines), or **Diagonal (+45°)** / **Diagonal (−45°)** (the 45° line through the G-code origin, in that direction). The reflection is applied after Offset/Rotation/Scale, so an offset source's position is mirrored along with its content. A back-view depth image (rendered from behind the object), or an STL imported rotated 180° about the matching axis, is already in flipped orientation and needs no mirror; Mirror is for back-side depth maps drawn in top-view coordinates. None by default. |
 | Blend mode | How this source combines with everything beneath it — see below. The bottom-most source in the stack always reads "Replace (base source)" and can't be changed, since there's nothing under it to blend with. |
 | Opacity | How strongly this source's blended result replaces what's beneath it, as a percentage; 0 hides it. |
 | Min depth / Max depth | Remaps this source's black/white pixels into a depth range, each a percentage of the canvas's Max cut depth: white maps to Min depth and black to Max depth. Setting Max depth below Min depth flips the source's polarity. |
@@ -196,6 +197,34 @@ The tool used for Clean-up (profile, diameter, feed rate, etc.) is independent o
 
 ---
 
+##### Step / Operation / Registration Holes
+
+Bores holes for registration pins, so the stock can be turned over and carved on its back side in exact alignment with the front. The holes are placed on the stock alone — the depth map, Process Region and prior steps play no part in where they go — and are symmetric about a chosen flip axis, so after flipping, the same pins fit the same holes. Hole depth is absolute and typically goes through the stock into the spoilboard: the pins then stay in the spoilboard while the stock is turned over. Restricted to an End Mill tool.
+
+A hole the tool's own diameter is plunged straight down, pecked in Max step-down increments with a lift out of the hole after each peck to clear chips. A larger hole is bored as a helix: the tool spirals down along the hole wall, dropping at most Max step-down per revolution, finishes with one flat circle at full depth, then moves back to the hole centre before retracting. Max step-down is the shared field under [Step / Tool](#step--tool); there's no Final step-down.
+
+| Parameter | Description |
+|---|---|
+| Flip axis | **Vertical axis**: two holes on the stock's vertical centre line, one near the bottom edge and one near the top. **Horizontal axis**: two holes on the horizontal centre line, near the left and right edges. **Diagonal**: an L of three holes, symmetric about the 45° line through the G-code origin — see below. |
+| Diagonal direction | Which 45° line a Diagonal flip uses: +45° (rising to the right) or −45°. Shown only for a Center G-code origin; with a corner origin the direction follows from the corner (+45° through Bottom-Left/Top-Right, −45° through Top-Left/Bottom-Right). |
+| Hole diameter | Finished hole diameter, in mm. Must be at least the tool diameter. |
+| Hole depth | Absolute hole depth, in mm — independent of Max cut depth. |
+| Edge inset | Distance from the stock edge (margin included) to each hole centre, in mm. **Auto** uses half the Stock margin — the middle of the margin strip, clear of the artwork — or 10 mm with no margin. |
+| Spacing | Diagonal only: length of each arm of the L, from the corner hole to each arm hole, in mm. **Auto** uses the shorter stock side minus twice the Edge inset, so both arm holes sit the same inset from the edges as the corner hole. |
+| Cut direction | Winding of a helical bore: Climb (and Either) run counter-clockwise, Conventional clockwise — for a clockwise spindle, counter-clockwise travel along an inside wall is climb milling. |
+
+Hole placement is shown in the 2D views before computing, as dashed outlines with the flip axis drawn through them (toggle with **H** — see [View Menu](#view-menu)). The tab also shows a one-line reminder of how to set up the back side for the current flip axis and G-code origin. Holes aren't checked against the stock edges or the artwork; placement is left to the user.
+
+**Two-sided milling workflow**
+
+1. In the front-side project, add a Registration Holes step and run it with the rest of the front side. Its holes go into the spoilboard; set pins in them.
+2. Flip the stock over the flip axis onto the pins. **Don't re-zero X/Y**: the pins locate the stock relative to the machine's unchanged zero. Re-zeroing Z is fine.
+3. Carve the back side from a second project with the same Stock margin and G-code origin, and the same canvas Width/Height — swapped for a Diagonal flip on non-square stock. Give each back-side source whatever Mirror its depth map needs (see [Sources](#sources)).
+
+Why this works: the back-side G-code needs its origin at the same physical point as the front side's. A flip about the stock's vertical or horizontal centre line maps the stock's footprint onto itself, so every G-code origin (any corner, or Center) lands back on the same point, and the back-side canvas has the same size. A 45° flip turns a W×H footprint into an H×W one, and only points on the flip line stay put — which is why the Diagonal flip line always passes through the G-code origin. The origin corner (or, for Center, the stock centre, which stays the centre of the transposed footprint) is then the same physical point on both sides, and the back-side canvas has Width and Height swapped.
+
+---
+
 ##### Step / Operation / Process Region
 
 The **Process Region** selector is the adaptive gating mechanism. It defines which areas of the depth map this step will process, based on what prior steps have already accomplished.
@@ -228,7 +257,7 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 
 | Parameter | Description |
 |---|---|
-| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). Cutout restricts this to End Mill only. |
+| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). Cutout and Registration Holes restrict this to End Mill only. |
 | Diameter | Cutter diameter in mm. |
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
 | Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. Not shown for Cutout or Pocket, which each have their own separate Boundary offset field instead — see [Step / Operation / Cutout](#step--operation--cutout) and [Step / Operation / Pocket](#step--operation--pocket). |
@@ -256,6 +285,10 @@ Z-level spacing is the separate **Z increment** field under
 Cutout shows its own independent Max/Final step-down pair too, alongside
 its own Cut depth and Boundary offset fields — see
 [Step / Operation / Cutout](#step--operation--cutout).
+
+Registration Holes shows only **Max step-down**, as its helix pitch (Z drop
+per revolution) or peck depth — see
+[Step / Operation / Registration Holes](#step--operation--registration-holes).
 
 ---
 
@@ -350,7 +383,7 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 #### View Menu
 
-All visualization modes show data for the currently active step. Cut moves, rapid moves, and tab markers can be toggled in any mode with **C**, **R**, and **T**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature.
+All visualization modes show data for the currently active step. Cut moves, rapid moves, tab markers, and registration hole outlines can be toggled in any mode with **C**, **R**, **T**, and **H**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature. The **H** toggle (**Show registration holes**) draws every Registration Holes step's hole outlines and flip axis in the 2D modes, from the step's current settings, so the placement can be checked before computing — see [Step / Operation / Registration Holes](#step--operation--registration-holes).
 
 **Show shading** (**S**) renders any of the 2D modes below as a hillshaded relief — simulated raking light and shadow over the mode's own colours — instead of a flat colour ramp, with vertical exaggeration auto-scaled from the max cut depth vs. the canvas footprint so shallow relief remains visible. It has no effect in Step Path (3D) mode.
 
@@ -358,7 +391,7 @@ All visualization modes show data for the currently active step. Cut moves, rapi
 |---|---|---|
 | Original | 1 | The composited depth map for the current step — every source it can see, blended together — with stock margin if configured. |
 | Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
-| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. For a Cutout step whose Cut depth exceeds Max cut depth, pixels actually cut all the way through render as a distinct highlighted colour instead of the ordinary depth grayscale, since a through-cut clips to the same value as reaching full relief depth — see [Cutout Pipeline](#cutout-pipeline). Requires toolpath to be computed.|
+| Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. For a Cutout step whose Cut depth exceeds Max cut depth (or a Registration Holes step whose Hole depth does), pixels actually cut all the way through render as a distinct highlighted colour instead of the ordinary depth grayscale, since a through-cut clips to the same value as reaching full relief depth — see [Cutout Pipeline](#cutout-pipeline). Requires toolpath to be computed.|
 | Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
 | Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
 | Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
@@ -487,6 +520,18 @@ Pocket shares Raster's kernel + accessibility (morphological opening) stage, but
 Pocket only clears the interior — it does not cut a wall-finishing pass around the pocket boundary. Every scan direction's own infill lines still stop at the interior mask's pixel-grid boundary, the same stair-stepped edge Raster leaves at any masked boundary — Zig-Zag's contour linking (step 6) only smooths the connecting move between lines, not each line's own endpoint. Onion Skin is the exception: its rings are extracted via sub-pixel marching squares (`skimage.find_contours`) directly, so its outermost ring traces a smoother boundary than the per-pixel stair-step.
 
 V-Carving Clean-up runs this identical pipeline with one substitution: step 1's achievable-depth erosion runs against `compute_vcarve_synth_achievable_depth`'s output — the nearest preceding V-Carving (Hybrid) step's own idealized-V-bit achievable-depth surface (see [V-Carving Pipeline](#v-carving-pipeline)) — instead of the raw depth map, so the clearing tool's kernel is eroded against the V-bit's own achievable-depth surface rather than the flat depth map. Target depth still defaults to 0, but that now means literal Z=0 (see [Step / Operation / Pocket](#step--operation--pocket)) — check its **Auto** box to track the depth map's own deepest point instead (same Auto behaviour as ordinary Pocket; it reads the raw depth map, not this step's own V-bit-eroded reference surface), mirroring what "0 = auto" used to give by default; see [Step / Operation / V-Carving Clean-up](#step--operation--v-carving-clean-up).
+
+---
+
+### Registration Holes Pipeline
+
+Like Cutout, Registration Holes is a flat, straight-wall End Mill cut with no kernel/accessibility stage and no Process Region gating; unlike Cutout, it doesn't read the depth map at all.
+
+1. **Hole placement** — Hole centres are computed in stock coordinates (the stock's bottom-left corner, margin included, is 0,0), spanning pixel centres like every other algorithm, so a flip axis through the stock centre is exactly the depth map's own centre line. **Vertical axis**/**Horizontal axis** put two holes on the centre line, Edge inset from the two stock edges it crosses. **Diagonal** builds an L: the flip line is the 45° line through the G-code origin (for Center, the line through the stock centre in the chosen direction); the corner hole sits on that line, Edge inset from both edges at the line's origin end (for Center, at the far end of the line's centred square of side min(W, H)); the two arm holes sit Spacing from the corner hole along the two stock edge directions pointing into the stock. Reflecting across the flip line fixes the corner hole and swaps the arm holes, so every pattern maps onto itself. The centres are then converted to G-code coordinates for the selected origin.
+2. **Boring** — Holes are visited nearest-first from the origin. Each is a single segment for a helix — Z=0 down to Hole depth along a circle of radius (Hole diameter − tool diameter)/2, at an equal Z drop per revolution no larger than Max step-down, then one flat revolution at full depth and a move to the centre — or, when Hole diameter is within 0.02 mm of the tool diameter, a peck per Max step-down. The pecks share one XY position, and [G-code generation](#g-code-generation) only retracts between segments whose XY differs, so each peck but the last carries its own feed-rate lift back to Z=0.
+3. **Result simulation** — Same as Raster, unioned with the previous step's result. A hole deeper than Max cut depth is marked as cut all the way through in the same separate channel Cutout uses (see [Cutout Pipeline](#cutout-pipeline)), so it shows as a hole in the Step Result view.
+
+The **Processing Mask** view shows the finished holes, placed exactly as this pipeline places them.
 
 ---
 

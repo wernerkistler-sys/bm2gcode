@@ -5217,3 +5217,290 @@ def _compute_cutout_from_rings(
     )
     progress(100, "Cutout tool path computation complete!")
     return tp
+
+
+# ── Registration holes ─────────────────────────────────────────────────────
+# Stock-space coordinates throughout: (0, 0) is the stock's bottom-left
+# corner (margin included), x to the right, y up, in mm. Conversion to G-code
+# coordinates happens only in compute_registration_holes_toolpath, via the
+# same origin offset table every other algorithm uses.
+
+_ORIGIN_CORNERS = {"Bottom-Left": (0, 0), "Bottom-Right": (1, 0),
+                   "Top-Left":    (0, 1), "Top-Right":    (1, 1)}
+
+# Hole diameters within this of the tool diameter are drilled with a straight
+# (pecked) plunge instead of a helix -- a helix of near-zero radius would just
+# be a slow plunge with extra points.
+_PLUNGE_RADIUS_TOL_MM = 0.02
+
+
+def _registration_diag_frame(W_mm, H_mm, origin, diag_dir):
+    """Return (anchor, u, v) for a Diagonal registration pattern.
+
+    anchor is the point of the flip line the pattern hangs off: the origin
+    corner, or the stock centre for a Center origin. u and v are the unit x/y
+    directions the L's arms point along (into the stock). The flip line runs
+    through anchor along u + v, so reflecting across it swaps u and v.
+    """
+    corner = _ORIGIN_CORNERS.get(origin)
+    if corner is None:   # Center
+        u = (1.0, 0.0)
+        v = (0.0, 1.0) if diag_dir == "+45°" else (0.0, -1.0)
+        return (W_mm / 2.0, H_mm / 2.0), u, v
+    fx, fy = corner
+    u = (1.0, 0.0) if fx == 0 else (-1.0, 0.0)
+    v = (0.0, 1.0) if fy == 0 else (0.0, -1.0)
+    return (fx * W_mm, fy * H_mm), u, v
+
+
+def registration_flip_axis(pattern, W_mm, H_mm, origin="Bottom-Left", diag_dir="+45°"):
+    """Return the flip axis of a registration pattern as (point, direction).
+
+    point is any (x, y) on the axis in stock space; direction is a unit
+    vector along it.
+
+    - "Vertical axis": x = W/2.
+    - "Horizontal axis": y = H/2.
+    - "Diagonal": the 45° line through the G-code origin -- the only line a
+      diagonal flip may use without re-zeroing X/Y, since a diagonal flip
+      transposes the stock's W×H footprint and only points on the flip line
+      stay put. The line's direction follows from the origin corner (+45°
+      through Bottom-Left/Top-Right, -45° through Top-Left/Bottom-Right); for
+      a Center origin, diag_dir ("+45°" or "−45°") picks it.
+    """
+    if pattern == "Vertical axis":
+        return (W_mm / 2.0, 0.0), (0.0, 1.0)
+    if pattern == "Horizontal axis":
+        return (0.0, H_mm / 2.0), (1.0, 0.0)
+    anchor, u, v = _registration_diag_frame(W_mm, H_mm, origin, diag_dir)
+    s = 1.0 / np.sqrt(2.0)
+    return anchor, ((u[0] + v[0]) * s, (u[1] + v[1]) * s)
+
+
+def registration_auto_spacing(W_mm, H_mm, inset_mm):
+    """Arm length of the Diagonal L pattern that keeps both arm holes the
+    same inset from the stock edges as the corner hole."""
+    return min(W_mm, H_mm) - 2.0 * inset_mm
+
+
+def registration_hole_centers(pattern, W_mm, H_mm, origin="Bottom-Left",
+                              diag_dir="+45°", inset_mm=10.0, spacing_mm=None):
+    """Return the registration hole centres as a list of (x, y) in stock space.
+
+    - "Vertical axis": two holes on x = W/2, inset_mm from the bottom and top
+      edges.
+    - "Horizontal axis": two holes on y = H/2, inset_mm from the left and
+      right edges.
+    - "Diagonal": an L of three holes -- a corner hole c on the flip line
+      (see registration_flip_axis) plus c + spacing along each of the two
+      edge directions into the stock. Reflecting across the flip line fixes
+      c and swaps the two arm holes. With a corner origin, c sits inset_mm
+      from both edges at that corner; with a Center origin, c sits on the
+      flip line at the far end of the line's centred min(W, H) square, again
+      inset_mm in from its edges. spacing_mm None means
+      registration_auto_spacing.
+
+    Every pattern maps onto itself under its own flip, so the pins fit the
+    same holes after the stock is turned over. No attempt is made to keep
+    holes inside the stock or out of the artwork: the placement is the
+    user's call.
+    """
+    if pattern == "Vertical axis":
+        return [(W_mm / 2.0, inset_mm), (W_mm / 2.0, H_mm - inset_mm)]
+    if pattern == "Horizontal axis":
+        return [(inset_mm, H_mm / 2.0), (W_mm - inset_mm, H_mm / 2.0)]
+
+    anchor, u, v = _registration_diag_frame(W_mm, H_mm, origin, diag_dir)
+    if origin in _ORIGIN_CORNERS:
+        back = -inset_mm
+    else:
+        back = min(W_mm, H_mm) / 2.0 - inset_mm
+    c = (anchor[0] - back * (u[0] + v[0]), anchor[1] - back * (u[1] + v[1]))
+    s = registration_auto_spacing(W_mm, H_mm, inset_mm) if spacing_mm is None else spacing_mm
+    return [c,
+            (c[0] + s * u[0], c[1] + s * u[1]),
+            (c[0] + s * v[0], c[1] + s * v[1])]
+
+
+def bore_hole_segments(cx, cy, r_path, depth_mm, pitch_mm, climb=True):
+    """Return the cutting segments that bore one hole centred at (cx, cy).
+
+    r_path is the tool-centre path radius: (hole diameter - tool diameter)/2.
+
+    - r_path below _PLUNGE_RADIUS_TOL_MM: a straight plunge, pecked in
+      pitch_mm steps (0 = one plunge to full depth). Every peck but the last
+      ends with a feed-rate lift back out of the hole to clear chips -- the
+      pecks share one XY, so ToolPath.iter_moves would otherwise bridge them
+      without retracting.
+    - Otherwise: a helix from Z=0 down to -depth_mm, dropping at most
+      pitch_mm per revolution (0 = the whole depth in one revolution),
+      followed by one flat full circle at the bottom to clean up the floor's
+      last ramp, then a move back to the centre so the retract doesn't drag
+      along the wall. climb=True runs counter-clockwise (climb milling on an
+      inside wall with a clockwise spindle), False clockwise.
+    """
+    if r_path < _PLUNGE_RADIUS_TOL_MM:
+        n = max(1, int(np.ceil(depth_mm / pitch_mm - 1e-9))) if pitch_mm > 0 else 1
+        zs = [-depth_mm * k / n for k in range(n + 1)]
+        segs = []
+        for k in range(n):
+            seg = [(cx, cy, zs[k]), (cx, cy, zs[k + 1])]
+            if k < n - 1:
+                seg.append((cx, cy, 0.0))
+            segs.append(seg)
+        return segs
+
+    n_rev = max(1, int(np.ceil(depth_mm / pitch_mm - 1e-9))) if pitch_mm > 0 else 1
+    # Chord ≤ 5° of arc and ≤ 0.2 mm, whichever is finer.
+    per_rev = max(72, int(np.ceil(2.0 * np.pi * r_path / 0.2)))
+    sign = 1.0 if climb else -1.0
+    t = np.linspace(0.0, n_rev + 1.0, int((n_rev + 1) * per_rev) + 1)
+    theta = sign * 2.0 * np.pi * t
+    z = -depth_mm * np.minimum(t / n_rev, 1.0)
+    pts = [(cx + r_path * np.cos(a), cy + r_path * np.sin(a), zz)
+           for a, zz in zip(theta, z)]
+    pts.append((cx, cy, -depth_mm))
+    return [[(float(x), float(y), float(zz)) for x, y, zz in pts]]
+
+
+def compute_registration_holes_toolpath(
+    tool, width_mm, height_mm, shape,
+    pattern="Vertical axis",
+    origin="Bottom-Left",
+    diag_dir="+45°",
+    hole_diameter_mm=6.0,
+    hole_depth_mm=15.0,
+    stepdown_mm=1.0,
+    inset_mm=10.0,
+    spacing_mm=None,
+    cut_direction="Climb",
+    max_depth=5.0,
+    prior_accessible=None,
+    previous_result=None,
+    previous_alpha=None,
+    progress=None,
+):
+    """Bore registration-pin holes for flipping the stock over.
+
+    Holes are placed by registration_hole_centers and bored by
+    bore_hole_segments, nearest-first from the G-code origin. Like
+    compute_cutout_toolpath this is a flat, straight-wall cut that ignores
+    the depth map and any Process Region gating -- the holes belong to the
+    stock, not the artwork -- and hole_depth_mm is an absolute depth,
+    independent of max_depth (typically through the stock and into the
+    spoilboard, so the pins stay put while the stock is turned over).
+
+    Parameters
+    ----------
+    tool : Tool
+        Expected profile "End Mill" (enforced by the UI).
+    width_mm, height_mm : float
+        Physical dimensions of the work area (stock including margin) in mm.
+    shape : (H, W)
+        Pixel shape of the canvas's depth map, for the simulated
+        result/accessible/alpha arrays.
+    pattern, diag_dir, inset_mm, spacing_mm :
+        See registration_hole_centers.
+    origin : str
+        G-code origin convention; also anchors the Diagonal flip line.
+    hole_diameter_mm : float
+        Finished hole diameter. Must be at least the tool diameter.
+    hole_depth_mm : float
+        Absolute hole depth in mm.
+    stepdown_mm : float
+        Helix pitch (Z drop per revolution), or peck depth for a hole the
+        tool's own size. 0 = single pass.
+    cut_direction : "Either" | "Climb" | "Conventional"
+        Helix winding: Climb and Either run counter-clockwise, Conventional
+        clockwise.
+    max_depth : float
+        Canvas's shared max cut depth in mm, for normalising the simulated
+        arrays. A hole deeper than this is marked as cut through in alpha,
+        using the same convention as Cutout.
+    prior_accessible, previous_result, previous_alpha : 2-D arrays or None
+        The previous step's cumulative surfaces, unioned into this step's.
+    progress : callable(pct, message)
+
+    Returns
+    -------
+    ToolPath
+    """
+    if progress is None:
+        progress = lambda pct, msg: None
+    r_path = (hole_diameter_mm - tool.diameter_mm) / 2.0
+    if r_path < -1e-9:
+        raise ValueError(
+            f"Hole diameter ({hole_diameter_mm:g} mm) is smaller than the tool "
+            f"diameter ({tool.diameter_mm:g} mm).")
+    r_path = max(r_path, 0.0)
+
+    H, W = shape
+    px_per_mm_x = W / width_mm
+    px_per_mm_y = H / height_mm
+    W_mm = (W - 1) / px_per_mm_x
+    H_mm = (H - 1) / px_per_mm_y
+    _ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+           "Top-Left":    0,       "Top-Right":    W_mm,
+           "Center":      W_mm / 2}.get(origin, 0)
+    _oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+           "Top-Left":    H_mm,    "Top-Right":    H_mm,
+           "Center":      H_mm / 2}.get(origin, 0)
+
+    progress(0, "Placing registration holes…")
+    centers = registration_hole_centers(pattern, W_mm, H_mm, origin, diag_dir,
+                                        inset_mm, spacing_mm)
+    gcode_centers = [(x - _ox, y - _oy) for x, y in centers]
+
+    remaining = list(gcode_centers)
+    ordered = []
+    cur = (0.0, 0.0)
+    while remaining:
+        i = min(range(len(remaining)),
+                key=lambda k: np.hypot(remaining[k][0] - cur[0], remaining[k][1] - cur[1]))
+        cur = remaining.pop(i)
+        ordered.append(cur)
+
+    climb = cut_direction != "Conventional"
+    segments = []
+    for k, (cx, cy) in enumerate(ordered):
+        progress(10 + 40 * k // max(len(ordered), 1),
+                 f"Boring hole {k + 1}/{len(ordered)}…")
+        segments.extend(bore_hole_segments(cx, cy, r_path, hole_depth_mm,
+                                           stepdown_mm, climb))
+
+    progress(50, "Simulating tool-swept removal surface…")
+    px_per_mm = (px_per_mm_x * px_per_mm_y) ** 0.5
+    kernel, footprint = _build_kernel(tool, px_per_mm, max_depth)
+    removed = simulate_toolpath_result(
+        ToolPath(segments=segments), (H, W), px_per_mm_x, px_per_mm_y,
+        _ox, _oy, max_depth, kernel, footprint)
+    result = np.maximum(previous_result if previous_result is not None else 0.0,
+                        removed).astype(np.float32)
+    accessible = np.maximum(prior_accessible if prior_accessible is not None else 0.0,
+                            removed).astype(np.float32)
+    if hole_depth_mm > max_depth:
+        alpha = np.minimum(previous_alpha if previous_alpha is not None else 1.0,
+                           np.where(removed >= 1.0 - 1e-3, 0.0, 1.0)).astype(np.float32)
+    else:
+        alpha = previous_alpha.copy() if previous_alpha is not None else None
+
+    axis_point, axis_dir = registration_flip_axis(pattern, W_mm, H_mm, origin, diag_dir)
+    metadata = {
+        'algorithm':        'Registration Holes',
+        'profile':          tool.profile,
+        'radius_mm':        tool.diameter_mm / 2,
+        'max_depth':        max_depth,
+        'pattern':          pattern,
+        'hole_centers':     gcode_centers,
+        'hole_diameter_mm': hole_diameter_mm,
+        'hole_depth_mm':    hole_depth_mm,
+        'stepdown_mm':      stepdown_mm,
+        'cut_method':       'plunge' if r_path < _PLUNGE_RADIUS_TOL_MM else 'helix',
+        'flip_axis':        ((axis_point[0] - _ox, axis_point[1] - _oy), axis_dir),
+        'cut_direction':    cut_direction,
+        'width_mm':         width_mm,
+        'height_mm':        height_mm,
+    }
+    progress(100, "Registration holes tool path complete!")
+    return ToolPath(segments=segments, result=result, accessible=accessible,
+                    alpha=alpha, metadata=metadata)

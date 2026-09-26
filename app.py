@@ -31,7 +31,7 @@ _HOLE_FACECOLOR = "#d9534f"
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, SPIRAL_DIRECTIONS,
     CUT_DIRECTIONS, ALGORITHMS,
-    ALGORITHM_FAMILY, DEFAULTS,
+    ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
@@ -47,7 +47,9 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_cutout_toolpath, compute_cutout_silhouette_mask,
                         _compute_cutout_rings, _compute_cutout_from_rings,
                         compute_pocket_toolpath, compute_pocket_mask, _build_kernel,
-                        compute_vcarve_synth_achievable_depth)
+                        compute_vcarve_synth_achievable_depth,
+                        compute_registration_holes_toolpath, registration_hole_centers,
+                        registration_flip_axis, registration_auto_spacing)
 from tool import Tool
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
@@ -117,6 +119,7 @@ class GCodeGeneratorApp:
         self.show_cut_moves_var = tk.BooleanVar(value=True)
         self.show_rapids_var    = tk.BooleanVar(value=True)
         self.show_tabs_var      = tk.BooleanVar(value=True)
+        self.show_reg_holes_var = tk.BooleanVar(value=True)
         self.show_shading_var   = tk.BooleanVar(value=False)
 
         menubar   = tk.Menu(self.root)
@@ -197,6 +200,10 @@ class GCodeGeneratorApp:
                                         accelerator="T",
                                         variable=self.show_tabs_var,
                                         command=self._on_display_mode_changed)
+        self._view_menu.add_checkbutton(label="Show registration holes",
+                                        accelerator="H",
+                                        variable=self.show_reg_holes_var,
+                                        command=self._on_display_mode_changed)
         self._view_menu.add_checkbutton(label="Show shading",
                                         accelerator="S",
                                         variable=self.show_shading_var,
@@ -241,6 +248,7 @@ class GCodeGeneratorApp:
         self.root.bind("<Key-c>", _make_toggle_handler(self.show_cut_moves_var))
         self.root.bind("<Key-r>", _make_toggle_handler(self.show_rapids_var))
         self.root.bind("<Key-t>", _make_toggle_handler(self.show_tabs_var))
+        self.root.bind("<Key-h>", _make_toggle_handler(self.show_reg_holes_var))
         self.root.bind("<Key-s>", _make_toggle_handler(self.show_shading_var))
 
     # ------------------------------------------------------------------ #
@@ -430,6 +438,7 @@ class GCodeGeneratorApp:
                      values=["Bottom-Left", "Bottom-Right",
                              "Top-Left", "Top-Right", "Center"],
                      state="readonly", width=22).pack(side=tk.RIGHT)
+        self.origin_var.trace_add("write", self._on_origin_changed)
 
     def _contain_footprint_mm(self, native_aspect, width_mm, height_mm, scale_pct):
         """Physical (footprint_w_mm, footprint_h_mm) a source occupies on
@@ -723,6 +732,16 @@ class GCodeGeneratorApp:
                              minval=1.0, maxval=1000.0, increment=1.0)
         scale.pack(fill=tk.X, pady=2)
 
+        # Reflects the placed source across a stock flip axis, for setting
+        # up the back side of a two-sided job (see layers._mirror_axis_mm).
+        mirror_row = ttk.Frame(tab)
+        mirror_row.pack(fill=tk.X, pady=2)
+        ttk.Label(mirror_row, text="Mirror:").pack(side=tk.LEFT)
+        mirror_var = tk.StringVar(value=layer.mirror)
+        ttk.Combobox(mirror_row, textvariable=mirror_var,
+                     values=LAYER_MIRRORS, state="readonly", width=14
+                     ).pack(side=tk.RIGHT)
+
         blend_row = ttk.Frame(tab)
         blend_row.pack(fill=tk.X, pady=2)
         ttk.Label(blend_row, text="Blend mode:").pack(side=tk.LEFT)
@@ -789,11 +808,13 @@ class GCodeGeneratorApp:
             except ValueError:
                 return   # mid-edit invalid text -- skip silently
             layer.blend_mode = blend_var.get()   # no-op when is_base
+            layer.mirror     = mirror_var.get()
             self._on_layer_property_changed()
 
         for entry in (ox, oy, rot, scale, opacity, min_depth, max_depth):
             entry.committed_var.trace_add("write", _apply)
         blend_var.trace_add("write", _apply)
+        mirror_var.trace_add("write", _apply)
 
     def _renumber_layer_tabs(self):
         for i, entry in enumerate(self._layer_tabs, start=1):
@@ -976,11 +997,16 @@ class GCodeGeneratorApp:
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'cutout_depth', 'cutout_stepdown', 'cutout_final_stepdown', 'cutout_extra_offset',
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
-                    'min_fw', 'max_fw', 'pocket_boundary_offset'):
-            dst[key].set(src[key].get())
+                    'min_fw', 'max_fw', 'pocket_boundary_offset',
+                    'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing'):
+            # Auto first, like _apply_step_dict: an Auto sync fired by the
+            # value write must see the copied Auto state, not the default.
             if dst[key].auto_var is not None and src[key].auto_var is not None:
                 dst[key].auto_var.set(src[key].auto_var.get())
+            dst[key].set(src[key].get())
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
+        dst['reghole_pattern_var'].set(src['reghole_pattern_var'].get())
+        dst['reghole_diag_dir_var'].set(src['reghole_diag_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
         dst['tsp_2opt_var'].set(src['tsp_2opt_var'].get())
         dst['avoid_air_var'].set(src['avoid_air_var'].get())
@@ -1122,6 +1148,64 @@ class GCodeGeneratorApp:
                                            minval=0.0, maxval=50.0, increment=0.05)
         contour_lateral_tol.pack(fill=tk.X, pady=2)
         step['contour_lateral_tol'] = contour_lateral_tol
+
+        # ── Registration-Holes-only controls (hidden unless that algorithm)
+        reghole_frame = ttk.Frame(operation_lf)
+        step['reghole_frame'] = reghole_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        reghole_pattern_row = ttk.Frame(reghole_frame)
+        reghole_pattern_row.pack(fill=tk.X, pady=2)
+        step['reghole_pattern_row'] = reghole_pattern_row
+        ttk.Label(reghole_pattern_row, text="Flip axis:").pack(side=tk.LEFT)
+        reghole_pattern_var = tk.StringVar(value=DEFAULTS["step_reghole_pattern"])
+        step['reghole_pattern_var'] = reghole_pattern_var
+        ttk.Combobox(reghole_pattern_row, textvariable=reghole_pattern_var,
+                     values=REG_HOLE_PATTERNS, state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
+
+        # Only a Center origin leaves the Diagonal line's direction open --
+        # a corner origin implies it (see registration_flip_axis).
+        reghole_diag_dir_row = ttk.Frame(reghole_frame)
+        step['reghole_diag_dir_row'] = reghole_diag_dir_row
+        ttk.Label(reghole_diag_dir_row, text="Diagonal direction:").pack(side=tk.LEFT)
+        reghole_diag_dir_var = tk.StringVar(value=DEFAULTS["step_reghole_diag_dir"])
+        step['reghole_diag_dir_var'] = reghole_diag_dir_var
+        ttk.Combobox(reghole_diag_dir_row, textvariable=reghole_diag_dir_var,
+                     values=DIAG_DIRECTIONS, state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
+
+        reghole_diameter = LabeledEntry(reghole_frame, "Hole diameter", "mm",
+                                        DEFAULTS["step_reghole_diameter"],
+                                        minval=0.01, maxval=200.0, increment=0.5)
+        reghole_diameter.pack(fill=tk.X, pady=2)
+        step['reghole_diameter'] = reghole_diameter
+
+        reghole_depth = LabeledEntry(reghole_frame, "Hole depth", "mm",
+                                     DEFAULTS["step_reghole_depth"],
+                                     minval=0.01, maxval=500.0, increment=0.5)
+        reghole_depth.pack(fill=tk.X, pady=2)
+        step['reghole_depth'] = reghole_depth
+
+        reghole_inset = LabeledEntry(reghole_frame, "Edge inset", "mm",
+                                     DEFAULTS["step_reghole_inset"], auto_label="Auto",
+                                     minval=0.0, maxval=100000.0, increment=1.0)
+        reghole_inset.pack(fill=tk.X, pady=2)
+        reghole_inset.auto_var.set(bool(int(DEFAULTS["step_reghole_inset_auto"])))
+        step['reghole_inset'] = reghole_inset
+
+        reghole_spacing = LabeledEntry(reghole_frame, "Spacing", "mm",
+                                       DEFAULTS["step_reghole_spacing"], auto_label="Auto",
+                                       minval=0.0, maxval=100000.0, increment=1.0)
+        reghole_spacing.auto_var.set(bool(int(DEFAULTS["step_reghole_spacing_auto"])))
+        step['reghole_spacing'] = reghole_spacing
+        # (packed by _refresh_layout, Diagonal only)
+
+        step['reghole_hint_var'] = tk.StringVar(value="")
+        reghole_hint = ttk.Label(reghole_frame, textvariable=step['reghole_hint_var'],
+                                 foreground="#666666", wraplength=230, justify=tk.LEFT)
+        reghole_hint.pack(fill=tk.X, pady=(2, 0))
+        step['reghole_hint'] = reghole_hint
 
         tsp_frame = ttk.Frame(operation_lf)
         step['tsp_frame'] = tsp_frame
@@ -1315,6 +1399,9 @@ class GCodeGeneratorApp:
             if family != "Pocket" and step['threshold'].auto_var is not None:
                 step['threshold'].auto_var.set(False)
 
+            if family != "Registration Holes":
+                step['reghole_frame'].pack_forget()
+
             if family == "V-Carving":
                 step['raster_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
@@ -1388,6 +1475,34 @@ class GCodeGeneratorApp:
                 step['vbit_angle'].set_state("disabled")
                 step['cutout_frame'].pack(fill=tk.X, after=step['diameter'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['alg_row'])
+            elif family == "Registration Holes":
+                # Stock-anchored like Cutout, but with no depth map input at
+                # all -- no threshold, Process Region, path ordering or
+                # air pruning. Max step-down is the helix pitch / peck depth.
+                for key in ('raster_frame', 'vcarve_frame', 'contour_frame', 'vbit_frame',
+                            'cutout_frame', 'raster_final_stepdown', 'extra_offset',
+                            'pocket_boundary_offset', 'min_fw', 'max_fw',
+                            'gating_frame', 'tsp_frame'):
+                    step[key].pack_forget()
+                step['profile_cb'].config(state="readonly", values=_CUTOUT_PROFILES)
+                if profile not in _CUTOUT_PROFILES:
+                    step['profile_var'].set("End Mill")
+                step['vbit_angle'].set_state("disabled")
+                step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['reghole_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['reghole_frame'])
+                diagonal = step['reghole_pattern_var'].get() == "Diagonal"
+                if diagonal and self.origin_var.get() == "Center":
+                    step['reghole_diag_dir_row'].pack(fill=tk.X, pady=2,
+                                                      after=step['reghole_pattern_row'])
+                else:
+                    step['reghole_diag_dir_row'].pack_forget()
+                if diagonal:
+                    step['reghole_spacing'].pack(fill=tk.X, pady=2,
+                                                 after=step['reghole_inset'])
+                else:
+                    step['reghole_spacing'].pack_forget()
+                self._sync_reghole_fields(step)
             elif family == "Pocket":   # Pocket, V-Carving Clean-up
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
@@ -1467,8 +1582,23 @@ class GCodeGeneratorApp:
             if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()
 
+        step['refresh_layout'] = _refresh_layout
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
+        reghole_pattern_var.trace_add("write", _refresh_layout)
+        reghole_diag_dir_var.trace_add("write", _refresh_layout)
+
+        def _on_reghole_param_changed(*_):
+            self._sync_reghole_fields(step)
+            if hasattr(self, '_view_menu'):
+                self._render()
+
+        for le in (reghole_diameter, reghole_inset, reghole_spacing):
+            le.committed_var.trace_add("write", _on_reghole_param_changed)
+        reghole_inset.auto_var.trace_add("write", _on_reghole_param_changed)
+        reghole_spacing.auto_var.trace_add("write", _on_reghole_param_changed)
+        for le in (self.width_mm, self.height_mm, self.margin_mm):
+            le.committed_var.trace_add("write", lambda *_: self._sync_reghole_fields(step))
         cut_dir_var.trace_add("write", _refresh_layout)
         dir_var.trace_add("write", _refresh_layout)
 
@@ -1545,6 +1675,14 @@ class GCodeGeneratorApp:
         step['cutout_stepdown'].set(DEFAULTS["step_cutout_stepdown"])
         step['cutout_final_stepdown'].set(DEFAULTS["step_cutout_final_stepdown"])
         step['cutout_extra_offset'].set(DEFAULTS["step_cutout_extra_offset"])
+        step['reghole_pattern_var'].set(DEFAULTS["step_reghole_pattern"])
+        step['reghole_diag_dir_var'].set(DEFAULTS["step_reghole_diag_dir"])
+        step['reghole_diameter'].set(DEFAULTS["step_reghole_diameter"])
+        step['reghole_depth'].set(DEFAULTS["step_reghole_depth"])
+        step['reghole_inset'].auto_var.set(bool(int(DEFAULTS["step_reghole_inset_auto"])))
+        step['reghole_inset'].set(DEFAULTS["step_reghole_inset"])
+        step['reghole_spacing'].auto_var.set(bool(int(DEFAULTS["step_reghole_spacing_auto"])))
+        step['reghole_spacing'].set(DEFAULTS["step_reghole_spacing"])
         step['contour_z_increment'].set(DEFAULTS["step_contour_z_increment"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
@@ -1766,7 +1904,8 @@ class GCodeGeneratorApp:
         composite_raw = layers_mod.composite(
             self.layers, (H, W), px_per_mm_x, px_per_mm_y, self.surface.get(),
             background_depth=background_depth_pct / 100.0,
-            visibility_override=visibility)
+            visibility_override=visibility,
+            origin=self.origin_var.get())
         n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, composite_raw)
         return composite_raw, n_grey_levels
 
@@ -2026,6 +2165,17 @@ class GCodeGeneratorApp:
         self._recalc_width()
         self._on_canvas_size_changed()
 
+    def _on_origin_changed(self, *_):
+        """The G-code origin anchors the diagonal flip line -- both a
+        Registration Holes step's (its layout, hint and preview) and a
+        source's diagonal Mirror (the composite itself)."""
+        for s in getattr(self, 'steps', []):
+            s['refresh_layout']()
+        if any(l.mirror.startswith("Diagonal") for l in getattr(self, 'layers', [])):
+            self._on_layer_property_changed()
+        elif hasattr(self, 'ax'):
+            self._render()
+
     def _on_depth_map_content_changed(self, *_):
         """z=0 colour / margin depth / background depth change the *content*
         of depth_map without changing the erosion cache key, so any cached
@@ -2242,6 +2392,14 @@ class GCodeGeneratorApp:
             'cutout_stepdown':       step['cutout_stepdown'].get(),
             'cutout_final_stepdown': step['cutout_final_stepdown'].get(),
             'cutout_extra_offset':   step['cutout_extra_offset'].get(),
+            'reghole_pattern':       step['reghole_pattern_var'].get(),
+            'reghole_diag_dir':      step['reghole_diag_dir_var'].get(),
+            'reghole_diameter':      step['reghole_diameter'].get(),
+            'reghole_depth':         step['reghole_depth'].get(),
+            'reghole_inset':         step['reghole_inset'].get(),
+            'reghole_inset_auto':    bool(step['reghole_inset'].auto_var.get()),
+            'reghole_spacing':       step['reghole_spacing'].get(),
+            'reghole_spacing_auto':  bool(step['reghole_spacing'].auto_var.get()),
             'contour_z_increment':  step['contour_z_increment'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
@@ -2293,6 +2451,16 @@ class GCodeGeneratorApp:
         step['cutout_stepdown'].set(d.get('cutout_stepdown', DEFAULTS['step_cutout_stepdown']))
         step['cutout_final_stepdown'].set(d.get('cutout_final_stepdown', DEFAULTS['step_cutout_final_stepdown']))
         step['cutout_extra_offset'].set(d.get('cutout_extra_offset', DEFAULTS['step_cutout_extra_offset']))
+        step['reghole_pattern_var'].set(d.get('reghole_pattern', DEFAULTS['step_reghole_pattern']))
+        step['reghole_diag_dir_var'].set(d.get('reghole_diag_dir', DEFAULTS['step_reghole_diag_dir']))
+        step['reghole_diameter'].set(d.get('reghole_diameter', DEFAULTS['step_reghole_diameter']))
+        step['reghole_depth'].set(d.get('reghole_depth', DEFAULTS['step_reghole_depth']))
+        step['reghole_inset'].auto_var.set(bool(d.get(
+            'reghole_inset_auto', bool(int(DEFAULTS['step_reghole_inset_auto'])))))
+        step['reghole_inset'].set(d.get('reghole_inset', DEFAULTS['step_reghole_inset']))
+        step['reghole_spacing'].auto_var.set(bool(d.get(
+            'reghole_spacing_auto', bool(int(DEFAULTS['step_reghole_spacing_auto'])))))
+        step['reghole_spacing'].set(d.get('reghole_spacing', DEFAULTS['step_reghole_spacing']))
         step['contour_z_increment'].set(d.get('contour_z_increment', DEFAULTS['step_contour_z_increment']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
@@ -2379,6 +2547,7 @@ class GCodeGeneratorApp:
             'min_depth_pct': layer.min_depth_pct,
             'max_depth_pct': layer.max_depth_pct,
             'visible':      layer.visible,
+            'mirror':       layer.mirror,
         }
         if layer.source_kind == 'stl' and layer.stl_params:
             d['stl_params'] = dict(layer.stl_params)
@@ -2432,6 +2601,7 @@ class GCodeGeneratorApp:
         layer.min_depth_pct = float(d.get('min_depth_pct', 0.0))
         layer.max_depth_pct = float(d.get('max_depth_pct', 100.0))
         layer.visible      = bool(d.get('visible', True))
+        layer.mirror       = d.get('mirror', DEFAULTS['layer_mirror'])
         return layer
 
     def _project_snapshot(self):
@@ -2971,6 +3141,22 @@ class GCodeGeneratorApp:
                 # clearing tool -- see _resolve_cleanup_reference.
                 params['cleanup_reference'] = self._resolve_cleanup_reference(
                     idx, max_depth, eff_width_mm, eff_height_mm)
+        elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
+            geo = self._reghole_geometry(step)
+            params.update({
+                'tool':                Tool("End Mill", float(step['diameter'].get()), 90.0),
+                'reghole_pattern':     geo['pattern'],
+                'reghole_diag_dir':    geo['diag_dir'],
+                'reghole_diameter_mm': float(step['reghole_diameter'].get()),
+                'reghole_depth_mm':    float(step['reghole_depth'].get()),
+                'reghole_stepdown_mm': float(step['stepdown'].get()),
+                'reghole_inset_mm':    geo['inset_mm'],
+                # None = auto, resolved by the algorithm against the depth
+                # map's own pixel-centre extent, like its hole positions.
+                'reghole_spacing_mm':  (None if step['reghole_spacing'].auto_var.get()
+                                        else geo['spacing_mm']),
+                'cut_direction':       step['cut_dir_var'].get(),
+            })
         else:  # Raster
             _profile    = step['profile_var'].get()
             _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
@@ -3135,6 +3321,27 @@ class GCodeGeneratorApp:
                 avoid_air          = params['avoid_air'],
                 feed_rate          = params['feed_rate'],
                 n_grey_levels      = n_grey_levels,
+                progress           = progress_fn,
+            )
+        elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
+            return compute_registration_holes_toolpath(
+                tool               = params['tool'],
+                width_mm           = params['eff_width_mm'],
+                height_mm          = params['eff_height_mm'],
+                shape              = depth_map.shape,
+                pattern            = params['reghole_pattern'],
+                origin             = params['origin'],
+                diag_dir           = params['reghole_diag_dir'],
+                hole_diameter_mm   = params['reghole_diameter_mm'],
+                hole_depth_mm      = params['reghole_depth_mm'],
+                stepdown_mm        = params['reghole_stepdown_mm'],
+                inset_mm           = params['reghole_inset_mm'],
+                spacing_mm         = params['reghole_spacing_mm'],
+                cut_direction      = params['cut_direction'],
+                max_depth          = params['max_depth'],
+                prior_accessible   = prev_tp.accessible if prev_tp is not None else None,
+                previous_result    = prev_tp.result     if prev_tp is not None else None,
+                previous_alpha     = prev_tp.alpha      if prev_tp is not None else None,
                 progress           = progress_fn,
             )
         elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
@@ -3350,6 +3557,9 @@ class GCodeGeneratorApp:
                   # of any prior step -- a missing prev_tp only affects this
                   # step's own result/accessible/alpha bookkeeping, not which
                   # pixels get cut, so there is nothing to warn about here.
+        elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
+            pass  # Holes are placed on the stock alone; a prior step only
+                  # feeds this step's result/accessible/alpha bookkeeping.
         elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
             pass  # Pocket/Clean-up cuts based on its own Target depth
                   # against the depth map regardless of any prior step -- a
@@ -3778,6 +3988,60 @@ class GCodeGeneratorApp:
         depth_map, _ = self._get_depth_map_for_step(step)
         threshold.set(f"{float(np.max(depth_map)) * max_depth:.3f}")
 
+    def _reghole_geometry(self, step):
+        """Resolve a Registration Holes step's hole layout from its current
+        fields as a dict: stock size W_mm/H_mm (margin included), origin,
+        pattern, diag_dir, inset_mm, spacing_mm. Auto inset is half the
+        stock margin -- the middle of the margin strip, clear of the artwork
+        -- or 10 mm with no margin; auto spacing is
+        registration_auto_spacing. Raises ValueError on unparsable input."""
+        margin_mm = float(self.margin_mm.get())
+        W_mm = float(self.width_mm.get())  + 2.0 * margin_mm
+        H_mm = float(self.height_mm.get()) + 2.0 * margin_mm
+        if step['reghole_inset'].auto_var.get():
+            inset_mm = margin_mm / 2.0 if margin_mm > 0.0 else 10.0
+        else:
+            inset_mm = float(step['reghole_inset'].get())
+        if step['reghole_spacing'].auto_var.get():
+            spacing_mm = registration_auto_spacing(W_mm, H_mm, inset_mm)
+        else:
+            spacing_mm = float(step['reghole_spacing'].get())
+        return {'W_mm': W_mm, 'H_mm': H_mm, 'origin': self.origin_var.get(),
+                'pattern': step['reghole_pattern_var'].get(),
+                'diag_dir': step['reghole_diag_dir_var'].get(),
+                'inset_mm': inset_mm, 'spacing_mm': spacing_mm}
+
+    def _sync_reghole_fields(self, step):
+        """Show a Registration Holes step's resolved Auto inset/spacing in
+        their (disabled) fields, and refresh its back-side hint. Cosmetic
+        only: _gather_step_params resolves the values afresh."""
+        if ALGORITHM_FAMILY.get(step['algorithm_var'].get()) != "Registration Holes":
+            return
+        try:
+            geo = self._reghole_geometry(step)
+        except ValueError:
+            return
+        if step['reghole_inset'].auto_var.get():
+            step['reghole_inset'].set(f"{geo['inset_mm']:.3f}")
+        if step['reghole_spacing'].auto_var.get():
+            step['reghole_spacing'].set(f"{geo['spacing_mm']:.3f}")
+
+        if geo['pattern'] == "Diagonal":
+            _, (dx, dy) = registration_flip_axis(
+                "Diagonal", geo['W_mm'], geo['H_mm'], geo['origin'], geo['diag_dir'])
+            line = "+45°" if dx * dy > 0 else "−45°"
+            swap = (" and swapped canvas Width/Height"
+                    if abs(geo['W_mm'] - geo['H_mm']) > 1e-9 else "")
+            hint = (f"Flip the stock over the {line} line through the G-code "
+                    f"origin. Back side: same G-code origin{swap}; don't "
+                    f"re-zero X/Y. Mirror: Diagonal ({line}).")
+        else:
+            which = "vertical" if geo['pattern'] == "Vertical axis" else "horizontal"
+            hint = (f"Flip the stock over its {which} centre line. Back side: "
+                    f"same stock size and G-code origin; don't re-zero X/Y. "
+                    f"Mirror: {geo['pattern']}.")
+        step['reghole_hint_var'].set(hint)
+
     def _is_3d_mode(self):
         return self.display_mode_var.get() in DISPLAY_3D_MODES
 
@@ -4055,7 +4319,8 @@ class GCodeGeneratorApp:
                 # all. Mirror that here instead of reading whatever stale
                 # mode the widget still holds from a different algorithm.
                 gating_mode = "Full depth map"
-                if (ALGORITHM_FAMILY[algorithm] not in ("Cutout", "Pocket")
+                if (ALGORITHM_FAMILY[algorithm] not in ("Cutout", "Pocket",
+                                                        "Registration Holes")
                         and 0 <= step_idx < len(self.steps)
                         and self.steps[step_idx].get('gating_mode_var') is not None):
                     gating_mode = self.steps[step_idx]['gating_mode_var'].get()
@@ -4125,6 +4390,22 @@ class GCodeGeneratorApp:
                         depth_map, threshold_mm, max_depth, r_px)
                     if mask is None:
                         mask = np.zeros_like(depth_map, dtype=bool)
+                elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
+                    # The finished holes, placed exactly as
+                    # compute_registration_holes_toolpath places them.
+                    H, W = depth_map.shape
+                    pxx = W / params['eff_width_mm']
+                    pxy = H / params['eff_height_mm']
+                    centers = registration_hole_centers(
+                        params['reghole_pattern'], (W - 1) / pxx, (H - 1) / pxy,
+                        params['origin'], params['reghole_diag_dir'],
+                        params['reghole_inset_mm'], params['reghole_spacing_mm'])
+                    rr, cc = np.mgrid[0:H, 0:W]
+                    r_mm = params['reghole_diameter_mm'] / 2.0
+                    mask = np.zeros_like(depth_map, dtype=bool)
+                    for hx, hy in centers:
+                        mask |= ((cc / pxx - hx) ** 2 + ((H - 1 - rr) / pxy - hy) ** 2
+                                 <= r_mm ** 2)
                 elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
                     cache_key = (
                         params['tool'].profile, params['tool'].diameter_mm,
@@ -4230,6 +4511,7 @@ class GCodeGeneratorApp:
         self.ax.imshow(display_data, interpolation="none", aspect="equal",
                        cmap=cmap, vmin=vmin, vmax=vmax, alpha=img_alpha)
         self._overlay_toolpath_2d(img, step_idx)
+        self._overlay_registration_holes(img)
         self.ax.axis("off")
         if title:
             self.ax.set_title(title, color="white", fontsize=10, pad=6)
@@ -4240,6 +4522,84 @@ class GCodeGeneratorApp:
             self.ax.set_ylim(saved_ylim)
 
         self.mpl_canvas.draw()
+
+    def _overlay_px_transform(self, img):
+        """(H, W, sx, sy, ox, oy) for drawing stock-mm geometry over the 2D
+        view's *img* (which spans the stock, margin included): sx/sy are
+        px per mm, ox/oy the G-code origin's offset from the stock's
+        bottom-left corner in mm. None if the canvas fields don't parse."""
+        try:
+            margin_mm = float(self.margin_mm.get())
+            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
+            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
+        except ValueError:
+            return None
+        if width_mm == 0 or height_mm == 0:
+            return None
+        H, W = img.shape[:2]
+        origin = self.origin_var.get()
+        ox = {"Bottom-Left": 0,          "Bottom-Right": width_mm,
+              "Top-Left":    0,          "Top-Right":    width_mm,
+              "Center":      width_mm  / 2}.get(origin, 0)
+        oy = {"Bottom-Left": 0,          "Bottom-Right": 0,
+              "Top-Left":    height_mm, "Top-Right":    height_mm,
+              "Center":      height_mm / 2}.get(origin, 0)
+        return H, W, W / width_mm, H / height_mm, ox, oy
+
+    def _overlay_registration_holes(self, img):
+        """Outline every Registration Holes step's holes and draw its flip
+        axis on the current 2D axes, from the step's current fields -- so
+        the placement is visible (and follows edits) before computing."""
+        if not self.show_reg_holes_var.get():
+            return
+        transform = self._overlay_px_transform(img)
+        if transform is None:
+            return
+        H, W, sx, sy, _, _ = transform
+        # Same pixel-centre stock extent the algorithm places holes in (see
+        # compute_registration_holes_toolpath), so outlines sit exactly on
+        # the cut holes.
+        W_mm, H_mm = (W - 1) / sx, (H - 1) / sy
+
+        def to_px(x, y):
+            return x * sx, (H - 1) - y * sy
+
+        from matplotlib.patches import Circle
+        from matplotlib.lines import Line2D
+        for step in self.steps:
+            if ALGORITHM_FAMILY.get(step['algorithm_var'].get()) != "Registration Holes":
+                continue
+            try:
+                geo = self._reghole_geometry(step)
+                r_mm = float(step['reghole_diameter'].get()) / 2.0
+            except ValueError:
+                continue
+            spacing = None if step['reghole_spacing'].auto_var.get() else geo['spacing_mm']
+            centers = registration_hole_centers(geo['pattern'], W_mm, H_mm, geo['origin'],
+                                                geo['diag_dir'], geo['inset_mm'], spacing)
+            for hx, hy in centers:
+                self.ax.add_patch(Circle(
+                    to_px(hx, hy), radius=max(r_mm * (sx + sy) / 2.0, 1.5),
+                    facecolor="none", edgecolor="#ffd54f", linewidth=1.2,
+                    linestyle="--", zorder=4))
+
+            # Clip the flip axis to the stock rectangle (Liang-Barsky).
+            (px, py), (dx, dy) = registration_flip_axis(
+                geo['pattern'], W_mm, H_mm, geo['origin'], geo['diag_dir'])
+            t0, t1 = -np.inf, np.inf
+            for p, d, hi in ((px, dx, W_mm), (py, dy, H_mm)):
+                if abs(d) < 1e-12:
+                    if p < -1e-9 or p > hi + 1e-9:
+                        t0, t1 = 1.0, 0.0
+                    continue
+                a, b = (0.0 - p) / d, (hi - p) / d
+                t0, t1 = max(t0, min(a, b)), min(t1, max(a, b))
+            if t0 < t1:
+                (x0, y0), (x1, y1) = (to_px(px + t0 * dx, py + t0 * dy),
+                                      to_px(px + t1 * dx, py + t1 * dy))
+                self.ax.add_line(Line2D([x0, x1], [y0, y1], color="#ffd54f",
+                                        linewidth=0.9, linestyle="-.", alpha=0.7,
+                                        zorder=4))
 
     def _overlay_toolpath_2d(self, img, step_idx):
         """Overlay cut moves, rapids, and tab markers on the current 2D axes."""
@@ -4252,26 +4612,10 @@ class GCodeGeneratorApp:
               if 0 <= step_idx < len(self.toolpaths) else None)
         if tp is None or not tp.segments:
             return
-        try:
-            margin_mm = float(self.margin_mm.get())
-            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
-            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
-        except ValueError:
+        transform = self._overlay_px_transform(img)
+        if transform is None:
             return
-        if width_mm == 0 or height_mm == 0:
-            return
-
-        H, W = img.shape[:2]
-        sx = W / width_mm
-        sy = H / height_mm
-
-        origin = self.origin_var.get()
-        _ox = {"Bottom-Left": 0,          "Bottom-Right": width_mm,
-               "Top-Left":    0,          "Top-Right":    width_mm,
-               "Center":      width_mm  / 2}.get(origin, 0)
-        _oy = {"Bottom-Left": 0,          "Bottom-Right": 0,
-               "Top-Left":    height_mm, "Top-Right":    height_mm,
-               "Center":      height_mm / 2}.get(origin, 0)
+        H, W, sx, sy, _ox, _oy = transform
 
         def to_px(x, y):
             # Inverse of: x_mm = col/sx - _ox,  y_mm = (H-1-row)/sy - _oy

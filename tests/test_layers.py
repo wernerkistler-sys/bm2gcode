@@ -10,7 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from layers import (Layer, to_depth, from_depth, to_grayscale, resize_raw,
-                    resample_layer, composite, compute_n_grey_levels)
+                    resample_layer, composite, compute_n_grey_levels,
+                    _mirror_axis_mm)
+from algorithms import registration_flip_axis
 
 FAILURES = []
 
@@ -308,6 +310,57 @@ offset_layer = make_layer(np.full((4, 4), 0.9, dtype=np.float32),
 resampled, coverage = resample_layer(offset_layer, (4, 4), 1.0, 1.0)
 check("a non-identity (offset) placement still incorporates the layer's own alpha into coverage",
       coverage.min() < 1.0)
+
+
+# --------------------------------------------------------------------------
+# Mirror: reflection across the stock flip axes, applied after placement
+# --------------------------------------------------------------------------
+print("mirror")
+
+rng = np.random.default_rng(0)
+sq = rng.random((9, 9)).astype(np.float32)
+for mirror, origin, expect in [
+        ("Vertical axis",   "Bottom-Left", np.fliplr(sq)),
+        ("Horizontal axis", "Bottom-Left", np.flipud(sq)),
+        ("Diagonal (+45°)", "Bottom-Left", np.rot90(sq, 2).T),   # y = x, rows point down
+        ("Diagonal (+45°)", "Top-Right",   np.rot90(sq, 2).T),
+        ("Diagonal (+45°)", "Center",      np.rot90(sq, 2).T),
+        ("Diagonal (−45°)", "Top-Left",    sq.T),
+        ("Diagonal (−45°)", "Bottom-Right", sq.T),
+        ("Diagonal (−45°)", "Center",      sq.T)]:
+    out, cov = resample_layer(make_layer(sq.copy(), mirror=mirror), sq.shape, 1.0, 1.0, origin)
+    check(f"{mirror} through {origin} on a square canvas",
+          np.allclose(out, expect, atol=1e-5) and np.allclose(cov, 1.0, atol=1e-5))
+
+marker = np.zeros((10, 10), dtype=np.float32)
+marker[4:6, 4:6] = 1.0
+off = make_layer(marker.copy(), offset_x_mm=3.0, mirror="Vertical axis")
+out, _ = resample_layer(off, (10, 10), 1.0, 1.0)
+cols = np.nonzero(out.max(axis=0) > 0.5)[0]
+check("a mirrored layer's offset is mirrored too (+3 mm lands at -3 mm)",
+      list(cols) == [1, 2])
+
+wide = np.zeros((5, 9), dtype=np.float32)   # H=5, W=9, 1 px/mm: 8 x 4 mm stock
+wide[4, 2] = 1.0                             # stock (x=2, y=0)
+out, _ = resample_layer(make_layer(wide.copy(), mirror="Diagonal (+45°)"),
+                        wide.shape, 1.0, 1.0, "Bottom-Left")
+check("Diagonal (+45°) from Bottom-Left on a non-square canvas maps (x, y) -> (y, x)",
+      out[4 - 2, 0] > 0.99 and out.sum() < 1.01)
+
+for mirror, pattern, dd in [("Vertical axis", "Vertical axis", "+45°"),
+                            ("Horizontal axis", "Horizontal axis", "+45°"),
+                            ("Diagonal (+45°)", "Diagonal", "+45°"),
+                            ("Diagonal (−45°)", "Diagonal", "−45°")]:
+    origins = (["Bottom-Left", "Top-Right", "Center"] if mirror == "Diagonal (+45°)" else
+               ["Top-Left", "Bottom-Right", "Center"] if mirror == "Diagonal (−45°)" else
+               ["Bottom-Left", "Center"])
+    for origin in origins:
+        pm, dm = _mirror_axis_mm(mirror, 120.0, 80.0, origin)
+        pr, dr = registration_flip_axis(pattern, 120.0, 80.0, origin, dd)
+        same_dir = abs(abs(dm[0] * dr[0] + dm[1] * dr[1]) - 1.0) < 1e-9
+        on_line = abs((pr[0] - pm[0]) * dm[1] - (pr[1] - pm[1]) * dm[0]) < 1e-9
+        check(f"{mirror} through {origin} uses the Registration Holes flip axis",
+              same_dir and on_line)
 
 
 print()

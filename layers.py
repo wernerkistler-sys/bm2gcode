@@ -40,10 +40,14 @@ class Layer:
                                       # max_depth_pct < min_depth_pct flips
                                       # the layer's polarity
     visible: bool = True
+    mirror: str = "None"             # see constants.LAYER_MIRRORS; reflects
+                                      # the placed layer across a stock flip
+                                      # axis (see _mirror_axis_mm)
 
     def is_identity_placement(self) -> bool:
         return (self.offset_x_mm == 0.0 and self.offset_y_mm == 0.0
-                and self.rotation_deg == 0.0 and self.scale_pct == 100.0)
+                and self.rotation_deg == 0.0 and self.scale_pct == 100.0
+                and self.mirror == "None")
 
 
 def to_grayscale(raw: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -116,8 +120,59 @@ def from_depth(depth: np.ndarray, surface: str) -> np.ndarray:
     return (1.0 - depth) if surface == "white" else depth
 
 
+def _mirror_axis_mm(mirror: str, W_mm: float, H_mm: float, origin: str):
+    """(point, unit direction) of a Mirror option's reflection axis, in stock
+    mm (bottom-left corner = 0,0, y up) -- the same flip axes as the
+    Registration Holes step (algorithms.registration_flip_axis): the stock's
+    vertical/horizontal centre line, or the 45° line through the G-code
+    origin. None for "None"."""
+    if mirror == "Vertical axis":
+        return (W_mm / 2.0, 0.0), (0.0, 1.0)
+    if mirror == "Horizontal axis":
+        return (0.0, H_mm / 2.0), (1.0, 0.0)
+    if mirror in ("Diagonal (+45°)", "Diagonal (−45°)"):
+        point = {"Bottom-Left": (0.0, 0.0),  "Bottom-Right": (W_mm, 0.0),
+                 "Top-Left":    (0.0, H_mm), "Top-Right":    (W_mm, H_mm)
+                 }.get(origin, (W_mm / 2.0, H_mm / 2.0))
+        s = 1.0 / np.sqrt(2.0)
+        return point, ((s, s) if mirror == "Diagonal (+45°)" else (s, -s))
+    return None
+
+
+def _mirror_params(mirror: str, canvas_shape: Tuple[int, int],
+                   px_per_mm_x: float, px_per_mm_y: float, origin: str):
+    """(R, t) of the canvas-pixel reflection q -> R @ q + t, q = [row, col],
+    for a Mirror option, or None for "None".
+
+    The reflection is built in stock mm -- where the flip axes are defined
+    -- and conjugated into pixel space, so a 45° axis stays a true 45° line
+    even when pixels aren't square. Stock mm spans pixel centres
+    (x = col / px_per_mm_x, y = (H - 1 - row) / px_per_mm_y), the same
+    convention the toolpath algorithms use, so a mirrored layer lines up
+    with toolpaths flipped across the same axis.
+    """
+    H, W = canvas_shape
+    axis = _mirror_axis_mm(mirror, (W - 1) / px_per_mm_x, (H - 1) / px_per_mm_y, origin)
+    if axis is None:
+        return None
+    (px, py), (dx, dy) = axis
+    A = np.array([[2 * dx * dx - 1, 2 * dx * dy],
+                  [2 * dx * dy,     2 * dy * dy - 1]])
+    P = np.array([px, py])
+    # [x, y] = S @ [row, col] + b
+    S = np.array([[0.0, 1.0 / px_per_mm_x], [-1.0 / px_per_mm_y, 0.0]])
+    b = np.array([0.0, (H - 1) / px_per_mm_y])
+    S_inv = np.linalg.inv(S)
+    # Rounded so an exact flip stays exact: a stray 1e-16 term would put the
+    # canvas's edge pixels a hair outside the layer, where affine_transform
+    # samples its zero fill instead of the edge.
+    return (np.round(S_inv @ A @ S, 12),
+            np.round(S_inv @ (P + A @ (b - P) - b), 9))
+
+
 def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
-                    px_per_mm_x: float, px_per_mm_y: float):
+                    px_per_mm_x: float, px_per_mm_y: float,
+                    origin: str = "Bottom-Left"):
     """(matrix, offset) for scipy.ndimage.affine_transform, which maps
     OUTPUT (canvas) pixel coords to INPUT (layer) pixel coords:
 
@@ -138,6 +193,11 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
     never on canvas resolution. fit_ratio (canvas px per layer-native px at
     scale_pct=100, along whichever axis the layer's aspect ratio binds)
     converts that into the pixel-space factor the matrix below needs.
+
+    mirror, if set, reflects the placed layer across a stock flip axis (see
+    _mirror_params) -- applied after placement, so an offset layer's offset
+    is mirrored along with its content. *origin* (the G-code origin) anchors
+    the diagonal axes.
     """
     import math
 
@@ -162,11 +222,16 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
         cy_l - (sin_t / s) * k1 - (cos_t / s) * k2,
         cx_l - (cos_t / s) * k1 + (sin_t / s) * k2,
     ])
+    mirror = _mirror_params(layer.mirror, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
+    if mirror is not None:
+        R, t = mirror
+        matrix, offset = matrix @ R, matrix @ t + offset
     return matrix, offset
 
 
 def resample_layer(layer: Layer, canvas_shape: Tuple[int, int],
-                    px_per_mm_x: float, px_per_mm_y: float
+                    px_per_mm_x: float, px_per_mm_y: float,
+                    origin: str = "Bottom-Left"
                     ) -> Tuple[np.ndarray, np.ndarray]:
     """Return (resampled_raw, coverage), both float32 and canvas_shape.
 
@@ -179,7 +244,7 @@ def resample_layer(layer: Layer, canvas_shape: Tuple[int, int],
                     else np.ones(canvas_shape, dtype=np.float32))
         return layer.raw, coverage
 
-    matrix, offset = _affine_params(layer, canvas_shape, px_per_mm_x, px_per_mm_y)
+    matrix, offset = _affine_params(layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
     resampled = affine_transform(
         layer.raw, matrix, offset=offset, output_shape=canvas_shape,
         order=1, cval=0.0, prefilter=False,
@@ -214,7 +279,8 @@ def _blend_op(mode: str, base: np.ndarray, layer_depth: np.ndarray) -> np.ndarra
 def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
               px_per_mm_x: float, px_per_mm_y: float,
               surface: str, background_depth: float = 0.0,
-              visibility_override: Optional[List[bool]] = None) -> np.ndarray:
+              visibility_override: Optional[List[bool]] = None,
+              origin: str = "Bottom-Left") -> np.ndarray:
     """Composite the visible layers bottom-to-top into a single float32 raw
     grayscale array (canvas_shape), in the project's own polarity.
 
@@ -234,6 +300,8 @@ def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
     own stored per-source visibility) gate the composite without mutating
     any Layer's shared .visible state. Missing/short lists fall back to
     the layer's own .visible for the uncovered tail.
+
+    origin is the G-code origin, which anchors the diagonal Mirror axes.
     """
     canvas_depth = np.full(canvas_shape, background_depth, dtype=np.float32)
     for i, layer in enumerate(layers):
@@ -243,7 +311,8 @@ def composite(layers: List[Layer], canvas_shape: Tuple[int, int],
             visible = layer.visible
         if not visible or layer.opacity_pct <= 0.0:
             continue
-        resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x, px_per_mm_y)
+        resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x, px_per_mm_y,
+                                             origin)
         depth = to_depth(resampled, surface, False)
         min_frac, max_frac = layer.min_depth_pct / 100.0, layer.max_depth_pct / 100.0
         layer_depth = np.clip(min_frac + (max_frac - min_frac) * depth, 0.0, 1.0)

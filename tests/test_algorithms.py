@@ -19,7 +19,10 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         _order_locked_raster_pass, _order_zigzag_pass,
                         _order_free_region_pass, prune_air_segments,
                         compute_air_free_depth, _retract_breakeven_mm, _build_kernel,
-                        simulate_toolpath_result, compute_raster_toolpath)
+                        simulate_toolpath_result, compute_raster_toolpath,
+                        registration_flip_axis, registration_hole_centers,
+                        registration_auto_spacing, bore_hole_segments,
+                        compute_registration_holes_toolpath)
 from tool import Tool
 from toolpath import ToolPath
 
@@ -1012,6 +1015,146 @@ for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Spiral (Outside-In)"):
         # plus once between passes.
         check(f"{rdir}: regions are still never interleaved within a pass",
               passes_switches <= 3)
+
+
+# --------------------------------------------------------------------------
+# registration holes: every pattern maps onto itself under its own flip, and
+# the flip keeps the G-code origin at the same physical point on the back
+# canvas (same W x H for the axis flips, H x W for Diagonal) -- the reason a
+# two-sided job needs no X/Y re-zeroing.
+# --------------------------------------------------------------------------
+print("registration holes")
+
+
+def _reflect(p, axis):
+    (ax, ay), (dx, dy) = axis
+    px, py = p[0] - ax, p[1] - ay
+    t = px * dx + py * dy
+    return (ax + 2 * t * dx - px, ay + 2 * t * dy - py)
+
+
+def _same_set(a, b, tol=1e-9):
+    b = list(b)
+    for p in a:
+        hit = [i for i, q in enumerate(b) if abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol]
+        if not hit:
+            return False
+        b.pop(hit[0])
+    return not b
+
+
+def _origin_point(origin, W, H):
+    return {"Bottom-Left": (0, 0), "Bottom-Right": (W, 0), "Top-Left": (0, H),
+            "Top-Right": (W, H), "Center": (W / 2, H / 2)}[origin]
+
+
+for (W, H) in [(100.0, 100.0), (120.0, 80.0), (80.0, 120.0)]:
+    for pattern in ("Vertical axis", "Horizontal axis", "Diagonal"):
+        for origin in ("Bottom-Left", "Bottom-Right", "Top-Left", "Top-Right", "Center"):
+            dirs = ("+45°", "−45°") if (pattern == "Diagonal" and origin == "Center") else ("+45°",)
+            for dd in dirs:
+                tag = f"{W:g}x{H:g} {pattern} {origin} {dd}"
+                axis = registration_flip_axis(pattern, W, H, origin, dd)
+                holes = registration_hole_centers(pattern, W, H, origin, dd, inset_mm=7.0)
+                check(f"{tag}: holes map onto themselves under the flip",
+                      _same_set(holes, [_reflect(p, axis) for p in holes]))
+                check(f"{tag}: auto-placed holes lie inside the stock",
+                      all(7.0 - 1e-9 <= x <= W - 7.0 + 1e-9
+                          and 7.0 - 1e-9 <= y <= H - 7.0 + 1e-9 for x, y in holes))
+                if pattern == "Diagonal":
+                    # The flipped stock occupies the reflected footprint; its
+                    # own origin point (same origin setting, H x W canvas
+                    # placed where the reflection puts it) must be the
+                    # machine zero the front side used.
+                    corners = [_reflect(p, axis) for p in
+                               [(0, 0), (W, 0), (0, H), (W, H)]]
+                    x0 = min(c[0] for c in corners)
+                    y0 = min(c[1] for c in corners)
+                    ox, oy = _origin_point(origin, H, W)
+                    back_origin = (x0 + ox, y0 + oy)
+                else:
+                    back_origin = _origin_point(origin, W, H)
+                front_origin = _origin_point(origin, W, H)
+                check(f"{tag}: flip keeps the G-code origin at the same physical point",
+                      np.hypot(back_origin[0] - front_origin[0],
+                               back_origin[1] - front_origin[1]) < 1e-9)
+
+check("auto spacing uses the shorter stock side",
+      registration_auto_spacing(120.0, 80.0, 10.0) == 60.0)
+diag = registration_hole_centers("Diagonal", 120.0, 80.0, "Bottom-Left", inset_mm=10.0)
+check("Diagonal from Bottom-Left: corner hole at (inset, inset), arms along x and y",
+      _same_set(diag, [(10.0, 10.0), (70.0, 10.0), (10.0, 70.0)]))
+diag = registration_hole_centers("Diagonal", 120.0, 80.0, "Top-Right", inset_mm=10.0,
+                                 spacing_mm=30.0)
+check("Diagonal from Top-Right with explicit spacing",
+      _same_set(diag, [(110.0, 70.0), (80.0, 70.0), (110.0, 40.0)]))
+
+# Helix: tool-centre radius, full depth, bounded Z drop per revolution.
+segs = bore_hole_segments(5.0, 5.0, 1.5, 10.0, 1.0, climb=True)
+pts = np.array(segs[0])
+r = np.hypot(pts[:-1, 0] - 5.0, pts[:-1, 1] - 5.0)
+check("helix: one continuous segment", len(segs) == 1)
+check("helix: every point but the lead-out sits on the path radius",
+      np.allclose(r, 1.5))
+check("helix: starts at the stock surface", abs(pts[0, 2]) < 1e-12)
+check("helix: reaches full depth", abs(pts[:, 2].min() + 10.0) < 1e-9)
+check("helix: ends back at the hole centre at full depth",
+      np.allclose(pts[-1], (5.0, 5.0, -10.0)))
+ang = np.unwrap(np.arctan2(pts[:-1, 1] - 5.0, pts[:-1, 0] - 5.0))
+per_rev = np.interp(ang[0] + 2 * np.pi, ang, pts[:-1, 2])
+check("helix: Climb winds counter-clockwise", ang[-1] > ang[0])
+check("helix: Z drop per revolution is at most the step-down",
+      abs(per_rev - pts[0, 2]) <= 1.0 + 1e-9)
+check("helix: ends with a flat full circle at the bottom",
+      np.all(np.abs(pts[:-1, 2][ang >= ang[-1] - 2 * np.pi + 1e-9] + 10.0) < 1e-9))
+conv = np.array(bore_hole_segments(5.0, 5.0, 1.5, 10.0, 1.0, climb=False)[0])
+ang_c = np.unwrap(np.arctan2(conv[:-1, 1] - 5.0, conv[:-1, 0] - 5.0))
+check("helix: Conventional winds clockwise", ang_c[-1] < ang_c[0])
+
+pecks = bore_hole_segments(5.0, 5.0, 0.0, 10.0, 4.0)
+check("plunge: pecked in step-down increments", len(pecks) == 3)
+check("plunge: all pecks at the hole centre",
+      all(abs(p[0] - 5.0) < 1e-12 and abs(p[1] - 5.0) < 1e-12 for sg in pecks for p in sg))
+check("plunge: every peck but the last lifts back out of the hole",
+      all(sg[-1][2] == 0.0 for sg in pecks[:-1]) and abs(pecks[-1][-1][2] + 10.0) < 1e-12)
+check("plunge: step-down 0 is a single plunge",
+      len(bore_hole_segments(0.0, 0.0, 0.0, 10.0, 0.0)) == 1)
+
+reg_tool = Tool("End Mill", 6.0, 90.0)
+try:
+    compute_registration_holes_toolpath(reg_tool, 100.0, 100.0, (200, 200),
+                                        hole_diameter_mm=5.0)
+    check("hole smaller than the tool raises", False)
+except ValueError:
+    check("hole smaller than the tool raises", True)
+
+tp_reg = compute_registration_holes_toolpath(
+    reg_tool, 100.0, 100.0, (201, 201), pattern="Diagonal", origin="Bottom-Left",
+    hole_diameter_mm=8.0, hole_depth_mm=15.0, stepdown_mm=2.0, inset_mm=10.0,
+    max_depth=5.0)
+check("toolpath: one segment per helical hole", len(tp_reg.segments) == 3)
+check("toolpath: result reaches full depth at the hole centres",
+      tp_reg.result[200 - 20, 20] >= 1.0 - 1e-3)
+check("toolpath: holes deeper than max depth are marked cut through",
+      tp_reg.alpha is not None and tp_reg.alpha[200 - 20, 20] == 0.0)
+check("toolpath: material between holes is untouched",
+      tp_reg.result[100, 100] == 0.0 and tp_reg.alpha[100, 100] == 1.0)
+# Like every algorithm, G-code X/Y span pixel centres: (W - 1) / px_per_mm.
+reg_ext = 200 / (201 / 100.0)
+check("toolpath: G-code centres follow the origin",
+      _same_set(tp_reg.metadata['hole_centers'],
+                [(10.0, 10.0), (reg_ext - 10.0, 10.0), (10.0, reg_ext - 10.0)], tol=1e-6))
+tp_tr = compute_registration_holes_toolpath(
+    reg_tool, 100.0, 100.0, (201, 201), pattern="Vertical axis", origin="Top-Right",
+    hole_diameter_mm=6.0, hole_depth_mm=4.0, stepdown_mm=2.0, inset_mm=10.0,
+    max_depth=5.0)
+check("toolpath: Top-Right origin shifts centres to negative X/Y",
+      _same_set(tp_tr.metadata['hole_centers'],
+                [(-reg_ext / 2, -(reg_ext - 10.0)), (-reg_ext / 2, -10.0)], tol=1e-6))
+check("toolpath: hole the tool's own size is plunged",
+      tp_tr.metadata['cut_method'] == 'plunge')
+check("toolpath: a hole shallower than max depth is not marked cut through",
+      tp_tr.alpha is None)
 
 
 print()

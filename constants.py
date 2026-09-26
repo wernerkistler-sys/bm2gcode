@@ -12,7 +12,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
                      "V-Carving Clean-up",
-                     "Cutout", "Pocket"]
+                     "Cutout", "Pocket", "Registration Holes"]
 
 # Which compute_*_toolpath pipeline each Algorithm dropdown entry uses.
 # V-Carving Clean-up displays under the V-Carving group but is really a
@@ -30,7 +30,19 @@ ALGORITHM_FAMILY  = {
     "V-Carving Clean-up":        "Pocket",
     "Cutout":                    "Cutout",
     "Pocket":                    "Pocket",
+    "Registration Holes":        "Registration Holes",
 }
+
+# Registration Holes flip axes (see algorithms.py's registration_flip_axis).
+# The Diagonal line always passes through the G-code origin; DIAG_DIRECTIONS
+# picks its direction only for a Center origin, since a corner origin implies it.
+REG_HOLE_PATTERNS = ["Vertical axis", "Horizontal axis", "Diagonal"]
+DIAG_DIRECTIONS   = ["+45°", "−45°"]
+# Per-layer Mirror options: the same flip axes, for back-side sources (see
+# layers.py's _mirror_axis_mm). Diagonals are the 45° line through the G-code
+# origin in the named direction.
+LAYER_MIRRORS     = ["None", "Vertical axis", "Horizontal axis",
+                     "Diagonal (+45°)", "Diagonal (−45°)"]
 BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
 DEFAULT_PREAMBLE = (
@@ -75,6 +87,7 @@ DEFAULTS = {
     "layer_min_depth_pct": "0.0",
     "layer_max_depth_pct": "100.0",
     "layer_visible":      "1",
+    "layer_mirror":       "None",     # see LAYER_MIRRORS
     # Background depth for canvas area no source covers (Canvas tab field)
     "canvas_background_depth_pct": "0.0",
     # Per-step defaults (prefix-free; used for every new step tab)
@@ -108,6 +121,15 @@ DEFAULTS = {
     "step_cutout_extra_offset":   "0.0",  # lateral-only outward push (mm); 0 = tool tangent to silhouette edge
     # Pocket-specific defaults (target depth reuses step_threshold, relabeled "Target depth")
     "step_pocket_boundary_offset": "0.0", # lateral-only outward push (mm); 0 = tool tangent to pocket wall
+    # Registration-Holes-specific defaults (helix pitch / peck depth reuses step_stepdown)
+    "step_reghole_pattern":   "Vertical axis",  # see REG_HOLE_PATTERNS
+    "step_reghole_diag_dir":  "+45°",           # see DIAG_DIRECTIONS; Center origin only
+    "step_reghole_diameter":  "6.0",   # finished hole diameter (mm); >= tool diameter
+    "step_reghole_depth":     "15.0",  # absolute hole depth (mm); typically into the spoilboard
+    "step_reghole_inset":     "10.0",  # hole centre distance from the stock edge (mm)
+    "step_reghole_inset_auto":   "1",  # 1 = inset follows margin/2 (10 mm with no margin)
+    "step_reghole_spacing":   "80.0",  # Diagonal L arm length (mm)
+    "step_reghole_spacing_auto": "1",  # 1 = min(W, H) - 2 * inset
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     "step_avoid_air":             "0",   # 1 = drop toolpath runs that would cut only air
