@@ -163,25 +163,62 @@ def generate_ramp(points: List[Point], z_start: float,
     return result
 
 
-def compute_backoff_point(prev_points: List[Point],
-                           settings: Optional[BackoffSettings]) -> Optional[Point]:
-    """Point `distance_mm` back along the reverse of the last leg's travel
-    direction, clamped to that leg's own length. None if the last move was
-    Z-only (no XY direction to back off along), the leg is degenerate, or
-    back-off is disabled/zero-distance."""
+def compute_backoff_path(prev_points: List[Point],
+                          settings: Optional[BackoffSettings]) -> List[Point]:
+    """Back-off polyline retracing `prev_points` backwards from its last
+    point for `distance_mm` of XY arc length, walking into as many earlier
+    legs as needed (and clamped to the segment's start).
+
+    Z rises at a nominal 45° (z_end + s at XY arc length s) but never drops
+    below the path's own Z at the XY it visits, and never decreases along
+    the back-off. Every waypoint therefore lies directly above a position
+    the tool tip already occupied -- a column the tool body has already
+    swept -- and since the path is linear within each leg and both ends of
+    every chord sit at or above it, the chords between waypoints are too.
+    So the back-off can never cut into material the tool just left.
+
+    Returns the waypoints after prev_points[-1] (which the caller already
+    knows and should NOT prepend), or [] when back-off is disabled,
+    zero-distance, or the path has no XY travel to retrace.
+    """
     if not settings or not settings.enabled or settings.distance_mm <= 0.0:
-        return None
+        return []
     if len(prev_points) < 2:
-        return None
-    x1, y1, _z1 = prev_points[-2]
-    x2, y2, z2 = prev_points[-1]
-    dx, dy = x2 - x1, y2 - y1
-    horiz = math.hypot(dx, dy)
-    if horiz < 1e-6:
-        return None
-    ux, uy = dx / horiz, dy / horiz
-    dist = min(settings.distance_mm, horiz)
-    return (x2 - ux * dist, y2 - uy * dist, z2 + dist)
+        return []
+
+    target = settings.distance_mm
+    z_end = prev_points[-1][2]
+    z_run = z_end
+    s = 0.0
+    result: List[Point] = []
+
+    def add(x: float, y: float, path_z: float) -> None:
+        nonlocal z_run
+        z_run = max(z_run, z_end + s, path_z)
+        if result:
+            last = result[-1]
+            if math.hypot(x - last[0], y - last[1]) < 1e-9 and abs(z_run - last[2]) < 1e-9:
+                return
+        elif math.hypot(x - prev_points[-1][0], y - prev_points[-1][1]) < 1e-9 \
+                and abs(z_run - z_end) < 1e-9:
+            return
+        result.append((x, y, z_run))
+
+    for i in range(len(prev_points) - 1, 0, -1):
+        x2, y2, z2 = prev_points[i]
+        x1, y1, z1 = prev_points[i - 1]
+        leg = math.hypot(x2 - x1, y2 - y1)
+        if s + leg >= target and leg > 1e-9:
+            t = (target - s) / leg
+            s = target
+            add(x2 + t * (x1 - x2), y2 + t * (y1 - y2), z2 + t * (z1 - z2))
+            break
+        s += leg
+        add(x1, y1, z1)
+
+    if s < 1e-6:
+        return []
+    return result
 
 
 def generate_corner_arc(corner: Point, dir_in: Tuple[float, float, float],

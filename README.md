@@ -303,7 +303,7 @@ The **Dress-up…** button on each step's tab opens that step's tool path dress-
 | Ramp angle | Target descent angle of the zig-zag, in degrees. |
 | Max ramp length | How far ahead along the upcoming cut path the zig-zag is allowed to range, in mm. |
 
-**Back off before retract** — before retracting to safe height, backs the tool away a short distance from the wall it just cut, opposite its last direction of travel, to avoid rubbing or burning the surface while lifting.
+**Back off before retract** — before retracting to safe height, backs the tool away a short distance from the wall it just cut by retracing its own path backwards, to avoid rubbing or burning the surface while lifting. If the last move had too little lateral travel to cover the distance (e.g. a near-vertical raise), the back-off continues into the moves before it. It rises at 45° while backing off, but never drops below the surface the tool just cut — where the path came down more steeply than that, the back-off follows the path's own slope instead.
 
 | Parameter | Description |
 |---|---|
@@ -625,7 +625,7 @@ The medial axis (`skimage.morphology.medial_axis`) is the set of centres of all 
 Iterates over the ordered segments. Consecutive segments whose endpoints touch are joined as G1 feed moves. Gaps trigger a retract (G0 to safe height), a rapid to the next entry XY position, and a plunge (G1 to entry Z). Three optional per-step dress-ups (see [Step / Dress-up](#step--dress-up), off by default) modify this base behaviour without changing the underlying cut geometry:
 
 - **Ramp-in** replaces the plunge below the stock surface (z < 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
-- **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract.
+- **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract. It retraces the just-cut path's XY footprint backwards (across as many prior moves as needed to cover the distance), emitted as G1 X/Y/Z moves whose Z rises at 45° but is never lower than the path's own Z at that XY — so every waypoint sits directly above a position the tool already occupied.
 - **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius. The arc's waypoints are emitted as G1 moves at its own configured feed (rather than G0), since G0 doesn't guarantee coordinated linear interpolation between waypoints on every controller — G1 is what makes the polyline actually trace the intended arc instead of a per-axis independent rapid.
 
 The fourth per-step dress-up, **Tabs**, isn't part of this stage at all — it modifies the cut geometry itself, earlier in the Cutout pipeline (see [Cutout Pipeline](#cutout-pipeline)), so by the time G-code generation runs, a tab is already just an ordinary Z change baked into the segments like any other.

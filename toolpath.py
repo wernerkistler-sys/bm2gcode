@@ -3,7 +3,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from dressup import generate_ramp, compute_backoff_point, generate_corner_arc
+from dressup import generate_ramp, compute_backoff_path, generate_corner_arc
 
 
 def _ramp_plan(points, z_from, ramp):
@@ -149,10 +149,10 @@ class ToolPath:
             if gap:
                 if prev_points is not None:
                     base = prev_points[-1]
-                    bo = compute_backoff_point(prev_points, backoff)
-                    if bo is not None:
-                        yield ('backoff', [base, bo])
-                        base = bo
+                    bo = compute_backoff_path(prev_points, backoff)
+                    if bo:
+                        yield ('backoff', [base] + bo)
+                        base = bo[-1]
                     px, py, pz = base
                     nx, ny = x0, y0
                     horiz = math.hypot(nx - px, ny - py)
@@ -221,10 +221,10 @@ class ToolPath:
 
         if prev_points is not None:
             base = prev_points[-1]
-            bo = compute_backoff_point(prev_points, backoff)
-            if bo is not None:
-                yield ('backoff', [base, bo])
-                base = bo
+            bo = compute_backoff_path(prev_points, backoff)
+            if bo:
+                yield ('backoff', [base] + bo)
+                base = bo[-1]
             yield ('rapid_retract', [base, (base[0], base[1], z_safe)])
 
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
@@ -393,8 +393,8 @@ class ToolPath:
                 x, y, _ = pts[-1]
                 lines.append(f"G0 X{x:.3f} Y{y:.3f}  ; rapid to span start")
             elif kind == 'backoff':
-                x, y, _ = pts[-1]
-                lines.append(f"G1 X{x:.3f} Y{y:.3f} F{feed_rate}  ; back off before retract")
+                for x, y, z in pts[1:]:
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}  ; back off before retract")
             elif kind == 'arc':
                 for x, y, z in pts[1:]:
                     lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{arc.feed_mm_min}  ; arc")

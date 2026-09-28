@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dressup import (RampSettings, BackoffSettings, ArcSettings,
-                      generate_ramp, compute_backoff_point, generate_corner_arc)
+                      generate_ramp, compute_backoff_path, generate_corner_arc)
 from toolpath import ToolPath
 
 FAILURES = []
@@ -84,28 +84,84 @@ check("max_legs cap never exceeds lookahead length",
       all(p[0] <= capped.max_length_mm + 1e-6 for p in ramp3))
 
 # --------------------------------------------------------------------------
-# compute_backoff_point
+# compute_backoff_path
 # --------------------------------------------------------------------------
-print("compute_backoff_point")
+print("compute_backoff_path")
 
 leg = [(0.0, 0.0, -5.0), (10.0, 0.0, -5.0)]
-bo = compute_backoff_point(leg, BackoffSettings(enabled=True, distance_mm=2.0))
+bo = compute_backoff_path(leg, BackoffSettings(enabled=True, distance_mm=2.0))
 check("backoff direction opposes travel and has the right magnitude",
-      bo is not None and abs(bo[0] - 8.0) < 1e-9 and abs(bo[1]) < 1e-9 and abs(bo[2] - (-3.0)) < 1e-9)
+      len(bo) == 1 and abs(bo[-1][0] - 8.0) < 1e-9 and abs(bo[-1][1]) < 1e-9
+      and abs(bo[-1][2] - (-3.0)) < 1e-9)
 
 short_leg = [(0.0, 0.0, -5.0), (1.0, 0.0, -5.0)]
-bo_clamped = compute_backoff_point(short_leg, BackoffSettings(enabled=True, distance_mm=5.0))
-check("backoff clamps to the leg's own length",
-      bo_clamped is not None and abs(bo_clamped[0] - 0.0) < 1e-9)
+bo_clamped = compute_backoff_path(short_leg, BackoffSettings(enabled=True, distance_mm=5.0))
+check("backoff clamps to the segment's start",
+      bo_clamped and abs(bo_clamped[-1][0] - 0.0) < 1e-9)
 
 vertical_leg = [(3.0, 4.0, -1.0), (3.0, 4.0, -5.0)]
-check("vertical-only last move returns None",
-      compute_backoff_point(vertical_leg, BackoffSettings(enabled=True, distance_mm=1.0)) is None)
+check("vertical-only path returns []",
+      compute_backoff_path(vertical_leg, BackoffSettings(enabled=True, distance_mm=1.0)) == [])
 
-check("disabled settings returns None",
-      compute_backoff_point(leg, BackoffSettings(enabled=False, distance_mm=2.0)) is None)
-check("zero distance returns None",
-      compute_backoff_point(leg, BackoffSettings(enabled=True, distance_mm=0.0)) is None)
+check("disabled settings returns []",
+      compute_backoff_path(leg, BackoffSettings(enabled=False, distance_mm=2.0)) == [])
+check("zero distance returns []",
+      compute_backoff_path(leg, BackoffSettings(enabled=True, distance_mm=0.0)) == [])
+
+# Near-vertical final raise: the last leg has almost no XY travel, so the
+# back-off has to continue into the previous leg to cover its distance.
+raise_end = [(0.0, 0.0, -5.0), (10.0, 0.0, -5.0), (10.01, 0.0, -1.0)]
+bo_raise = compute_backoff_path(raise_end, BackoffSettings(enabled=True, distance_mm=2.0))
+check("near-vertical last move extends into the previous leg",
+      bo_raise and abs(bo_raise[-1][0] - 8.01) < 1e-9 and abs(bo_raise[-1][1]) < 1e-9)
+check("near-vertical last move back-off never descends",
+      all(bo_raise[i][2] <= bo_raise[i + 1][2] + 1e-12 for i in range(len(bo_raise) - 1))
+      and bo_raise[0][2] >= -1.0 - 1e-12)
+
+# Steep descent (5:1): a plain 45° rise would land at z=-4.5, below the
+# surface cut at x=0.5 (z=-2.5).
+steep = [(0.0, 0.0, 0.0), (1.0, 0.0, -5.0)]
+bo_steep = compute_backoff_path(steep, BackoffSettings(enabled=True, distance_mm=0.5))
+check("steep descent back-off stays on or above the cut surface",
+      bo_steep and abs(bo_steep[-1][0] - 0.5) < 1e-9 and bo_steep[-1][2] >= -2.5 - 1e-9)
+
+
+def path_z_at(path, x, y):
+    """Highest Z of `path` at XY (x, y), or None if (x, y) isn't on it."""
+    best = None
+    for (x1, y1, z1), (x2, y2, z2) in zip(path, path[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-18:
+            if math.hypot(x - x1, y - y1) < 1e-7:
+                z = max(z1, z2)
+            else:
+                continue
+        else:
+            t = ((x - x1) * dx + (y - y1) * dy) / L2
+            if t < -1e-9 or t > 1 + 1e-9:
+                continue
+            if math.hypot(x1 + t * dx - x, y1 + t * dy - y) > 1e-7:
+                continue
+            z = z1 + t * (z2 - z1)
+        best = z if best is None else max(best, z)
+    return best
+
+
+import random
+rng = random.Random(1234)
+all_ok = True
+for _ in range(200):
+    n = rng.randint(2, 6)
+    poly = [(rng.uniform(-3, 3), rng.uniform(-3, 3), rng.uniform(-6, 0)) for _ in range(n)]
+    if rng.random() < 0.3:
+        poly.append((poly[-1][0], poly[-1][1], rng.uniform(-6, 0)))  # pure-Z last leg
+    pts = compute_backoff_path(poly, BackoffSettings(enabled=True, distance_mm=rng.uniform(0.1, 4.0)))
+    for p in pts:
+        pz = path_z_at(poly, p[0], p[1])
+        if pz is None or p[2] < pz - 1e-9:
+            all_ok = False
+check("random polylines: back-off stays on the path's XY and never below its Z", all_ok)
 
 # --------------------------------------------------------------------------
 # generate_corner_arc
@@ -182,6 +238,9 @@ gcode_enabled = tp.to_gcode(feed_rate=800, feed_rapid=1500, z_safe=5.0,
                             ramp=ramp_s, backoff=backoff_s, arc=arc_s)
 check("enabled G-code contains ramp/back-off/arc comments",
       '; ramp' in gcode_enabled and '; back off' in gcode_enabled and '; arc' in gcode_enabled)
+backoff_lines = [ln for ln in gcode_enabled.splitlines() if '; back off' in ln]
+check("back-off G-code lines carry Z",
+      backoff_lines and all(' Z' in ln for ln in backoff_lines))
 
 for kind, pts in tp.iter_moves(z_safe=5.0, ramp=ramp_s, backoff=backoff_s, arc=arc_s):
     # The very first rapid_traverse is a lone target point -- the prior
