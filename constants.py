@@ -75,6 +75,7 @@ DEFAULTS = {
     "z_safe":            "5.0",
     "feed_rapid":        "1500",
     "accel_mm_s2":       "300",
+    "spindle_dwell_s":   "3",   # pause after each step's S word (s); 0 = no pause
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
     # Per-layer defaults (used for every newly added layer)
@@ -99,6 +100,8 @@ DEFAULTS = {
     "step_raster_final_stepdown": "0.0",
     "step_extra_offset":          "0.0", # stock-to-leave allowance, lateral+vertical (mm); 0 = none
     "step_feed_rate":    "800",
+    "step_plunge_rate":  "0",    # mm/min for vertical descents; 0 = use feed rate
+    "step_spindle_rpm":  "0",    # S word emitted at the step's start; 0 = none
     "step_raster_dir":   "Vertical",
     "step_cut_direction": "Climb",
     "step_threshold":    "0",    # mm; 0 = visit all pixels (V-Carving/Cutout: 0 = auto-split at depth-map midpoint; Pocket: literal 0, a full-stock flattening pass -- check the field's Auto box to use the depth map's actual deepest point instead)

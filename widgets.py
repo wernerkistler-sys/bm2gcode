@@ -1,9 +1,13 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import copy
+import math
 import queue
 import re
 
-from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE
+from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, TOOL_PROFILES
+from tool_library import (ToolLibrary, ToolDef, Material, CuttingData,
+                          new_id, format_value)
 import stl_mesh
 
 
@@ -403,7 +407,7 @@ def _fmt_time(minutes):
 
 class SettingsDialog(tk.Toplevel):
     """Modal dialog for editing global G-code settings (z_safe, feed_rapid,
-    preamble, postamble).  Modifies *settings* dict in-place on OK."""
+    acceleration, spindle spin-up dwell, preamble, postamble).  Modifies *settings* dict in-place on OK."""
 
     def __init__(self, parent, settings):
         super().__init__(parent)
@@ -437,6 +441,11 @@ class SettingsDialog(tk.Toplevel):
                                    str(settings.get('accel_mm_s2', 300.0)),
                                    minval=1.0, maxval=10000.0, increment=10.0)
         self._accel.pack(fill=tk.X, pady=2)
+
+        self._dwell = LabeledEntry(mf, "Spindle spin-up dwell", "s",
+                                   str(settings.get('spindle_dwell_s', 3.0)),
+                                   minval=0.0, maxval=600.0, increment=1.0)
+        self._dwell.pack(fill=tk.X, pady=2)
 
         # ── G-code preamble ───────────────────────────────────────────
         pre_sf = SectionFrame(outer, "G-code Preamble")
@@ -519,10 +528,11 @@ class SettingsDialog(tk.Toplevel):
             z_safe      = float(self._z_safe.get())
             feed_rapid  = float(self._feed_rapid.get())
             accel_mm_s2 = float(self._accel.get())
+            dwell_s     = float(self._dwell.get())
         except ValueError:
             messagebox.showerror("Invalid input",
-                                 "Safe height, rapid feed and max acceleration "
-                                 "must be numbers.",
+                                 "Safe height, rapid feed, max acceleration and "
+                                 "spindle spin-up dwell must be numbers.",
                                  parent=self)
             return
 
@@ -539,6 +549,7 @@ class SettingsDialog(tk.Toplevel):
         self._settings['z_safe']      = z_safe
         self._settings['feed_rapid']  = feed_rapid
         self._settings['accel_mm_s2'] = accel_mm_s2
+        self._settings['spindle_dwell_s'] = max(0.0, dwell_s)
         self._settings['preamble']    = preamble
         self._settings['postamble']   = postamble
         self.confirmed = True
@@ -798,6 +809,570 @@ class DressUpDialog(tk.Toplevel):
         self._settings['tab_phase_pct']  = tab_phase
         self._settings['tab_angle_deg']  = tab_angle
         self.confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
+class ToolLibraryDialog(tk.Toplevel):
+    """Modal editor for the tool library.
+
+    Edits a deep copy of *library*. After ``wait_window`` returns, read
+    ``self.confirmed`` and, if True, ``self.library`` (the edited copy).
+    Saving the library file is up to the caller.
+    """
+
+    _PREVIEW_W = 120
+    _PREVIEW_H = 140
+
+    def __init__(self, parent, library, select_tool_id=None):
+        super().__init__(parent)
+        self.title("Tool Library")
+        self.resizable(True, True)
+        self.minsize(720, 560)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self.library   = copy.deepcopy(library)
+        self.confirmed = False
+        self._tool     = None    # ToolDef shown in the geometry form
+        self._loading  = False   # True while forms are filled programmatically
+
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        nb = ttk.Notebook(outer)
+        nb.pack(fill=tk.BOTH, expand=True)
+        tools_tab = ttk.Frame(nb, padding=8)
+        mats_tab  = ttk.Frame(nb, padding=8)
+        nb.add(tools_tab, text="Tools")
+        nb.add(mats_tab,  text="Materials")
+        self._build_tools_tab(tools_tab)
+        self._build_materials_tab(mats_tab)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="Import…", command=self._import).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Export…", command=self._export).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        self._refresh_tool_tree(select_tool_id)
+        self._refresh_material_list()
+
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+
+        self.wait_window()
+
+    # ------------------------------------------------------------------ #
+    #  Tools tab
+    # ------------------------------------------------------------------ #
+    def _build_tools_tab(self, tab):
+        top = ttk.Frame(tab)
+        top.pack(fill=tk.BOTH, expand=True)
+
+        # ── Tool list ─────────────────────────────────────────────────
+        left = ttk.Frame(top)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._tool_tree = ttk.Treeview(left, columns=("num", "name", "profile", "diam"),
+                                       show="headings", selectmode="browse", height=8)
+        for col, text, width, anchor in (("num", "#", 36, tk.E),
+                                         ("name", "Name", 170, tk.W),
+                                         ("profile", "Profile", 80, tk.W),
+                                         ("diam", "Ø mm", 60, tk.E)):
+            self._tool_tree.heading(col, text=text)
+            self._tool_tree.column(col, width=width, anchor=anchor,
+                                   stretch=(col == "name"))
+        self._tool_tree.pack(fill=tk.BOTH, expand=True)
+        self._tool_tree.bind("<<TreeviewSelect>>", self._on_tool_selected)
+
+        list_btns = ttk.Frame(left)
+        list_btns.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(list_btns, text="New",       command=self._new_tool).pack(side=tk.LEFT)
+        ttk.Button(list_btns, text="Duplicate", command=self._duplicate_tool).pack(side=tk.LEFT, padx=4)
+        ttk.Button(list_btns, text="Delete",    command=self._delete_tool).pack(side=tk.LEFT)
+
+        # ── Geometry form ─────────────────────────────────────────────
+        geo = SectionFrame(top, "Geometry")
+        geo.pack(side=tk.LEFT, fill=tk.BOTH, padx=(8, 0))
+        form = ttk.Frame(geo)
+        form.pack(side=tk.LEFT, fill=tk.Y)
+
+        self._name_var = tk.StringVar()
+        row = ttk.Frame(form)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Name").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self._name_var, width=22).pack(side=tk.RIGHT)
+
+        self._number_var = tk.StringVar()
+        row = ttk.Frame(form)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Tool number").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self._number_var, width=8).pack(side=tk.RIGHT)
+
+        self._profile_var = tk.StringVar()
+        row = ttk.Frame(form)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Profile").pack(side=tk.LEFT)
+        ttk.Combobox(row, textvariable=self._profile_var, values=TOOL_PROFILES,
+                     state="readonly", width=12).pack(side=tk.RIGHT)
+
+        self._diam = LabeledEntry(form, "Diameter", "mm", "6",
+                                  minval=0.01, maxval=200.0, increment=0.5)
+        self._diam.pack(fill=tk.X, pady=2)
+        self._angle = LabeledEntry(form, "V-bit angle", "°", "60",
+                                   minval=1.0, maxval=179.0, increment=5.0)
+        self._angle.pack(fill=tk.X, pady=2)
+        self._flute = LabeledEntry(form, "Flute length", "mm", "0",
+                                   minval=0.0, maxval=500.0, increment=1.0)
+        self._flute.pack(fill=tk.X, pady=2)
+
+        self._notes_var = tk.StringVar()
+        row = ttk.Frame(form)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Notes").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self._notes_var, width=22).pack(side=tk.RIGHT)
+
+        self._preview = tk.Canvas(geo, width=self._PREVIEW_W, height=self._PREVIEW_H,
+                                  background="#2b2b2b", highlightthickness=0)
+        self._preview.pack(side=tk.LEFT, padx=(8, 0), anchor=tk.N)
+
+        for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
+            var.trace_add("write", self._on_geometry_changed)
+        for le in (self._diam, self._angle, self._flute):
+            le.committed_var.trace_add("write", self._on_geometry_changed)
+
+        # ── Cutting data ──────────────────────────────────────────────
+        cut = SectionFrame(tab, "Cutting data")
+        cut.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._cut_tree = ttk.Treeview(cut, columns=("mat", "feed", "plunge", "rpm", "sd"),
+                                      show="headings", selectmode="browse", height=4)
+        for col, text, width in (("mat", "Material", 160), ("feed", "Feed mm/min", 90),
+                                 ("plunge", "Plunge mm/min", 100), ("rpm", "RPM", 70),
+                                 ("sd", "Step-down mm", 90)):
+            self._cut_tree.heading(col, text=text)
+            self._cut_tree.column(col, width=width,
+                                  anchor=tk.W if col == "mat" else tk.E,
+                                  stretch=(col == "mat"))
+        self._cut_tree.pack(fill=tk.BOTH, expand=True)
+        self._cut_tree.bind("<<TreeviewSelect>>", self._on_cutting_selected)
+
+        cform = ttk.Frame(cut)
+        cform.pack(fill=tk.X, pady=(6, 0))
+        self._cut_mat_var = tk.StringVar()
+        ttk.Label(cform, text="Material").grid(row=0, column=0, sticky=tk.W)
+        self._cut_mat_cb = ttk.Combobox(cform, textvariable=self._cut_mat_var,
+                                        state="readonly", width=18)
+        self._cut_mat_cb.grid(row=0, column=1, sticky=tk.W, padx=(4, 12))
+        self._cut_mat_var.trace_add("write", self._on_cutting_material_chosen)
+        self._cut_feed   = LabeledEntry(cform, "Feed", "mm/min", "800",
+                                        minval=1.0, maxval=30000.0, increment=50.0)
+        self._cut_plunge = LabeledEntry(cform, "Plunge (0 = feed)", "mm/min", "0",
+                                        minval=0.0, maxval=30000.0, increment=50.0)
+        self._cut_rpm    = LabeledEntry(cform, "Spindle (0 = none)", "RPM", "0",
+                                        minval=0.0, maxval=100000.0, increment=1000.0)
+        self._cut_sd     = LabeledEntry(cform, "Step-down", "mm", "1",
+                                        minval=0.0, maxval=50.0, increment=0.1)
+        self._cut_feed.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=2)
+        self._cut_plunge.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=2)
+        self._cut_rpm.grid(row=1, column=2, sticky=tk.EW, padx=(12, 0), pady=2)
+        self._cut_sd.grid(row=2, column=2, sticky=tk.EW, padx=(12, 0), pady=2)
+        cbtns = ttk.Frame(cform)
+        cbtns.grid(row=0, column=2, sticky=tk.E)
+        ttk.Button(cbtns, text="Set", command=self._set_cutting).pack(side=tk.LEFT)
+        ttk.Button(cbtns, text="Remove", command=self._remove_cutting).pack(side=tk.LEFT, padx=(4, 0))
+        cform.columnconfigure(2, weight=1)
+
+    def _refresh_tool_tree(self, select_id=None):
+        tree = self._tool_tree
+        tree.delete(*tree.get_children())
+        for t in self.library.tools:
+            tree.insert("", tk.END, iid=t.id, values=self._tool_row(t))
+        if select_id is None and self._tool is not None:
+            select_id = self._tool.id
+        if select_id is None or not tree.exists(select_id):
+            children = tree.get_children()
+            select_id = children[0] if children else None
+        if select_id is not None:
+            tree.selection_set(select_id)
+            tree.see(select_id)
+        # <<TreeviewSelect>> is only delivered on the next event-loop pass;
+        # show the tool now so edits made before then land on the right one.
+        self._show_tool(self.library.find_tool(select_id) if select_id else None)
+
+    @staticmethod
+    def _tool_row(t):
+        return ("" if t.number is None else t.number, t.name, t.profile,
+                format_value(t.diameter_mm))
+
+    def _on_tool_selected(self, _event=None):
+        sel = self._tool_tree.selection()
+        self._show_tool(self.library.find_tool(sel[0]) if sel else None)
+
+    def _show_tool(self, tool):
+        self._tool = tool
+        self._loading = True
+        try:
+            if tool is None:
+                for var in (self._name_var, self._number_var, self._notes_var):
+                    var.set("")
+            else:
+                self._name_var.set(tool.name)
+                self._number_var.set("" if tool.number is None else str(tool.number))
+                self._profile_var.set(tool.profile)
+                self._diam.set(format_value(tool.diameter_mm))
+                self._angle.set(format_value(tool.vbit_angle_deg))
+                self._flute.set(format_value(tool.flute_length_mm))
+                self._notes_var.set(tool.notes)
+        finally:
+            self._loading = False
+        self._angle.set_state("normal" if tool is not None and tool.profile == "V-Bit"
+                              else "disabled")
+        self._refresh_cutting_tree()
+        self._draw_preview()
+
+    def _on_geometry_changed(self, *_):
+        if self._loading or self._tool is None:
+            return
+        t = self._tool
+        t.name    = self._name_var.get()
+        t.profile = self._profile_var.get()
+        t.notes   = self._notes_var.get()
+        number = self._number_var.get().strip()
+        if not number:
+            t.number = None
+        else:
+            try:
+                t.number = int(number)
+            except ValueError:
+                pass
+        for le, attr in ((self._diam, 'diameter_mm'), (self._angle, 'vbit_angle_deg'),
+                         (self._flute, 'flute_length_mm')):
+            try:
+                setattr(t, attr, float(le.get()))
+            except ValueError:
+                pass
+        self._angle.set_state("normal" if t.profile == "V-Bit" else "disabled")
+        self._tool_tree.item(t.id, values=self._tool_row(t))
+        self._draw_preview()
+
+    def _draw_preview(self):
+        """Side view of the cutter tip, scaled to fit the canvas."""
+        c = self._preview
+        c.delete("all")
+        t = self._tool
+        if t is None or t.diameter_mm <= 0:
+            return
+        W, H, pad = self._PREVIEW_W, self._PREVIEW_H, 12
+        R = t.diameter_mm / 2.0
+        if t.profile == "V-Bit":
+            half = math.radians(max(1.0, min(179.0, t.vbit_angle_deg)) / 2.0)
+            tip_h = R / math.tan(half)
+        elif t.profile == "Ball":
+            tip_h = R
+        else:
+            tip_h = 0.0
+        body_h = max(t.flute_length_mm, tip_h + R, 2.0 * R)
+        scale = min((W - 2 * pad) / (2.0 * R), (H - 2 * pad) / body_h)
+        cx, bottom = W / 2.0, H - pad
+        r, th, bh = R * scale, tip_h * scale, body_h * scale
+        top = bottom - bh
+        if t.profile == "V-Bit":
+            pts = [cx - r, top, cx + r, top, cx + r, bottom - th, cx, bottom, cx - r, bottom - th]
+        elif t.profile == "Ball":
+            n = 16
+            arc = [(cx + r * math.cos(math.pi * i / n), bottom - r + r * math.sin(math.pi * i / n))
+                   for i in range(n + 1)]
+            pts = [cx - r, top, cx + r, top]
+            for x, y in arc:
+                pts += [x, y]
+        else:
+            pts = [cx - r, top, cx + r, top, cx + r, bottom, cx - r, bottom]
+        c.create_polygon(pts, fill="#7a8ca3", outline="#d0d8e0")
+        c.create_text(W / 2.0, pad / 2.0 + 2, text=f"Ø {format_value(t.diameter_mm)} mm",
+                      fill="#d0d8e0", font=("TkDefaultFont", 8))
+
+    def _new_tool(self):
+        t = ToolDef(id=new_id(), name="New tool", profile="End Mill", diameter_mm=6.0)
+        self.library.tools.append(t)
+        self._refresh_tool_tree(t.id)
+
+    def _duplicate_tool(self):
+        if self._tool is None:
+            return
+        t = copy.deepcopy(self._tool)
+        t.id = new_id()
+        t.name = f"{t.name} (copy)"
+        self.library.tools.append(t)
+        self._refresh_tool_tree(t.id)
+
+    def _delete_tool(self):
+        if self._tool is None:
+            return
+        if not messagebox.askyesno(
+                "Delete tool",
+                f"Delete \"{self._tool.name}\" from the library?\n\n"
+                "Steps linked to it keep their values and show \"not in library\".",
+                parent=self):
+            return
+        self.library.tools.remove(self._tool)
+        self._tool = None
+        self._refresh_tool_tree()
+
+    # ── Cutting data ──────────────────────────────────────────────────
+    def _material_name(self, material_id):
+        m = self.library.find_material(material_id)
+        return m.name if m is not None else f"(unknown: {material_id})"
+
+    def _refresh_cutting_tree(self, select_material_id=None):
+        tree = self._cut_tree
+        tree.delete(*tree.get_children())
+        self._cut_mat_cb.config(values=[m.name for m in self.library.materials])
+        if self._tool is None:
+            return
+        for mid, cd in self._tool.cutting.items():
+            tree.insert("", tk.END, iid=mid, values=(
+                self._material_name(mid), format_value(cd.feed_rate),
+                format_value(cd.plunge_rate), format_value(cd.spindle_rpm),
+                format_value(cd.stepdown_mm)))
+        if select_material_id is not None and tree.exists(select_material_id):
+            tree.selection_set(select_material_id)
+
+    def _on_cutting_selected(self, _event=None):
+        sel = self._cut_tree.selection()
+        if not sel or self._tool is None:
+            return
+        cd = self._tool.cutting.get(sel[0])
+        if cd is None:
+            return
+        m = self.library.find_material(sel[0])
+        self._loading = True
+        try:
+            self._cut_mat_var.set(m.name if m is not None else "")
+        finally:
+            self._loading = False
+        self._fill_cutting_form(cd)
+
+    def _fill_cutting_form(self, cd):
+        self._cut_feed.set(format_value(cd.feed_rate))
+        self._cut_plunge.set(format_value(cd.plunge_rate))
+        self._cut_rpm.set(format_value(cd.spindle_rpm))
+        self._cut_sd.set(format_value(cd.stepdown_mm))
+
+    def _on_cutting_material_chosen(self, *_):
+        """Choosing a material with existing data loads it into the form."""
+        if self._loading or self._tool is None:
+            return
+        mid = self._chosen_material_id()
+        if mid is not None and mid in self._tool.cutting:
+            self._cut_tree.selection_set(mid)
+
+    def _chosen_material_id(self):
+        name = self._cut_mat_var.get()
+        for m in self.library.materials:
+            if m.name == name:
+                return m.id
+        return None
+
+    def _set_cutting(self):
+        if self._tool is None:
+            return
+        mid = self._chosen_material_id()
+        if mid is None:
+            messagebox.showwarning("No material", "Choose a material first.", parent=self)
+            return
+        try:
+            cd = CuttingData(feed_rate=float(self._cut_feed.get()),
+                             stepdown_mm=float(self._cut_sd.get()),
+                             plunge_rate=float(self._cut_plunge.get()),
+                             spindle_rpm=float(self._cut_rpm.get()))
+        except ValueError:
+            messagebox.showerror("Invalid input", "Cutting data must be numbers.", parent=self)
+            return
+        self._tool.cutting[mid] = cd
+        self._refresh_cutting_tree(mid)
+
+    def _remove_cutting(self):
+        sel = self._cut_tree.selection()
+        if not sel or self._tool is None:
+            return
+        self._tool.cutting.pop(sel[0], None)
+        self._refresh_cutting_tree()
+
+    # ------------------------------------------------------------------ #
+    #  Materials tab
+    # ------------------------------------------------------------------ #
+    def _build_materials_tab(self, tab):
+        self._mat_list = tk.Listbox(tab, height=10, exportselection=False)
+        self._mat_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        btns = ttk.Frame(tab)
+        btns.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        ttk.Button(btns, text="Add…",    command=self._add_material).pack(fill=tk.X)
+        ttk.Button(btns, text="Rename…", command=self._rename_material).pack(fill=tk.X, pady=4)
+        ttk.Button(btns, text="Delete",  command=self._delete_material).pack(fill=tk.X)
+
+    def _refresh_material_list(self):
+        self._mat_list.delete(0, tk.END)
+        for m in self.library.materials:
+            self._mat_list.insert(tk.END, m.name)
+        self._refresh_cutting_tree()
+
+    def _selected_material(self):
+        sel = self._mat_list.curselection()
+        return self.library.materials[sel[0]] if sel else None
+
+    def _ask_material_name(self, title, initial=""):
+        name = simpledialog.askstring(title, "Material name:", initialvalue=initial,
+                                      parent=self)
+        if name is None:
+            return None
+        name = name.strip()
+        if not name:
+            return None
+        if any(m.name == name for m in self.library.materials):
+            messagebox.showerror("Duplicate name",
+                                 f"A material named \"{name}\" already exists.", parent=self)
+            return None
+        return name
+
+    def _add_material(self):
+        name = self._ask_material_name("Add material")
+        if name is not None:
+            self.library.materials.append(Material(new_id(), name))
+            self._refresh_material_list()
+
+    def _rename_material(self):
+        m = self._selected_material()
+        if m is None:
+            return
+        name = self._ask_material_name("Rename material", m.name)
+        if name is not None:
+            m.name = name
+            self._refresh_material_list()
+
+    def _delete_material(self):
+        m = self._selected_material()
+        if m is None:
+            return
+        users = self.library.tools_using_material(m.id)
+        if users:
+            if not messagebox.askyesno(
+                    "Delete material",
+                    f"{len(users)} tool(s) have cutting data for \"{m.name}\".\n"
+                    "Delete the material and that cutting data?", parent=self):
+                return
+        for t in users:
+            t.cutting.pop(m.id, None)
+        self.library.materials.remove(m)
+        self._refresh_material_list()
+
+    # ------------------------------------------------------------------ #
+    #  Import / export / close
+    # ------------------------------------------------------------------ #
+    def _import(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Import Tool Library",
+            filetypes=[("Tool library", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            other = ToolLibrary.load(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Import error", f"Could not read tool library:\n{exc}",
+                                 parent=self)
+            return
+
+        def on_conflict(existing, incoming):
+            answer = messagebox.askyesnocancel(
+                "Tool already in library",
+                f"\"{incoming.name}\" is already in the library as \"{existing.name}\".\n\n"
+                "Yes: replace it\nNo: keep both\nCancel: skip this tool", parent=self)
+            if answer is None:
+                return "skip"
+            return "replace" if answer else "keep_both"
+
+        n = self.library.merge(other, on_conflict)
+        self._tool = None
+        self._refresh_tool_tree()
+        self._refresh_material_list()
+        messagebox.showinfo("Import", f"{n} tool(s) imported.", parent=self)
+
+    def _export(self):
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export Tool Library", defaultextension=".json",
+            filetypes=[("Tool library", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.library.save(path)
+        except OSError as exc:
+            messagebox.showerror("Export error", f"Could not write tool library:\n{exc}",
+                                 parent=self)
+
+    def _confirm(self):
+        for t in self.library.tools:
+            if not t.name.strip():
+                messagebox.showerror("Missing name", "Every tool needs a name.", parent=self)
+                self._tool_tree.selection_set(t.id)
+                return
+        self.confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
+class ApplyMaterialDialog(tk.Toplevel):
+    """Modal dialog asking which linked steps should receive the cutting
+    data for a newly chosen material.
+
+    *rows* is a list of ``(label, enabled)`` pairs, one per step; disabled
+    rows (e.g. the tool has no data for the material) are shown unchecked.
+    After ``wait_window`` returns, ``self.selected_indices`` is the list of
+    checked row indices, or None if cancelled.
+    """
+
+    def __init__(self, parent, material_name, rows):
+        super().__init__(parent)
+        self.title("Apply Cutting Data")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+        self.selected_indices = None
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(outer, text=f"Apply cutting data for {material_name} "
+                              f"to these steps that use library tools?",
+                  wraplength=380).pack(anchor=tk.W, pady=(0, 8))
+        self._vars = []
+        for label, enabled in rows:
+            var = tk.BooleanVar(value=enabled)
+            self._vars.append(var)
+            ttk.Checkbutton(outer, text=label, variable=var,
+                            state=tk.NORMAL if enabled else tk.DISABLED).pack(anchor=tk.W, pady=1)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(btn_row, text="Apply", command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Don't apply", command=self._cancel).pack(side=tk.RIGHT)
+
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+        self.wait_window()
+
+    def _confirm(self):
+        self.selected_indices = [i for i, v in enumerate(self._vars) if v.get()]
         self.grab_release()
         self.destroy()
 

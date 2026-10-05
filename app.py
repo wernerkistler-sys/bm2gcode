@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import json
 import os
 import matplotlib.colors as mcolors
@@ -40,7 +40,8 @@ from constants import (
 )
 from widgets import (ProgressDialog, LabeledEntry,
                      SettingsDialog, DressUpDialog, ExportToolpathDialog,
-                     ImportSTLDialog, _fmt_time)
+                     ImportSTLDialog, ToolLibraryDialog, ApplyMaterialDialog,
+                     _fmt_time)
 from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_contour_toolpath, compute_vcarve_mask,
                         resolve_vcarve_threshold_norm, compute_raster_gate_mask,
@@ -51,10 +52,37 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_registration_holes_toolpath, registration_hole_centers,
                         registration_flip_axis, registration_auto_spacing)
 from tool import Tool
+from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state,
+                          update_cutting_from_step, tool_from_step, format_value,
+                          STEPDOWN_FIELDS, SYNC_GEOMETRY_DIFFERS, SYNC_MODIFIED,
+                          SYNC_MISSING, SYNC_NO_DATA)
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
 import stl_mesh
 
+# Tool profiles each algorithm accepts (see _refresh_layout, which forces the
+# step's profile into this list, and the step's Library combobox, which only
+# offers library tools with one of these profiles).
+_VCARVE_PROFILES  = ["V-Bit", "Ball"]
+_RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
+_CUTOUT_PROFILES  = ["End Mill"]
+
+
+def _allowed_profiles(algorithm):
+    family = ALGORITHM_FAMILY[algorithm]
+    if family == "V-Carving":
+        return _VCARVE_PROFILES
+    if family in ("Cutout", "Registration Holes"):
+        return _CUTOUT_PROFILES
+    return _RASTER_PROFILES
+
+
+# Status text shown next to a linked step's Library combobox.
+_SYNC_STATUS_TEXT = {
+    SYNC_GEOMETRY_DIFFERS: "● geometry differs",
+    SYNC_MODIFIED:         "● modified",
+    SYNC_MISSING:          "● not in library",
+}
 
 
 class GCodeGeneratorApp:
@@ -69,9 +97,17 @@ class GCodeGeneratorApp:
             'z_safe':      float(DEFAULTS['z_safe']),
             'feed_rapid':  float(DEFAULTS['feed_rapid']),
             'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
+            'spindle_dwell_s': float(DEFAULTS['spindle_dwell_s']),
             'preamble':    DEFAULTS['preamble'],
             'postamble':   DEFAULTS['postamble'],
         }
+
+        # User-wide tool library (outside any project) and the project's
+        # material, which picks each linked step's cutting data.
+        self._tool_library_path = ToolLibrary.default_path()
+        self.tool_library, library_warning = ToolLibrary.load_or_seed(
+            self._tool_library_path)
+        self._material_id, self._material_name = self._default_material()
 
         self.current_image   = None   # 2-D float32 [0,1] grayscale array -- cached
                                        # composite of self.layers, see _recompute_composite()
@@ -109,6 +145,9 @@ class GCodeGeneratorApp:
         # changes even if the user never opens or saves a project file.
         self._saved_snapshot = self._snapshot_key()
         self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
+        if library_warning:
+            self.root.after(200, lambda: messagebox.showwarning(
+                "Tool Library", library_warning))
 
     # ------------------------------------------------------------------ #
     #  Menu
@@ -163,6 +202,11 @@ class GCodeGeneratorApp:
             label="Recompute Canvas Resolution",
             command=self._recompute_auto_resolution)
         menubar.add_cascade(label="Compute", menu=compute_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Tool Library…", accelerator="Ctrl+T",
+                               command=self._open_tool_library)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
 
         self._view_menu = tk.Menu(menubar, tearoff=0)
 
@@ -220,6 +264,7 @@ class GCodeGeneratorApp:
         self.root.bind("<Control-s>", lambda e: self._save_project())
         self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self._on_exit())
+        self.root.bind("<Control-t>", lambda e: self._open_tool_library())
         self.root.bind("<F5>", lambda _: self._compute_step(
             self.steps[self._steps_nb.index("current")]))
         self.root.bind("<F6>", lambda _: self._compute_all_steps())
@@ -400,6 +445,17 @@ class GCodeGeneratorApp:
         self.max_depth = LabeledEntry(tab, "Max cut depth", "mm", DEFAULTS["max_depth"],
                                       minval=0.01, maxval=200.0, increment=1.0)
         self.max_depth.pack(fill=tk.X, pady=2)
+
+        material_row = ttk.Frame(tab)
+        material_row.pack(fill=tk.X, pady=2)
+        ttk.Label(material_row, text="Material").pack(side=tk.LEFT)
+        self.material_var = tk.StringVar()
+        self._material_cb = ttk.Combobox(material_row, textvariable=self.material_var,
+                                         state="readonly", width=22)
+        self._material_cb.pack(side=tk.RIGHT)
+        self._material_cb.bind("<<ComboboxSelected>>", self._on_material_selected)
+        self._refresh_material_combo()
+
         self.margin_mm = LabeledEntry(tab, "Stock margin", "mm", DEFAULTS["margin_mm"],
                                       minval=0.0, maxval=5000.0, increment=1.0)
         self.margin_mm.pack(fill=tk.X, pady=2)
@@ -996,7 +1052,8 @@ class GCodeGeneratorApp:
                     'extra_offset',
                     'vbit_angle', 'vcarve_stepdown', 'vcarve_final_stepdown',
                     'cutout_depth', 'cutout_stepdown', 'cutout_final_stepdown', 'cutout_extra_offset',
-                    'contour_z_increment', 'contour_lateral_tol', 'feed_rate', 'threshold',
+                    'contour_z_increment', 'contour_lateral_tol', 'feed_rate',
+                    'plunge_rate', 'spindle_rpm', 'threshold',
                     'min_fw', 'max_fw', 'pocket_boundary_offset',
                     'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing'):
             # Auto first, like _apply_step_dict: an Auto sync fired by the
@@ -1005,6 +1062,9 @@ class GCodeGeneratorApp:
                 dst[key].auto_var.set(src[key].auto_var.get())
             dst[key].set(src[key].get())
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
+        for key in ('library_material_id_var', 'library_tool_name_var',
+                    'library_tool_id_var'):
+            dst[key].set(src[key].get())
         dst['reghole_pattern_var'].set(src['reghole_pattern_var'].get())
         dst['reghole_diag_dir_var'].set(src['reghole_diag_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
@@ -1267,6 +1327,41 @@ class GCodeGeneratorApp:
         tool_lf.pack(fill=tk.X, pady=(0, 4))
         step['tool_lf'] = tool_lf
 
+        step['library_tool_id_var']     = tk.StringVar(value="")
+        step['library_tool_name_var']   = tk.StringVar(value="")
+        step['library_material_id_var'] = tk.StringVar(value="")
+        step['library_cb_ids'] = [""]   # tool id per combobox entry ("" = none)
+        library_row = ttk.Frame(tool_lf)
+        library_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(library_row, text="Library:").pack(side=tk.LEFT)
+        library_menu_btn = ttk.Menubutton(library_row, text="⋯", width=2)
+        library_menu_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        library_menu = tk.Menu(library_menu_btn, tearoff=0)
+        library_menu.add_command(label="Re-apply from library",
+                                 command=lambda: self._reapply_library_tool(step))
+        library_menu.add_command(label="Update library tool from this step…",
+                                 command=lambda: self._update_library_tool_from_step(step))
+        library_menu.add_command(label="Save as new library tool…",
+                                 command=lambda: self._save_step_as_library_tool(step))
+        library_menu.add_command(label="Unlink",
+                                 command=lambda: self._unlink_library_tool(step))
+        library_menu.add_separator()
+        library_menu.add_command(
+            label="Open Tool Library…",
+            command=lambda: self._open_tool_library(
+                step['library_tool_id_var'].get() or None))
+        library_menu_btn['menu'] = library_menu
+        step['library_display_var'] = tk.StringVar(value="(none)")
+        library_cb = ttk.Combobox(library_row, textvariable=step['library_display_var'],
+                                  state="readonly", width=22)
+        library_cb.pack(side=tk.RIGHT)
+        library_cb.bind("<<ComboboxSelected>>",
+                        lambda _e: self._on_library_tool_chosen(step))
+        step['library_cb'] = library_cb
+        step['tool_status_var'] = tk.StringVar(value="")
+        ttk.Label(tool_lf, textvariable=step['tool_status_var'],
+                  foreground="#c07000").pack(anchor=tk.E)
+
         profile_row = ttk.Frame(tool_lf)
         profile_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(profile_row, text="Profile:").pack(side=tk.LEFT)
@@ -1369,11 +1464,17 @@ class GCodeGeneratorApp:
         feed.pack(fill=tk.X, pady=2)
         step['feed_rate'] = feed
 
-        # ── Wire up algorithm / profile toggle ────────────────────────
-        _VCARVE_PROFILES  = ["V-Bit", "Ball"]
-        _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
-        _CUTOUT_PROFILES  = ["End Mill"]
+        plunge = LabeledEntry(tool_lf, "Plunge rate", "mm/min", DEFAULTS["step_plunge_rate"],
+                              minval=0.0, maxval=30000.0, increment=50.0)
+        plunge.pack(fill=tk.X, pady=2)
+        step['plunge_rate'] = plunge
 
+        rpm = LabeledEntry(tool_lf, "Spindle speed", "RPM", DEFAULTS["step_spindle_rpm"],
+                           minval=0.0, maxval=100000.0, increment=1000.0)
+        rpm.pack(fill=tk.X, pady=2)
+        step['spindle_rpm'] = rpm
+
+        # ── Wire up algorithm / profile toggle ────────────────────────
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
@@ -1649,6 +1750,17 @@ class GCodeGeneratorApp:
         cutout_extra_offset.committed_var.trace_add("write", _on_mask_param_changed)
         pocket_boundary_offset.committed_var.trace_add("write", _on_mask_param_changed)
 
+        def _on_tool_value_changed(*_):
+            self._refresh_library_link(step)
+
+        for key in ('diameter', 'vbit_angle', 'feed_rate', 'plunge_rate',
+                    'spindle_rpm') + STEPDOWN_FIELDS:
+            step[key].committed_var.trace_add("write", _on_tool_value_changed)
+        for var in (step['profile_var'], algorithm_var,
+                    step['library_tool_id_var'], step['library_tool_name_var']):
+            var.trace_add("write", _on_tool_value_changed)
+        self._refresh_library_link(step)
+
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
         step['algorithm_var'].set(DEFAULTS["step_algorithm"])
@@ -1660,6 +1772,9 @@ class GCodeGeneratorApp:
         step['stepdown'].set(DEFAULTS["step_stepdown"])
         step['extra_offset'].set(DEFAULTS["step_extra_offset"])
         step['feed_rate'].set(DEFAULTS["step_feed_rate"])
+        step['plunge_rate'].set(DEFAULTS["step_plunge_rate"])
+        step['spindle_rpm'].set(DEFAULTS["step_spindle_rpm"])
+        self._set_library_link(step, "", "", "")
         step['threshold'].auto_var.set(False)
         step['threshold'].set(DEFAULTS["step_threshold"])
         step['raster_dir_var'].set(DEFAULTS["step_raster_dir"])
@@ -2331,21 +2446,40 @@ class GCodeGeneratorApp:
         for idx, (step, tp) in enumerate(zip(self.steps, self.toolpaths)):
             if tp is None:
                 continue
-            feed_rate = tp.metadata.get('feed_rate', 800.0)
-            stats = tp.get_stats(
-                feed_rate   = feed_rate,
-                feed_rapid  = self._settings['feed_rapid'],
-                z_safe      = self._settings['z_safe'],
-                accel_mm_s2 = self._settings['accel_mm_s2'],
-                ramp        = self._ramp_settings(step),
-                backoff     = self._backoff_settings(step),
-                arc         = self._arc_settings(step),
-            )
-            step['info_var'].set(
-                f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-                f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                f" @ {feed_rate:.0f} mm/min")
+            self._show_step_stats(idx, step, tp)
         self._on_display_mode_changed()
+
+    @staticmethod
+    def _store_cutting_metadata(tp, params):
+        """Record the step's feeds, spindle speed and library tool on its
+        computed toolpath, so stats and export use the values it was
+        computed with."""
+        tp.metadata['feed_rate']   = params['feed_rate']
+        tp.metadata['plunge_rate'] = params['plunge_rate']
+        tp.metadata['spindle_rpm'] = params['spindle_rpm']
+        tp.metadata['library_tool_id']   = params['library_tool_id']
+        tp.metadata['library_tool_name'] = params['library_tool_name']
+
+    def _show_step_stats(self, idx, step, tp):
+        """Set a computed step's info line (motion count / est. time),
+        using its own dress-up settings and the feeds stored on *tp*."""
+        feed_rate = tp.metadata.get('feed_rate', 800.0)
+        stats = tp.get_stats(
+            feed_rate       = feed_rate,
+            feed_rapid      = self._settings['feed_rapid'],
+            z_safe          = self._settings['z_safe'],
+            accel_mm_s2     = self._settings['accel_mm_s2'],
+            ramp            = self._ramp_settings(step),
+            backoff         = self._backoff_settings(step),
+            arc             = self._arc_settings(step),
+            plunge_rate     = tp.metadata.get('plunge_rate', 0.0),
+            spindle_rpm     = tp.metadata.get('spindle_rpm', 0.0),
+            spindle_dwell_s = self._settings['spindle_dwell_s'],
+        )
+        step['info_var'].set(
+            f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+            f"Est. time: {_fmt_time(stats['est_minutes'])}"
+            f" @ {feed_rate:.0f} mm/min")
 
     def _ramp_settings(self, step):
         return RampSettings(enabled=step['ramp_in_enabled_var'].get(),
@@ -2369,6 +2503,237 @@ class GCodeGeneratorApp:
             height_mm=step['tab_height_mm_var'].get(),
             phase_pct=step['tab_phase_pct_var'].get(),
             tab_angle_deg=step['tab_angle_deg_var'].get())
+
+    # ------------------------------------------------------------------ #
+    #  Tool library
+    # ------------------------------------------------------------------ #
+    def _default_material(self):
+        """(id, name) of the library's first material, or (None, "")."""
+        if self.tool_library.materials:
+            m = self.tool_library.materials[0]
+            return m.id, m.name
+        return None, ""
+
+    def _material_display_name(self):
+        if self._material_id is None:
+            return "(none)"
+        m = self.tool_library.find_material(self._material_id)
+        if m is not None:
+            return m.name
+        return f"{self._material_name or self._material_id} (not in library)"
+
+    def _refresh_material_combo(self):
+        m = self.tool_library.find_material(self._material_id)
+        if m is not None:
+            self._material_name = m.name
+        self._material_cb.config(values=[m.name for m in self.tool_library.materials])
+        self.material_var.set(self._material_display_name())
+
+    def _set_project_material(self, material_id, material_name):
+        """Set the project material without offering to re-apply cutting
+        data (used by New/Open Project)."""
+        self._material_id   = material_id
+        self._material_name = material_name
+        self._refresh_material_combo()
+        self._refresh_all_library_links()
+
+    def _on_material_selected(self, _event=None):
+        name = self.material_var.get()
+        material = next((m for m in self.tool_library.materials if m.name == name), None)
+        if material is None or material.id == self._material_id:
+            self._refresh_material_combo()
+            return
+        self._set_project_material(material.id, material.name)
+
+        linked = []
+        for i, step in enumerate(self.steps):
+            tool_id = step['library_tool_id_var'].get()
+            if not tool_id:
+                continue
+            tool = self.tool_library.find_tool(tool_id)
+            if tool is None:
+                continue
+            has_data = material.id in tool.cutting
+            label = f"Step {i + 1} — {tool.name}"
+            if not has_data:
+                label += f"  (no data for {material.name})"
+            linked.append((step, tool, label, has_data))
+        if not linked:
+            return
+        dlg = ApplyMaterialDialog(self.root, material.name,
+                                  [(label, has_data) for _, _, label, has_data in linked])
+        for i in dlg.selected_indices or []:
+            step, tool, _, has_data = linked[i]
+            if has_data:
+                self._apply_library_tool(step, tool)
+
+    def _save_tool_library(self):
+        try:
+            self.tool_library.save(self._tool_library_path)
+        except OSError as exc:
+            messagebox.showerror("Tool Library",
+                                 f"Could not save the tool library:\n{exc}")
+
+    def _open_tool_library(self, select_tool_id=None):
+        dlg = ToolLibraryDialog(self.root, self.tool_library, select_tool_id)
+        if not dlg.confirmed:
+            return
+        self.tool_library = dlg.library
+        self._save_tool_library()
+        self._refresh_material_combo()
+        self._refresh_all_library_links()
+
+    def _step_tool_values(self, step):
+        """The step's current values for every field the library maps to."""
+        values = {'profile': step['profile_var'].get()}
+        for key in ('diameter', 'vbit_angle', 'feed_rate', 'plunge_rate',
+                    'spindle_rpm') + STEPDOWN_FIELDS:
+            values[key] = step[key].get()
+        return values
+
+    def _set_library_link(self, step, tool_id, tool_name, material_id):
+        step['library_material_id_var'].set(material_id or "")
+        step['library_tool_name_var'].set(tool_name or "")
+        step['library_tool_id_var'].set(tool_id or "")
+
+    def _refresh_all_library_links(self):
+        for step in self.steps:
+            self._refresh_library_link(step)
+
+    def _refresh_library_link(self, step):
+        """Refresh a step's Library combobox (tools the current algorithm
+        accepts, plus the linked tool if it isn't one of them) and its
+        sync status against the library and the project material."""
+        if 'library_cb' not in step:
+            return
+        algorithm = step['algorithm_var'].get()
+        tool_id   = step['library_tool_id_var'].get()
+        tool      = self.tool_library.find_tool(tool_id) if tool_id else None
+
+        candidates = self.tool_library.tools_for_profiles(_allowed_profiles(algorithm))
+        ids    = [""] + [t.id for t in candidates]
+        labels = ["(none)"] + [t.name for t in candidates]
+        if tool_id and tool_id not in ids:
+            ids.append(tool_id)
+            labels.append(tool.name if tool is not None else
+                          f"{step['library_tool_name_var'].get() or tool_id} (not in library)")
+        step['library_cb_ids'] = ids
+        step['library_cb'].config(values=labels)
+        step['library_display_var'].set(labels[ids.index(tool_id)] if tool_id else "(none)")
+
+        if not tool_id:
+            step['tool_status_var'].set("")
+            return
+        cutting = cutting_for(tool, self._material_id)
+        state = sync_state(self._step_tool_values(step), tool, cutting,
+                           ALGORITHM_FAMILY[algorithm])
+        if state == SYNC_NO_DATA:
+            text = f"● no data for {self._material_name or 'this material'}"
+        else:
+            text = _SYNC_STATUS_TEXT.get(state, "")
+        step['tool_status_var'].set(text)
+
+    def _on_library_tool_chosen(self, step):
+        idx = step['library_cb'].current()
+        if idx < 0:
+            return
+        tool_id = step['library_cb_ids'][idx]
+        if not tool_id:
+            self._unlink_library_tool(step)
+            return
+        tool = self.tool_library.find_tool(tool_id)
+        if tool is None:
+            self._refresh_library_link(step)
+            return
+        self._apply_library_tool(step, tool)
+
+    def _apply_library_tool(self, step, tool):
+        """Copy *tool*'s geometry and its cutting data for the project
+        material into the step, and link the step to it."""
+        cutting = cutting_for(tool, self._material_id)
+        values = step_values_from(tool, cutting)
+        # Profile first: its traces (_refresh_layout, Auto max feature
+        # width) must see the new profile before the dependent fields land.
+        step['profile_var'].set(values.pop('profile'))
+        for key, value in values.items():
+            step[key].set(value)
+        self._set_library_link(step, tool.id, tool.name,
+                               self._material_id if cutting is not None else "")
+        self._refresh_library_link(step)
+
+    def _linked_tool_or_warn(self, step):
+        tool_id = step['library_tool_id_var'].get()
+        if not tool_id:
+            messagebox.showinfo("Tool Library", "This step is not linked to a library tool.")
+            return None
+        tool = self.tool_library.find_tool(tool_id)
+        if tool is None:
+            messagebox.showwarning(
+                "Tool Library",
+                f"\"{step['library_tool_name_var'].get()}\" is not in the tool library.")
+        return tool
+
+    def _reapply_library_tool(self, step):
+        tool = self._linked_tool_or_warn(step)
+        if tool is not None:
+            self._apply_library_tool(step, tool)
+
+    def _update_library_tool_from_step(self, step):
+        tool = self._linked_tool_or_warn(step)
+        if tool is None:
+            return
+        if self._material_id is None or self.tool_library.find_material(self._material_id) is None:
+            messagebox.showwarning("Tool Library",
+                                   "Choose a library material on the Canvas tab first.")
+            return
+        family = ALGORITHM_FAMILY[step['algorithm_var'].get()]
+        values = self._step_tool_values(step)
+        message = (f"Update the cutting data of \"{tool.name}\" for "
+                   f"{self._material_name} from this step?")
+        if sync_state(values, tool, None, family) == SYNC_GEOMETRY_DIFFERS:
+            message += ("\n\nThis step's profile, diameter or V angle differs from the "
+                        "library tool. Only the cutting data is updated; the tool's "
+                        "geometry is left unchanged. Use \"Save as new library tool…\" "
+                        "to keep this step's geometry.")
+        if not messagebox.askyesno("Update library tool", message):
+            return
+        try:
+            updated = update_cutting_from_step(tool, self._material_id, values, family)
+        except ValueError:
+            messagebox.showerror("Tool Library", "The step's cutting values must be numbers.")
+            return
+        self.tool_library.tools[self.tool_library.tools.index(tool)] = updated
+        self._save_tool_library()
+        step['library_material_id_var'].set(self._material_id)
+        self._refresh_all_library_links()
+
+    def _save_step_as_library_tool(self, step):
+        values = self._step_tool_values(step)
+        try:
+            default_name = f"{format_value(float(values['diameter']))} mm {values['profile']}"
+        except ValueError:
+            default_name = values['profile']
+        name = simpledialog.askstring("Save as new library tool", "Tool name:",
+                                      initialvalue=default_name, parent=self.root)
+        if name is None or not name.strip():
+            return
+        material_id = (self._material_id
+                       if self.tool_library.find_material(self._material_id) is not None
+                       else None)
+        family = ALGORITHM_FAMILY[step['algorithm_var'].get()]
+        try:
+            tool = tool_from_step(name.strip(), values, material_id, family)
+        except ValueError:
+            messagebox.showerror("Tool Library", "The step's tool values must be numbers.")
+            return
+        self.tool_library.tools.append(tool)
+        self._save_tool_library()
+        self._set_library_link(step, tool.id, tool.name, material_id or "")
+        self._refresh_all_library_links()
+
+    def _unlink_library_tool(self, step):
+        self._set_library_link(step, "", "", "")
+        self._refresh_library_link(step)
 
     # ------------------------------------------------------------------ #
     #  Project save / load
@@ -2406,6 +2771,11 @@ class GCodeGeneratorApp:
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'avoid_air':            step['avoid_air_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
+            'plunge_rate':          step['plunge_rate'].get(),
+            'spindle_rpm':          step['spindle_rpm'].get(),
+            'library_tool_id':      step['library_tool_id_var'].get(),
+            'library_tool_name':    step['library_tool_name_var'].get(),
+            'library_material_id':  step['library_material_id_var'].get(),
             'threshold':            step['threshold'].get(),
             'threshold_auto':       bool(step['threshold'].auto_var.get()),
             'min_fw':               step['min_fw'].get(),
@@ -2467,6 +2837,11 @@ class GCodeGeneratorApp:
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['avoid_air_var'].set(bool(d.get('avoid_air', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
+        step['plunge_rate'].set(d.get('plunge_rate', DEFAULTS['step_plunge_rate']))
+        step['spindle_rpm'].set(d.get('spindle_rpm', DEFAULTS['step_spindle_rpm']))
+        self._set_library_link(step, d.get('library_tool_id', ""),
+                               d.get('library_tool_name', ""),
+                               d.get('library_material_id', ""))
         step['threshold'].auto_var.set(bool(d.get('threshold_auto', False)))
         step['threshold'].set(d.get('threshold', DEFAULTS['step_threshold']))
         step['min_fw'].set(d.get('min_fw', DEFAULTS['step_min_fw']))
@@ -2629,11 +3004,14 @@ class GCodeGeneratorApp:
                 'surface':         self.surface.get(),
                 'origin':          self.origin_var.get(),
                 'aspect_locked':   self._aspect_lock_var.get(),
+                'material_id':     self._material_id,
+                'material_name':   self._material_name,
             },
             'machine': {
                 'z_safe':      self._settings['z_safe'],
                 'feed_rapid':  self._settings['feed_rapid'],
                 'accel_mm_s2': self._settings['accel_mm_s2'],
+                'spindle_dwell_s': self._settings['spindle_dwell_s'],
                 'preamble':    self._settings['preamble'],
                 'postamble':   self._settings['postamble'],
             },
@@ -2683,10 +3061,12 @@ class GCodeGeneratorApp:
         self.background_depth_pct.set(DEFAULTS['canvas_background_depth_pct'])
         self.surface.set(DEFAULTS['surface'])
         self.origin_var.set(DEFAULTS['origin'])
+        self._set_project_material(*self._default_material())
 
         self._settings['z_safe']      = float(DEFAULTS['z_safe'])
         self._settings['feed_rapid']  = float(DEFAULTS['feed_rapid'])
         self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
+        self._settings['spindle_dwell_s'] = float(DEFAULTS['spindle_dwell_s'])
         self._settings['preamble']    = DEFAULTS['preamble']
         self._settings['postamble']   = DEFAULTS['postamble']
 
@@ -2739,7 +3119,7 @@ class GCodeGeneratorApp:
             d['path_rel'] = self._make_rel_path(layer.path, path)
             layers_out.append(d)
         project = {
-            'version': 4,
+            'version': 5,
             'layers': layers_out,
             'canvas': snapshot['canvas'],
             'global': snapshot['global'],
@@ -2771,7 +3151,7 @@ class GCodeGeneratorApp:
             return
 
         version = project.get('version', 1)
-        if version not in (1, 2, 3, 4):
+        if version not in (1, 2, 3, 4, 5):
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
@@ -2815,12 +3195,18 @@ class GCodeGeneratorApp:
         self.margin_depth_pct.set(g.get('margin_depth_pct', DEFAULTS['margin_depth_pct']))
         self.surface.set(g.get('surface', DEFAULTS['surface']))
         self.origin_var.set(g.get('origin', DEFAULTS['origin']))
+        if g.get('material_id'):
+            self._set_project_material(g['material_id'], g.get('material_name', ""))
+        else:
+            self._set_project_material(*self._default_material())
 
         # ── Machine settings ──────────────────────────────────────────
         m = project.get('machine', {})
         self._settings['z_safe']      = m.get('z_safe',      self._settings['z_safe'])
         self._settings['feed_rapid']  = m.get('feed_rapid',  self._settings['feed_rapid'])
         self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
+        self._settings['spindle_dwell_s'] = m.get('spindle_dwell_s',
+                                                  float(DEFAULTS['spindle_dwell_s']))
         self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
         self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
 
@@ -2852,7 +3238,7 @@ class GCodeGeneratorApp:
             self._apply_step_dict(step, d)
 
         # ── Layers (version 2+) ───────────────────────────────────────────
-        if version in (2, 3, 4) and 'layers' in project:
+        if version >= 2 and 'layers' in project:
             layer_dicts = project.get('layers') or []
             resolved_layers = []
             failed = []
@@ -3039,6 +3425,8 @@ class GCodeGeneratorApp:
         idx       = self.steps.index(step)
         algorithm = step['algorithm_var'].get()
         feed_rate    = float(step['feed_rate'].get())
+        plunge_rate  = float(step['plunge_rate'].get())
+        spindle_rpm  = float(step['spindle_rpm'].get())
         width_mm      = float(self.width_mm.get())
         height_mm     = float(self.height_mm.get())
         margin_mm     = float(self.margin_mm.get())
@@ -3061,6 +3449,10 @@ class GCodeGeneratorApp:
             'idx':           idx,
             'algorithm':     algorithm,
             'feed_rate':     feed_rate,
+            'plunge_rate':   plunge_rate,
+            'spindle_rpm':   spindle_rpm,
+            'library_tool_id':   step['library_tool_id_var'].get(),
+            'library_tool_name': step['library_tool_name_var'].get(),
             'threshold_mm':  threshold_mm,
             'eff_width_mm':  eff_width_mm,
             'eff_height_mm': eff_height_mm,
@@ -3580,7 +3972,6 @@ class GCodeGeneratorApp:
                         f"full depth map.\n\nContinue anyway?"):
                     return
 
-        feed_rate = params['feed_rate']
         dlg = ProgressDialog(self.root,
                              title=f"Computing Step {idx + 1} Tool Path")
 
@@ -3599,21 +3990,9 @@ class GCodeGeneratorApp:
 
             def _done():
                 self.toolpaths[idx] = result
-                result.metadata['feed_rate'] = feed_rate
-                stats = result.get_stats(
-                    feed_rate   = feed_rate,
-                    feed_rapid  = self._settings['feed_rapid'],
-                    z_safe      = self._settings['z_safe'],
-                    accel_mm_s2 = self._settings['accel_mm_s2'],
-                    ramp        = self._ramp_settings(step),
-                    backoff     = self._backoff_settings(step),
-                    arc         = self._arc_settings(step),
-                )
+                self._store_cutting_metadata(result, params)
                 dlg.close("Completed.")
-                step['info_var'].set(
-                    f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-                    f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                    f" @ {feed_rate:.0f} mm/min")
+                self._show_step_stats(idx, step, result)
                 self.display_step_var.set(idx + 1)
                 if not self.show_cut_moves_var.get():
                     self.show_cut_moves_var.set(True)
@@ -3675,24 +4054,11 @@ class GCodeGeneratorApp:
                     return
 
                 # Store immediately so the next step's prev_tp is up to date.
-                self.toolpaths[idx]          = result
-                result.metadata['feed_rate'] = params['feed_rate']
+                self.toolpaths[idx] = result
+                self._store_cutting_metadata(result, params)
 
-                feed_rate = params['feed_rate']
-                def _update_ui(idx=idx, s=step, r=result, fr=feed_rate):
-                    stats = r.get_stats(
-                        feed_rate   = fr,
-                        feed_rapid  = self._settings['feed_rapid'],
-                        z_safe      = self._settings['z_safe'],
-                        accel_mm_s2 = self._settings['accel_mm_s2'],
-                        ramp        = self._ramp_settings(s),
-                        backoff     = self._backoff_settings(s),
-                        arc         = self._arc_settings(s),
-                    )
-                    s['info_var'].set(
-                        f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-                        f"Est. time: {_fmt_time(stats['est_minutes'])}"
-                        f" @ {fr:.0f} mm/min")
+                def _update_ui(idx=idx, s=step, r=result):
+                    self._show_step_stats(idx, s, r)
                 self.root.after(0, _update_ui)
 
             def _all_done():
@@ -3714,11 +4080,17 @@ class GCodeGeneratorApp:
             profile = (tp.metadata.get('profile', step['profile_var'].get())
                        if tp else step['profile_var'].get())
             diam_mm = tp.metadata.get('radius_mm', 0) * 2 if tp else 0.0
+            tool_id   = tp.metadata.get('library_tool_id', "") if tp else ""
+            tool_name = tp.metadata.get('library_tool_name', "") if tp else ""
+            label = f"Step {i + 1} — {profile} ∅{diam_mm:.4g} mm"
+            if tool_id:
+                label += f" ({tool_name})"
             info.append({
-                'label':       f"Step {i + 1} — {profile} ∅{diam_mm:.4g} mm",
+                'label':       label,
                 'computed':    tp is not None,
                 'profile':     profile,
                 'diameter_mm': diam_mm,
+                'tool_id':     tool_id,
             })
         return info
 
@@ -3738,10 +4110,17 @@ class GCodeGeneratorApp:
                        or DEFAULT_POSTAMBLE.format(z_safe=z_safe))
 
         # Warn if the selected steps use different tools — tool changes are not
-        # supported in a single G-code file.
-        tools = {(steps_info[i]['profile'], steps_info[i]['diameter_mm'])
-                 for i in indices}
-        if len(tools) > 1:
+        # supported in a single G-code file. Two linked steps are the same
+        # tool exactly when their library ids match; otherwise profile and
+        # diameter decide.
+        def _same_tool(a, b):
+            if a['tool_id'] and b['tool_id']:
+                return a['tool_id'] == b['tool_id']
+            return (a['profile'], a['diameter_mm']) == (b['profile'], b['diameter_mm'])
+
+        selected = [steps_info[i] for i in indices]
+        if any(not _same_tool(a, b)
+               for i, a in enumerate(selected) for b in selected[i + 1:]):
             proceed = messagebox.askokcancel(
                 "Tool change not supported",
                 "The selected steps use different tools. A single G-code file "
@@ -3761,14 +4140,24 @@ class GCodeGeneratorApp:
 
         try:
             bodies = []
+            # S word + spin-up dwell only where the speed actually changes:
+            # consecutive steps at the same RPM don't wait again.
+            last_rpm = None
             for idx in indices:
                 tp   = self.toolpaths[idx]
                 step = self.steps[idx]
                 feed_rate = tp.metadata.get('feed_rate', 800.0)
+                rpm = tp.metadata.get('spindle_rpm', 0.0)
+                emit_rpm = rpm if (rpm > 0 and rpm != last_rpm) else 0.0
+                if rpm > 0:
+                    last_rpm = rpm
                 bodies.append(tp.to_gcode(feed_rate, feed_rapid, z_safe, accel_mm_s2,
                                            ramp=self._ramp_settings(step),
                                            backoff=self._backoff_settings(step),
-                                           arc=self._arc_settings(step)))
+                                           arc=self._arc_settings(step),
+                                           plunge_rate=tp.metadata.get('plunge_rate', 0.0),
+                                           spindle_rpm=emit_rpm,
+                                           spindle_dwell_s=self._settings['spindle_dwell_s']))
 
             gcode = preamble + "\n\n" + "\n\n".join(bodies) + "\n\n" + postamble
             with open(path, "w", encoding="utf-8") as f:

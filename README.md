@@ -52,6 +52,7 @@ The Canvas tab is the notebook's permanent first tab, above the source tabs. Its
 | Max Megapixels | Upper bound on the canvas's total pixel count (Width × Height at the chosen density), so a high-resolution image (or a small physical canvas) can't blow the working grid up indefinitely. Applies whether or not an image source is present — if Min. px/mm alone would already exceed it for the current Width/Height, you're asked to confirm before proceeding. |
 | Effective resolution | Read-only: the pixel grid size and density the canvas actually settled on, between the Min. px/mm floor and the Max Megapixels ceiling. Recomputed when a source is added, when Width/Height/Min. px/mm/Max Megapixels change, via **Compute → Recompute Canvas Resolution**, or automatically before each Compute Step — not continuously while dragging a source's Scale/Offset. |
 | Max cut depth | Maximum cut depth in mm. The pixel representing full depth (black when z=0 colour = "white", white when z=0 colour = "black") is carved to this depth. |
+| Material | The workpiece material, chosen from the [Tool Library](#tool-library)'s materials. It decides which cutting data a step linked to a library tool receives. Choosing a different material lists the linked steps and asks which of them should receive that material's cutting data; nothing changes without confirmation. Saved with the project. |
 | Stock margin | Flat uncarved border around the canvas, in mm. |
 | Margin depth | How deep to cut the stock margin, as a percentage of Max cut depth. |
 | Background depth | Depth, as a percentage of Max cut depth, given to any canvas pixel that no source covers. |
@@ -257,11 +258,14 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 
 | Parameter | Description |
 |---|---|
+| Library | The [Tool Library](#tool-library) tool this step uses, or (none). Lists only tools whose profile the step's algorithm accepts. Choosing a tool copies its profile, diameter, V-bit angle and — for the project's Material — feed rate, plunge rate, spindle speed and step-down into the step's fields, and links the step to the tool. The fields stay editable. A status next to the field shows when the step no longer matches the library: **● modified** (cutting data differs), **● geometry differs** (profile, diameter or V-bit angle differs — e.g. after switching to an algorithm that forces another profile), **● no data for *material*** (the tool has no cutting data for the project's Material; only the geometry was copied) or **● not in library** (the tool was deleted; the step keeps its values). The **⋯** button offers Re-apply from library, Update library tool from this step (writes the step's cutting data for the project's Material into the tool; never its geometry), Save as new library tool…, Unlink and Open Tool Library…. |
 | Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V). Cutout and Registration Holes restrict this to End Mill only. |
 | Diameter | Cutter diameter in mm. |
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
 | Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. Not shown for Cutout or Pocket, which each have their own separate Boundary offset field instead — see [Step / Operation / Cutout](#step--operation--cutout) and [Step / Operation / Pocket](#step--operation--pocket). |
 | Feed rate | Cutting feed rate in mm/min. |
+| Plunge rate | Feed rate in mm/min for vertical descents: plunges, and pecks inside a cut (e.g. Registration Holes' pecked holes). Ramps keep the cutting feed, since they move mostly sideways. 0 = use Feed rate. |
+| Spindle speed | Spindle speed in RPM. When > 0, the step's G-code starts with an `S` word followed by the spin-up dwell from [Settings](#file-menu); consecutive exported steps at the same speed don't repeat it. 0 = no `S` word (the preamble's speed applies). |
 
 **Step-down controls (Raster Scan and V-Carving):**
 
@@ -365,6 +369,8 @@ Adding an STL as an additional source (via a source tab's or the Canvas tab's **
 |---|---|
 | Safe height | Z height used for all rapid travel moves between cuts (mm). |
 | Rapid feed | Feed rate for rapid moves, used only for time estimates (mm/min). |
+| Max acceleration | Machine acceleration, used only for time estimates (mm/s²). |
+| Spindle spin-up dwell | Pause in seconds emitted as `G4 P…` after each step's `S` word, so the spindle reaches its new speed before cutting. 0 = no pause. `G4 P` is in seconds on GRBL and LinuxCNC; some controllers read it as milliseconds — check yours. |
 | G-code Preamble | G-code inserted before the cutting program (spindle start, dwell, etc.). |
 | G-code Postamble | G-code inserted after cutting (spindle stop, return to home, etc.). |
 
@@ -378,6 +384,26 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 |---|---|---|
 | Compute Current Step | F5 | Compute the toolpath for the currently active step tab. |
 | Compute All Steps | F6 | Compute all steps in sequence. Required when any step uses a gating mode that references a prior step's result. |
+
+---
+
+#### Tools Menu
+
+| Item | Shortcut | Description |
+|---|---|---|
+| Tool Library… | Ctrl+T | Open the [Tool Library](#tool-library) editor. |
+
+##### Tool Library
+
+The tool library is a list of cutting tools shared by all projects. It lives in one file outside any project: `%APPDATA%m2gcode	ool_library.json` on Windows, `~/.config/bm2gcode/tool_library.json` elsewhere. On first run it is created with a 6 mm end mill, a 3 mm ball nose and a 60° V-bit, with cutting data for Softwood, Hardwood and MDF. If the file can't be read, it is renamed to `tool_library.json.bak`, a warning is shown, and the starter library is used instead.
+
+Each tool has a name, tool number, profile, diameter, V-bit angle, flute length and notes, plus cutting data per material: feed rate, plunge rate, spindle speed and max step-down. Stepover isn't part of the library — it describes the finish a step wants, so it stays a step setting.
+
+The editor's **Tools** tab lists the tools (New, Duplicate, Delete), shows the selected tool's geometry with a side-view preview, and its cutting data per material: pick a material, enter the values and press **Set**; **Remove** deletes the selected material's row. The **Materials** tab adds, renames and deletes materials; deleting one that tools have cutting data for asks first and removes that data too. **Import…** merges another library file (tools already present by id can be replaced, kept alongside, or skipped); **Export…** writes the library to a file. **OK** saves the library; **Cancel** discards the changes.
+
+Projects stay self-contained: a step copies the library values into its own fields and only remembers which tool (and material) they came from, so a project opens with the same values on a machine whose library lacks that tool. Editing the library doesn't change any step by itself — linked steps show **● modified** until re-applied. Library edits don't mark the project as changed; linking, unlinking or re-applying does.
+
+Each library value is written to all three step-down fields (Raster Scan / Pocket / Contour / Registration Holes, V-Carving, Cutout), so switching the step's algorithm later doesn't leave a stale value; the status only compares the field the current algorithm uses.
 
 ---
 
@@ -630,7 +656,7 @@ Iterates over the ordered segments. Consecutive segments whose endpoints touch a
 
 The fourth per-step dress-up, **Tabs**, isn't part of this stage at all — it modifies the cut geometry itself, earlier in the Cutout pipeline (see [Cutout Pipeline](#cutout-pipeline)), so by the time G-code generation runs, a tab is already just an ordinary Z change baked into the segments like any other.
 
-The preamble and postamble are injected verbatim. A comment header records tool profile, work area dimensions, estimated run time, cut distance, and rapid distance.
+The preamble and postamble are injected verbatim. A comment header records tool profile, work area dimensions, estimated run time, cut distance, and rapid distance. Vertical descents (plunges, and same-XY descending moves inside a cut) use the step's Plunge rate when it is > 0. When a step's Spindle speed is > 0 and differs from the last speed emitted in the file, its body starts with `S<rpm>` and, if the spin-up dwell is > 0, `G4 P<seconds>`; the run-time estimate includes both the plunge rate and the dwell.
 
 ---
 

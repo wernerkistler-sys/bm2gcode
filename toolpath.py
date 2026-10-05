@@ -27,6 +27,13 @@ def _ramp_plan(points, z_from, ramp):
     return split_z, [points[0]]
 
 
+def _is_vertical_descent(p0, p1):
+    """True for a move that only goes down in Z (no XY travel) -- a plunge
+    or a peck, fed at the plunge rate."""
+    return (abs(p1[0] - p0[0]) < 1e-6 and abs(p1[1] - p0[1]) < 1e-6
+            and p1[2] < p0[2] - 1e-9)
+
+
 def _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts):
     """Yield the ('plunge', ...) / ('ramp', ...) move(s) for a descent from
     z_from to z0 at fixed XY, per the plan from _ramp_plan(): a plain
@@ -228,7 +235,8 @@ class ToolPath:
             yield ('rapid_retract', [base, (base[0], base[1], z_safe)])
 
     def get_stats(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
-                  accel_mm_s2=300.0, ramp=None, backoff=None, arc=None):
+                  accel_mm_s2=300.0, ramp=None, backoff=None, arc=None,
+                  plunge_rate=0.0, spindle_rpm=0.0, spindle_dwell_s=0.0):
         """Compute statistics from the path segments.
 
         ``est_minutes`` models a trapezoidal (or triangular, for motions too
@@ -244,7 +252,9 @@ class ToolPath:
 
         Geometry (rapid/retract/plunge/ramp/back-off/arc synthesis) comes
         from :meth:`iter_moves`, so these stats always match what
-        :meth:`to_gcode` actually emits.
+        :meth:`to_gcode` actually emits. Vertical descents run at
+        *plunge_rate* when it is > 0, and the spindle spin-up dwell counts
+        when *spindle_rpm* > 0, matching :meth:`to_gcode`.
         """
         cut_dist = rapid_dist = 0.0
         motion_count = 0
@@ -255,6 +265,8 @@ class ToolPath:
 
         feed_rate_s  = max(feed_rate,  1.0) / 60.0
         feed_rapid_s = max(feed_rapid, 1.0) / 60.0
+        plunge_s     = (max(plunge_rate, 1.0) / 60.0 if plunge_rate > 0
+                        else feed_rate_s)
 
         def add_motion(p0, p1, vmax):
             dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
@@ -280,7 +292,10 @@ class ToolPath:
                     rapid_dist += d
                 else:
                     cut_dist += d
-                add_motion(p0, p1, vmax)
+                if kind in ('plunge', 'cut') and _is_vertical_descent(p0, p1):
+                    add_motion(p0, p1, plunge_s)
+                else:
+                    add_motion(p0, p1, vmax)
                 motion_count += 1
 
         # Junction (corner) velocities: the machine starts and ends the
@@ -310,6 +325,9 @@ class ToolPath:
                 vp = min(vp, vmax)
                 time_sec += (max(0.0, vp - v_enter) + max(0.0, vp - v_exit)) / accel
 
+        if spindle_rpm > 0 and spindle_dwell_s > 0:
+            time_sec += spindle_dwell_s
+
         return {
             'motion_count': motion_count,
             'cut_distance_mm': cut_dist,
@@ -318,7 +336,8 @@ class ToolPath:
         }
 
     def to_gcode(self, feed_rate=800.0, feed_rapid=3000.0, z_safe=5.0,
-                 accel_mm_s2=300.0, ramp=None, backoff=None, arc=None):
+                 accel_mm_s2=300.0, ramp=None, backoff=None, arc=None,
+                 plunge_rate=0.0, spindle_rpm=0.0, spindle_dwell_s=0.0):
         """Generate G-code string for the motion segments.
 
         The output is self-contained: it starts with a move to z_safe and ends
@@ -330,6 +349,12 @@ class ToolPath:
         from the wall before retracting, and round the rapid's sharp corners
         into tangent arcs, respectively. Left as ``None`` (or disabled),
         output is the plain retract/traverse/plunge behaviour.
+
+        Vertical descents (plunges, and pecks inside cut segments) run at
+        *plunge_rate* when it is > 0; ramps keep *feed_rate*. When
+        *spindle_rpm* > 0, an ``S`` word follows the initial safe-height
+        move, then a ``G4`` dwell of *spindle_dwell_s* seconds (if > 0) so
+        the spindle reaches speed before cutting.
         """
 
         def fmt_time(minutes):
@@ -371,7 +396,9 @@ class ToolPath:
                         f"(spans from prior residual only)")
 
         stats = self.get_stats(feed_rate, feed_rapid, z_safe, accel_mm_s2,
-                                ramp, backoff, arc)
+                                ramp, backoff, arc, plunge_rate,
+                                spindle_rpm, spindle_dwell_s)
+        plunge_feed = plunge_rate if plunge_rate > 0 else feed_rate
 
         lines += [
             f"; Total motion lines: {stats['motion_count']}",
@@ -379,12 +406,18 @@ class ToolPath:
             f"; Rapid distance: {stats['rapid_distance_mm']:.0f} mm",
             f"; Estimated time: {fmt_time(stats['est_minutes'])} "
             f"@ {feed_rate:.0f} mm/min",
-            "",
         ]
+        if plunge_rate > 0:
+            lines.append(f"; Plunge rate: {plunge_rate:.0f} mm/min")
+        lines.append("")
 
         # Explicit safe-height move at the start — body is self-contained and
         # does not rely on the preamble having done this.
         lines.append(f"G0 Z{z_safe:.3f}  ; move to safe height")
+        if spindle_rpm > 0:
+            lines.append(f"S{spindle_rpm:.0f}  ; spindle speed")
+            if spindle_dwell_s > 0:
+                lines.append(f"G4 P{spindle_dwell_s:g}  ; wait for spindle to reach speed")
 
         for kind, pts in self.iter_moves(z_safe=z_safe, ramp=ramp, backoff=backoff, arc=arc):
             if kind == 'rapid_retract':
@@ -402,9 +435,10 @@ class ToolPath:
                 for x, y, z in pts[1:]:
                     lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}  ; ramp")
             elif kind == 'plunge':
-                lines.append(f"G1 Z{pts[-1][2]:.3f} F{feed_rate}  ; plunge")
+                lines.append(f"G1 Z{pts[-1][2]:.3f} F{plunge_feed}  ; plunge")
             elif kind == 'cut':
-                for x, y, z in pts[1:]:
-                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feed_rate}")
+                for p0, (x, y, z) in zip(pts, pts[1:]):
+                    f = plunge_feed if _is_vertical_descent(p0, (x, y, z)) else feed_rate
+                    lines.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{f}")
 
         return "\n".join(lines)
