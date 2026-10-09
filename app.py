@@ -34,7 +34,8 @@ from constants import (
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
-    DISPLAY_STEP_3D, DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
+    DISPLAY_STEP_3D, DISPLAY_STEP_ACCESSIBLE, DISPLAY_STEP_UNACCESSIBLE,
+    DISPLAY_PROC_MASK,
     DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
@@ -211,8 +212,9 @@ class GCodeGeneratorApp:
         self._view_menu = tk.Menu(menubar, tearoff=0)
 
         _display_hotkeys = [
+            (DISPLAY_STEP_3D,           "0"),
             (DISPLAY_ORIGINAL,          "1"),
-            (DISPLAY_STEP_3D,           "2"),
+            (DISPLAY_STEP_ACCESSIBLE,   "2"),
             (DISPLAY_STEP_RESULT,       "3"),
             (DISPLAY_STEP_RES,          "4"),
             (DISPLAY_STEP_UNACCESSIBLE, "5"),
@@ -4214,7 +4216,8 @@ class GCodeGeneratorApp:
         available_modes = [
             m for m in DISPLAY_MODES
             if not (m == DISPLAY_PROC_MASK  and not has_step)
-            and not (m == DISPLAY_STEP_UNACCESSIBLE and not has_accessible)
+            and not (m in (DISPLAY_STEP_ACCESSIBLE, DISPLAY_STEP_UNACCESSIBLE)
+                     and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
             and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
@@ -4255,9 +4258,10 @@ class GCodeGeneratorApp:
         """Sign that makes a mode's raw array values read as physically-real
         Z in mm, matching _update_coord_display's convention: material
         amount (residual/unaccessible/mask/diff) is positive going up, but
-        Original and Step Result read positive going down (deeper cut =
-        lower)."""
-        return -1 if mode in (DISPLAY_ORIGINAL, DISPLAY_STEP_RESULT) else 1
+        Original, Step Accessible and Step Result read positive going down
+        (deeper cut = lower)."""
+        return -1 if mode in (DISPLAY_ORIGINAL, DISPLAY_STEP_RESULT,
+                              DISPLAY_STEP_ACCESSIBLE) else 1
 
     def _apply_shading(self, img, mode, cmap, vmin, vmax, step_idx):
         """RGB hillshade of *img*, tinted with its own cmap/vmin/vmax (so
@@ -4680,6 +4684,16 @@ class GCodeGeneratorApp:
             else:
                 mode  = DISPLAY_ORIGINAL   # fall through to original
 
+        elif mode == DISPLAY_STEP_ACCESSIBLE:
+            accessible = self._accessible_for_step(step_idx)
+            if accessible is not None:
+                img   = accessible
+                # Same polarity handling as Step Result, so the two compare directly
+                cmap  = "gray_r" if self.surface.get() == "white" else "gray"
+                title = f"Step {step_idx + 1} Accessible"
+            else:
+                mode  = DISPLAY_ORIGINAL   # fall through to original
+
         elif mode in (DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK):
             depth_map, _ = self._get_depth_map()
             accessible    = self._accessible_for_step(step_idx)
@@ -4871,7 +4885,7 @@ class GCodeGeneratorApp:
             else:
                 mode = DISPLAY_ORIGINAL
 
-        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
+        if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_ACCESSIBLE,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
                         DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
             img   = self._pad_image(self.current_image)

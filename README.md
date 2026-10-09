@@ -32,7 +32,7 @@ python bm2gcode.py
 3. Optionally add more sources with **Add Source** (on the Canvas tab, or on any source's own tab) and arrange them with each source's Offset, Rotation, Scale, and Blend mode (see [Sources](#sources) below).
 4. Configure one or more **steps** — choose algorithm, tool, region targeting, and which sources it should see for each.
 5. **Compute → Compute All Steps** (F6) — generate toolpaths.
-6. Use the **View** menu (hotkeys 1–8) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
+6. Use the **View** menu (hotkeys 0–8) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 7. **File → Export Toolpath…** — save a `.nc` G-code file for your CNC machine.
 
 Save your work at any time with **File → Save Project…** (Ctrl+S); reload it later with **File → Open Project…** (Ctrl+Shift+O). Project files store the canvas, every source's placement, all step configuration, and a path back to each source's original image or STL file (re-rasterized with the same settings on reload).
@@ -426,14 +426,15 @@ Each library value is written to all three step-down fields (Raster Scan / Pocke
 
 #### View Menu
 
-All visualization modes show data for the currently active step. Cut moves, rapid moves, tab markers, and registration hole outlines can be toggled in any mode with **C**, **R**, **T**, and **H**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 2) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature. The **H** toggle (**Show registration holes**) draws every Registration Holes step's hole outlines and flip axis in the 2D modes, from the step's current settings, so the placement can be checked before computing — see [Step / Operation / Registration Holes](#step--operation--registration-holes).
+All visualization modes show data for the currently active step. Cut moves, rapid moves, tab markers, and registration hole outlines can be toggled in any mode with **C**, **R**, **T**, and **H**. When ramp-in, back-off, or arc-rounding dress-ups are enabled for a step (see [Step / Dress-up](#step--dress-up), above), the 3D toolpath preview (mode 0) renders them too, toggled together with rapid moves. Tabs are different: they're baked into the cut geometry itself, so they always show up as real Z-height changes in the 3D preview regardless of any toggle. The **T** toggle instead controls a 2D-only marker — a filled circle at each tab, sized to its width — since a top-down view has no other way to show a Z-only feature. The **H** toggle (**Show registration holes**) draws every Registration Holes step's hole outlines and flip axis in the 2D modes, from the step's current settings, so the placement can be checked before computing — see [Step / Operation / Registration Holes](#step--operation--registration-holes).
 
 **Show shading** (**S**) renders any of the 2D modes below as a hillshaded relief — simulated raking light and shadow over the mode's own colours — instead of a flat colour ramp, with vertical exaggeration auto-scaled from the max cut depth vs. the canvas footprint so shallow relief remains visible. It has no effect in Step Path (3D) mode.
 
 | Mode | Hotkey | Shows |
 |---|---|---|
+| Step Path (3D) | 0 | 3D visualization of the computed toolpath. |
 | Original | 1 | The composited depth map for the current step — every source it can see, blended together — with stock margin if configured. |
-| Step Path (3D) | 2 | 3D visualization of the computed toolpath. |
+| Step Accessible | 2 | The deepest surface the current tool profile can reach — the depth map opened by the tool shape — shown in the same grayscale as Step Result. Step Unaccessible is the original minus this surface. Requires recomputation when tool parameters are changed.|
 | Step Result | 3 | The simulated surface that remains after this step — the depth achieved, pixel by pixel. For a Cutout step whose Cut depth exceeds Max cut depth (or a Registration Holes step whose Hole depth does), pixels actually cut all the way through render as a distinct highlighted colour instead of the ordinary depth grayscale, since a through-cut clips to the same value as reaching full relief depth — see [Cutout Pipeline](#cutout-pipeline). Requires toolpath to be computed.|
 | Step Residual | 4 | Material that this step failed to remove. Positive (warm) values indicate regions where the target depth was not reached; cf. the "Residual from prior step" option for "Process region". Requires toolpath to be computed.|
 | Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
