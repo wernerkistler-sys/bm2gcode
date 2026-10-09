@@ -42,6 +42,13 @@ check("no temporary file left behind", not os.path.exists(path + ".tmp"))
 reloaded = ToolLibrary.load(path)
 check("round-trip preserves everything", reloaded.to_dict() == lib.to_dict())
 check("round-trip keeps tool number", reloaded.tools[0].number == 1)
+check("round-trip keeps shank diameter and overall length",
+      reloaded.tools[0].shank_diameter_mm == 6.0
+      and reloaded.tools[0].overall_length_mm == 60.0)
+old = ToolDef.from_dict({'id': 'x', 'name': 'old', 'profile': 'End Mill',
+                         'diameter_mm': 3.0})
+check("missing shank diameter / overall length default to 0",
+      old.shank_diameter_mm == 0.0 and old.overall_length_mm == 0.0)
 check("seeded library has three tools and three materials",
       len(lib.tools) == 3 and len(lib.materials) == 3)
 check("every seeded tool has data for every seeded material",

@@ -826,7 +826,7 @@ class ToolLibraryDialog(tk.Toplevel):
     """
 
     _PREVIEW_W = 120
-    _PREVIEW_H = 140
+    _PREVIEW_H = 220
 
     def __init__(self, parent, library, select_tool_id=None):
         super().__init__(parent)
@@ -932,6 +932,12 @@ class ToolLibraryDialog(tk.Toplevel):
         self._flute = LabeledEntry(form, "Flute length", "mm", "0",
                                    minval=0.0, maxval=500.0, increment=1.0)
         self._flute.pack(fill=tk.X, pady=2)
+        self._shank = LabeledEntry(form, "Shank Ø (0 = Ø)", "mm", "0",
+                                   minval=0.0, maxval=200.0, increment=0.5)
+        self._shank.pack(fill=tk.X, pady=2)
+        self._length = LabeledEntry(form, "Overall length", "mm", "0",
+                                    minval=0.0, maxval=1000.0, increment=1.0)
+        self._length.pack(fill=tk.X, pady=2)
 
         self._notes_var = tk.StringVar()
         row = ttk.Frame(form)
@@ -945,7 +951,7 @@ class ToolLibraryDialog(tk.Toplevel):
 
         for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
             var.trace_add("write", self._on_geometry_changed)
-        for le in (self._diam, self._angle, self._flute):
+        for le in (self._diam, self._angle, self._flute, self._shank, self._length):
             le.committed_var.trace_add("write", self._on_geometry_changed)
 
         # ── Cutting data ──────────────────────────────────────────────
@@ -1029,6 +1035,8 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._diam.set(format_value(tool.diameter_mm))
                 self._angle.set(format_value(tool.vbit_angle_deg))
                 self._flute.set(format_value(tool.flute_length_mm))
+                self._shank.set(format_value(tool.shank_diameter_mm))
+                self._length.set(format_value(tool.overall_length_mm))
                 self._notes_var.set(tool.notes)
         finally:
             self._loading = False
@@ -1053,7 +1061,9 @@ class ToolLibraryDialog(tk.Toplevel):
             except ValueError:
                 pass
         for le, attr in ((self._diam, 'diameter_mm'), (self._angle, 'vbit_angle_deg'),
-                         (self._flute, 'flute_length_mm')):
+                         (self._flute, 'flute_length_mm'),
+                         (self._shank, 'shank_diameter_mm'),
+                         (self._length, 'overall_length_mm')):
             try:
                 setattr(t, attr, float(le.get()))
             except ValueError:
@@ -1063,14 +1073,21 @@ class ToolLibraryDialog(tk.Toplevel):
         self._draw_preview()
 
     def _draw_preview(self):
-        """Side view of the cutter tip, scaled to fit the canvas."""
+        """Side view of the whole tool -- cutting part and shank -- scaled to
+        fit the canvas. The cutting part is the flute length measured from
+        the tip, never shorter than the tip itself (cone or ball); without a
+        flute length a default of the tip plus one radius, and at least one
+        diameter, is drawn. Without
+        an overall length (or one shorter than the cutting part) only a stub
+        of the shank is drawn, open at the top."""
         c = self._preview
         c.delete("all")
         t = self._tool
         if t is None or t.diameter_mm <= 0:
             return
-        W, H, pad = self._PREVIEW_W, self._PREVIEW_H, 12
-        R = t.diameter_mm / 2.0
+        W, H, pad, label_h = self._PREVIEW_W, self._PREVIEW_H, 12, 14
+        R  = t.diameter_mm / 2.0
+        Rs = (t.shank_diameter_mm if t.shank_diameter_mm > 0 else t.diameter_mm) / 2.0
         if t.profile == "V-Bit":
             half = math.radians(max(1.0, min(179.0, t.vbit_angle_deg)) / 2.0)
             tip_h = R / math.tan(half)
@@ -1078,8 +1095,15 @@ class ToolLibraryDialog(tk.Toplevel):
             tip_h = R
         else:
             tip_h = 0.0
-        body_h = max(t.flute_length_mm, tip_h + R, 2.0 * R)
-        scale = min((W - 2 * pad) / (2.0 * R), (H - 2 * pad) / body_h)
+        if t.flute_length_mm > 0:
+            body_h = max(t.flute_length_mm, tip_h)
+        else:
+            body_h = max(tip_h + R, 2.0 * R)
+        shank_closed = t.overall_length_mm > body_h
+        shank_h = (t.overall_length_mm - body_h if shank_closed
+                   else max(2.0 * Rs, 0.4 * body_h))
+        scale = min((W - 2 * pad) / (2.0 * max(R, Rs)),
+                    (H - 2 * pad - label_h) / (body_h + shank_h))
         cx, bottom = W / 2.0, H - pad
         r, th, bh = R * scale, tip_h * scale, body_h * scale
         top = bottom - bh
@@ -1094,9 +1118,24 @@ class ToolLibraryDialog(tk.Toplevel):
                 pts += [x, y]
         else:
             pts = [cx - r, top, cx + r, top, cx + r, bottom, cx - r, bottom]
-        c.create_polygon(pts, fill="#7a8ca3", outline="#d0d8e0")
-        c.create_text(W / 2.0, pad / 2.0 + 2, text=f"Ø {format_value(t.diameter_mm)} mm",
-                      fill="#d0d8e0", font=("TkDefaultFont", 8))
+
+        line, shank_fill = "#d0d8e0", "#a3abb5"
+        rs, s_top = Rs * scale, top - shank_h * scale
+        if shank_closed:
+            c.create_polygon([cx - rs, s_top, cx + rs, s_top, cx + rs, top, cx - rs, top],
+                             fill=shank_fill, outline=line)
+        else:
+            c.create_rectangle(cx - rs, s_top, cx + rs, top, fill=shank_fill, width=0)
+            c.create_line(cx - rs, s_top, cx - rs, top, fill=line)
+            c.create_line(cx + rs, s_top, cx + rs, top, fill=line)
+            c.create_line(cx - rs, s_top, cx + rs, s_top, fill=line, dash=(2, 2))
+        c.create_polygon(pts, fill="#7a8ca3", outline=line)
+
+        label = f"Ø {format_value(t.diameter_mm)} mm"
+        if t.overall_length_mm > 0:
+            label = f"Ø {format_value(t.diameter_mm)} · L {format_value(t.overall_length_mm)} mm"
+        c.create_text(W / 2.0, pad / 2.0 + 2, text=label,
+                      fill=line, font=("TkDefaultFont", 8))
 
     def _new_tool(self):
         t = ToolDef(id=new_id(), name="New tool", profile="End Mill", diameter_mm=6.0)

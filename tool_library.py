@@ -60,6 +60,8 @@ class ToolDef:
     diameter_mm: float
     vbit_angle_deg: float = 90.0
     flute_length_mm: float = 0.0
+    shank_diameter_mm: float = 0.0    # 0 = same as diameter_mm
+    overall_length_mm: float = 0.0    # 0 = not specified
     number: int | None = None         # tool number for a future M6 Tn
     notes: str = ""
     profile_points: list | None = None   # reserved for custom profiles
@@ -72,7 +74,9 @@ class ToolDef:
         return {
             'id': self.id, 'name': self.name, 'profile': self.profile,
             'diameter_mm': self.diameter_mm, 'vbit_angle_deg': self.vbit_angle_deg,
-            'flute_length_mm': self.flute_length_mm, 'number': self.number,
+            'flute_length_mm': self.flute_length_mm,
+            'shank_diameter_mm': self.shank_diameter_mm,
+            'overall_length_mm': self.overall_length_mm, 'number': self.number,
             'notes': self.notes, 'profile_points': self.profile_points,
             'cutting': {mid: cd.to_dict() for mid, cd in self.cutting.items()},
         }
@@ -85,6 +89,8 @@ class ToolDef:
             diameter_mm=float(d['diameter_mm']),
             vbit_angle_deg=float(d.get('vbit_angle_deg', 90.0)),
             flute_length_mm=float(d.get('flute_length_mm', 0.0)),
+            shank_diameter_mm=float(d.get('shank_diameter_mm', 0.0)),
+            overall_length_mm=float(d.get('overall_length_mm', 0.0)),
             number=int(number) if number is not None else None,
             notes=str(d.get('notes', '')),
             profile_points=d.get('profile_points'),
@@ -229,17 +235,20 @@ class ToolLibrary:
 
         tools = [
             ToolDef('tool-6mm-end-mill', '6 mm End Mill', 'End Mill', 6.0,
-                    flute_length_mm=22.0, number=1,
+                    flute_length_mm=22.0, shank_diameter_mm=6.0,
+                    overall_length_mm=60.0, number=1,
                     cutting=data({softwood.id: (1500, 500, 18000, 3.0),
                                   hardwood.id: (1000, 300, 18000, 2.0),
                                   mdf.id:      (1800, 500, 18000, 3.0)})),
             ToolDef('tool-3mm-ball', '3 mm Ball Nose', 'Ball', 3.0,
-                    flute_length_mm=12.0, number=2,
+                    flute_length_mm=12.0, shank_diameter_mm=6.0,
+                    overall_length_mm=50.0, number=2,
                     cutting=data({softwood.id: (1200, 400, 20000, 1.5),
                                   hardwood.id: (800, 250, 20000, 1.0),
                                   mdf.id:      (1400, 400, 20000, 1.5)})),
             ToolDef('tool-60deg-vbit', '60° V-Bit', 'V-Bit', 12.0,
-                    vbit_angle_deg=60.0, flute_length_mm=10.0, number=3,
+                    vbit_angle_deg=60.0, flute_length_mm=10.0,
+                    shank_diameter_mm=6.0, overall_length_mm=45.0, number=3,
                     cutting=data({softwood.id: (1000, 400, 18000, 2.0),
                                   hardwood.id: (700, 250, 18000, 1.5),
                                   mdf.id:      (1200, 400, 18000, 2.0)})),
