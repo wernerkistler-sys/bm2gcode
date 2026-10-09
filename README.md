@@ -108,6 +108,19 @@ Each cutting step appears as a numbered tab. Use the **Add Step After** and **Re
 
 **Algorithm** selects the cutting strategy. The parameters displayed below the selector adapt to the chosen algorithm.
 
+| Algorithm | What it does | Typical use |
+|---|---|---|
+| [Raster Scan](#step--operation--raster-scan) | Sweeps the tool in parallel lines (or a rectangular spiral), following the depth map's relief along each line. | Roughing and finishing of general 3D reliefs. |
+| [Contour](#step--operation--contour) | Cuts the relief as stacked iso-depth (waterline) contours, level by level. | Roughing terraced reliefs; finishing steep walls a raster leaves stepped. |
+| [V-Carving (Depth Map)](#step--operation--v-carving) | Runs a V-bit or ball-nose along the medial axis of the carved region, with cut depth taken from the depth map. | Engraving where the depth map itself encodes the desired depth. |
+| [V-Carving (Sub-pixel)](#step--operation--v-carving) | As Depth Map, but with a smoother centreline traced from the region's sub-pixel boundary. | Curved or flowing artwork where a pixel-grid centreline looks jagged. |
+| [V-Carving (Feature Width)](#step--operation--v-carving) | Runs along the centreline, with cut depth set by the feature's local width so the V-bit's flanks touch both edges. | Classic V-carved lettering and line art. |
+| [V-Carving (Hybrid)](#step--operation--v-carving) | Feature Width's centreline plus waterline contour rings that clear features too wide for the V-bit to fill in one stroke, down to Max cut depth. V-Bit only. | V-carved lettering and artwork with wide strokes or open areas, leaving sharp V-shaped walls and corners. |
+| [V-Carving Clean-up](#step--operation--v-carving-clean-up) | Pocket-clears the flat floor that a preceding V-Carving (Hybrid) step's V-bit couldn't reach, without touching its sloped walls. | Flattening the bottom of wide V-carved areas with an end mill. |
+| [Cutout](#step--operation--cutout) | Cuts straight down around the outer silhouette, through the full stock thickness, with optional tabs. | Freeing the finished part from the stock. |
+| [Pocket](#step--operation--pocket) | Clears a flat-bottomed recess at a fixed Target depth with zig-zag, spiral, or onion-skin infill. | Flat recesses, or facing/flattening the whole stock. |
+| [Registration Holes](#step--operation--registration-holes) | Bores pin holes symmetric about a flip axis, independent of the depth map. | Aligning the stock for two-sided milling. |
+
 ---
 
 ##### Step / Operation / Raster Scan
@@ -138,16 +151,20 @@ Traces the depth map as a stack of iso-depth contours, like topographic lines on
 
 ##### Step / Operation / V-Carving
 
-Uses a V-bit or ball-nose bit whose effective cutting width varies with depth to follow the features of the depth map. Three variants are available:
+Uses a V-bit or ball-nose bit whose effective cutting width varies with depth to follow the features of the depth map. Four variants are available:
 
 - **V-Carving (Depth Map)** — the tool follows the pixel mask; cut depth at each point is given by the depth map directly.
 - **V-Carving (Sub-pixel)** — the mask boundary is traced as a smooth contour rather than a pixel-grid staircase before the skeleton is extracted. This produces smoother centrelines for curved or flowing features.
 - **V-Carving (Feature Width)** — cut depth at each skeleton point is determined by the width of the feature at that point (the diameter of the largest inscribed circle). Best for line art, lettering, and narrow grooves where the V-bit should naturally fill the groove width. Note: the cut depth derived from feature width may exceed the depth map value at that pixel, but is always clipped to Max cut depth.
+- **V-Carving (Hybrid)** — combines the Feature Width centreline with waterline contour rings. Where a feature is narrow, the centreline alone carves it, exactly as in Feature Width. Where a feature is wider than the V-bit can fill from its centreline at Max cut depth, Feature Width would cut a single deep groove and leave material standing on either side; Hybrid instead also traces contour rings around the feature at every pass level down to Max cut depth, each ring offset from the feature edge by exactly as far as the V-bit's cone reaches at that depth. The result is a V-shaped wall along every edge — with sharp corners preserved by the centreline — around a flat floor at Max cut depth. That floor, inside the deepest ring, is wider than the V-bit can clear; follow up with a [V-Carving Clean-up](#step--operation--v-carving-clean-up) step to flatten it with an end mill. Hybrid requires a V-Bit tool.
 
 | Parameter | Description |
 |---|---|
 | Min feature width | Skips features narrower than this (mm). Features too narrow for the tool to enter cleanly are excluded from the skeleton. |
 | Max feature width | Limits the maximum carved feature width (mm). "Auto" derives this limit from the tool geometry and Max cut depth — the widest feature the tool can reach at full depth. |
+| Cut direction | V-Carving (Hybrid) only. Climb or Conventional forces every contour ring to travel in one consistent direction relative to the spindle rotation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained. The centreline strokes are unaffected, since a centreline has no inside or outside wall to keep on a particular side of the tool. |
+
+For V-Carving (Hybrid), the Max step-down and Final step-down fields under [Step / Tool](#step--tool) also set the spacing of the contour rings: one ring level per pass, from the first step-down down to Max cut depth (a single ring at Max cut depth when Max step-down is 0). If the V-bit's diameter is too small for its cone to reach one step-down before the shank would take over, computing the step shows a warning — the deepest centreline cuts in wide areas then can't be a clean V-taper.
 
 ---
 
@@ -498,19 +515,21 @@ This section describes how each algorithm works internally — the pipeline stag
 
 ### V-Carving Pipeline
 
-All three V-Carving variants share stages 1–2 and 4–8; they differ in how the skeleton is extracted (stage 3).
+All four V-Carving variants share stages 1–2 and 4–8; they differ in how the skeleton is extracted (stage 3), and Hybrid adds waterline contour rings to the path (stage 5).
 
 1. **Kernel + accessibility map** — Identical to Raster.
 2. **V-carving mask** — Computes the region to carve:
    - Pixels shallower than Z-threshold are excluded. A Z-threshold of 0 is treated as "not set" and auto-splits at the midpoint of the depth map's own value range instead — otherwise a literal 0 would keep the flat background (always at depth 0) in the mask alongside the artwork, turning the skeleton (stage 3) into the medial axis of the whole canvas rectangle rather than the artwork's own shape.
    - Features narrower than Min feature width are removed by morphological opening.
    - Feature interiors wider than Max feature width (where the tool cannot reach the configured depth) are excluded using the distance transform.
-3. **Skeleton extraction** — one of three methods:
+3. **Skeleton extraction** — one of three methods (Hybrid uses Feature Width's):
    - *Depth Map*: medial axis of the mask (`skimage.morphology.medial_axis`). Cut depth at each skeleton point is taken directly from the depth map.
    - *Sub-pixel*: Voronoi diagram of the mask boundary contour. Ridges with a small opening angle — arising from closely-spaced same-side boundary points, not true centrelines — are discarded using the Attali–Montanvert criterion. Remaining ridges are discretised to 1-pixel width. Cut depth follows the depth map but the skeleton geometry is smoother than the pixel-grid medial axis.
    - *Feature Width*: same Voronoi skeleton. Cut depth at each point is derived from the inscribed-circle radius at that point (the radius of the widest circle fitting the mask there), converted to a physical depth via the tool geometry (V-bit cone formula or ball-nose formula). The resulting depth may exceed the depth map value at that pixel but is always clipped to Max cut depth.
 4. **Branch decomposition** — The skeleton is split at junction pixels into polyline branches.
 5. **Branch ordering** — Greedy nearest-endpoint ordering across all branches; optional 2-opt.
+
+   *Hybrid only — waterline contour rings*: the skeleton is kept whole (unpruned) and 2-opt is applied to it on its own; contour rings are then appended after it. The rings are extracted from the achievable-depth surface of an idealized V-bit — same angle as the real tool, but just large enough that its cone tapers to a point exactly at Max cut depth (`compute_vcarve_synth_achievable_depth`) — rather than the real tool's surface, so the rings follow where a V-bit's flank can actually reach at each depth regardless of the real tool's diameter. Ring levels are the pass ceilings from Max step-down / Final step-down down to Max cut depth. The rings are extracted on the unmasked surface and only then clipped to the V-carving mask from stage 2, so clipping doesn't invent spurious geometry along the mask edge. They are ordered with Contour's windowed ordering (see [Contour Pipeline](#contour-pipeline) step 5), with Cut direction applied to each ring's orientation. The combined skeleton + rings path then continues through the remaining stages. The idealized V-bit's achievable-depth surface is also what a later [V-Carving Clean-up](#step--operation--v-carving-clean-up) step erodes against (see [Pocket Pipeline](#pocket-pipeline)).
 6. **Multi-pass depth slicing** — Same mechanism as Raster: branches are split into per-pass sub-segments when Max step-down > 0. If Avoid cutting air is on, air-cutting runs are then removed from each pass (see [Air-cut pruning](#air-cut-pruning)).
 7. **Per-pass ordering** — Optional 2-opt.
 8. **Simplification + result simulation** — Same as Raster.
