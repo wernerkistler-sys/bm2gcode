@@ -1,4 +1,4 @@
-TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit"]
+TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit", "Custom"]
 RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Diagonal (45°)", "Diagonal (135°)",
                      "Spiral (Outside-In)", "Spiral (Inside-Out)"]
 SPIRAL_DIRECTIONS = ["Spiral (Outside-In)", "Spiral (Inside-Out)"]

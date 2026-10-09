@@ -5,10 +5,13 @@ import math
 import queue
 import re
 
+import numpy as np
+
 from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, TOOL_PROFILES
 from tool_library import (ToolLibrary, ToolDef, Material, CuttingData,
                           new_id, format_value)
 import stl_mesh
+import tool_profile
 
 
 class ProgressDialog(tk.Toplevel):
@@ -817,6 +820,496 @@ class DressUpDialog(tk.Toplevel):
         self.destroy()
 
 
+class ProfileEditorDialog(tk.Toplevel):
+    """Modal editor for a Custom tool profile: the right half of the
+    cutter's side silhouette as a chain of cubic Bezier segments (see
+    tool_profile for the node format).
+
+    The canvas shows the drawn curve and its handles on the right, the
+    mirrored curve greyed on the left, and the filled silhouette of the
+    radial height curve the toolpath engine actually uses (the lower
+    envelope, dashed orange) behind them. After ``wait_window`` returns,
+    ``result`` holds the edited node list, or None when cancelled.
+    """
+
+    _CANVAS_W = 460
+    _CANVAS_H = 420
+    _MARGIN   = 28
+    _HIT_PX   = 7
+    _GRID_STEPS = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
+
+    def __init__(self, parent, nodes=None, title="Edit Profile"):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(True, True)
+        self.minsize(720, 480)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+
+        self.result   = None
+        self._nodes   = (copy.deepcopy(nodes) if nodes
+                         else tool_profile.point_roundover(12.7, 6.35))
+        self._undo    = []      # earlier node lists, most recent last
+        self._sel     = None    # index of the selected node
+        self._drag    = None    # (node index, "p" | "in" | "out") being dragged
+        self._pan     = None    # (x, y) of the last pan event
+        self._loading = False   # True while node entries are filled programmatically
+        self._scale   = 1.0     # canvas px per mm
+        self._ox = self._oy = 0.0   # canvas position of r = 0, z = 0
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(outer)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._canvas = tk.Canvas(left, width=self._CANVAS_W, height=self._CANVAS_H,
+                                 background="#2b2b2b", highlightthickness=0)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._info_var = tk.StringVar()
+        ttk.Label(left, textvariable=self._info_var, justify=tk.LEFT,
+                  wraplength=self._CANVAS_W).pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(left, foreground="#666666", justify=tk.LEFT, wraplength=self._CANVAS_W,
+                  text="Drag points and handles (Shift+drag a handle for a sharp corner). "
+                       "Double-click the curve to add a point, Delete removes the "
+                       "selected one. Wheel zooms, right-drag pans, Ctrl+Z undoes."
+                  ).pack(anchor=tk.W, pady=(2, 0))
+
+        right = ttk.Frame(outer, padding=(10, 0, 0, 0))
+        right.pack(side=tk.LEFT, fill=tk.Y)
+
+        preset = SectionFrame(right, "Start from preset")
+        preset.pack(fill=tk.X)
+        self._preset_var = tk.StringVar(value=tool_profile.PRESETS[0])
+        ttk.Combobox(preset, textvariable=self._preset_var, values=tool_profile.PRESETS,
+                     state="readonly", width=20).pack(fill=tk.X, pady=(0, 4))
+        self._p_diam   = LabeledEntry(preset, "Diameter", "mm", "12.7",
+                                      minval=0.1, maxval=200.0, increment=0.5)
+        self._p_height = LabeledEntry(preset, "Height", "mm", "6.35",
+                                      minval=0.0, maxval=200.0, increment=0.5)
+        self._p_angle  = LabeledEntry(preset, "Angle", "°", "0",
+                                      minval=0.0, maxval=179.0, increment=5.0)
+        self._p_radius = LabeledEntry(preset, "Corner radius", "mm", "1",
+                                      minval=0.0, maxval=100.0, increment=0.5)
+        for le in (self._p_diam, self._p_height, self._p_angle, self._p_radius):
+            le.pack(fill=tk.X, pady=2)
+        ttk.Button(preset, text="Apply preset", command=self._apply_preset
+                   ).pack(anchor=tk.E, pady=(4, 0))
+        self._preset_var.trace_add("write", self._on_preset_chosen)
+        self._on_preset_chosen()
+
+        node = SectionFrame(right, "Selected point")
+        node.pack(fill=tk.X, pady=(8, 0))
+        self._node_r = LabeledEntry(node, "r (from axis)", "mm", "0",
+                                    minval=0.0, maxval=200.0, increment=0.1)
+        self._node_z = LabeledEntry(node, "z (above tip)", "mm", "0",
+                                    minval=-200.0, maxval=500.0, increment=0.1)
+        self._node_r.pack(fill=tk.X, pady=2)
+        self._node_z.pack(fill=tk.X, pady=2)
+        self._node_r.committed_var.trace_add("write", self._on_node_entry)
+        self._node_z.committed_var.trace_add("write", self._on_node_entry)
+        self._smooth_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(node, text="Smooth (mirror handles)",
+                        variable=self._smooth_var).pack(anchor=tk.W, pady=2)
+        row = ttk.Frame(node)
+        row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(row, text="Add point", command=self._add_point).pack(side=tk.LEFT)
+        ttk.Button(row, text="Delete point", command=self._delete_point
+                   ).pack(side=tk.LEFT, padx=(4, 0))
+
+        view = SectionFrame(right, "View")
+        view.pack(fill=tk.X, pady=(8, 0))
+        self._snap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(view, text="Snap to grid", variable=self._snap_var
+                        ).pack(anchor=tk.W)
+        row = ttk.Frame(view)
+        row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(row, text="Fit", command=self._fit).pack(side=tk.LEFT)
+        ttk.Button(row, text="Undo", command=self._undo_last).pack(side=tk.LEFT, padx=(4, 0))
+
+        btn_row = ttk.Frame(right)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="OK", command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        c = self._canvas
+        c.bind("<ButtonPress-1>", self._on_press)
+        c.bind("<B1-Motion>", self._on_motion)
+        c.bind("<ButtonRelease-1>", self._on_release)
+        c.bind("<Double-Button-1>", self._on_double_click)
+        for btn in ("2", "3"):
+            c.bind(f"<ButtonPress-{btn}>", self._on_pan_start)
+            c.bind(f"<B{btn}-Motion>", self._on_pan)
+        c.bind("<MouseWheel>", self._on_wheel)
+        c.bind("<Button-4>", self._on_wheel)
+        c.bind("<Button-5>", self._on_wheel)
+        c.bind("<Delete>", lambda _e: self._delete_point())
+        c.bind("<BackSpace>", lambda _e: self._delete_point())
+        c.bind("<Configure>", lambda _e: self._fit())
+        self.bind("<Control-z>", lambda _e: self._undo_last())
+
+        self._select(None)
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{max(0, pw)}+{max(0, ph)}")
+        self._fit()
+        self.wait_window()
+
+    # ── Coordinates ───────────────────────────────────────────────────
+    def _w2c(self, r, z):
+        return self._ox + r * self._scale, self._oy - z * self._scale
+
+    def _c2w(self, x, y):
+        return (x - self._ox) / self._scale, (self._oy - y) / self._scale
+
+    def _canvas_size(self):
+        c = self._canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1 or h <= 1:
+            w, h = int(c['width']), int(c['height'])
+        return w, h
+
+    def _grid_step(self):
+        for step in self._GRID_STEPS:
+            if step * self._scale >= 24:
+                return step
+        return self._GRID_STEPS[-1]
+
+    def _fit(self):
+        pts = [tool_profile.sample_profile(self._nodes)]
+        for n in self._nodes:
+            pts.append([n['p'], n['in'], n['out']])
+        pts = np.vstack(pts)
+        r_max = max(float(np.abs(pts[:, 0]).max()), 0.5)
+        z_min = min(float(pts[:, 1].min()), 0.0)
+        z_max = max(float(pts[:, 1].max()), z_min + 0.5)
+        W, H = self._canvas_size()
+        m = self._MARGIN
+        self._scale = max(1e-3, min((W - 2 * m) / (2.0 * r_max),
+                                    (H - 2 * m) / (z_max - z_min)))
+        extra = (H - 2 * m) - (z_max - z_min) * self._scale
+        self._ox = W / 2.0
+        self._oy = H - m - extra / 2.0 + z_min * self._scale
+        self._redraw()
+
+    # ── Drawing ───────────────────────────────────────────────────────
+    def _redraw(self):
+        c = self._canvas
+        c.delete("all")
+        W, H = self._canvas_size()
+
+        step = self._grid_step()
+        r0, z1 = self._c2w(0, 0)
+        r1, z0 = self._c2w(W, H)
+        k = math.floor(r0 / step)
+        while k * step <= r1:
+            x, _ = self._w2c(k * step, 0)
+            c.create_line(x, 0, x, H, fill="#353535")
+            k += 1
+        k = math.floor(z0 / step)
+        while k * step <= z1:
+            _, y = self._w2c(0, k * step)
+            c.create_line(0, y, W, y, fill="#353535")
+            k += 1
+        x_axis, y_tip = self._w2c(0, 0)
+        c.create_line(x_axis, 0, x_axis, H, fill="#707070", dash=(4, 3))
+        c.create_line(0, y_tip, W, y_tip, fill="#707070")
+        c.create_text(W - 4, H - 4, anchor=tk.SE, fill="#808080",
+                      text=f"grid {format_value(step)} mm", font=("TkDefaultFont", 8))
+
+        pts = tool_profile.sample_profile(self._nodes)
+        rh = tool_profile.radial_height(self._nodes)
+        if rh is not None:
+            # radial_height measures from the curve's lowest point (where
+            # the toolpath engine puts Z = 0); draw it back in curve space.
+            r, h = rh
+            h = h + float(pts[:, 1].min())
+            top = max(float(h.max()), h[0] + 0.25 * float(r[-1]))
+            poly = [self._w2c(-r[-1], top)]
+            poly += [self._w2c(-ri, hi) for ri, hi in zip(r[::-1], h[::-1])]
+            poly += [self._w2c(ri, hi) for ri, hi in zip(r, h)]
+            poly.append(self._w2c(r[-1], top))
+            c.create_polygon(*[v for p in poly for v in p], fill="#41506a", outline="")
+            env = [self._w2c(ri, hi) for ri, hi in zip(r, h)]
+            c.create_line(*[v for p in env for v in p], fill="#ff9933", width=2, dash=(5, 3))
+
+        right = [self._w2c(rr, zz) for rr, zz in pts]
+        left  = [self._w2c(-rr, zz) for rr, zz in pts]
+        c.create_line(*[v for p in left for v in p], fill="#808a96", width=1)
+        c.create_line(*[v for p in right for v in p], fill="#ffffff", width=2)
+
+        last = len(self._nodes) - 1
+        for i, n in enumerate(self._nodes):
+            px, py = self._w2c(*n['p'])
+            sel = (i == self._sel)
+            for key in ('in', 'out'):
+                if (key == 'in' and i == 0) or (key == 'out' and i == last):
+                    continue
+                hx, hy = self._w2c(*n[key])
+                c.create_line(px, py, hx, hy, fill="#8899aa")
+                c.create_oval(hx - 4, hy - 4, hx + 4, hy + 4,
+                              fill="#ffcc66" if sel else "#9a7a40", outline="")
+            c.create_rectangle(px - 4, py - 4, px + 4, py + 4,
+                               fill="#ff6644" if sel else "#ffffff", outline="#202020")
+        self._update_info(rh)
+
+    def _update_info(self, rh):
+        if rh is None:
+            self._info_var.set("The profile has no width.")
+            return
+        r, h = rh
+        text = (f"Ø {format_value(2.0 * r[-1])} mm · "
+                f"edge height {format_value(float(h.max()))} mm · "
+                f"{len(self._nodes)} points")
+        issues = tool_profile.validate(self._nodes)
+        if issues:
+            text += "\n⚠ " + "\n⚠ ".join(issues)
+        self._info_var.set(text)
+
+    # ── Editing ───────────────────────────────────────────────────────
+    def _push_undo(self):
+        self._undo.append(copy.deepcopy(self._nodes))
+        del self._undo[:-100]
+
+    def _undo_last(self):
+        if not self._undo:
+            return
+        self._nodes = self._undo.pop()
+        if self._sel is not None and self._sel >= len(self._nodes):
+            self._sel = None
+        self._select(self._sel)
+        self._redraw()
+
+    def _select(self, idx):
+        self._sel = idx
+        self._loading = True
+        try:
+            if idx is None:
+                self._node_r.set("0")
+                self._node_z.set("0")
+            else:
+                r, z = self._nodes[idx]['p']
+                self._node_r.set(format_value(r))
+                self._node_z.set(format_value(z))
+        finally:
+            self._loading = False
+        self._node_r.set_state("disabled" if idx in (None, 0) else "normal")
+        self._node_z.set_state("disabled" if idx is None else "normal")
+
+    def _snap(self, r, z):
+        if self._snap_var.get():
+            step = self._grid_step()
+            r, z = round(r / step) * step, round(z / step) * step
+        return r, z
+
+    def _move_anchor(self, i, r, z):
+        n = self._nodes[i]
+        r = 0.0 if i == 0 else max(0.0, r)
+        dr, dz = r - n['p'][0], z - n['p'][1]
+        for key in ('p', 'in', 'out'):
+            n[key] = [max(0.0, n[key][0] + dr), n[key][1] + dz]
+
+    def _move_handle(self, i, key, r, z, mirror):
+        n = self._nodes[i]
+        n[key] = [max(0.0, r), z]
+        other = 'out' if key == 'in' else 'in'
+        if not mirror or (other == 'in' and i == 0) \
+                or (other == 'out' and i == len(self._nodes) - 1):
+            return
+        px, pz = n['p']
+        vx, vz = px - n[key][0], pz - n[key][1]
+        length = math.hypot(vx, vz)
+        other_len = math.hypot(n[other][0] - px, n[other][1] - pz)
+        if length < 1e-9 or other_len < 1e-9:
+            return
+        n[other] = [max(0.0, px + vx / length * other_len), pz + vz / length * other_len]
+
+    def _hit(self, x, y):
+        """(node index, key) of the handle or anchor under (x, y), or None.
+        Handles win over anchors since they sit on top of them when
+        retracted."""
+        best, best_d = None, None
+        last = len(self._nodes) - 1
+        for i, n in enumerate(self._nodes):
+            for key in ('in', 'out', 'p'):
+                if (key == 'in' and i == 0) or (key == 'out' and i == last):
+                    continue
+                hx, hy = self._w2c(*n[key])
+                d = math.hypot(hx - x, hy - y)
+                if d > self._HIT_PX:
+                    continue
+                d += 1.0 if key == 'p' else 0.0
+                if best_d is None or d < best_d:
+                    best, best_d = (i, key), d
+        return best
+
+    def _on_press(self, event):
+        self._canvas.focus_set()
+        hit = self._hit(event.x, event.y)
+        if hit is None:
+            self._drag = None
+            self._select(None)
+        else:
+            self._push_undo()
+            self._drag = hit
+            self._select(hit[0])
+        self._redraw()
+
+    def _on_motion(self, event):
+        if self._drag is None:
+            return
+        i, key = self._drag
+        r, z = self._snap(*self._c2w(event.x, event.y))
+        if key == 'p':
+            self._move_anchor(i, r, z)
+            self._select(i)
+        else:
+            shift = bool(event.state & 0x0001)
+            self._move_handle(i, key, r, z, self._smooth_var.get() and not shift)
+        self._redraw()
+
+    def _on_release(self, _event):
+        self._drag = None
+
+    def _split(self, i, t):
+        """Split segment i (node i → node i+1) at parameter t, keeping its
+        shape, and select the new node."""
+        a, b = self._nodes[i], self._nodes[i + 1]
+        p0, p1 = np.asarray(a['p']), np.asarray(a['out'])
+        p2, p3 = np.asarray(b['in']), np.asarray(b['p'])
+        q0, q1, q2 = p0 + (p1 - p0) * t, p1 + (p2 - p1) * t, p2 + (p3 - p2) * t
+        r0, r1 = q0 + (q1 - q0) * t, q1 + (q2 - q1) * t
+        mid = r0 + (r1 - r0) * t
+        a['out'] = q0.tolist()
+        b['in'] = q2.tolist()
+        self._nodes.insert(i + 1, tool_profile.make_node(mid, r0, r1))
+        self._select(i + 1)
+
+    def _on_double_click(self, event):
+        t = np.linspace(0.0, 1.0, 65)
+        best = None
+        for i in range(len(self._nodes) - 1):
+            seg = tool_profile.sample_profile(self._nodes[i:i + 2], per_segment=64)
+            xy = np.array([self._w2c(r, z) for r, z in seg])
+            d = np.hypot(xy[:, 0] - event.x, xy[:, 1] - event.y)
+            j = int(np.argmin(d))
+            if d[j] <= 1.5 * self._HIT_PX and (best is None or d[j] < best[0]):
+                best = (d[j], i, t[j])
+        if best is None or best[2] in (0.0, 1.0):
+            return
+        self._push_undo()
+        self._split(best[1], best[2])
+        self._redraw()
+
+    def _add_point(self):
+        i = self._sel if self._sel is not None else len(self._nodes) - 2
+        i = min(i, len(self._nodes) - 2)
+        self._push_undo()
+        self._split(i, 0.5)
+        self._redraw()
+
+    def _delete_point(self):
+        i = self._sel
+        if i is None or i == 0 or len(self._nodes) <= 2:
+            return
+        self._push_undo()
+        del self._nodes[i]
+        self._select(None)
+        self._redraw()
+
+    def _on_node_entry(self, *_):
+        if self._loading or self._sel is None:
+            return
+        try:
+            r, z = float(self._node_r.get()), float(self._node_z.get())
+        except ValueError:
+            return
+        if [r, z] == self._nodes[self._sel]['p']:
+            return
+        self._push_undo()
+        self._move_anchor(self._sel, r, z)
+        self._redraw()
+
+    # ── View ──────────────────────────────────────────────────────────
+    def _on_wheel(self, event):
+        up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+        f = 1.2 if up else 1.0 / 1.2
+        wr, wz = self._c2w(event.x, event.y)
+        self._scale *= f
+        self._ox = event.x - wr * self._scale
+        self._oy = event.y + wz * self._scale
+        self._redraw()
+        return "break"
+
+    def _on_pan_start(self, event):
+        self._pan = (event.x, event.y)
+
+    def _on_pan(self, event):
+        if self._pan is None:
+            return
+        self._ox += event.x - self._pan[0]
+        self._oy += event.y - self._pan[1]
+        self._pan = (event.x, event.y)
+        self._redraw()
+
+    # ── Presets ───────────────────────────────────────────────────────
+    _PRESET_FIELDS = {
+        "Point round-over": ("diam", "height", "angle"),
+        "Ball":             ("diam",),
+        "V-Bit":            ("diam", "angle"),
+        "Flat":             ("diam",),
+        "Bull nose":        ("diam", "radius"),
+    }
+
+    def _on_preset_chosen(self, *_):
+        preset = self._preset_var.get()
+        fields = self._PRESET_FIELDS.get(preset, ())
+        for name, le in (("diam", self._p_diam), ("height", self._p_height),
+                         ("angle", self._p_angle), ("radius", self._p_radius)):
+            le.set_state("normal" if name in fields else "disabled")
+        self._p_angle.set_label("Tip angle" if preset == "Point round-over" else "Angle")
+        if preset == "V-Bit" and float(self._p_angle.get()) < 1.0:
+            self._p_angle.set("60")
+
+    def _apply_preset(self):
+        try:
+            d = float(self._p_diam.get())
+            height = float(self._p_height.get())
+            angle = float(self._p_angle.get())
+            radius = float(self._p_radius.get())
+        except ValueError:
+            return
+        preset = self._preset_var.get()
+        if preset == "Point round-over":
+            nodes = tool_profile.point_roundover(d, height, angle)
+        elif preset == "Ball":
+            nodes = tool_profile.ball(d)
+        elif preset == "V-Bit":
+            nodes = tool_profile.vbit(d, max(1.0, angle))
+        elif preset == "Flat":
+            nodes = tool_profile.flat(d)
+        else:
+            nodes = tool_profile.bull_nose(d, radius)
+        self._push_undo()
+        self._nodes = nodes
+        self._select(None)
+        self._fit()
+
+    # ── Close ─────────────────────────────────────────────────────────
+    def _confirm(self):
+        if tool_profile.radial_height(self._nodes) is None:
+            messagebox.showerror("Profile", "The profile has no width.", parent=self)
+            return
+        self.result = tool_profile.normalize_nodes(self._nodes)
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
 class ToolLibraryDialog(tk.Toplevel):
     """Modal editor for the tool library.
 
@@ -929,6 +1422,9 @@ class ToolLibraryDialog(tk.Toplevel):
         self._angle = LabeledEntry(form, "V-bit angle", "°", "60",
                                    minval=1.0, maxval=179.0, increment=5.0)
         self._angle.pack(fill=tk.X, pady=2)
+        self._edit_profile_btn = ttk.Button(form, text="Edit profile…",
+                                            command=self._edit_profile)
+        self._edit_profile_btn.pack(anchor=tk.E, pady=2)
         self._flute = LabeledEntry(form, "Flute length", "mm", "0",
                                    minval=0.0, maxval=500.0, increment=1.0)
         self._flute.pack(fill=tk.X, pady=2)
@@ -1040,8 +1536,7 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._notes_var.set(tool.notes)
         finally:
             self._loading = False
-        self._angle.set_state("normal" if tool is not None and tool.profile == "V-Bit"
-                              else "disabled")
+        self._update_geometry_states()
         self._refresh_cutting_tree()
         self._draw_preview()
 
@@ -1068,14 +1563,55 @@ class ToolLibraryDialog(tk.Toplevel):
                 setattr(t, attr, float(le.get()))
             except ValueError:
                 pass
-        self._angle.set_state("normal" if t.profile == "V-Bit" else "disabled")
+        if t.profile == "Custom":
+            if not t.profile_points:
+                t.profile_points = tool_profile.point_roundover(
+                    t.diameter_mm, t.diameter_mm / 2.0)
+            self._sync_custom_diameter()
+        self._update_geometry_states()
+        self._tool_tree.item(t.id, values=self._tool_row(t))
+        self._draw_preview()
+
+    def _update_geometry_states(self):
+        """Enable the fields that apply to the shown tool's profile: the V
+        angle for V-bits; for Custom profiles the curve sets the diameter
+        and is edited in the profile editor."""
+        profile = self._tool.profile if self._tool is not None else None
+        self._angle.set_state("normal" if profile == "V-Bit" else "disabled")
+        self._diam.set_state("disabled" if profile == "Custom" else "normal")
+        self._edit_profile_btn.config(state="normal" if profile == "Custom" else "disabled")
+
+    def _sync_custom_diameter(self):
+        """Set the shown Custom tool's diameter from its curve."""
+        t = self._tool
+        rh = tool_profile.radial_height(t.profile_points)
+        if rh is None:
+            return
+        t.diameter_mm = round(2.0 * float(rh[0][-1]), 6)
+        self._loading = True
+        try:
+            self._diam.set(format_value(t.diameter_mm))
+        finally:
+            self._loading = False
+
+    def _edit_profile(self):
+        t = self._tool
+        if t is None or t.profile != "Custom":
+            return
+        dlg = ProfileEditorDialog(self, t.profile_points, title=f"Profile — {t.name}")
+        self.grab_set()
+        if dlg.result is None:
+            return
+        t.profile_points = dlg.result
+        self._sync_custom_diameter()
         self._tool_tree.item(t.id, values=self._tool_row(t))
         self._draw_preview()
 
     def _draw_preview(self):
         """Side view of the whole tool -- cutting part and shank -- scaled to
         fit the canvas. The cutting part is the flute length measured from
-        the tip, never shorter than the tip itself (cone or ball); without a
+        the tip, never shorter than the tip itself (cone, ball or custom
+        edge); without a
         flute length a default of the tip plus one radius, and at least one
         diameter, is drawn. Without
         an overall length (or one shorter than the cutting part) only a stub
@@ -1093,6 +1629,9 @@ class ToolLibraryDialog(tk.Toplevel):
             tip_h = R / math.tan(half)
         elif t.profile == "Ball":
             tip_h = R
+        elif t.profile == "Custom" and t.profile_points:
+            curve = tool_profile.profile_curve(t.profile_points)
+            tip_h = float(max(h for _, h in curve)) if curve else 0.0
         else:
             tip_h = 0.0
         if t.flute_length_mm > 0:
@@ -1116,6 +1655,14 @@ class ToolLibraryDialog(tk.Toplevel):
             pts = [cx - r, top, cx + r, top]
             for x, y in arc:
                 pts += [x, y]
+        elif t.profile == "Custom" and t.profile_points and curve:
+            rr, hh = tool_profile.curve_arrays(curve)
+            pts = [cx - r, top]
+            for ri, hi in zip(rr[::-1], hh[::-1]):
+                pts += [cx - ri * scale, bottom - hi * scale]
+            for ri, hi in zip(rr, hh):
+                pts += [cx + ri * scale, bottom - hi * scale]
+            pts += [cx + r, top]
         else:
             pts = [cx - r, top, cx + r, top, cx + r, bottom, cx - r, bottom]
 

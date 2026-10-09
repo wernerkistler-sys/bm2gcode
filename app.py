@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import copy
 import json
 import os
 import matplotlib.colors as mcolors
@@ -60,17 +61,25 @@ from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
 import stl_mesh
+import tool_profile
 
 # Tool profiles each algorithm accepts (see _refresh_layout, which forces the
 # step's profile into this list, and the step's Library combobox, which only
 # offers library tools with one of these profiles).
-_VCARVE_PROFILES  = ["V-Bit", "Ball"]
-_RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit"]
+_VCARVE_PROFILES  = ["V-Bit", "Ball", "Custom"]
+_HYBRID_PROFILES  = ["V-Bit"]
+_RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit", "Custom"]
 _CUTOUT_PROFILES  = ["End Mill"]
+
+
+class _MissingProfileCurve(ValueError):
+    """A step uses the Custom profile but carries no curve."""
 
 
 def _allowed_profiles(algorithm):
     family = ALGORITHM_FAMILY[algorithm]
+    if algorithm == "V-Carving (Hybrid)":
+        return _HYBRID_PROFILES
     if family == "V-Carving":
         return _VCARVE_PROFILES
     if family in ("Cutout", "Registration Holes"):
@@ -1049,6 +1058,7 @@ class GCodeGeneratorApp:
     def _copy_step_settings(self, src, dst):
         """Copy all user-editable settings from src step dict to dst step dict."""
         dst['algorithm_var'].set(src['algorithm_var'].get())
+        self._set_step_profile_nodes(dst, copy.deepcopy(src['profile_nodes']))
         dst['profile_var'].set(src['profile_var'].get())
         for key in ('diameter', 'stepover', 'raster_offset', 'stepdown', 'raster_final_stepdown',
                     'extra_offset',
@@ -1379,6 +1389,10 @@ class GCodeGeneratorApp:
         diam.pack(fill=tk.X, pady=2)
         step['diameter'] = diam
 
+        # A Custom profile's Bezier nodes, copied from its library tool,
+        # where the curve is edited.
+        step['profile_nodes'] = None
+
         # ── Raster step-down controls (shown for Raster Scan only) ───────
         stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"],
                                 minval=0.01, maxval=50.0, increment=0.1)
@@ -1524,11 +1538,12 @@ class GCodeGeneratorApp:
                     step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['tsp_frame'])
                 else:
                     step['cut_dir_row'].pack_forget()
-                step['profile_cb'].config(state="readonly", values=_VCARVE_PROFILES)
-                if profile not in _VCARVE_PROFILES:
+                allowed = _allowed_profiles(alg)
+                step['profile_cb'].config(state="readonly", values=allowed)
+                if profile not in allowed:
                     step['profile_var'].set("V-Bit")
                 step['vbit_angle'].set_state(
-                    "disabled" if profile == "Ball" else "normal")
+                    "normal" if profile == "V-Bit" else "disabled")
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['vcarve_frame'])
                 step['pocket_boundary_offset'].pack_forget()
                 step['cutout_frame'].pack_forget()
@@ -1669,6 +1684,9 @@ class GCodeGeneratorApp:
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
 
+            step['diameter'].set_state(
+                "disabled" if step['profile_var'].get() == "Custom" else "normal")
+
             locked = ((family != "V-Carving") or alg == "V-Carving (Hybrid)") \
                      and step['cut_dir_var'].get() != "Either"
             # Pocket's own per-pass ordering (see compute_pocket_toolpath's
@@ -1725,7 +1743,12 @@ class GCodeGeneratorApp:
                 max_depth = float(self.max_depth.get())
             except (ValueError, AttributeError):
                 return
-            if profile == "V-Bit":
+            if profile == "Custom":
+                curve = self._step_profile_curve(step)
+                if curve is None:
+                    return
+                r = tool_profile.radius_at_depth(curve, max_depth)
+            elif profile == "V-Bit":
                 r = max_depth * math.tan(math.radians(angle / 2.0))
             elif profile == "Ball":
                 R = diameter / 2.0
@@ -1766,6 +1789,7 @@ class GCodeGeneratorApp:
     def _reset_step_widgets(self, step):
         """Reset a step's widgets to DEFAULTS."""
         step['algorithm_var'].set(DEFAULTS["step_algorithm"])
+        self._set_step_profile_nodes(step, None)
         step['profile_var'].set(DEFAULTS["step_profile"])
         step['profile_cb'].config(state="readonly")
         step['diameter'].set(DEFAULTS["step_diameter"])
@@ -2585,9 +2609,36 @@ class GCodeGeneratorApp:
         self._refresh_material_combo()
         self._refresh_all_library_links()
 
+    def _step_profile_curve(self, step):
+        """The radial height curve of the step's Custom profile, or None."""
+        nodes = step['profile_nodes']
+        return tool_profile.profile_curve(nodes) if nodes else None
+
+    def _step_tool(self, step):
+        """The step's Tool. A Custom profile takes its diameter from its
+        curve; the V-bit angle is only read for V-bits."""
+        profile = step['profile_var'].get()
+        if profile == "Custom":
+            curve = self._step_profile_curve(step)
+            if curve is None:
+                raise _MissingProfileCurve("This step uses a Custom profile but has no curve. "
+                                 "Choose a Custom tool from the tool library.")
+            return Tool(profile, 2.0 * tool_profile.curve_radius(curve), 90.0, curve)
+        angle = float(step['vbit_angle'].get()) if profile == "V-Bit" else 90.0
+        return Tool(profile, float(step['diameter'].get()), angle)
+
+    def _set_step_profile_nodes(self, step, nodes):
+        """Store a Custom profile's Bezier nodes on the step. The Diameter
+        field follows the curve."""
+        step['profile_nodes'] = nodes
+        curve = self._step_profile_curve(step)
+        if curve is not None:
+            step['diameter'].set(format_value(2.0 * tool_profile.curve_radius(curve)))
+
     def _step_tool_values(self, step):
         """The step's current values for every field the library maps to."""
-        values = {'profile': step['profile_var'].get()}
+        values = {'profile': step['profile_var'].get(),
+                  'profile_nodes': step['profile_nodes']}
         for key in ('diameter', 'vbit_angle', 'feed_rate', 'plunge_rate',
                     'spindle_rpm') + STEPDOWN_FIELDS:
             values[key] = step[key].get()
@@ -2654,8 +2705,11 @@ class GCodeGeneratorApp:
         material into the step, and link the step to it."""
         cutting = cutting_for(tool, self._material_id)
         values = step_values_from(tool, cutting)
-        # Profile first: its traces (_refresh_layout, Auto max feature
-        # width) must see the new profile before the dependent fields land.
+        # Curve and profile first: their traces (_refresh_layout, Auto max
+        # feature width) must see the new profile before the dependent
+        # fields land.
+        if 'profile_nodes' in values:
+            self._set_step_profile_nodes(step, values.pop('profile_nodes'))
         step['profile_var'].set(values.pop('profile'))
         for key, value in values.items():
             step[key].set(value)
@@ -2693,7 +2747,8 @@ class GCodeGeneratorApp:
         message = (f"Update the cutting data of \"{tool.name}\" for "
                    f"{self._material_name} from this step?")
         if sync_state(values, tool, None, family) == SYNC_GEOMETRY_DIFFERS:
-            message += ("\n\nThis step's profile, diameter or V angle differs from the "
+            message += ("\n\nThis step's profile, diameter, V angle or custom curve "
+                        "differs from the "
                         "library tool. Only the cutting data is updated; the tool's "
                         "geometry is left unchanged. Use \"Save as new library tool…\" "
                         "to keep this step's geometry.")
@@ -2744,6 +2799,7 @@ class GCodeGeneratorApp:
         return {
             'algorithm':            step['algorithm_var'].get(),
             'profile':              step['profile_var'].get(),
+            'profile_nodes':        copy.deepcopy(step['profile_nodes']),
             'diameter':             step['diameter'].get(),
             'stepover':             step['stepover'].get(),
             'raster_offset':        step['raster_offset'].get(),
@@ -2807,6 +2863,7 @@ class GCodeGeneratorApp:
 
     def _apply_step_dict(self, step, d):
         step['algorithm_var'].set(d.get('algorithm', DEFAULTS['step_algorithm']))
+        self._set_step_profile_nodes(step, tool_profile.normalize_nodes(d.get('profile_nodes')))
         step['profile_var'].set(d.get('profile', DEFAULTS['step_profile']))
         step['diameter'].set(d.get('diameter', DEFAULTS['step_diameter']))
         step['stepover'].set(d.get('stepover', DEFAULTS['step_stepover']))
@@ -3399,14 +3456,12 @@ class GCodeGeneratorApp:
         for i in range(idx - 1, -1, -1):
             prior = self.steps[i]
             if prior['algorithm_var'].get() == "V-Carving (Hybrid)":
-                tool = Tool(prior['profile_var'].get(),
-                            float(prior['diameter'].get()),
-                            float(prior['vbit_angle'].get()))
+                tool = self._step_tool(prior)
                 extra_offset_mm = float(prior['extra_offset'].get())
                 depth_map, n_grey_levels = self._get_depth_map_for_step(prior)
                 erosion_cache_key = (
                     tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
-                    max_depth, eff_width_mm, eff_height_mm,
+                    tool_profile.curve_key(tool.profile_curve), max_depth, eff_width_mm, eff_height_mm,
                     extra_offset_mm, tuple(prior.get('source_visibility', ())))
                 return {
                     'tool':              tool,
@@ -3469,9 +3524,7 @@ class GCodeGeneratorApp:
         }
 
         if ALGORITHM_FAMILY[algorithm] == "V-Carving":
-            _profile    = step['profile_var'].get()
-            _vbit_angle = float(step['vbit_angle'].get()) if _profile != "Ball" else 90.0
-            tool        = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            tool        = self._step_tool(step)
             params.update({
                 'tool':                     tool,
                 'min_feature_width_mm':     float(step['min_fw'].get()),
@@ -3487,9 +3540,7 @@ class GCodeGeneratorApp:
                 'gating_mode':              step['gating_mode_var'].get(),
             })
         elif algorithm == "Contour":
-            _profile    = step['profile_var'].get()
-            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
-            tool = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            tool = self._step_tool(step)
             params.update({
                 'tool':                tool,
                 'contour_z_increment_mm': float(step['contour_z_increment'].get()),
@@ -3512,9 +3563,7 @@ class GCodeGeneratorApp:
                 'tab_settings':             self._tab_settings(step),
             })
         elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
-            _profile    = step['profile_var'].get()
-            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
-            tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            tool     = self._step_tool(step)
             stepover = float(step['stepover'].get())
             params.update({
                 'tool':                     tool,
@@ -3552,9 +3601,7 @@ class GCodeGeneratorApp:
                 'cut_direction':       step['cut_dir_var'].get(),
             })
         else:  # Raster
-            _profile    = step['profile_var'].get()
-            _vbit_angle = float(step['vbit_angle'].get()) if _profile == "V-Bit" else 0.0
-            tool     = Tool(_profile, float(step['diameter'].get()), _vbit_angle)
+            tool     = self._step_tool(step)
             stepover = float(step['stepover'].get())
             params.update({
                 'tool':                     tool,
@@ -3587,7 +3634,7 @@ class GCodeGeneratorApp:
 
         tool = params['tool']
         erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
-                             params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
+                             tool_profile.curve_key(tool.profile_curve), params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
                              params['extra_offset_mm'], params['source_visibility'])
 
         if ALGORITHM_FAMILY[algorithm] == "V-Carving":
@@ -3928,6 +3975,9 @@ class GCodeGeneratorApp:
         idx = self.steps.index(step)
         try:
             params = self._gather_step_params(step)
+        except _MissingProfileCurve as exc:
+            messagebox.showerror("Invalid input", f"Step {idx + 1}: {exc}")
+            return
         except ValueError:
             messagebox.showerror("Invalid input",
                                  f"Please check the settings for Step {idx + 1}.")
@@ -4021,6 +4071,10 @@ class GCodeGeneratorApp:
         for step in self.steps:
             try:
                 all_params.append(self._gather_step_params(step))
+            except _MissingProfileCurve as exc:
+                messagebox.showerror("Invalid input",
+                                     f"Step {self.steps.index(step) + 1}: {exc}")
+                return
             except ValueError:
                 idx = self.steps.index(step)
                 messagebox.showerror("Invalid input",
@@ -4092,6 +4146,8 @@ class GCodeGeneratorApp:
                 'computed':    tp is not None,
                 'profile':     profile,
                 'diameter_mm': diam_mm,
+                'profile_key': tool_profile.curve_key(self._step_profile_curve(step))
+                               if profile == "Custom" else "",
                 'tool_id':     tool_id,
             })
         return info
@@ -4113,12 +4169,13 @@ class GCodeGeneratorApp:
 
         # Warn if the selected steps use different tools — tool changes are not
         # supported in a single G-code file. Two linked steps are the same
-        # tool exactly when their library ids match; otherwise profile and
-        # diameter decide.
+        # tool exactly when their library ids match; otherwise profile,
+        # diameter and (for Custom) the curve decide.
         def _same_tool(a, b):
             if a['tool_id'] and b['tool_id']:
                 return a['tool_id'] == b['tool_id']
-            return (a['profile'], a['diameter_mm']) == (b['profile'], b['diameter_mm'])
+            return ((a['profile'], a['diameter_mm'], a['profile_key'])
+                    == (b['profile'], b['diameter_mm'], b['profile_key']))
 
         selected = [steps_info[i] for i in indices]
         if any(not _same_tool(a, b)

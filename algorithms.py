@@ -3,6 +3,7 @@ import numpy as np
 from tool import Tool
 from toolpath import ToolPath
 from dressup import apply_tabs
+import tool_profile
 
 
 def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
@@ -300,6 +301,17 @@ def _build_kernel(tool, px_per_mm, max_depth):
         r_mm = r_px / px_per_mm
         kernel    = (r_mm / (tan_half * max_depth)).astype(np.float32)
         footprint = r_px <= k_rad
+    elif tool.profile == "Custom":
+        if not tool.profile_curve:
+            raise ValueError("Custom profile has no curve.")
+        r_s, h_s = tool_profile.curve_arrays(tool.profile_curve)
+        k_rad = max(1, int(np.ceil(r_s[-1] * px_per_mm)))
+        ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
+        r_px = np.sqrt(kx**2 + ky**2)
+        cap = np.interp(r_px / px_per_mm, r_s, h_s)
+        cap[r_px > k_rad] = 1e9
+        kernel    = (cap / max_depth).astype(np.float32)
+        footprint = r_px <= k_rad
     else:  # End Mill: flat bottom, vertical walls
         k_rad = max(1, int(np.ceil(R_mm * px_per_mm)))
         ky, kx = np.mgrid[-k_rad:k_rad+1, -k_rad:k_rad+1]
@@ -325,6 +337,9 @@ def _planning_kernel(tool, px_per_mm, max_depth, extra_offset_mm,
         return real_kernel, real_footprint
     inflated = dataclasses.replace(
         tool, diameter_mm=max(tool.diameter_mm + 2.0 * extra_offset_mm, 0.01))
+    if tool.profile == "Custom":
+        inflated.profile_curve = tool_profile.offset_curve(tool.profile_curve,
+                                                           extra_offset_mm)
     return _build_kernel(inflated, px_per_mm, max_depth)
 
 
@@ -3330,6 +3345,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     progress(0, "Building tool geometry kernel…")
     if tool.profile == "Ball" and tool.diameter_mm <= 0.0:
         raise ValueError("Ball profile requires a positive tool diameter.")
+    if tool.profile == "Custom" and not tool.profile_curve:
+        raise ValueError("Custom profile has no curve.")
     kernel_vcarve, footprint_vcarve = _build_kernel(tool, px_per_mm, max_depth)
     kernel_plan, footprint_plan = _planning_kernel(
         tool, px_per_mm, max_depth, extra_offset_mm, kernel_vcarve, footprint_vcarve)
@@ -3514,6 +3531,9 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             inscribed_depth_norm = (
                 _R_mm - np.sqrt(np.maximum(0.0, _R_mm**2 - _r_mm**2))
             ) / max_depth
+        elif tool.profile == 'Custom':
+            inscribed_depth_norm = tool_profile.inscribed_depth(
+                tool.profile_curve, radius_map / px_per_mm) / max_depth
         else:  # End Mill — inscribed circle does not constrain depth
             progress(48, "Warning: 'inscribed' mode is not meaningful for End Mill; "
                          "falling back to grey-erosion depth.")

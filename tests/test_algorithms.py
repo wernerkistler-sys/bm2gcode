@@ -25,6 +25,7 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         compute_registration_holes_toolpath)
 from tool import Tool
 from toolpath import ToolPath
+import tool_profile
 
 FAILURES = []
 
@@ -1023,6 +1024,24 @@ for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Spiral (Outside-In)"):
 # canvas (same W x H for the axis flips, H x W for Diagonal) -- the reason a
 # two-sided job needs no X/Y re-zeroing.
 # --------------------------------------------------------------------------
+print("custom profile in compute_raster_toolpath")
+
+# A Custom profile drawn as a flat-bottomed cylinder must mill exactly what
+# an End Mill of the same diameter does: same kernel, same toolpath.
+_flat = tool_profile.profile_curve(tool_profile.flat(1.0))
+_res = {}
+for _name, _tool in (("End Mill", Tool("End Mill", 1.0)),
+                     ("Custom", Tool("Custom", 1.0, 90.0, _flat))):
+    _res[_name] = compute_raster_toolpath(
+        dome, n_grey_levels=256, tool=_tool, step_mm=0.3, stepdown_mm=5.0,
+        max_depth=5.0, width_mm=12.0, height_mm=12.0, raster_dir="Horizontal",
+        progress=_noop_progress)
+check("Custom flat profile gives the End Mill result map",
+      np.allclose(_res["Custom"].result, _res["End Mill"].result, atol=1e-6))
+check("Custom flat profile gives the End Mill segments",
+      len(_res["Custom"].segments) == len(_res["End Mill"].segments))
+
+
 print("registration holes")
 
 

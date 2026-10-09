@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from tool import Tool
+import tool_profile
 
 LIBRARY_VERSION = 1
 
@@ -56,7 +57,7 @@ class ToolDef:
     """One physical cutter: its geometry plus cutting data per material."""
     id: str
     name: str
-    profile: str                      # "Ball" | "End Mill" | "V-Bit"
+    profile: str                      # "Ball" | "End Mill" | "V-Bit" | "Custom"
     diameter_mm: float
     vbit_angle_deg: float = 90.0
     flute_length_mm: float = 0.0
@@ -64,10 +65,15 @@ class ToolDef:
     overall_length_mm: float = 0.0    # 0 = not specified
     number: int | None = None         # tool number for a future M6 Tn
     notes: str = ""
-    profile_points: list | None = None   # reserved for custom profiles
+    profile_points: list | None = None   # Bezier nodes of a Custom profile
     cutting: dict = field(default_factory=dict)   # material_id -> CuttingData
 
     def to_tool(self) -> Tool:
+        if self.profile == "Custom" and self.profile_points:
+            curve = tool_profile.profile_curve(self.profile_points)
+            if curve is not None:
+                return Tool(self.profile, 2.0 * tool_profile.curve_radius(curve),
+                            self.vbit_angle_deg, curve)
         return Tool(self.profile, self.diameter_mm, self.vbit_angle_deg)
 
     def to_dict(self):
@@ -93,7 +99,7 @@ class ToolDef:
             overall_length_mm=float(d.get('overall_length_mm', 0.0)),
             number=int(number) if number is not None else None,
             notes=str(d.get('notes', '')),
-            profile_points=d.get('profile_points'),
+            profile_points=tool_profile.normalize_nodes(d.get('profile_points')),
             cutting={str(mid): CuttingData.from_dict(cd)
                      for mid, cd in (d.get('cutting') or {}).items()},
         )
@@ -315,11 +321,14 @@ def stepdown_field_for(family) -> str:
 
 def step_values_from(tool, cutting):
     """Step field values (as strings, keyed by step-field name) to write
-    when applying *tool*. The V-bit angle is included only for V-bits;
-    cutting fields only when *cutting* is given."""
+    when applying *tool*. The V-bit angle is included only for V-bits,
+    a deep copy of the Bezier nodes (key 'profile_nodes') only for Custom
+    profiles, and cutting fields only when *cutting* is given."""
     values = {'profile': tool.profile, 'diameter': format_value(tool.diameter_mm)}
     if tool.profile == "V-Bit":
         values['vbit_angle'] = format_value(tool.vbit_angle_deg)
+    if tool.profile == "Custom":
+        values['profile_nodes'] = copy.deepcopy(tool.profile_points)
     if cutting is not None:
         values['feed_rate']   = format_value(cutting.feed_rate)
         values['plunge_rate'] = format_value(cutting.plunge_rate)
@@ -334,6 +343,13 @@ def _same(a, b) -> bool:
         return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-6)
     except (TypeError, ValueError):
         return False
+
+
+def _same_profile(nodes_a, nodes_b) -> bool:
+    """True when two Bezier node lists give the same radial height curve."""
+    if not nodes_a or not nodes_b:
+        return not nodes_a and not nodes_b
+    return tool_profile.profile_curve(nodes_a) == tool_profile.profile_curve(nodes_b)
 
 
 def sync_state(step_values, tool, cutting, family) -> str:
@@ -354,6 +370,9 @@ def sync_state(step_values, tool, cutting, family) -> str:
     if tool.profile == "V-Bit" and not _same(step_values.get('vbit_angle'),
                                              tool.vbit_angle_deg):
         return SYNC_GEOMETRY_DIFFERS
+    if tool.profile == "Custom" and not _same_profile(step_values.get('profile_nodes'),
+                                                      tool.profile_points):
+        return SYNC_GEOMETRY_DIFFERS
     if cutting is None:
         return SYNC_NO_DATA
     expected = (('feed_rate',   cutting.feed_rate),
@@ -368,7 +387,8 @@ def sync_state(step_values, tool, cutting, family) -> str:
 
 def update_cutting_from_step(tool, material_id, step_values, family):
     """A copy of *tool* whose cutting data for *material_id* is taken from
-    the step. Geometry (profile, diameter, V angle) is left unchanged.
+    the step. Geometry (profile, diameter, V angle, custom curve) is left
+    unchanged.
     Raises ValueError if a step value is not a number."""
     updated = copy.deepcopy(tool)
     updated.cutting[material_id] = CuttingData(
@@ -387,7 +407,9 @@ def tool_from_step(name, step_values, material_id, family):
         id=new_id(), name=name, profile=profile,
         diameter_mm=float(step_values['diameter']),
         vbit_angle_deg=(float(step_values['vbit_angle'])
-                        if profile == "V-Bit" else 90.0))
+                        if profile == "V-Bit" else 90.0),
+        profile_points=(copy.deepcopy(step_values.get('profile_nodes'))
+                        if profile == "Custom" else None))
     if material_id is not None:
         tool = update_cutting_from_step(tool, material_id, step_values, family)
     return tool

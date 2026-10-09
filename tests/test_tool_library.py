@@ -8,6 +8,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tool_profile
 from tool_library import (
     ToolLibrary, ToolDef, Material, CuttingData,
     cutting_for, step_values_from, stepdown_field_for, sync_state,
@@ -236,6 +237,48 @@ n = target.merge(incoming, lambda existing, inc: "skip")
 check("skip: only the new tool counted", n == 1)
 check("merge copies, does not alias",
       target.find_tool('tool-new') is not incoming.tools[1])
+
+
+# --------------------------------------------------------------------------
+# Custom profiles
+# --------------------------------------------------------------------------
+print("custom profiles")
+
+nodes = tool_profile.point_roundover(12.7, 6.35)
+custom = ToolDef(id='tool-custom', name='Round-over', profile='Custom',
+                 diameter_mm=12.7, profile_points=nodes)
+custom.cutting['mat-mdf'] = CuttingData(feed_rate=900.0, stepdown_mm=1.0)
+lib = ToolLibrary.seeded()
+lib.tools.append(custom)
+cpath = os.path.join(TMP, "custom", "tool_library.json")
+lib.save(cpath)
+loaded = ToolLibrary.load(cpath).find_tool('tool-custom')
+check("custom nodes survive save / load", loaded.profile_points == nodes)
+t = loaded.to_tool()
+check("to_tool carries the sampled curve",
+      t.profile == "Custom" and t.profile_curve == tool_profile.profile_curve(nodes)
+      and abs(t.diameter_mm - 12.7) < 1e-6)
+
+bad = custom.to_dict()
+bad['profile_points'] = [{'p': 'oops'}]
+check("malformed nodes load as None", ToolDef.from_dict(bad).profile_points is None)
+
+values = step_values_from(custom, custom.cutting['mat-mdf'])
+check("step values include a copy of the nodes",
+      values['profile_nodes'] == nodes and values['profile_nodes'] is not nodes)
+check("custom step in sync",
+      sync_state(values, custom, custom.cutting['mat-mdf'], "Raster Scan") == SYNC_IN_SYNC)
+edited = dict(values, profile_nodes=tool_profile.point_roundover(12.7, 5.0))
+check("different curve is a geometry difference",
+      sync_state(edited, custom, custom.cutting['mat-mdf'], "Raster Scan")
+      == SYNC_GEOMETRY_DIFFERS)
+check("missing curve is a geometry difference",
+      sync_state(dict(values, profile_nodes=None), custom, None, "Raster Scan")
+      == SYNC_GEOMETRY_DIFFERS)
+new_tool = tool_from_step("From step", values, 'mat-mdf', "Raster Scan")
+check("tool_from_step keeps the curve", new_tool.profile_points == nodes)
+check("non-custom step values have no nodes",
+      'profile_nodes' not in step_values_from(ToolLibrary.seeded().tools[0], None))
 
 
 print()
