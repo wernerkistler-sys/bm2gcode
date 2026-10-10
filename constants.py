@@ -73,12 +73,12 @@ DEFAULTS = {
     "surface":           "white",
     # Global machine / G-code settings
     "z_safe":            "5.0",
-    "feed_rapid":        "1500",
+    "feed_rapid":        "2000",
     "accel_mm_s2":       "300",
-    "spindle_dwell_s":   "3",   # pause after each step's S word (s); 0 = no pause
+    "spindle_dwell_s":   "30",   # pause after each step's S word (s); 0 = no pause
     "spindle_max_rpm":   "24000",   # cap for recommended spindle speeds; 0 = no limit
     "spindle_min_rpm":   "6000",    # floor for recommended spindle speeds; 0 = no limit
-    "feed_max":          "5000",    # cap for recommended feed rates (mm/min); 0 = no limit
+    "feed_max":          "2000",    # cap for recommended feed rates (mm/min); 0 = no limit
     "preamble":          "",    # '' → use DEFAULT_PREAMBLE
     "postamble":         "",    # '' → use DEFAULT_POSTAMBLE
     # Per-layer defaults (used for every newly added layer)
