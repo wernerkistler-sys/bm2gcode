@@ -1398,7 +1398,7 @@ class ToolLibraryDialog(tk.Toplevel):
         top.pack(fill=tk.BOTH, expand=True)
 
         # ── Tool list ─────────────────────────────────────────────────
-        left = ttk.Frame(top)
+        left = SectionFrame(top, "Tools")
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._tool_tree = ttk.Treeview(left, columns=("num", "name", "profile", "diam"),
                                        show="headings", selectmode="browse", height=8)
@@ -1446,24 +1446,24 @@ class ToolLibraryDialog(tk.Toplevel):
         self._diam = LabeledEntry(form, "Diameter", "mm", "6",
                                   minval=0.01, maxval=200.0, increment=0.5)
         self._diam.pack(fill=tk.X, pady=2)
-        self._flutes = LabeledEntry(form, "Flutes", "", "2",
-                                    minval=1.0, maxval=12.0, increment=1.0)
-        self._flutes.pack(fill=tk.X, pady=2)
         self._angle = LabeledEntry(form, "V-bit angle", "°", "60",
                                    minval=1.0, maxval=179.0, increment=5.0)
         self._angle.pack(fill=tk.X, pady=2)
         self._edit_profile_btn = ttk.Button(form, text="Edit profile…",
                                             command=self._edit_profile)
         self._edit_profile_btn.pack(anchor=tk.E, pady=2)
+        self._flutes = LabeledEntry(form, "Flutes", "", "2",
+                                    minval=1.0, maxval=12.0, increment=1.0)
+        self._flutes.pack(fill=tk.X, pady=2)
         self._flute = LabeledEntry(form, "Flute length", "mm", "0",
                                    minval=0.0, maxval=500.0, increment=1.0)
         self._flute.pack(fill=tk.X, pady=2)
-        self._shank = LabeledEntry(form, "Shank Ø (0 = Ø)", "mm", "0",
-                                   minval=0.0, maxval=200.0, increment=0.5)
-        self._shank.pack(fill=tk.X, pady=2)
         self._length = LabeledEntry(form, "Overall length", "mm", "0",
                                     minval=0.0, maxval=1000.0, increment=1.0)
         self._length.pack(fill=tk.X, pady=2)
+        self._shank = LabeledEntry(form, "Shank Ø (0 = Ø)", "mm", "0",
+                                   minval=0.0, maxval=200.0, increment=0.5)
+        self._shank.pack(fill=tk.X, pady=2)
 
         self._notes_var = tk.StringVar()
         row = ttk.Frame(form)
@@ -1473,7 +1473,8 @@ class ToolLibraryDialog(tk.Toplevel):
 
         self._preview = tk.Canvas(geo, width=self._PREVIEW_W, height=self._PREVIEW_H,
                                   background="#2b2b2b", highlightthickness=0)
-        self._preview.pack(side=tk.LEFT, padx=(8, 0), anchor=tk.N)
+        self._preview.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=(8, 0))
+        self._preview.bind("<Configure>", lambda _e: self._draw_preview())
 
         for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
             var.trace_add("write", self._on_geometry_changed)
@@ -1516,18 +1517,42 @@ class ToolLibraryDialog(tk.Toplevel):
         self._cut_plunge.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=2)
         self._cut_rpm.grid(row=1, column=2, sticky=tk.EW, padx=(12, 0), pady=2)
         self._cut_sd.grid(row=2, column=2, sticky=tk.EW, padx=(12, 0), pady=2)
+        self._cut_stats = ttk.Label(cform, foreground="#666666")
+        self._cut_stats.grid(row=1, column=3, sticky=tk.W, padx=(8, 0))
+        for le in (self._cut_feed, self._cut_rpm, self._diam, self._flutes):
+            le.committed_var.trace_add("write", self._update_cut_stats)
+        self._update_cut_stats()
         cbtns = ttk.Frame(cform)
-        cbtns.grid(row=0, column=2, sticky=tk.E)
+        cbtns.grid(row=0, column=2, columnspan=2, sticky=tk.E)
         ttk.Button(cbtns, text="Set", command=self._set_cutting).pack(side=tk.LEFT)
         ttk.Button(cbtns, text="Remove", command=self._remove_cutting).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(cbtns, text="Recommend…",
                    command=self._recommend_cutting).pack(side=tk.LEFT, padx=(4, 0))
-        cform.columnconfigure(2, weight=1)
+        cform.columnconfigure(3, weight=1)
+
+    def _update_cut_stats(self, *_):
+        """Show cutting speed vc = π·D·n / 1000 (m/min) and chip load
+        fz = feed / (n · flutes) (mm/tooth) for the feed and spindle speed in
+        the cutting-data form and the diameter and flutes in the geometry
+        form."""
+        try:
+            feed   = float(self._cut_feed.get())
+            rpm    = float(self._cut_rpm.get())
+            diam   = float(self._diam.get())
+            flutes = max(1, int(float(self._flutes.get())))
+        except ValueError:
+            rpm = 0.0
+        if rpm <= 0:
+            self._cut_stats.config(text="vc –  ·  fz –")
+            return
+        vc = math.pi * diam * rpm / 1000.0
+        fz = feed / (rpm * flutes)
+        self._cut_stats.config(text=f"vc {vc:.0f} m/min  ·  fz {fz:.3f} mm")
 
     def _refresh_tool_tree(self, select_id=None):
         tree = self._tool_tree
         tree.delete(*tree.get_children())
-        for t in self.library.tools:
+        for t in self.library.sorted_tools():
             tree.insert("", tk.END, iid=t.id, values=self._tool_row(t))
         if select_id is None and self._tool is not None:
             select_id = self._tool.id
@@ -1608,6 +1633,8 @@ class ToolLibraryDialog(tk.Toplevel):
             self._sync_custom_diameter()
         self._update_geometry_states()
         self._tool_tree.item(t.id, values=self._tool_row(t))
+        self._tool_tree.move(t.id, "", self.library.sorted_tools().index(t))
+        self._tool_tree.see(t.id)
         self._draw_preview()
 
     def _update_geometry_states(self):
@@ -1659,7 +1686,10 @@ class ToolLibraryDialog(tk.Toplevel):
         t = self._tool
         if t is None or t.diameter_mm <= 0:
             return
-        W, H, pad, label_h = self._PREVIEW_W, self._PREVIEW_H, 12, 14
+        W, H = c.winfo_width(), c.winfo_height()
+        if W <= 1 or H <= 1:    # not mapped yet
+            W, H = self._PREVIEW_W, self._PREVIEW_H
+        pad, label_h = 12, 14
         R  = t.diameter_mm / 2.0
         Rs = (t.shank_diameter_mm if t.shank_diameter_mm > 0 else t.diameter_mm) / 2.0
         if t.profile == "V-Bit":
@@ -2071,7 +2101,7 @@ class ToolLibraryDialog(tk.Toplevel):
                                  parent=self)
 
     def _confirm(self):
-        for t in self.library.tools:
+        for t in self.library.sorted_tools():
             if not t.name.strip():
                 messagebox.showerror("Missing name", "Every tool needs a name.", parent=self)
                 self._tool_tree.selection_set(t.id)

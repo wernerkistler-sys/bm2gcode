@@ -191,8 +191,13 @@ class ToolLibrary:
                 return m
         return None
 
+    def sorted_tools(self):
+        """Tools ordered by tool number, then name; unnumbered tools last."""
+        return sorted(self.tools, key=lambda t: (t.number is None, t.number or 0,
+                                                 t.name.casefold()))
+
     def tools_for_profiles(self, profiles):
-        return [t for t in self.tools if t.profile in profiles]
+        return [t for t in self.sorted_tools() if t.profile in profiles]
 
     def tools_using_material(self, material_id):
         return [t for t in self.tools if material_id in t.cutting]

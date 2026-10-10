@@ -397,6 +397,17 @@ try:
 except ValueError:
     check("no reference data raises", True)
 
+# Tools sort by number, then name (case-insensitive); unnumbered tools last.
+sort_lib = ToolLibrary(tools=[ToolDef('a', 'zeta', 'End Mill', 3.0),
+                              ToolDef('b', 'Beta', 'V-Bit', 6.0, number=2),
+                              ToolDef('c', 'alpha', 'End Mill', 6.0, number=2),
+                              ToolDef('d', 'Alpha', 'Ball', 6.0),
+                              ToolDef('e', 'Omega', 'End Mill', 6.0, number=1)])
+check("sorted_tools orders by number, then name, unnumbered last",
+      [t.id for t in sort_lib.sorted_tools()] == ['e', 'c', 'b', 'd', 'a'])
+check("tools_for_profiles keeps the sorted order",
+      [t.id for t in sort_lib.tools_for_profiles(('End Mill',))] == ['e', 'c', 'a'])
+
 
 print()
 if FAILURES:
