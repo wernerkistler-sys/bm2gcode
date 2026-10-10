@@ -9,7 +9,8 @@ import numpy as np
 
 from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, TOOL_PROFILES
 from tool_library import (ToolLibrary, ToolDef, Material, CuttingData,
-                          new_id, format_value)
+                          new_id, format_value, recommend_cutting,
+                          FZ_DIAMETERS_MM, MATERIAL_PRESETS, PLUNGE_FRACTION)
 import stl_mesh
 import tool_profile
 
@@ -410,7 +411,8 @@ def _fmt_time(minutes):
 
 class SettingsDialog(tk.Toplevel):
     """Modal dialog for editing global G-code settings (z_safe, feed_rapid,
-    acceleration, spindle spin-up dwell, preamble, postamble).  Modifies *settings* dict in-place on OK."""
+    acceleration, spindle spin-up dwell, spindle speed range, max feed rate,
+    preamble, postamble).  Modifies *settings* dict in-place on OK."""
 
     def __init__(self, parent, settings):
         super().__init__(parent)
@@ -449,6 +451,21 @@ class SettingsDialog(tk.Toplevel):
                                    str(settings.get('spindle_dwell_s', 3.0)),
                                    minval=0.0, maxval=600.0, increment=1.0)
         self._dwell.pack(fill=tk.X, pady=2)
+
+        self._max_rpm = LabeledEntry(mf, "Max spindle speed (0 = no limit)", "RPM",
+                                     str(settings.get('spindle_max_rpm', 24000.0)),
+                                     minval=0.0, maxval=100000.0, increment=1000.0)
+        self._max_rpm.pack(fill=tk.X, pady=2)
+
+        self._min_rpm = LabeledEntry(mf, "Min spindle speed (0 = no limit)", "RPM",
+                                     str(settings.get('spindle_min_rpm', 6000.0)),
+                                     minval=0.0, maxval=100000.0, increment=1000.0)
+        self._min_rpm.pack(fill=tk.X, pady=2)
+
+        self._feed_max = LabeledEntry(mf, "Max feed rate (0 = no limit)", "mm/min",
+                                      str(settings.get('feed_max', 5000.0)),
+                                      minval=0.0, maxval=100000.0, increment=100.0)
+        self._feed_max.pack(fill=tk.X, pady=2)
 
         # ── G-code preamble ───────────────────────────────────────────
         pre_sf = SectionFrame(outer, "G-code Preamble")
@@ -532,10 +549,14 @@ class SettingsDialog(tk.Toplevel):
             feed_rapid  = float(self._feed_rapid.get())
             accel_mm_s2 = float(self._accel.get())
             dwell_s     = float(self._dwell.get())
+            max_rpm     = float(self._max_rpm.get())
+            min_rpm     = float(self._min_rpm.get())
+            feed_max    = float(self._feed_max.get())
         except ValueError:
             messagebox.showerror("Invalid input",
-                                 "Safe height, rapid feed, max acceleration and "
-                                 "spindle spin-up dwell must be numbers.",
+                                 "Safe height, rapid feed, max acceleration, "
+                                 "spindle spin-up dwell, spindle speeds and max "
+                                 "feed rate must be numbers.",
                                  parent=self)
             return
 
@@ -553,6 +574,9 @@ class SettingsDialog(tk.Toplevel):
         self._settings['feed_rapid']  = feed_rapid
         self._settings['accel_mm_s2'] = accel_mm_s2
         self._settings['spindle_dwell_s'] = max(0.0, dwell_s)
+        self._settings['spindle_max_rpm'] = max(0.0, max_rpm)
+        self._settings['spindle_min_rpm'] = max(0.0, min_rpm)
+        self._settings['feed_max']        = max(0.0, feed_max)
         self._settings['preamble']    = preamble
         self._settings['postamble']   = postamble
         self.confirmed = True
@@ -1321,7 +1345,8 @@ class ToolLibraryDialog(tk.Toplevel):
     _PREVIEW_W = 120
     _PREVIEW_H = 220
 
-    def __init__(self, parent, library, select_tool_id=None):
+    def __init__(self, parent, library, select_tool_id=None, spindle_max_rpm=0.0,
+                 spindle_min_rpm=0.0, feed_max=0.0):
         super().__init__(parent)
         self.title("Tool Library")
         self.resizable(True, True)
@@ -1333,6 +1358,8 @@ class ToolLibraryDialog(tk.Toplevel):
         self.confirmed = False
         self._tool     = None    # ToolDef shown in the geometry form
         self._loading  = False   # True while forms are filled programmatically
+        self._machine_limits = (spindle_max_rpm, spindle_min_rpm, feed_max)
+        self._material = None    # Material shown in the reference-data form
 
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -1419,6 +1446,9 @@ class ToolLibraryDialog(tk.Toplevel):
         self._diam = LabeledEntry(form, "Diameter", "mm", "6",
                                   minval=0.01, maxval=200.0, increment=0.5)
         self._diam.pack(fill=tk.X, pady=2)
+        self._flutes = LabeledEntry(form, "Flutes", "", "2",
+                                    minval=1.0, maxval=12.0, increment=1.0)
+        self._flutes.pack(fill=tk.X, pady=2)
         self._angle = LabeledEntry(form, "V-bit angle", "°", "60",
                                    minval=1.0, maxval=179.0, increment=5.0)
         self._angle.pack(fill=tk.X, pady=2)
@@ -1447,7 +1477,8 @@ class ToolLibraryDialog(tk.Toplevel):
 
         for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
             var.trace_add("write", self._on_geometry_changed)
-        for le in (self._diam, self._angle, self._flute, self._shank, self._length):
+        for le in (self._diam, self._flutes, self._angle, self._flute, self._shank,
+                   self._length):
             le.committed_var.trace_add("write", self._on_geometry_changed)
 
         # ── Cutting data ──────────────────────────────────────────────
@@ -1489,6 +1520,8 @@ class ToolLibraryDialog(tk.Toplevel):
         cbtns.grid(row=0, column=2, sticky=tk.E)
         ttk.Button(cbtns, text="Set", command=self._set_cutting).pack(side=tk.LEFT)
         ttk.Button(cbtns, text="Remove", command=self._remove_cutting).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(cbtns, text="Recommend…",
+                   command=self._recommend_cutting).pack(side=tk.LEFT, padx=(4, 0))
         cform.columnconfigure(2, weight=1)
 
     def _refresh_tool_tree(self, select_id=None):
@@ -1529,6 +1562,7 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._number_var.set("" if tool.number is None else str(tool.number))
                 self._profile_var.set(tool.profile)
                 self._diam.set(format_value(tool.diameter_mm))
+                self._flutes.set(str(tool.flutes))
                 self._angle.set(format_value(tool.vbit_angle_deg))
                 self._flute.set(format_value(tool.flute_length_mm))
                 self._shank.set(format_value(tool.shank_diameter_mm))
@@ -1555,6 +1589,10 @@ class ToolLibraryDialog(tk.Toplevel):
                 t.number = int(number)
             except ValueError:
                 pass
+        try:
+            t.flutes = max(1, int(float(self._flutes.get())))
+        except ValueError:
+            pass
         for le, attr in ((self._diam, 'diameter_mm'), (self._angle, 'vbit_angle_deg'),
                          (self._flute, 'flute_length_mm'),
                          (self._shank, 'shank_diameter_mm'),
@@ -1791,23 +1829,154 @@ class ToolLibraryDialog(tk.Toplevel):
         self._tool.cutting.pop(sel[0], None)
         self._refresh_cutting_tree()
 
+    def _recommend_cutting(self):
+        """Open the recommendation for the shown tool and chosen material;
+        accepted values fill the cutting form (Set stores them)."""
+        if self._tool is None:
+            return
+        m = self.library.find_material(self._chosen_material_id())
+        if m is None:
+            messagebox.showwarning("No material", "Choose a material first.", parent=self)
+            return
+        if not m.has_reference():
+            messagebox.showinfo(
+                "No reference data",
+                f"\"{m.name}\" has no reference cutting data.\n\n"
+                "Enter it, or load a preset, on the Materials tab.", parent=self)
+            return
+        dlg = CuttingRecommendationDialog(self, self._tool, m, *self._machine_limits)
+        self.grab_set()
+        if dlg.result is not None:
+            self._fill_cutting_form(dlg.result)
+
     # ------------------------------------------------------------------ #
     #  Materials tab
     # ------------------------------------------------------------------ #
     def _build_materials_tab(self, tab):
         self._mat_list = tk.Listbox(tab, height=10, exportselection=False)
         self._mat_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._mat_list.bind("<<ListboxSelect>>", self._on_material_selected)
         btns = ttk.Frame(tab)
         btns.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
         ttk.Button(btns, text="Add…",    command=self._add_material).pack(fill=tk.X)
         ttk.Button(btns, text="Rename…", command=self._rename_material).pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="Delete",  command=self._delete_material).pack(fill=tk.X)
 
+        # ── Reference data for cutting recommendations ────────────────
+        ref = SectionFrame(tab, "Reference data")
+        ref.pack(side=tk.LEFT, fill=tk.BOTH, padx=(8, 0))
+        row = ttk.Frame(ref)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Load preset").pack(side=tk.LEFT)
+        self._preset_var = tk.StringVar()
+        self._preset_cb = ttk.Combobox(row, textvariable=self._preset_var,
+                                       values=list(MATERIAL_PRESETS), state="readonly",
+                                       width=24)
+        self._preset_cb.pack(side=tk.RIGHT)
+        self._preset_cb.bind("<<ComboboxSelected>>", self._on_preset_chosen)
+        self._mat_vc = LabeledEntry(ref, "Cutting speed vc", "m/min", "0",
+                                    minval=0.0, maxval=5000.0, increment=25.0)
+        self._mat_vc.pack(fill=tk.X, pady=2)
+        self._mat_sd = LabeledEntry(ref, "Step-down per pass", "× Ø", "0",
+                                    minval=0.0, maxval=10.0, increment=0.05)
+        self._mat_sd.pack(fill=tk.X, pady=2)
+        ttk.Label(ref, text="Feed per tooth fz (mm) by cutter diameter:").pack(
+            anchor=tk.W, pady=(6, 2))
+        grid = ttk.Frame(ref)
+        grid.pack(fill=tk.X)
+        self._mat_fz_vars = []
+        self._mat_fz_entries = []
+        for i, d in enumerate(FZ_DIAMETERS_MM):
+            r, c = divmod(i, 3)
+            ttk.Label(grid, text=f"Ø {format_value(d)}").grid(
+                row=r, column=2 * c, sticky=tk.E, padx=(8 if c else 0, 2), pady=1)
+            var = tk.StringVar()
+            entry = ttk.Entry(grid, textvariable=var, width=7, justify=tk.RIGHT)
+            entry.grid(row=r, column=2 * c + 1, sticky=tk.W, pady=1)
+            var.trace_add("write", self._on_material_data_changed)
+            self._mat_fz_vars.append(var)
+            self._mat_fz_entries.append(entry)
+        ttk.Label(ref, text="Values come from the Stepcraft milling-parameter sheet;\n"
+                            "between diameters fz is interpolated.",
+                  foreground="#666666").pack(anchor=tk.W, pady=(6, 0))
+        for le in (self._mat_vc, self._mat_sd):
+            le.committed_var.trace_add("write", self._on_material_data_changed)
+        self._show_material(None)
+
     def _refresh_material_list(self):
         self._mat_list.delete(0, tk.END)
         for m in self.library.materials:
             self._mat_list.insert(tk.END, m.name)
+        if self._material in self.library.materials:
+            i = self.library.materials.index(self._material)
+            self._mat_list.selection_set(i)
+            self._mat_list.see(i)
+        else:
+            self._show_material(None)
         self._refresh_cutting_tree()
+
+    def _on_material_selected(self, _event=None):
+        self._show_material(self._selected_material())
+
+    def _show_material(self, material):
+        """Fill the reference-data form from *material* (None clears and
+        disables it)."""
+        self._material = material
+        self._loading = True
+        try:
+            self._preset_var.set("")
+            if material is None:
+                self._mat_vc.set("0")
+                self._mat_sd.set("0")
+                for var in self._mat_fz_vars:
+                    var.set("")
+            else:
+                self._mat_vc.set(format_value(material.cutting_speed_m_min))
+                self._mat_sd.set(format_value(material.stepdown_factor))
+                fz = material.feed_per_tooth_mm or [None] * len(FZ_DIAMETERS_MM)
+                for var, v in zip(self._mat_fz_vars, fz):
+                    var.set("" if v is None else format_value(v))
+        finally:
+            self._loading = False
+        state = "disabled" if material is None else "normal"
+        self._mat_vc.set_state(state)
+        self._mat_sd.set_state(state)
+        for entry in self._mat_fz_entries:
+            entry.config(state=state)
+        self._preset_cb.config(state="disabled" if material is None else "readonly")
+
+    def _on_preset_chosen(self, _event=None):
+        name = self._preset_var.get()
+        if self._material is None or name not in MATERIAL_PRESETS:
+            return
+        self._material.apply_preset(name)
+        self._show_material(self._material)
+        self._preset_var.set(name)
+
+    def _on_material_data_changed(self, *_):
+        """Write the form into the shown material. Fields that aren't
+        numbers leave the stored value unchanged; an empty fz field clears
+        that diameter's value, which makes the row incomplete."""
+        if self._loading or self._material is None:
+            return
+        m = self._material
+        for le, attr in ((self._mat_vc, 'cutting_speed_m_min'),
+                         (self._mat_sd, 'stepdown_factor')):
+            try:
+                setattr(m, attr, float(le.get()))
+            except ValueError:
+                pass
+        fz = list(m.feed_per_tooth_mm or [0.0] * len(FZ_DIAMETERS_MM))
+        for i, var in enumerate(self._mat_fz_vars):
+            text = var.get().strip().replace(',', '.')
+            if not text:
+                fz[i] = 0.0
+                continue
+            try:
+                fz[i] = max(0.0, float(text))
+            except ValueError:
+                pass
+        m.feed_per_tooth_mm = fz if any(fz) else None
 
     def _selected_material(self):
         sel = self._mat_list.curselection()
@@ -1908,6 +2077,153 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._tool_tree.selection_set(t.id)
                 return
         self.confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
+class CuttingRecommendationDialog(tk.Toplevel):
+    """Modal dialog showing recommended cutting data for *tool* in
+    *material* and how it is derived (see ``tool_library.recommend_cutting``).
+
+    The adjustment and machine limits set here apply to this calculation
+    only.
+    After ``wait_window`` returns, ``self.result`` is the accepted
+    ``CuttingData``, or None if cancelled.
+    """
+
+    _ADJUSTMENTS = {"Standard": 0.0, "Roughing (vc −25 %)": -25.0,
+                    "Finishing (vc +25 %)": 25.0}
+
+    def __init__(self, parent, tool, material, spindle_max_rpm, spindle_min_rpm=0.0,
+                 feed_max=0.0):
+        super().__init__(parent)
+        self.title("Recommended Cutting Data")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+        self.result = None
+        self._tool = tool
+        self._material = material
+        self._rec = None
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(outer, text=f"{tool.name} in {material.name}",
+                  font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W, pady=(0, 8))
+
+        opts = SectionFrame(outer, "Options")
+        opts.pack(fill=tk.X)
+        row = ttk.Frame(opts)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="Adjustment").pack(side=tk.LEFT)
+        self._adjust_var = tk.StringVar(value="Standard")
+        ttk.Combobox(row, textvariable=self._adjust_var, values=list(self._ADJUSTMENTS),
+                     state="readonly", width=20).pack(side=tk.RIGHT)
+        self._max_rpm = LabeledEntry(opts, "Max spindle speed (0 = no limit)", "RPM",
+                                     format_value(spindle_max_rpm),
+                                     minval=0.0, maxval=100000.0, increment=1000.0)
+        self._max_rpm.pack(fill=tk.X, pady=2)
+        self._min_rpm = LabeledEntry(opts, "Min spindle speed (0 = no limit)", "RPM",
+                                     format_value(spindle_min_rpm),
+                                     minval=0.0, maxval=100000.0, increment=1000.0)
+        self._min_rpm.pack(fill=tk.X, pady=2)
+        self._feed_max = LabeledEntry(opts, "Max feed rate (0 = no limit)", "mm/min",
+                                      format_value(feed_max),
+                                      minval=0.0, maxval=100000.0, increment=100.0)
+        self._feed_max.pack(fill=tk.X, pady=2)
+
+        calc = SectionFrame(outer, "Calculation")
+        calc.pack(fill=tk.X, pady=(8, 0))
+        self._calc_labels = {}
+        rows = (("d",       "Cutter diameter d"),
+                ("z",       "Flutes z"),
+                ("vc",      "Cutting speed vc"),
+                ("fz",      "Feed per tooth fz"),
+                ("n_calc",  "n = vc·1000 / (π·d)"),
+                ("rpm",     "Spindle speed"),
+                ("feed",    "Feed vf = n·z·fz"),
+                ("vc_eff",  "Effective vc"),
+                ("fz_eff",  "Effective fz"),
+                ("plunge",  f"Plunge = vf / {round(1 / PLUNGE_FRACTION)}"),
+                ("sd",      "Step-down"))
+        grid = ttk.Frame(calc)
+        grid.pack(fill=tk.X)
+        for r, (key, text) in enumerate(rows):
+            ttk.Label(grid, text=text).grid(row=r, column=0, sticky=tk.W, pady=1)
+            lbl = ttk.Label(grid, text="", anchor=tk.E)
+            lbl.grid(row=r, column=1, sticky=tk.E, padx=(16, 0), pady=1)
+            self._calc_labels[key] = lbl
+        grid.columnconfigure(1, weight=1)
+        self._notes = ttk.Label(calc, text="", wraplength=360, foreground="#a06000",
+                                justify=tk.LEFT)
+        self._notes.pack(anchor=tk.W, pady=(6, 0))
+        self._warnings = ttk.Label(calc, text="", wraplength=360, foreground="#c02020",
+                                   justify=tk.LEFT)
+        self._warnings.pack(anchor=tk.W, pady=(4, 0))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(12, 0))
+        self._use_btn = ttk.Button(btn_row, text="Use values", command=self._confirm)
+        self._use_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+
+        self._adjust_var.trace_add("write", self._recompute)
+        for le in (self._max_rpm, self._min_rpm, self._feed_max):
+            le.committed_var.trace_add("write", self._recompute)
+        self._recompute()
+
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{pw}+{ph}")
+        self.wait_window()
+
+    def _recompute(self, *_):
+        limits = []
+        for le in (self._max_rpm, self._min_rpm, self._feed_max):
+            try:
+                limits.append(float(le.get()))
+            except ValueError:
+                limits.append(0.0)
+        max_rpm, min_rpm, feed_max = limits
+        adjust = self._ADJUSTMENTS.get(self._adjust_var.get(), 0.0)
+        try:
+            rec = recommend_cutting(self._tool, self._material, max_rpm, adjust,
+                                    max_feed=feed_max, min_rpm=min_rpm)
+        except ValueError as exc:
+            self._rec = None
+            for lbl in self._calc_labels.values():
+                lbl.config(text="—")
+            self._notes.config(text=str(exc))
+            self._warnings.config(text="")
+            self._use_btn.config(state="disabled")
+            return
+        self._rec = rec
+        L = self._calc_labels
+        L['d'].config(text=f"{format_value(rec.diameter_mm)} mm")
+        L['z'].config(text=str(rec.flutes))
+        L['vc'].config(text=f"{rec.vc_m_min:.0f} m/min")
+        L['fz'].config(text=f"{rec.fz_mm:.4f} mm")
+        L['n_calc'].config(text=f"{rec.rpm_calc:.0f} RPM")
+        L['rpm'].config(text=f"{rec.rpm:.0f} RPM")
+        L['feed'].config(text=f"{rec.feed_rate:.0f} mm/min")
+        L['vc_eff'].config(text=f"{rec.vc_eff_m_min:.0f} m/min")
+        L['fz_eff'].config(text=f"{rec.fz_eff_mm:.4f} mm")
+        L['plunge'].config(text=f"{rec.plunge_rate:.0f} mm/min")
+        L['sd'].config(text=f"{format_value(self._material.stepdown_factor)} × d → "
+                            f"{format_value(rec.stepdown_mm)} mm")
+        self._notes.config(text="\n".join(rec.notes))
+        self._warnings.config(text="\n".join(rec.warnings))
+        self._use_btn.config(state="normal")
+
+    def _confirm(self):
+        if self._rec is None:
+            return
+        self.result = self._rec.to_cutting()
         self.grab_release()
         self.destroy()
 

@@ -108,6 +108,9 @@ class GCodeGeneratorApp:
             'feed_rapid':  float(DEFAULTS['feed_rapid']),
             'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
             'spindle_dwell_s': float(DEFAULTS['spindle_dwell_s']),
+            'spindle_max_rpm': float(DEFAULTS['spindle_max_rpm']),
+            'spindle_min_rpm': float(DEFAULTS['spindle_min_rpm']),
+            'feed_max':        float(DEFAULTS['feed_max']),
             'preamble':    DEFAULTS['preamble'],
             'postamble':   DEFAULTS['postamble'],
         }
@@ -2601,7 +2604,10 @@ class GCodeGeneratorApp:
                                  f"Could not save the tool library:\n{exc}")
 
     def _open_tool_library(self, select_tool_id=None):
-        dlg = ToolLibraryDialog(self.root, self.tool_library, select_tool_id)
+        dlg = ToolLibraryDialog(self.root, self.tool_library, select_tool_id,
+                                spindle_max_rpm=self._settings['spindle_max_rpm'],
+                                spindle_min_rpm=self._settings['spindle_min_rpm'],
+                                feed_max=self._settings['feed_max'])
         if not dlg.confirmed:
             return
         self.tool_library = dlg.library
@@ -3071,6 +3077,9 @@ class GCodeGeneratorApp:
                 'feed_rapid':  self._settings['feed_rapid'],
                 'accel_mm_s2': self._settings['accel_mm_s2'],
                 'spindle_dwell_s': self._settings['spindle_dwell_s'],
+                'spindle_max_rpm': self._settings['spindle_max_rpm'],
+                'spindle_min_rpm': self._settings['spindle_min_rpm'],
+                'feed_max':        self._settings['feed_max'],
                 'preamble':    self._settings['preamble'],
                 'postamble':   self._settings['postamble'],
             },
@@ -3126,6 +3135,9 @@ class GCodeGeneratorApp:
         self._settings['feed_rapid']  = float(DEFAULTS['feed_rapid'])
         self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
         self._settings['spindle_dwell_s'] = float(DEFAULTS['spindle_dwell_s'])
+        self._settings['spindle_max_rpm'] = float(DEFAULTS['spindle_max_rpm'])
+        self._settings['spindle_min_rpm'] = float(DEFAULTS['spindle_min_rpm'])
+        self._settings['feed_max']        = float(DEFAULTS['feed_max'])
         self._settings['preamble']    = DEFAULTS['preamble']
         self._settings['postamble']   = DEFAULTS['postamble']
 
@@ -3266,6 +3278,11 @@ class GCodeGeneratorApp:
         self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
         self._settings['spindle_dwell_s'] = m.get('spindle_dwell_s',
                                                   float(DEFAULTS['spindle_dwell_s']))
+        self._settings['spindle_max_rpm'] = m.get('spindle_max_rpm',
+                                                  float(DEFAULTS['spindle_max_rpm']))
+        self._settings['spindle_min_rpm'] = m.get('spindle_min_rpm',
+                                                  float(DEFAULTS['spindle_min_rpm']))
+        self._settings['feed_max']        = m.get('feed_max', float(DEFAULTS['feed_max']))
         self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
         self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
 

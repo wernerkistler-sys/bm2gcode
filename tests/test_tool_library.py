@@ -13,6 +13,7 @@ from tool_library import (
     ToolLibrary, ToolDef, Material, CuttingData,
     cutting_for, step_values_from, stepdown_field_for, sync_state,
     update_cutting_from_step, tool_from_step, format_value,
+    recommend_cutting, interpolate_fz, MATERIAL_PRESETS, PLUNGE_FRACTION,
     SYNC_IN_SYNC, SYNC_GEOMETRY_DIFFERS, SYNC_MODIFIED, SYNC_MISSING, SYNC_NO_DATA,
 )
 
@@ -279,6 +280,122 @@ new_tool = tool_from_step("From step", values, 'mat-mdf', "Raster Scan")
 check("tool_from_step keeps the curve", new_tool.profile_points == nodes)
 check("non-custom step values have no nodes",
       'profile_nodes' not in step_values_from(ToolLibrary.seeded().tools[0], None))
+
+
+# --------------------------------------------------------------------------
+# Cutting recommendations
+# --------------------------------------------------------------------------
+print("cutting recommendations")
+
+def preset_material(name):
+    m = Material("mat-" + name.lower().replace(' ', '-'), name)
+    m.apply_preset(name)
+    return m
+
+seeded = ToolLibrary.seeded()
+check("seeded materials have reference data",
+      all(m.has_reference() for m in seeded.materials))
+check("seeded tools have 2 flutes", all(t.flutes == 2 for t in seeded.tools))
+check("all presets are complete",
+      all(preset_material(n).has_reference() for n in MATERIAL_PRESETS))
+
+# Flutes and material reference data survive a round-trip.
+t = ToolDef('t-z', 'Z', 'End Mill', 6.0, flutes=3)
+check("flutes round-trip", ToolDef.from_dict(t.to_dict()).flutes == 3)
+alu = preset_material("Wrought aluminium")
+alu2 = Material.from_dict(alu.to_dict())
+check("material reference round-trip",
+      alu2.cutting_speed_m_min == 500 and alu2.feed_per_tooth_mm == alu.feed_per_tooth_mm
+      and alu2.stepdown_factor == 0.05)
+old = ToolLibrary.from_dict({'materials': [{'id': 'm', 'name': 'Old'}],
+                             'tools': [{'id': 't', 'name': 'T', 'profile': 'Ball',
+                                        'diameter_mm': 3.0}]})
+check("old library loads with defaults",
+      old.tools[0].flutes == 2 and not old.materials[0].has_reference())
+
+# The sheet's worked example: wrought aluminium, Ø 8, 2 flutes.
+mill8 = ToolDef('t8', '8 mm', 'End Mill', 8.0)
+rec = recommend_cutting(mill8, alu, 0)
+check("example rpm", rec.rpm == 19900 and abs(rec.rpm_calc - 19894.4) < 0.1)
+check("example feed", rec.feed_rate == round(19900 * 2 * 0.064))
+check("plunge is a third of feed",
+      rec.plunge_rate == round(rec.feed_rate * PLUNGE_FRACTION))
+check("metal step-down", rec.stepdown_mm == 0.4)
+check("no notes for an in-table end mill", rec.notes == [])
+
+capped = recommend_cutting(mill8, alu, 18000)
+check("rpm capped at spindle max", capped.rpm == 18000)
+check("capped feed", capped.feed_rate == 2304)
+check("cap noted", len(capped.notes) == 1)
+
+check("more flutes, more feed",
+      recommend_cutting(ToolDef('t', 't', 'End Mill', 8.0, flutes=3), alu, 0).feed_rate
+      == round(19900 * 3 * 0.064))
+rough = recommend_cutting(mill8, alu, 0, vc_adjust_pct=-25)
+check("roughing lowers rpm", rough.rpm < rec.rpm and abs(rough.vc_m_min - 375) < 1e-9)
+
+fz7, note = interpolate_fz(alu, 7.0)
+check("fz interpolated between diameters", abs(fz7 - 0.057) < 1e-9 and note is None)
+fz_small, note_small = interpolate_fz(alu, 0.5)
+fz_big, note_big = interpolate_fz(alu, 16.0)
+check("fz clamps below the table", fz_small == 0.010 and note_small)
+check("fz clamps above the table", fz_big == 0.100 and note_big)
+check("fz at table end has no note", interpolate_fz(alu, 12.0)[1] is None)
+
+wood = preset_material("Softwood")
+mill6 = ToolDef('t6', '6 mm', 'End Mill', 6.0)
+check("wood step-down is half the diameter",
+      recommend_cutting(mill6, wood, 0).stepdown_mm == 3.0)
+short = ToolDef('t6s', '6 mm short', 'End Mill', 6.0, flute_length_mm=2.0)
+rec_short = recommend_cutting(short, wood, 0)
+check("step-down capped at flute length", rec_short.stepdown_mm == 2.0 and rec_short.notes)
+check("v-bit gets a diameter note",
+      recommend_cutting(seeded.tools[2], wood, 0).notes)
+check("to_cutting carries the values",
+      rec.to_cutting() == CuttingData(rec.feed_rate, rec.stepdown_mm,
+                                      rec.plunge_rate, rec.rpm))
+
+# Machine feed limit: fz is kept by lowering n, down to the spindle minimum.
+mdf = preset_material("MDF")
+mill6z3 = ToolDef('t6z3', '6 mm 3F', 'End Mill', 6.0, flutes=3)
+unlimited = recommend_cutting(mill6z3, mdf, 24000)
+check("feed limit off matches plain result",
+      recommend_cutting(mill6z3, mdf, 24000, max_feed=0, min_rpm=0) == unlimited)
+check("unlimited feed is high", unlimited.feed_rate == round(23900 * 3 * 0.3))
+kept = recommend_cutting(mill6z3, mdf, 24000, max_feed=5000, min_rpm=0)
+check("feed limit lowers rpm, keeps fz",
+      kept.rpm == 5500 and kept.feed_rate == 4950 and kept.fz_eff_mm == 0.3)
+check("feed-limited note, no warning", kept.notes and not kept.warnings)
+check("effective vc follows rpm",
+      abs(kept.vc_eff_m_min - 5500 * 3.141592653589793 * 6 / 1000) < 1e-9)
+floor = recommend_cutting(mill6z3, mdf, 24000, max_feed=5000, min_rpm=6000)
+check("min rpm floor reduces fz",
+      floor.rpm == 6000 and floor.feed_rate == 5000
+      and abs(floor.fz_eff_mm - 5000 / (6000 * 3)) < 1e-9)
+check("reduced fz is a warning", len(floor.warnings) == 1)
+check("plunge follows the limited feed",
+      floor.plunge_rate == round(5000 * PLUNGE_FRACTION))
+for d_ in (1.0, 3.0, 6.0, 12.0):
+    for z_ in (1, 2, 4):
+        r = recommend_cutting(ToolDef('x', 'x', 'End Mill', d_, flutes=z_), mdf, 24000,
+                              max_feed=3000, min_rpm=8000)
+        if r.feed_rate > 3000 or r.rpm < 8000 or r.rpm > 24000:
+            check(f"limits hold for Ø{d_} z{z_}", False)
+check("limits hold across diameters and flutes", True)
+
+# Spindle minimum raises n when vc asks for less; fz is kept.
+steel = preset_material("Steel")
+mill12 = ToolDef('t12', '12 mm', 'End Mill', 12.0)
+slow = recommend_cutting(mill12, steel, 24000, min_rpm=6000)
+check("min rpm raises a slow spindle",
+      slow.rpm == 6000 and slow.fz_eff_mm == 0.080 and slow.feed_rate == 6000 * 2 * 0.080)
+check("raised vc reported", slow.vc_eff_m_min > slow.vc_m_min and slow.notes)
+
+try:
+    recommend_cutting(mill8, Material('m', 'Bare'), 0)
+    check("no reference data raises", False)
+except ValueError:
+    check("no reference data raises", True)
 
 
 print()

@@ -31,6 +31,30 @@ SYNC_NO_DATA          = "no_data"
 # Every step-down field a library value is written to.
 STEPDOWN_FIELDS = ('stepdown', 'vcarve_stepdown', 'cutout_stepdown')
 
+# Cutter diameters (mm) a material's feed-per-tooth row is given for.
+FZ_DIAMETERS_MM = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0)
+
+# Plunge rate recommended as a fraction of the recommended feed rate.
+PLUNGE_FRACTION = 1.0 / 3.0
+
+# Reference cutting data per material from the Stepcraft "Fräsparameter"
+# sheet: cutting speed vc (m/min), feed per tooth fz (mm) for each of
+# FZ_DIAMETERS_MM, and the slot depth per pass as a multiple of the cutter
+# diameter (the sheet's conservative D-series values: 0.05 for non-ferrous
+# metals, 0.5 for wood and plastics; steel, which the slot-depth table
+# doesn't list, takes the metal value).
+MATERIAL_PRESETS = {
+    "Cast aluminium (>6 % Si)": (200, (0.010, 0.010, 0.010, 0.015, 0.015, 0.025, 0.030, 0.038, 0.050), 0.05),
+    "Wrought aluminium":        (500, (0.010, 0.020, 0.025, 0.050, 0.050, 0.050, 0.064, 0.080, 0.100), 0.05),
+    "Soft plastic":             (600, (0.025, 0.030, 0.035, 0.045, 0.065, 0.090, 0.100, 0.200, 0.300), 0.5),
+    "Hard plastic":             (550, (0.015, 0.020, 0.025, 0.050, 0.060, 0.080, 0.089, 0.100, 0.150), 0.5),
+    "Hardwood":                 (450, (0.020, 0.025, 0.030, 0.055, 0.065, 0.085, 0.095, 0.095, 0.155), 0.5),
+    "Softwood":                 (500, (0.025, 0.030, 0.035, 0.060, 0.070, 0.090, 0.100, 0.110, 0.160), 0.5),
+    "MDF":                      (450, (0.050, 0.070, 0.100, 0.150, 0.200, 0.300, 0.400, 0.500, 0.600), 0.5),
+    "Brass, copper, bronze":    (365, (0.015, 0.020, 0.025, 0.025, 0.030, 0.050, 0.056, 0.065, 0.080), 0.05),
+    "Steel":                    (75,  (0.010, 0.010, 0.012, 0.025, 0.030, 0.038, 0.045, 0.050, 0.080), 0.05),
+}
+
 
 @dataclass
 class CuttingData:
@@ -63,6 +87,7 @@ class ToolDef:
     flute_length_mm: float = 0.0
     shank_diameter_mm: float = 0.0    # 0 = same as diameter_mm
     overall_length_mm: float = 0.0    # 0 = not specified
+    flutes: int = 2                   # number of cutting edges (z)
     number: int | None = None         # tool number for a future M6 Tn
     notes: str = ""
     profile_points: list | None = None   # Bezier nodes of a Custom profile
@@ -82,7 +107,8 @@ class ToolDef:
             'diameter_mm': self.diameter_mm, 'vbit_angle_deg': self.vbit_angle_deg,
             'flute_length_mm': self.flute_length_mm,
             'shank_diameter_mm': self.shank_diameter_mm,
-            'overall_length_mm': self.overall_length_mm, 'number': self.number,
+            'overall_length_mm': self.overall_length_mm, 'flutes': self.flutes,
+            'number': self.number,
             'notes': self.notes, 'profile_points': self.profile_points,
             'cutting': {mid: cd.to_dict() for mid, cd in self.cutting.items()},
         }
@@ -97,6 +123,7 @@ class ToolDef:
             flute_length_mm=float(d.get('flute_length_mm', 0.0)),
             shank_diameter_mm=float(d.get('shank_diameter_mm', 0.0)),
             overall_length_mm=float(d.get('overall_length_mm', 0.0)),
+            flutes=max(1, int(d.get('flutes', 2))),
             number=int(number) if number is not None else None,
             notes=str(d.get('notes', '')),
             profile_points=tool_profile.normalize_nodes(d.get('profile_points')),
@@ -107,15 +134,39 @@ class ToolDef:
 
 @dataclass
 class Material:
+    """A workpiece material plus the reference data cutting recommendations
+    are computed from (see ``recommend_cutting``)."""
     id: str
     name: str
+    cutting_speed_m_min: float = 0.0        # vc; 0 = no reference data
+    feed_per_tooth_mm: list | None = None   # fz per FZ_DIAMETERS_MM entry
+    stepdown_factor: float = 0.0            # step-down per pass as a multiple of Ø
+
+    def has_reference(self) -> bool:
+        return (self.cutting_speed_m_min > 0 and self.feed_per_tooth_mm is not None
+                and len(self.feed_per_tooth_mm) == len(FZ_DIAMETERS_MM)
+                and all(fz > 0 for fz in self.feed_per_tooth_mm))
+
+    def apply_preset(self, preset_name):
+        """Copy the reference data of a MATERIAL_PRESETS entry."""
+        vc, fz, factor = MATERIAL_PRESETS[preset_name]
+        self.cutting_speed_m_min = float(vc)
+        self.feed_per_tooth_mm = [float(x) for x in fz]
+        self.stepdown_factor = float(factor)
 
     def to_dict(self):
-        return {'id': self.id, 'name': self.name}
+        return {'id': self.id, 'name': self.name,
+                'cutting_speed_m_min': self.cutting_speed_m_min,
+                'feed_per_tooth_mm': self.feed_per_tooth_mm,
+                'stepdown_factor': self.stepdown_factor}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(id=str(d['id']), name=str(d['name']))
+        fz = d.get('feed_per_tooth_mm')
+        return cls(id=str(d['id']), name=str(d['name']),
+                   cutting_speed_m_min=float(d.get('cutting_speed_m_min', 0.0)),
+                   feed_per_tooth_mm=[float(x) for x in fz] if fz else None,
+                   stepdown_factor=float(d.get('stepdown_factor', 0.0)))
 
 
 def new_id() -> str:
@@ -234,6 +285,8 @@ class ToolLibrary:
         softwood = Material('mat-softwood', 'Softwood')
         hardwood = Material('mat-hardwood', 'Hardwood')
         mdf      = Material('mat-mdf', 'MDF')
+        for m in (softwood, hardwood, mdf):
+            m.apply_preset(m.name)
 
         def data(rows):
             return {mid: CuttingData(feed, sd, plunge, rpm)
@@ -413,3 +466,134 @@ def tool_from_step(name, step_values, material_id, family):
     if material_id is not None:
         tool = update_cutting_from_step(tool, material_id, step_values, family)
     return tool
+
+
+# ── Cutting recommendations ───────────────────────────────────────────────
+
+@dataclass
+class Recommendation:
+    """Recommended cutting data for one (tool, material) pair, with the
+    intermediate values of the calculation."""
+    diameter_mm: float
+    flutes: int
+    vc_m_min: float          # cutting speed after the adjustment
+    fz_mm: float             # feed per tooth for the tool's diameter
+    rpm_calc: float          # spindle speed reaching vc
+    rpm: float               # spindle speed used, within the spindle's limits
+    vc_eff_m_min: float      # cutting speed at the spindle speed used
+    fz_eff_mm: float         # feed per tooth at the feed rate used
+    feed_rate: float         # mm/min
+    plunge_rate: float       # mm/min
+    stepdown_mm: float
+    notes: list = field(default_factory=list)      # how limits shaped the result
+    warnings: list = field(default_factory=list)   # results that risk the cut
+
+    def to_cutting(self) -> CuttingData:
+        return CuttingData(feed_rate=self.feed_rate, stepdown_mm=self.stepdown_mm,
+                           plunge_rate=self.plunge_rate, spindle_rpm=self.rpm)
+
+
+def interpolate_fz(material, diameter_mm):
+    """``(fz, note)``: the material's feed per tooth for *diameter_mm*,
+    linearly interpolated between the FZ_DIAMETERS_MM entries. Outside
+    their range the nearest end value is used and *note* says so;
+    otherwise *note* is None."""
+    ds, fz = FZ_DIAMETERS_MM, material.feed_per_tooth_mm
+    if diameter_mm <= ds[0] or diameter_mm >= ds[-1]:
+        i = 0 if diameter_mm <= ds[0] else -1
+        note = None
+        if not math.isclose(diameter_mm, ds[i]):
+            note = (f"Ø {format_value(diameter_mm)} mm is outside the "
+                    f"{format_value(ds[0])}–{format_value(ds[-1])} mm table; "
+                    f"the feed per tooth for Ø {format_value(ds[i])} mm is used.")
+        return float(fz[i]), note
+    for k in range(1, len(ds)):
+        if diameter_mm <= ds[k]:
+            t = (diameter_mm - ds[k - 1]) / (ds[k] - ds[k - 1])
+            return float(fz[k - 1] + t * (fz[k] - fz[k - 1])), None
+    return float(fz[-1]), None
+
+
+def _round_rpm(n, down=False):
+    """*n* rounded to 100 RPM (to whole RPM below 100); *down* rounds down."""
+    step = 100.0 if n >= 100 else 1.0
+    return (math.floor(n / step) if down else round(n / step)) * step
+
+
+def recommend_cutting(tool, material, max_rpm, vc_adjust_pct=0.0,
+                      max_feed=0.0, min_rpm=0.0) -> Recommendation:
+    """Recommended cutting data for *tool* in *material*.
+
+    n = vc·1000 / (π·d), rounded to 100 RPM and kept within the spindle's
+    [*min_rpm*, *max_rpm*] range (0 = no limit); feed = n · flutes · fz.
+    When the feed exceeds *max_feed* (0 = no limit), the feed per tooth is
+    kept and n is lowered instead: a lower cutting speed is harmless, while
+    a thinner chip makes the edge rub rather than cut. Only when n would
+    have to fall below *min_rpm* does the feed per tooth drop, which is
+    reported in ``warnings``. Plunge = feed · PLUNGE_FRACTION; step-down =
+    material's step-down factor · d, capped at the tool's flute length when
+    one is set. *vc_adjust_pct* scales the material's cutting speed (e.g.
+    -25 for roughing). Raises ValueError when the material has no reference
+    data or the tool has no diameter.
+    """
+    if not material.has_reference():
+        raise ValueError(f"Material \"{material.name}\" has no reference cutting data.")
+    d = float(tool.diameter_mm)
+    if d <= 0:
+        raise ValueError("The tool has no diameter.")
+    notes, warnings = [], []
+    flutes = max(1, int(tool.flutes))
+    vc = material.cutting_speed_m_min * (1.0 + vc_adjust_pct / 100.0)
+    fz, fz_note = interpolate_fz(material, d)
+    if fz_note:
+        notes.append(fz_note)
+    hi = float(max_rpm) if max_rpm and max_rpm > 0 else math.inf
+    lo = min(float(min_rpm), hi) if min_rpm and min_rpm > 0 else 0.0
+
+    def vc_at(n):
+        return n * math.pi * d / 1000.0
+
+    rpm_calc = vc * 1000.0 / (math.pi * d)
+    rpm = _round_rpm(rpm_calc)
+    if rpm > hi:
+        rpm = hi
+        notes.append(f"The calculated {rpm_calc:.0f} RPM exceeds the spindle's "
+                     f"maximum; {format_value(hi)} RPM is used.")
+    elif rpm < lo:
+        rpm = lo
+        notes.append(f"The calculated {rpm_calc:.0f} RPM is below the spindle's "
+                     f"minimum; {format_value(lo)} RPM is used (vc "
+                     f"{vc_at(rpm):.0f} m/min).")
+    feed, fz_eff = rpm * flutes * fz, fz
+    if max_feed and max_feed > 0 and feed > max_feed:
+        rpm_fz = _round_rpm(max_feed / (flutes * fz), down=True)
+        if rpm_fz >= max(lo, 1.0):
+            rpm, feed = rpm_fz, rpm_fz * flutes * fz
+            notes.append(f"The feed is limited to the machine maximum of "
+                         f"{format_value(max_feed)} mm/min; the spindle speed is "
+                         f"lowered to {rpm:.0f} RPM to keep the feed per tooth "
+                         f"(vc {vc_at(rpm):.0f} m/min).")
+        else:
+            rpm = lo if lo > 0 else max(1.0, math.floor(max_feed / (flutes * fz)))
+            feed = float(max_feed)
+            fz_eff = feed / (rpm * flutes)
+            warnings.append(f"Even at the spindle's minimum speed the feed would exceed "
+                            f"the machine maximum of {format_value(max_feed)} mm/min, so "
+                            f"the feed per tooth drops to {fz_eff:.4f} mm "
+                            f"({(fz_eff / fz - 1.0) * 100.0:.0f} %). Thin chips make the "
+                            f"edge rub and heat up; consider a cutter with fewer flutes.")
+    feed = float(round(feed))
+    if max_feed and max_feed > 0:
+        feed = min(feed, float(max_feed))
+    stepdown = material.stepdown_factor * d
+    if tool.flute_length_mm > 0 and stepdown > tool.flute_length_mm:
+        stepdown = tool.flute_length_mm
+        notes.append("The step-down is limited to the flute length.")
+    if tool.profile in ("V-Bit", "Custom"):
+        notes.append("The calculation uses the full diameter; near the tip the "
+                     "cutting diameter is smaller.")
+    return Recommendation(
+        diameter_mm=d, flutes=flutes, vc_m_min=vc, fz_mm=fz,
+        rpm_calc=rpm_calc, rpm=float(rpm), vc_eff_m_min=vc_at(rpm), fz_eff_mm=fz_eff,
+        feed_rate=feed, plunge_rate=float(round(feed * PLUNGE_FRACTION)),
+        stepdown_mm=round(stepdown, 2), notes=notes, warnings=warnings)
