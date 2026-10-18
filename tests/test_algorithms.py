@@ -655,6 +655,21 @@ for direction in ("X", "Y", "D45", "D135"):
     check(f"_order_locked_raster_pass runs for direction={direction!r}",
           len(ordered) == 2)
 
+# Tool at a corner on the stock side of the starting end line: the adjacent
+# line's entry is nearer, but the sweep must still begin on the end line and
+# visit every line in sequence.
+stack = [[(0.0, y, 0.0), (10.0, y, 0.0)] for y in (4.0, 3.0, 2.0, 1.0, 0.0)]
+ordered = _order_locked_raster_pass(stack, "X", (0.0, 0.0))
+check("_order_locked_raster_pass starts on the end line, not its neighbour",
+      [seg[0][1] for seg in ordered] == [0.0, 1.0, 2.0, 3.0, 4.0]
+      or [seg[0][1] for seg in ordered] == [4.0, 3.0, 2.0, 1.0, 0.0])
+check("_order_locked_raster_pass keeps one travel direction per sweep",
+      len({seg[0][0] for seg in ordered}) == 1)
+ordered_zz = _order_zigzag_pass(stack, [0] * len(stack), "X", (0.0, 0.0), True)
+check("_order_zigzag_pass (locked) visits lines in sequence",
+      [seg[0][1] for seg in ordered_zz] in ([0.0, 1.0, 2.0, 3.0, 4.0],
+                                             [4.0, 3.0, 2.0, 1.0, 0.0]))
+
 
 # --------------------------------------------------------------------------
 # _region_contour_rings / _make_contour_ring: ring count and arc-length table

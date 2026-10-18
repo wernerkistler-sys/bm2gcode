@@ -956,7 +956,10 @@ def _order_locked_raster_pass(pass_segs, direction, cur):
         step = 1 if mode == 'A' else -1
         nptr = ptr + step
         cands = list(remaining.get(keys[ptr], ())) if 0 <= ptr < len(keys) else []
-        if 0 <= nptr < len(keys):
+        # The first cut is taken from the chosen end line alone: an adjacent
+        # line's entry is often nearer cur, and taking it would strand the
+        # end line until the sweep flips back for it.
+        if ordered and 0 <= nptr < len(keys):
             cands += list(remaining[keys[nptr]])
         if cands:
             bi = nearest(cands, mode, cur)
