@@ -19,6 +19,7 @@ python tests/test_dressup.py
 python tests/test_layers.py
 python tests/test_algorithms.py
 python tests/test_tool_library.py
+python tests/test_grey_morphology.py
 ```
 There is no test runner config, build step, or lint config in this repo.
 
@@ -37,6 +38,7 @@ Module responsibilities:
 - **`tool.py`** — the `Tool` dataclass (profile, diameter, V-bit angle).
 - **`tool_library.py`** — the user-wide tool library (no Tk code): `ToolLibrary`/`ToolDef`/`Material`/`CuttingData`, JSON load/save at a per-user path (atomic save; a damaged file is moved to `.bak` and reseeded), import merging, and the pure step-field mapping used by the step tab — `step_values_from`, `sync_state` (compares only the step-down field the algorithm family reads), `update_cutting_from_step` (never changes geometry). Steps copy library values and store only a link (`library_tool_id`/`_name`/`_material_id`), so projects stay self-contained.
 - **`algorithms.py`** — the six toolpath algorithms (`compute_raster_toolpath`, `compute_contour_toolpath`, `compute_vcarve_toolpath`, `compute_cutout_toolpath`, `compute_pocket_toolpath`, `compute_registration_holes_toolpath`) plus shared machinery: tool-accessibility morphological opening, multi-pass depth-slicing, path ordering (greedy + 2-opt), geodesic terrain linking, RDP simplification. This is the core of the project — see `README.md`'s "Technical Details" section for the pipeline stages before modifying.
+- **`grey_morphology.py`** — `grey_erosion`/`grey_dilation`/`grey_opening` with `scipy.ndimage`'s results but memory bounded for large kernels (row-by-row decomposition; scipy's own offset table grows with r⁴). `algorithms.py` imports these instead of scipy's — use them for any new grey morphology.
 - **`dressup.py`** — the four per-step G-code dress-ups: ramp-in, back-off-before-retract, arc-rounded rapid corners, and Cutout tabs (`RampSettings`/`BackoffSettings`/`ArcSettings`/`TabSettings` + `generate_ramp`/`compute_backoff_point`/`generate_corner_arc`/`apply_tabs`). Tabs alter cut geometry (consumed inside `algorithms.py`'s Cutout pipeline); the other three only alter G-code emission (consumed by `toolpath.py`).
 - **`toolpath.py`** — `ToolPath`: holds computed segments/result map, emits G-code (`to_gcode`), applies the three emission-time dress-ups, and computes run-time/distance stats.
 

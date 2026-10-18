@@ -406,7 +406,7 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
     geometry kernel to produce the cumulative material-removal map (float32,
     values in [0, 1] normalised depth units).
     """
-    from scipy.ndimage import grey_dilation as _grey_dilation
+    from grey_morphology import grey_dilation as _grey_dilation
     H, W = shape
     px_per_mm = (px_per_mm_x * px_per_mm_y) ** 0.5
     pts = toolpath.resample(resample_spacing_px / px_per_mm)
@@ -594,7 +594,7 @@ def compute_air_free_depth(previous_result, kernel, footprint, shape,
     """
     if previous_result is None and previous_alpha is None:
         return np.zeros(shape, dtype=np.float32)
-    from scipy.ndimage import grey_erosion
+    from grey_morphology import grey_erosion
     removed = (previous_result.astype(np.float64) if previous_result is not None
                else np.zeros(shape, dtype=np.float64))
     if previous_alpha is not None:
@@ -2071,7 +2071,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     -------
     ToolPath
     """
-    from scipy.ndimage import grey_erosion, grey_dilation
+    from grey_morphology import grey_erosion, grey_dilation
 
 
     if work_surface_tol is None:
@@ -2481,7 +2481,8 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     Returns (pocket_mask, center_depth_contour_pocket, accessible_pocket,
     target_z_norm, kernel_pocket, footprint_pocket).
     """
-    from scipy.ndimage import grey_erosion, grey_dilation, binary_erosion
+    from scipy.ndimage import binary_erosion
+    from grey_morphology import grey_erosion, grey_dilation
     from skimage.morphology import disk
 
     if progress is None:
@@ -3087,7 +3088,7 @@ def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
     filtered = ref
     if min_feature_width_mm > 0.0:
         from skimage.morphology import disk as _disk
-        from scipy.ndimage import grey_opening as _grey_opening
+        from grey_morphology import grey_opening as _grey_opening
         radius = max(1, int(np.ceil((min_feature_width_mm / 2.0) * px_per_mm)))
         filtered = _grey_opening(
             ref.astype(np.float64), footprint=_disk(radius)
@@ -3135,7 +3136,7 @@ def compute_vcarve_synth_achievable_depth(depth_map, tool, max_depth,
     function's own Stage 0 does, so this is safe to call standalone.
     """
     from math import radians, tan
-    from scipy.ndimage import grey_erosion
+    from grey_morphology import grey_erosion
 
     if progress is None:
         progress = lambda pct, msg: None
@@ -3292,7 +3293,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     -------
     ToolPath
     """
-    from scipy.ndimage import grey_erosion, grey_dilation, distance_transform_edt, label
+    from scipy.ndimage import distance_transform_edt, label
+    from grey_morphology import grey_erosion, grey_dilation
 
     _alg_name = ('V-Carving (Sub-pixel)'    if skeleton_mode == 'voronoi'
                  else 'V-Carving (Feature Width)' if skeleton_mode == 'inscribed'
@@ -4426,7 +4428,7 @@ def compute_contour_toolpath(
     ToolPath
     """
     import math
-    from scipy.ndimage import grey_erosion, grey_dilation
+    from grey_morphology import grey_erosion, grey_dilation
     from skimage.measure import find_contours
 
     # None/<=0 both mean "unconstrained" — normalise once, used for both the
