@@ -51,6 +51,10 @@ old = ToolDef.from_dict({'id': 'x', 'name': 'old', 'profile': 'End Mill',
                          'diameter_mm': 3.0})
 check("missing shank diameter / overall length default to 0",
       old.shank_diameter_mm == 0.0 and old.overall_length_mm == 0.0)
+check("missing max rpm defaults to no limit", old.max_rpm == 0.0)
+rated = ToolDef('r', 'rated', 'End Mill', 50.0, max_rpm=16000.0)
+check("round-trip keeps max rpm",
+      ToolDef.from_dict(rated.to_dict()).max_rpm == 16000.0)
 check("seeded library has three tools and three materials",
       len(lib.tools) == 3 and len(lib.materials) == 3)
 check("every seeded tool has data for every seeded material",
@@ -390,6 +394,42 @@ slow = recommend_cutting(mill12, steel, 24000, min_rpm=6000)
 check("min rpm raises a slow spindle",
       slow.rpm == 6000 and slow.fz_eff_mm == 0.080 and slow.feed_rate == 6000 * 2 * 0.080)
 check("raised vc reported", slow.vc_eff_m_min > slow.vc_m_min and slow.notes)
+
+# Large cutters: step-down based on the table's largest diameter.
+surf = ToolDef('ts', '2" surfacing', 'End Mill', 50.8)
+big = recommend_cutting(surf, wood, 24000)
+check("large cutter step-down uses Ø 12", big.stepdown_mm == 6.0)
+check("large cutter step-down note",
+      any("table's largest diameter" in n for n in big.notes))
+check("Ø 12 step-down has no clip note",
+      not any("table's largest diameter" in n
+              for n in recommend_cutting(mill12, wood, 24000).notes))
+
+# Custom feed per tooth replaces the table value.
+custom = recommend_cutting(mill6, wood, 24000, fz_override=0.05)
+check("fz override used", custom.fz_mm == 0.05
+      and custom.feed_rate == round(custom.rpm * 2 * 0.05))
+check("fz override noted", any("custom feed per tooth" in n for n in custom.notes))
+check("fz override 0 uses the table",
+      recommend_cutting(mill6, wood, 24000, fz_override=0) ==
+      recommend_cutting(mill6, wood, 24000))
+custom_big = recommend_cutting(surf, wood, 24000, fz_override=0.2)
+check("fz override skips the table-range note",
+      custom_big.fz_mm == 0.2 and not any("outside" in n for n in custom_big.notes))
+
+# Tool's rated maximum speed caps n below the spindle's maximum.
+rated6 = ToolDef('t6r', '6 mm rated', 'End Mill', 6.0, max_rpm=18000.0)
+capped_tool = recommend_cutting(rated6, wood, 24000)
+check("tool max rpm caps n", capped_tool.rpm == 18000
+      and any("tool's rated maximum" in n for n in capped_tool.notes))
+check("spindle max below tool max wins",
+      recommend_cutting(rated6, wood, 12000).rpm == 12000)
+clash = recommend_cutting(ToolDef('t50r', '50 rated', 'End Mill', 50.8, max_rpm=6000.0),
+                          wood, 24000, min_rpm=8000)
+check("spindle min above tool max warns",
+      clash.rpm == 6000 and any("can't be run safely" in w for w in clash.warnings))
+check("spindle min above spindle max does not warn",
+      not recommend_cutting(mill6, wood, 5000, min_rpm=8000).warnings)
 
 try:
     recommend_cutting(mill8, Material('m', 'Bare'), 0)

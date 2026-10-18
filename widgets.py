@@ -1464,6 +1464,9 @@ class ToolLibraryDialog(tk.Toplevel):
         self._shank = LabeledEntry(form, "Shank Ø (0 = Ø)", "mm", "0",
                                    minval=0.0, maxval=200.0, increment=0.5)
         self._shank.pack(fill=tk.X, pady=2)
+        self._max_rpm = LabeledEntry(form, "Max speed (0 = no limit)", "RPM", "0",
+                                     minval=0.0, maxval=100000.0, increment=1000.0)
+        self._max_rpm.pack(fill=tk.X, pady=2)
 
         self._notes_var = tk.StringVar()
         row = ttk.Frame(form)
@@ -1478,8 +1481,8 @@ class ToolLibraryDialog(tk.Toplevel):
 
         for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
             var.trace_add("write", self._on_geometry_changed)
-        for le in (self._diam, self._flutes, self._angle, self._flute, self._shank,
-                   self._length):
+        for le in (self._diam, self._flutes, self._max_rpm, self._angle, self._flute,
+                   self._shank, self._length):
             le.committed_var.trace_add("write", self._on_geometry_changed)
 
         # ── Cutting data ──────────────────────────────────────────────
@@ -1588,6 +1591,7 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._profile_var.set(tool.profile)
                 self._diam.set(format_value(tool.diameter_mm))
                 self._flutes.set(str(tool.flutes))
+                self._max_rpm.set(format_value(tool.max_rpm))
                 self._angle.set(format_value(tool.vbit_angle_deg))
                 self._flute.set(format_value(tool.flute_length_mm))
                 self._shank.set(format_value(tool.shank_diameter_mm))
@@ -1616,6 +1620,10 @@ class ToolLibraryDialog(tk.Toplevel):
                 pass
         try:
             t.flutes = max(1, int(float(self._flutes.get())))
+        except ValueError:
+            pass
+        try:
+            t.max_rpm = max(0.0, float(self._max_rpm.get()))
         except ValueError:
             pass
         for le, attr in ((self._diam, 'diameter_mm'), (self._angle, 'vbit_angle_deg'),
@@ -2119,8 +2127,8 @@ class CuttingRecommendationDialog(tk.Toplevel):
     """Modal dialog showing recommended cutting data for *tool* in
     *material* and how it is derived (see ``tool_library.recommend_cutting``).
 
-    The adjustment and machine limits set here apply to this calculation
-    only.
+    The adjustment, machine limits and custom feed per tooth set here
+    apply to this calculation only.
     After ``wait_window`` returns, ``self.result`` is the accepted
     ``CuttingData``, or None if cancelled.
     """
@@ -2165,6 +2173,9 @@ class CuttingRecommendationDialog(tk.Toplevel):
                                       format_value(feed_max),
                                       minval=0.0, maxval=100000.0, increment=100.0)
         self._feed_max.pack(fill=tk.X, pady=2)
+        self._fz_override = LabeledEntry(opts, "Feed per tooth (0 = material table)", "mm",
+                                         "0", minval=0.0, maxval=5.0, increment=0.005)
+        self._fz_override.pack(fill=tk.X, pady=2)
 
         calc = SectionFrame(outer, "Calculation")
         calc.pack(fill=tk.X, pady=(8, 0))
@@ -2202,7 +2213,7 @@ class CuttingRecommendationDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
 
         self._adjust_var.trace_add("write", self._recompute)
-        for le in (self._max_rpm, self._min_rpm, self._feed_max):
+        for le in (self._max_rpm, self._min_rpm, self._feed_max, self._fz_override):
             le.committed_var.trace_add("write", self._recompute)
         self._recompute()
 
@@ -2214,16 +2225,17 @@ class CuttingRecommendationDialog(tk.Toplevel):
 
     def _recompute(self, *_):
         limits = []
-        for le in (self._max_rpm, self._min_rpm, self._feed_max):
+        for le in (self._max_rpm, self._min_rpm, self._feed_max, self._fz_override):
             try:
                 limits.append(float(le.get()))
             except ValueError:
                 limits.append(0.0)
-        max_rpm, min_rpm, feed_max = limits
+        max_rpm, min_rpm, feed_max, fz_override = limits
         adjust = self._ADJUSTMENTS.get(self._adjust_var.get(), 0.0)
         try:
             rec = recommend_cutting(self._tool, self._material, max_rpm, adjust,
-                                    max_feed=feed_max, min_rpm=min_rpm)
+                                    max_feed=feed_max, min_rpm=min_rpm,
+                                    fz_override=fz_override)
         except ValueError as exc:
             self._rec = None
             for lbl in self._calc_labels.values():

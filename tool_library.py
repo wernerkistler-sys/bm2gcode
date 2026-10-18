@@ -88,6 +88,7 @@ class ToolDef:
     shank_diameter_mm: float = 0.0    # 0 = same as diameter_mm
     overall_length_mm: float = 0.0    # 0 = not specified
     flutes: int = 2                   # number of cutting edges (z)
+    max_rpm: float = 0.0              # rated maximum spindle speed; 0 = no limit
     number: int | None = None         # tool number for a future M6 Tn
     notes: str = ""
     profile_points: list | None = None   # Bezier nodes of a Custom profile
@@ -108,6 +109,7 @@ class ToolDef:
             'flute_length_mm': self.flute_length_mm,
             'shank_diameter_mm': self.shank_diameter_mm,
             'overall_length_mm': self.overall_length_mm, 'flutes': self.flutes,
+            'max_rpm': self.max_rpm,
             'number': self.number,
             'notes': self.notes, 'profile_points': self.profile_points,
             'cutting': {mid: cd.to_dict() for mid, cd in self.cutting.items()},
@@ -124,6 +126,7 @@ class ToolDef:
             shank_diameter_mm=float(d.get('shank_diameter_mm', 0.0)),
             overall_length_mm=float(d.get('overall_length_mm', 0.0)),
             flutes=max(1, int(d.get('flutes', 2))),
+            max_rpm=max(0.0, float(d.get('max_rpm', 0.0))),
             number=int(number) if number is not None else None,
             notes=str(d.get('notes', '')),
             profile_points=tool_profile.normalize_nodes(d.get('profile_points')),
@@ -526,17 +529,20 @@ def _round_rpm(n, down=False):
 
 
 def recommend_cutting(tool, material, max_rpm, vc_adjust_pct=0.0,
-                      max_feed=0.0, min_rpm=0.0) -> Recommendation:
+                      max_feed=0.0, min_rpm=0.0, fz_override=0.0) -> Recommendation:
     """Recommended cutting data for *tool* in *material*.
 
     n = vc·1000 / (π·d), rounded to 100 RPM and kept within the spindle's
-    [*min_rpm*, *max_rpm*] range (0 = no limit); feed = n · flutes · fz.
+    [*min_rpm*, *max_rpm*] range (0 = no limit) and below the tool's rated
+    maximum; feed = n · flutes · fz, with fz from the material's table or
+    *fz_override* when it is above 0.
     When the feed exceeds *max_feed* (0 = no limit), the feed per tooth is
     kept and n is lowered instead: a lower cutting speed is harmless, while
     a thinner chip makes the edge rub rather than cut. Only when n would
     have to fall below *min_rpm* does the feed per tooth drop, which is
     reported in ``warnings``. Plunge = feed · PLUNGE_FRACTION; step-down =
-    material's step-down factor · d, capped at the tool's flute length when
+    material's step-down factor · d, with d taken as at most the table's
+    largest diameter and the result capped at the tool's flute length when
     one is set. *vc_adjust_pct* scales the material's cutting speed (e.g.
     -25 for roughing). Raises ValueError when the material has no reference
     data or the tool has no diameter.
@@ -549,11 +555,23 @@ def recommend_cutting(tool, material, max_rpm, vc_adjust_pct=0.0,
     notes, warnings = [], []
     flutes = max(1, int(tool.flutes))
     vc = material.cutting_speed_m_min * (1.0 + vc_adjust_pct / 100.0)
-    fz, fz_note = interpolate_fz(material, d)
-    if fz_note:
-        notes.append(fz_note)
+    if fz_override and fz_override > 0:
+        fz = float(fz_override)
+        notes.append("A custom feed per tooth is used instead of the material's table.")
+    else:
+        fz, fz_note = interpolate_fz(material, d)
+        if fz_note:
+            notes.append(fz_note)
     hi = float(max_rpm) if max_rpm and max_rpm > 0 else math.inf
-    lo = min(float(min_rpm), hi) if min_rpm and min_rpm > 0 else 0.0
+    hi_name = "the spindle's maximum"
+    if tool.max_rpm > 0 and tool.max_rpm < hi:
+        hi, hi_name = float(tool.max_rpm), "the tool's rated maximum"
+    lo = float(min_rpm) if min_rpm and min_rpm > 0 else 0.0
+    if lo > hi and hi_name == "the tool's rated maximum":
+        warnings.append(f"The spindle's minimum of {format_value(lo)} RPM exceeds the "
+                        f"tool's rated maximum of {format_value(hi)} RPM; the tool "
+                        f"can't be run safely on this spindle.")
+    lo = min(lo, hi)
 
     def vc_at(n):
         return n * math.pi * d / 1000.0
@@ -562,8 +580,8 @@ def recommend_cutting(tool, material, max_rpm, vc_adjust_pct=0.0,
     rpm = _round_rpm(rpm_calc)
     if rpm > hi:
         rpm = hi
-        notes.append(f"The calculated {rpm_calc:.0f} RPM exceeds the spindle's "
-                     f"maximum; {format_value(hi)} RPM is used.")
+        notes.append(f"The calculated {rpm_calc:.0f} RPM exceeds {hi_name}; "
+                     f"{format_value(hi)} RPM is used.")
     elif rpm < lo:
         rpm = lo
         notes.append(f"The calculated {rpm_calc:.0f} RPM is below the spindle's "
@@ -590,7 +608,11 @@ def recommend_cutting(tool, material, max_rpm, vc_adjust_pct=0.0,
     feed = float(round(feed))
     if max_feed and max_feed > 0:
         feed = min(feed, float(max_feed))
-    stepdown = material.stepdown_factor * d
+    d_max = FZ_DIAMETERS_MM[-1]
+    stepdown = material.stepdown_factor * min(d, d_max)
+    if d > d_max and not math.isclose(d, d_max) and material.stepdown_factor > 0:
+        notes.append(f"The step-down is based on Ø {format_value(d_max)} mm, the "
+                     f"table's largest diameter.")
     if tool.flute_length_mm > 0 and stepdown > tool.flute_length_mm:
         stepdown = tool.flute_length_mm
         notes.append("The step-down is limited to the flute length.")
