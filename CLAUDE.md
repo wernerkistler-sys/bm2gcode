@@ -47,3 +47,7 @@ Data flow: sources (`layers.py`/`stl_mesh.py`) → composited depth map → an a
 ## Code style
 
 - Comments must describe only what the code currently does — never phrase them relative to a prior version (no "now does X", "changed to Y", "removed Z", "also handles..."). Write as if the code had always been this way.
+
+## Git
+
+- Commit directly to `main`; never create a branch for a commit.
