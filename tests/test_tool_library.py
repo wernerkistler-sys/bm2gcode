@@ -449,6 +449,55 @@ check("tools_for_profiles keeps the sorted order",
       [t.id for t in sort_lib.tools_for_profiles(('End Mill',))] == ['e', 'c', 'a'])
 
 
+# --------------------------------------------------------------------------
+# Undercut-profile geometry (neck, shank, head height, dovetail angle)
+# --------------------------------------------------------------------------
+print("undercut geometry")
+
+dove = ToolDef('tool-dove', 'Dovetail 10', 'Dovetail', 10.0,
+               neck_diameter_mm=4.0, neck_length_mm=12.0, shank_diameter_mm=6.0,
+               head_height_mm=3.0, dovetail_angle_deg=45.0)
+back = ToolDef.from_dict(dove.to_dict())
+check("undercut fields survive a dict round-trip",
+      (back.neck_diameter_mm, back.neck_length_mm, back.shank_diameter_mm,
+       back.head_height_mm, back.dovetail_angle_deg) == (4.0, 12.0, 6.0, 3.0, 45.0))
+old = dict(dove.to_dict())
+for k in ('neck_diameter_mm', 'neck_length_mm', 'shank_diameter_mm',
+          'head_height_mm', 'dovetail_angle_deg'):
+    old.pop(k)
+legacy = ToolDef.from_dict(old)
+check("a library written before the undercut fields still loads",
+      legacy.neck_diameter_mm == 0.0 and legacy.dovetail_angle_deg == 60.0)
+t = dove.to_tool()
+check("to_tool carries the undercut geometry",
+      (t.neck_diameter_mm, t.shank_diameter_mm, t.head_height_mm,
+       t.dovetail_angle_deg) == (4.0, 6.0, 3.0, 45.0))
+
+vals = step_values_from(dove, None)
+check("step_values_from writes every Dovetail field",
+      all(k in vals for k in ('neck_diameter', 'neck_length', 'shank_diameter',
+                              'head_height', 'dovetail_angle')))
+lolli = ToolDef('tool-lolli', 'Lollipop 6', 'Lollipop', 6.0, neck_diameter_mm=3.0)
+lv = step_values_from(lolli, None)
+check("step_values_from skips fields a Lollipop does not use",
+      'neck_diameter' in lv and 'head_height' not in lv and 'dovetail_angle' not in lv)
+check("ball tools write no undercut fields",
+      'neck_diameter' not in step_values_from(ToolDef('b', 'b', 'Ball', 3.0), None))
+
+check("matching undercut geometry is in sync (no data)",
+      sync_state(dict(vals), dove, None, "Undercut") == SYNC_NO_DATA)
+changed = dict(vals, neck_diameter="3.5")
+check("a different neck diameter is a geometry difference",
+      sync_state(changed, dove, None, "Undercut") == SYNC_GEOMETRY_DIFFERS)
+built = tool_from_step("from step", dict(vals, feed_rate="500", plunge_rate="0",
+                                         spindle_rpm="0", stepdown="0.5"),
+                       None, "Undercut")
+check("tool_from_step keeps the undercut geometry",
+      (built.profile, built.neck_diameter_mm, built.head_height_mm,
+       built.dovetail_angle_deg) == ("Dovetail", 4.0, 3.0, 45.0))
+check("Undercut reads the plain step-down field", stepdown_field_for("Undercut") == 'stepdown')
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

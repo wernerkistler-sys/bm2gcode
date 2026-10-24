@@ -16,7 +16,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 
-from tool import Tool
+from tool import Tool, UNDERCUT_FIELDS
 import tool_profile
 
 LIBRARY_VERSION = 1
@@ -81,14 +81,20 @@ class ToolDef:
     """One physical cutter: its geometry plus cutting data per material."""
     id: str
     name: str
-    profile: str                      # "Ball" | "End Mill" | "V-Bit" | "Custom"
+    profile: str                      # "Ball" | "End Mill" | "V-Bit" | "Custom" | undercut profile
     diameter_mm: float
     vbit_angle_deg: float = 90.0
     flute_length_mm: float = 0.0
-    shank_diameter_mm: float = 0.0    # 0 = same as diameter_mm
+    # 0 = same as diameter_mm; for an undercut profile, 0 (or anything not
+    # wider than the neck) means no shank wider than the neck.
+    shank_diameter_mm: float = 0.0
     overall_length_mm: float = 0.0    # 0 = not specified
     flutes: int = 2                   # number of cutting edges (z)
     max_rpm: float = 0.0              # rated maximum spindle speed; 0 = no limit
+    neck_diameter_mm: float = 0.0     # undercut profiles only (see tool.UNDERCUT_FIELDS)
+    neck_length_mm: float = 0.0
+    head_height_mm: float = 0.0
+    dovetail_angle_deg: float = 60.0
     number: int | None = None         # tool number for a future M6 Tn
     notes: str = ""
     profile_points: list | None = None   # Bezier nodes of a Custom profile
@@ -100,7 +106,12 @@ class ToolDef:
             if curve is not None:
                 return Tool(self.profile, 2.0 * tool_profile.curve_radius(curve),
                             self.vbit_angle_deg, curve)
-        return Tool(self.profile, self.diameter_mm, self.vbit_angle_deg)
+        return Tool(self.profile, self.diameter_mm, self.vbit_angle_deg,
+                    neck_diameter_mm=self.neck_diameter_mm,
+                    neck_length_mm=self.neck_length_mm,
+                    shank_diameter_mm=self.shank_diameter_mm,
+                    head_height_mm=self.head_height_mm,
+                    dovetail_angle_deg=self.dovetail_angle_deg)
 
     def to_dict(self):
         return {
@@ -110,6 +121,10 @@ class ToolDef:
             'shank_diameter_mm': self.shank_diameter_mm,
             'overall_length_mm': self.overall_length_mm, 'flutes': self.flutes,
             'max_rpm': self.max_rpm,
+            'neck_diameter_mm': self.neck_diameter_mm,
+            'neck_length_mm': self.neck_length_mm,
+            'head_height_mm': self.head_height_mm,
+            'dovetail_angle_deg': self.dovetail_angle_deg,
             'number': self.number,
             'notes': self.notes, 'profile_points': self.profile_points,
             'cutting': {mid: cd.to_dict() for mid, cd in self.cutting.items()},
@@ -127,6 +142,10 @@ class ToolDef:
             overall_length_mm=float(d.get('overall_length_mm', 0.0)),
             flutes=max(1, int(d.get('flutes', 2))),
             max_rpm=max(0.0, float(d.get('max_rpm', 0.0))),
+            neck_diameter_mm=float(d.get('neck_diameter_mm', 0.0)),
+            neck_length_mm=float(d.get('neck_length_mm', 0.0)),
+            head_height_mm=float(d.get('head_height_mm', 0.0)),
+            dovetail_angle_deg=float(d.get('dovetail_angle_deg', 60.0)),
             number=int(number) if number is not None else None,
             notes=str(d.get('notes', '')),
             profile_points=tool_profile.normalize_nodes(d.get('profile_points')),
@@ -384,12 +403,15 @@ def step_values_from(tool, cutting):
     """Step field values (as strings, keyed by step-field name) to write
     when applying *tool*. The V-bit angle is included only for V-bits,
     a deep copy of the Bezier nodes (key 'profile_nodes') only for Custom
-    profiles, and cutting fields only when *cutting* is given."""
+    profiles, the neck/head fields only for the undercut profiles that use
+    them, and cutting fields only when *cutting* is given."""
     values = {'profile': tool.profile, 'diameter': format_value(tool.diameter_mm)}
     if tool.profile == "V-Bit":
         values['vbit_angle'] = format_value(tool.vbit_angle_deg)
     if tool.profile == "Custom":
         values['profile_nodes'] = copy.deepcopy(tool.profile_points)
+    for attr, key in UNDERCUT_FIELDS.get(tool.profile, ()):
+        values[key] = format_value(getattr(tool, attr))
     if cutting is not None:
         values['feed_rate']   = format_value(cutting.feed_rate)
         values['plunge_rate'] = format_value(cutting.plunge_rate)
@@ -434,6 +456,9 @@ def sync_state(step_values, tool, cutting, family) -> str:
     if tool.profile == "Custom" and not _same_profile(step_values.get('profile_nodes'),
                                                       tool.profile_points):
         return SYNC_GEOMETRY_DIFFERS
+    for attr, key in UNDERCUT_FIELDS.get(tool.profile, ()):
+        if not _same(step_values.get(key), getattr(tool, attr)):
+            return SYNC_GEOMETRY_DIFFERS
     if cutting is None:
         return SYNC_NO_DATA
     expected = (('feed_rate',   cutting.feed_rate),
@@ -448,8 +473,8 @@ def sync_state(step_values, tool, cutting, family) -> str:
 
 def update_cutting_from_step(tool, material_id, step_values, family):
     """A copy of *tool* whose cutting data for *material_id* is taken from
-    the step. Geometry (profile, diameter, V angle, custom curve) is left
-    unchanged.
+    the step. Geometry (profile, diameter, V angle, custom curve,
+    neck/head) is left unchanged.
     Raises ValueError if a step value is not a number."""
     updated = copy.deepcopy(tool)
     updated.cutting[material_id] = CuttingData(
@@ -471,6 +496,8 @@ def tool_from_step(name, step_values, material_id, family):
                         if profile == "V-Bit" else 90.0),
         profile_points=(copy.deepcopy(step_values.get('profile_nodes'))
                         if profile == "Custom" else None))
+    for attr, key in UNDERCUT_FIELDS.get(profile, ()):
+        setattr(tool, attr, float(step_values[key]))
     if material_id is not None:
         tool = update_cutting_from_step(tool, material_id, step_values, family)
     return tool

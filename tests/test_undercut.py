@@ -1,0 +1,499 @@
+"""Plain assert-based tests for undercut planning: tool kernels (undercut.py),
+mesh dexels (stl_mesh.py), gap compositing (layers.py) and the Undercut
+toolpath itself.
+
+Run with: python tests/test_undercut.py
+"""
+import math
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+
+from layers import Layer, Gaps, composite, composite_gaps, pad_gaps, to_depth
+from stl_mesh import (load_stl, generate_dexels, generate_heightmap,
+                      normalize_and_orient)
+from tool import Tool, undercut_geometry_error
+from undercut import (build_undercut_kernels, compute_undercut_toolpath,
+                      NECK, _floor_ceil_at, _head_profile, _resample_gaps)
+
+FAILURES = []
+
+
+def check(name, cond):
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        print(f"  FAIL {name}")
+        FAILURES.append(name)
+
+
+def lollipop(d=6.0, neck=3.0, **kw):
+    return Tool("Lollipop", d, neck_diameter_mm=neck, **kw)
+
+
+# --------------------------------------------------------------------------
+# Inverted truncated cone standing on a plate: radius RB at the plate, RT at
+# the top, so the flank overhangs the plate by RT - RB all around.
+# --------------------------------------------------------------------------
+SIZE_MM, PX = 60.0, 4.0
+RB, RT, HC = 8.0, 12.0, 6.0          # max_depth = HC: plate top at full depth
+N_PX = int(SIZE_MM * PX)
+AXIS = ((N_PX - 1) / 2.0 / PX, (N_PX - 1) / 2.0 / PX)   # (x, y) mm, pixel-centred
+
+
+def cone_fixture():
+    """(depth_map, gaps) of the cone on the canvas grid, analytic."""
+    rows, cols = np.mgrid[0:N_PX, 0:N_PX]
+    x = cols / PX
+    y = (N_PX - 1 - rows) / PX
+    r = np.hypot(x - AXIS[0], y - AXIS[1])
+    depth = np.where(r < RT, 0.0, 1.0).astype(np.float32)
+    under = (r > RB) & (r < RT)
+    pix = np.flatnonzero(under.ravel())
+    ceil = 1.0 - (r.ravel()[pix] - RB) / (RT - RB)
+    return depth, Gaps.from_lists((N_PX, N_PX), pix, ceil, np.ones(pix.size))
+
+
+def cone_solid(xs, ys, zs):
+    """True where (x, y, z mm; z = 0 at the cone top) is inside cone or plate."""
+    r = np.hypot(xs - AXIS[0], ys - AXIS[1])
+    zr = zs + HC                                   # height above the plate
+    in_cone = (zr >= 0) & (zs <= 0) & (r <= RB + (RT - RB) * zr / HC)
+    return (zr < 0) | in_cone
+
+
+def tool_sample_points(tool, shrink):
+    """Surface sample points of an undercut tool's head and neck, relative to
+    the tip, pulled *shrink* mm inward (the check's tolerance)."""
+    R = tool.diameter_mm / 2.0
+    rn = tool.neck_diameter_mm / 2.0
+    radii = np.linspace(0.0, R, 49)
+    lo, hi = _head_profile(tool, radii)
+    prof = []                                   # (r, h) outline points
+    prof += [(r, l + shrink) for r, l in zip(radii, lo) if r <= R - shrink]
+    prof += [(r, h - shrink) for r, h in zip(radii, hi) if rn <= r <= R - shrink]
+    for h in np.linspace(lo[-1], hi[-1], 9):    # rim
+        prof.append((R - shrink, h))
+    top_neck = float(np.interp(rn, radii, hi))
+    for h in np.linspace(top_neck, top_neck + 20.0, 41):
+        prof.append((rn - shrink, h))
+    pts = []
+    for r, h in prof:
+        if h > hi.max() + 25 or r < 0:
+            continue
+        for az in np.linspace(0, 2 * math.pi, 36, endpoint=False):
+            pts.append((r * math.cos(az), r * math.sin(az), h))
+    return np.array(pts)
+
+
+def collisions(tp, tool, shrink, dz=0.0):
+    """Path points at which the sampled tool (its tip *dz* mm below the
+    path's tip) intersects the cone."""
+    body = tool_sample_points(tool, shrink)
+    hits = 0
+    for seg in tp.segments:
+        for x, y, z in seg:
+            hits += int(cone_solid(body[:, 0] + x, body[:, 1] + y,
+                                   body[:, 2] + z + dz).any())
+    return hits
+
+
+def cross2(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def plunge_ok(x, y, z, tool, shrink):
+    """A vertical plunge from above to (x, y, z) misses the cone (sampled)."""
+    body = tool_sample_points(tool, shrink)
+    for zz in np.linspace(z, 2.0, 30):
+        if cone_solid(body[:, 0] + x, body[:, 1] + y, body[:, 2] + zz).any():
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Tool geometry validation
+# --------------------------------------------------------------------------
+print("undercut tool validation")
+check("valid lollipop", undercut_geometry_error(lollipop()) is None)
+check("neck must be thinner than the head",
+      undercut_geometry_error(lollipop(neck=6.0)) is not None)
+check("wider shank needs a neck length",
+      undercut_geometry_error(lollipop(shank_diameter_mm=6.0)) is not None)
+check("T-Slot needs a head height",
+      undercut_geometry_error(Tool("T-Slot", 10.0, neck_diameter_mm=4.0)) is not None)
+check("Dovetail head must not be narrower than the neck at its top",
+      undercut_geometry_error(Tool("Dovetail", 10.0, neck_diameter_mm=6.0,
+                                   head_height_mm=5.0, dovetail_angle_deg=45.0))
+      is not None)
+check("non-undercut profiles are not validated",
+      undercut_geometry_error(Tool("Ball", 6.0)) is None)
+
+
+# --------------------------------------------------------------------------
+# Kernels: lo/hi at known radii, neck sentinel, allowance
+# --------------------------------------------------------------------------
+print("undercut kernels")
+md = 10.0
+lo, hi, fp = build_undercut_kernels(lollipop(), 10.0, md)
+c = lo.shape[0] // 2
+check("lollipop tip: lo = 0", abs(lo[c, c]) < 1e-12)
+check("lollipop over the neck: hi = NECK", hi[c, c] == NECK and hi[c, c + 15] == NECK)
+r_mm = 2.0                                  # 20 px, between neck (1.5) and R (3)
+check("lollipop lo/hi at r = 2 mm",
+      abs(lo[c, c + 20] - (3 - math.sqrt(5)) / md) < 1e-9
+      and abs(hi[c, c + 20] - (3 + math.sqrt(5)) / md) < 1e-9)
+check("lollipop rim: lo = hi = R", abs(lo[c, c + 30] - 0.3) < 1e-9
+      and abs(hi[c, c + 30] - 0.3) < 1e-9)
+
+lo, hi, fp = build_undercut_kernels(Tool("T-Slot", 10.0, neck_diameter_mm=4.0,
+                                         head_height_mm=2.0), 10.0, md)
+c = lo.shape[0] // 2
+check("T-Slot: flat underside, top at head height outside the neck",
+      np.all(lo[fp] == 0.0) and abs(hi[c, c + 40] - 0.2) < 1e-12 and hi[c, c + 10] == NECK)
+
+lo, hi, fp = build_undercut_kernels(Tool("Dovetail", 10.0, neck_diameter_mm=4.0,
+                                         head_height_mm=2.0, dovetail_angle_deg=45.0),
+                                    10.0, md)
+c = lo.shape[0] // 2
+check("Dovetail flank: hi = (R - r) tan a, capped at the head height",
+      abs(hi[c, c + 40] - 0.1) < 1e-9 and abs(hi[c, c + 25] - 0.2) < 1e-9)
+
+lo0, hi0, fp0 = build_undercut_kernels(lollipop(), 10.0, md)
+lo1, hi1, fp1 = build_undercut_kernels(lollipop(), 10.0, md, allowance_mm=0.5)
+c0, c1 = lo0.shape[0] // 2, lo1.shape[0] // 2
+check("allowance grows the footprint by its radius",
+      lo1.shape[0] == lo0.shape[0] + 10 and fp1[c1, c1 + 35] and fp0[c0, c0 + 30])
+check("allowance lowers the underside by its radius at the tip",
+      abs(lo1[c1, c1] - (-0.05)) < 1e-9)
+# Lollipop grown by a: a sphere of R + a about the same centre (R above the
+# tip), on a neck a wider.
+check("allowance: underside and top follow the sphere of R + a",
+      abs(lo1[c1, c1 + 25] - (3 - math.sqrt(3.5 ** 2 - 2.5 ** 2)) / md) < 0.003
+      and abs(hi1[c1, c1 + 25] - (3 + math.sqrt(3.5 ** 2 - 2.5 ** 2)) / md) < 0.003)
+check("allowance widens the neck by its radius",
+      hi1[c1, c1 + 20] >= NECK and hi1[c1, c1 + 21] < NECK)
+
+
+# --------------------------------------------------------------------------
+# Floor / ceiling selection
+# --------------------------------------------------------------------------
+print("floor/ceiling selection")
+g = Gaps.from_lists((1, 3), [1, 1, 2], [0.2, 0.6, 0.3], [0.4, 0.8, 1.0])
+top = np.array([[0.0, 0.1, 0.1]])
+F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.5)
+check("no gap: top surface floor, open sky", F[0, 0] == 0.0 and C[0, 0] < -1e5 and not act[0, 0])
+check("depth in solid below gap 0 uses gap 0", F[0, 1] == 0.4 and C[0, 1] == 0.2)
+F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.7)
+check("depth inside gap 1 uses gap 1", F[0, 1] == 0.8 and C[0, 1] == 0.6)
+F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.25)
+check("depth above every gap ceiling: no gap", F[0, 2] == 0.1 and not act[0, 2])
+
+rg = _resample_gaps(g, (1, 5))
+check("nearest resample keeps each column's gaps",
+      list(rg.counts[0]) == [0, 0, 2, 1, 1]
+      and np.allclose(rg.ceil[rg.offsets[2]:rg.offsets[3]], [0.2, 0.6]))
+pg = pad_gaps(g, 1, 2)
+check("pad_gaps shifts gaps by the margin", pg.shape == (3, 7)
+      and list(pg.counts[1]) == [0, 0, 0, 2, 1, 0, 0])
+
+
+# --------------------------------------------------------------------------
+# Dexels from a mesh: the inverted cone on a plate, as an ASCII STL
+# --------------------------------------------------------------------------
+print("dexels")
+
+
+def _frustum_and_plate(n=96, plate=20.0, hp=2.0):
+    """Closed triangles (outward winding) for the cone on a plate, in mm,
+    plate top at z = hp: two closed shells touching at the cone's base."""
+
+    def orient(tris, centre):
+        tris = np.array(tris, np.float64)
+        for k, t in enumerate(tris):
+            nrm = np.cross(t[1] - t[0], t[2] - t[0])
+            if np.dot(nrm, t.mean(axis=0) - centre) < 0:
+                tris[k] = t[[0, 2, 1]]
+        return tris
+
+    def quads(*qs):
+        out = []
+        for a, b, c_, d_ in qs:
+            out.extend([(a, b, c_), (a, c_, d_)])
+        return out
+
+    P = plate
+    v = [(-P, -P, 0), (P, -P, 0), (P, P, 0), (-P, P, 0),
+         (-P, -P, hp), (P, -P, hp), (P, P, hp), (-P, P, hp)]
+    box = quads((v[0], v[3], v[2], v[1]), (v[4], v[5], v[6], v[7]),
+                (v[0], v[1], v[5], v[4]), (v[1], v[2], v[6], v[5]),
+                (v[2], v[3], v[7], v[6]), (v[3], v[0], v[4], v[7]))
+    cone = []
+    ang = np.linspace(0, 2 * math.pi, n, endpoint=False)
+    for i in range(n):
+        a0, a1 = ang[i], ang[(i + 1) % n]
+        b0 = (RB * math.cos(a0), RB * math.sin(a0), hp)
+        b1 = (RB * math.cos(a1), RB * math.sin(a1), hp)
+        t0 = (RT * math.cos(a0), RT * math.sin(a0), hp + HC)
+        t1 = (RT * math.cos(a1), RT * math.sin(a1), hp + HC)
+        cone += quads((b0, b1, t1, t0))
+        cone.append(((0, 0, hp + HC), t0, t1))
+        cone.append(((0, 0, hp), b1, b0))
+    return np.concatenate([orient(box, np.array([0, 0, hp / 2])),
+                           orient(cone, np.array([0, 0, hp + HC / 2]))])
+
+
+def _write_ascii_stl(path, tris):
+    with open(path, 'w') as f:
+        f.write("solid t\n")
+        for t in tris:
+            f.write(" facet normal 0 0 0\n  outer loop\n")
+            for v in t:
+                f.write(f"   vertex {v[0]:.9g} {v[1]:.9g} {v[2]:.9g}\n")
+            f.write("  endloop\n endfacet\n")
+        f.write("endsolid t\n")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    stl_path = os.path.join(tmp, "cone.stl")
+    _write_ascii_stl(stl_path, _frustum_and_plate())
+    tris = load_stl(stl_path)
+n_mesh = 161                                   # 40 mm / 0.25 mm + 1
+dex = generate_dexels(tris, n_mesh, n_mesh)
+hm = generate_heightmap(tris, n_mesh, n_mesh)
+counts = np.diff(dex.offsets).reshape(dex.shape)
+check("Dexels.top is exactly the heightmap",
+      np.array_equal(np.isnan(dex.top), np.isnan(np.flipud(hm)))
+      and np.array_equal(dex.top[~np.isnan(dex.top)], np.flipud(hm)[~np.isnan(dex.top)]))
+mm = np.linspace(-20, 20, n_mesh)
+rows, cols = np.mgrid[0:n_mesh, 0:n_mesh]
+xx, yy = mm[cols], mm[::-1][rows]
+rr = np.hypot(xx, yy)
+# Columns reduced to their top hit: a ray through the mesh's outline, where
+# float rounding can drop one of two coincident crossings.
+cnt_now = np.diff(dex.offsets).reshape(dex.shape)
+on_silhouette = (np.abs(rr - RT) < 0.2) | (np.abs(xx) > 19.9) | (np.abs(yy) > 19.9)
+check("inconsistent columns only where a ray grazes the outline",
+      not np.any((cnt_now == 1) & ~on_silhouette))
+under = (rr > RB + 0.3) & (rr < RT - 0.3)
+check("columns under the overhang have 4 hits (top, flank, plate top, plate bottom)",
+      np.all(counts[under] == 4))
+check("columns through the cone core have 2 hits (cap/plate seam cancels)",
+      np.all(counts[rr < RB - 0.3] == 2))
+check("plate-only columns have 2 hits", np.all(counts[(rr > RT + 0.3) & (np.abs(xx) < 19.5)
+                                                        & (np.abs(yy) < 19.5)] == 2))
+i = int(np.flatnonzero((under & (np.abs(rr - 11.0) < 0.2)).ravel())[0])
+zc = dex.z[dex.offsets[i]:dex.offsets[i + 1]]
+flank = 2.0 + HC * (rr.ravel()[i] - RB) / (RT - RB)
+check("flank hit at the analytic height", abs(zc[1] - flank) < 0.05 and abs(zc[2] - 2.0) < 1e-6)
+
+open_tris = _frustum_and_plate()[2:]          # drop the plate bottom
+dex_open = generate_dexels(open_tris, n_mesh, n_mesh)
+cnt_open = np.diff(dex_open.offsets).reshape(dex_open.shape)
+check("open-bottom columns end in a bottomless solid (odd count)",
+      np.all(cnt_open[(rr > RT + 0.3) & (np.abs(xx) < 19.5) & (np.abs(yy) < 19.5)] % 2 == 1))
+flipped = generate_dexels(_frustum_and_plate()[:, [0, 2, 1]], n_mesh, n_mesh)
+check("an inside-out mesh gives the same dexels",
+      np.array_equal(flipped.offsets, dex.offsets) and np.allclose(flipped.z, dex.z))
+
+
+# --------------------------------------------------------------------------
+# composite_gaps: the STL layer's gaps land where the composite top is its own
+# --------------------------------------------------------------------------
+print("composite_gaps")
+raw, alpha = normalize_and_orient(hm)
+layer = Layer(name="cone", raw=raw, source_kind="stl", alpha=alpha)
+layer.dexels = dex
+shape = (n_mesh, n_mesh)
+ppm = n_mesh / 40.0
+comp = to_depth(composite([layer], shape, ppm, ppm, "white"), "white", False)
+gp, warns = composite_gaps([layer], shape, ppm, ppm, "white", comp)
+gc = gp.counts
+check("one gap per column under the overhang", np.all(gc[under] == 1) and not warns)
+check("no gaps outside the overhang", gc[~((rr > RB - 0.3) & (rr < RT + 0.3))].sum() == 0)
+j = int(np.flatnonzero((under & (np.abs(rr - 11.0) < 0.2)).ravel())[0])
+k = gp.offsets[j]
+# depth = 1 - (z - plate_top) / HC with the plate top (z = 2) at full depth
+from layers import _layer_depth_affine
+a_, b_ = _layer_depth_affine(layer, "white")
+flank_z = 2.0 + HC * (rr.ravel()[j] - RB) / (RT - RB)
+check("gap ceiling = flank depth, floor = plate top, as the layer maps depth",
+      abs(gp.ceil[k] - (a_ * flank_z + b_)) < 0.01
+      and abs(gp.floor[k] - min(a_ * 2.0 + b_, 1.0)) < 1e-6)
+check("top-surface depth of the gap columns matches the composite",
+      np.all(np.abs(comp[under] - (a_ * 8.0 + b_)) < 1e-4))
+
+shifted = Layer(name="cone", raw=raw, source_kind="stl", alpha=alpha,
+                offset_x_mm=4.0, mirror="Vertical axis")
+shifted.dexels = dex
+comp_s = to_depth(composite([shifted], shape, ppm, ppm, "white"), "white", False)
+gs, _ = composite_gaps([shifted], shape, ppm, ppm, "white", comp_s)
+rr_s = np.hypot(xx + 4.0, yy)                   # offset +4 then mirrored to -4
+under_s = (rr_s > RB + 0.4) & (rr_s < RT - 0.4)
+check("placement and Mirror move the gaps with the layer",
+      np.all(gs.counts[under_s] == 1)
+      and gs.counts[~((rr_s > RB - 0.4) & (rr_s < RT + 0.4))].sum() == 0)
+
+cover = Layer(name="block", raw=np.full(shape, 0.5, np.float32), source_kind="image",
+              scale_pct=50.0)
+comp_c = to_depth(composite([layer, cover], shape, ppm, ppm, "white"), "white", False)
+gcv, _ = composite_gaps([layer, cover], shape, ppm, ppm, "white", comp_c)
+covered = (np.abs(xx) < 9.5) & (np.abs(yy) < 9.5)
+check("a layer covering the STL hides its gaps", gcv.counts[covered].sum() == 0
+      and gcv.counts[under & ~((np.abs(xx) < 10.5) & (np.abs(yy) < 10.5))].min() == 1)
+
+inv = Layer(name="cone", raw=raw, source_kind="stl", alpha=alpha,
+            min_depth_pct=100.0, max_depth_pct=0.0)
+inv.dexels = dex
+comp_i = to_depth(composite([inv], shape, ppm, ppm, "white"), "white", False)
+gi, warns_i = composite_gaps([inv], shape, ppm, ppm, "white", comp_i)
+check("inverted polarity is ignored with a warning",
+      gi.counts.sum() == 0 and len(warns_i) == 1)
+
+
+# --------------------------------------------------------------------------
+# Undercut toolpath on the analytic cone with a Lollipop
+# --------------------------------------------------------------------------
+print("undercut toolpath: inverted cone, Lollipop")
+depth, gaps = cone_fixture()
+tool = lollipop()                                 # R = 3, neck r = 1.5 -> reach 1.5
+prev = depth.copy()                               # 2.5D roughing done
+tp = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC,
+                               SIZE_MM, SIZE_MM, previous_result=prev)
+pts = np.array([p for s in tp.segments for p in s])
+rho = np.hypot(pts[:, 0] - AXIS[0], pts[:, 1] - AXIS[1])
+check("produces chains", len(tp.segments) > 0)
+check("the head reaches under the lip (>= 1 mm)", rho.min() - 3.0 < RT - 1.0)
+check("the neck axis stays outside the lip by the neck radius",
+      rho.min() >= RT + 1.5 - 0.01)
+check("no tool/part collision (sampled tool shrunk by 0.15 mm)",
+      collisions(tp, tool, 0.15) == 0)
+check("every chain starts and ends where a vertical plunge is clear",
+      all(plunge_ok(*s[0], tool, 0.15) and plunge_ok(*s[-1], tool, 0.15)
+          for s in tp.segments))
+check("every chain stays at one depth", all(len({round(p[2], 9) for p in s}) == 1
+                                            for s in tp.segments))
+zs = [s[0][2] for s in tp.segments]
+check("levels are cut top-down", all(a >= b - 1e-9 for a, b in zip(zs, zs[1:])))
+check("the previous result is passed through unchanged", np.array_equal(tp.result, prev))
+check("no warnings on a reachable undercut", tp.metadata['warnings'] == [])
+
+# Rings within a level: cut from open sky toward the wall (small step-over).
+tp_r = compute_undercut_toolpath(depth, gaps, tool, 0.5, 8.0, HC,
+                                 SIZE_MM, SIZE_MM, previous_result=prev)
+check("small step-over: no tool/part collision", collisions(tp_r, tool, 0.15) == 0)
+lvl = {}
+for s in tp_r.segments:
+    lvl.setdefault(round(s[0][2], 6), []).append(np.array(s))
+ordered_ok, n_multi = True, 0
+for z, segs in lvl.items():
+    allp = np.vstack(segs)
+    r_all = np.hypot(allp[:, 0] - AXIS[0], allp[:, 1] - AXIS[1])
+    under_pts = r_all < 14.99                    # not reachable by a plunge
+    if under_pts.sum() < 20:
+        continue
+    r_u = r_all[under_pts]
+    half = len(r_u) // 2
+    if np.ptp(r_u) > 0.8:
+        n_multi += 1
+        ordered_ok &= r_u[:half].mean() > r_u[half:].mean()
+check("some level has more than one ring", n_multi > 0)
+check("rings run from open sky inward, waterline last", ordered_ok)
+
+# Climb: uncut material (the cone axis side) on the right of travel.
+seg = max(tp.segments, key=len)
+a = np.array(seg)
+mid = len(a) // 2
+tang = a[mid + 1, :2] - a[mid - 1, :2]
+to_axis = np.array(AXIS) - a[mid, :2]
+check("Climb keeps the material on the right", cross2(tang, to_axis) < 0)
+
+tp_conv = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                    previous_result=prev, cut_direction="Conventional")
+a = np.array(max(tp_conv.segments, key=len))
+mid = len(a) // 2
+tang = a[mid + 1, :2] - a[mid - 1, :2]
+check("Conventional keeps the material on the left",
+      cross2(tang, np.array(AXIS) - a[mid, :2]) > 0)
+
+
+print("undercut toolpath: T-Slot and Dovetail")
+for t_tool in (Tool("T-Slot", 6.0, neck_diameter_mm=3.0, head_height_mm=1.5),
+               Tool("Dovetail", 7.0, neck_diameter_mm=3.0, head_height_mm=2.0,
+                    dovetail_angle_deg=60.0)):
+    tp_t = compute_undercut_toolpath(depth, gaps, t_tool, 0.5, 30.0, HC,
+                                     SIZE_MM, SIZE_MM, previous_result=prev)
+    p_t = np.array([p for s_ in tp_t.segments for p in s_])
+    check(f"{t_tool.profile}: reaches under the lip",
+          len(tp_t.segments) > 0
+          and np.hypot(p_t[:, 0] - AXIS[0], p_t[:, 1] - AXIS[1]).min()
+          - t_tool.diameter_mm / 2 < RT - 0.5)
+    check(f"{t_tool.profile}: no tool/part collision", collisions(tp_t, t_tool, 0.15) == 0)
+    check(f"{t_tool.profile}: chains start and end plunge-clear",
+          all(plunge_ok(*s_[0], t_tool, 0.15) and plunge_ok(*s_[-1], t_tool, 0.15)
+              for s_ in tp_t.segments))
+
+
+print("undercut toolpath: stock to leave")
+tp_a = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                 previous_result=prev, extra_offset_mm=0.5)
+pts_a = np.array([p for s in tp_a.segments for p in s])
+# The tool grown by 0.5 mm: sphere of 3.5 about the same centre, so its tip
+# is 0.5 mm below the real tip; neck 0.5 mm wider. Checked to within 0.2 mm
+# (under one 0.25 mm pixel): the lip's sharp corner falls between pixel
+# centres.
+check("stock to leave keeps the tool 0.5 mm off (sampled, grown tool)",
+      len(tp_a.segments) > 0
+      and collisions(tp_a, Tool("Lollipop", 7.0, neck_diameter_mm=4.0), 0.2, dz=-0.5) == 0)
+check("stock to leave reaches less far",
+      np.hypot(pts_a[:, 0] - AXIS[0], pts_a[:, 1] - AXIS[1]).min() > rho.min())
+
+
+print("undercut toolpath: shank wider than the neck")
+tool_s = lollipop(shank_diameter_mm=8.0, neck_length_mm=2.0)
+tp_s = compute_undercut_toolpath(depth, gaps, tool_s, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                 previous_result=prev)
+check("a 2 mm neck cannot reach the undercut, which starts 3.5 mm down",
+      tp_s.segments == [] and any("No undercut is reachable" in w
+                                   for w in tp_s.metadata['warnings']))
+tool_l = lollipop(shank_diameter_mm=8.0, neck_length_mm=4.5)
+tp_l = compute_undercut_toolpath(depth, gaps, tool_l, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                 previous_result=prev)
+zs_l = [p[2] for s in tp_l.segments for p in s]
+check("a 4.5 mm neck keeps the wide shank above the cone top",
+      len(zs_l) > 0 and min(zs_l) >= -4.5 - 1e-6 and max(zs_l) <= -3.5 + 1e-6)
+
+
+print("undercut toolpath: unreachable and empty cases")
+tool_fat = lollipop(d=6.0, neck=5.6)              # reach 0.2 mm < 1 px margin
+tp_f = compute_undercut_toolpath(depth, gaps, tool_fat, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                 previous_result=prev)
+check("a neck almost as wide as the head reaches (almost) nothing", collisions(tp_f, tool_fat, 0.15) == 0)
+tp_e = compute_undercut_toolpath(depth, Gaps.empty(depth.shape), tool, 0.5, 30.0, HC,
+                                 SIZE_MM, SIZE_MM, previous_result=prev)
+check("no gaps: no chains, with a warning", tp_e.segments == []
+      and any("no undercuts" in w for w in tp_e.metadata['warnings']))
+
+print("undercut toolpath: non-square pixels")
+depth_ns = depth[:, :-1]                          # 240 x 239 px over 59.75 x 60 mm
+pix = gaps.pixel_index()
+keep = pix % N_PX < N_PX - 1
+r_, c_ = pix[keep] // N_PX, pix[keep] % N_PX
+gaps_ns = Gaps.from_lists(depth_ns.shape, r_ * (N_PX - 1) + c_, gaps.ceil[keep],
+                          gaps.floor[keep])
+tp_ns = compute_undercut_toolpath(depth_ns, gaps_ns, tool, 1.0, 30.0, HC,
+                                  SIZE_MM * (N_PX - 1) / N_PX, SIZE_MM,
+                                  previous_result=depth_ns.copy())
+check("non-square pixels still produce chains", len(tp_ns.segments) > 0)
+check("non-square pixels: no tool/part collision", collisions(tp_ns, tool, 0.25) == 0)
+
+
+print()
+if FAILURES:
+    print(f"{len(FAILURES)} FAILED: {FAILURES}")
+    sys.exit(1)
+print("all ok")

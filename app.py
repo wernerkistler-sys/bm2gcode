@@ -53,7 +53,8 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_vcarve_synth_achievable_depth,
                         compute_registration_holes_toolpath, registration_hole_centers,
                         registration_flip_axis, registration_auto_spacing)
-from tool import Tool
+from tool import Tool, UNDERCUT_PROFILES
+from undercut import compute_undercut_toolpath
 from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state,
                           update_cutting_from_step, tool_from_step, format_value,
                           STEPDOWN_FIELDS, SYNC_GEOMETRY_DIFFERS, SYNC_MODIFIED,
@@ -70,6 +71,11 @@ _VCARVE_PROFILES  = ["V-Bit", "Ball", "Custom"]
 _HYBRID_PROFILES  = ["V-Bit"]
 _RASTER_PROFILES  = ["Ball", "End Mill", "V-Bit", "Custom"]
 _CUTOUT_PROFILES  = ["End Mill"]
+_UNDERCUT_PROFILES = list(UNDERCUT_PROFILES)
+
+# Step fields holding an undercut tool's extra geometry (see tool.UNDERCUT_FIELDS).
+_UNDERCUT_KEYS = ('neck_diameter', 'neck_length', 'shank_diameter',
+                  'head_height', 'dovetail_angle')
 
 
 class _MissingProfileCurve(ValueError):
@@ -84,6 +90,8 @@ def _allowed_profiles(algorithm):
         return _VCARVE_PROFILES
     if family in ("Cutout", "Registration Holes"):
         return _CUTOUT_PROFILES
+    if family == "Undercut":
+        return _UNDERCUT_PROFILES
     return _RASTER_PROFILES
 
 
@@ -1070,7 +1078,8 @@ class GCodeGeneratorApp:
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate',
                     'plunge_rate', 'spindle_rpm', 'threshold',
                     'min_fw', 'max_fw', 'pocket_boundary_offset',
-                    'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing'):
+                    'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing'
+                    ) + _UNDERCUT_KEYS:
             # Auto first, like _apply_step_dict: an Auto sync fired by the
             # value write must see the copied Auto state, not the default.
             if dst[key].auto_var is not None and src[key].auto_var is not None:
@@ -1185,6 +1194,7 @@ class GCodeGeneratorApp:
 
         dir_row = ttk.Frame(raster_frame)
         dir_row.pack(fill=tk.X, pady=2)
+        step['raster_dir_row'] = dir_row
         ttk.Label(dir_row, text="Scan direction:").pack(side=tk.LEFT)
         dir_var = tk.StringVar(value=DEFAULTS["step_raster_dir"])
         step['raster_dir_var'] = dir_var
@@ -1398,6 +1408,21 @@ class GCodeGeneratorApp:
         # where the curve is edited.
         step['profile_nodes'] = None
 
+        # ── Undercut-tool geometry (shown for the Undercut algorithm) ────
+        undercut_frame = ttk.Frame(tool_lf)
+        step['undercut_frame'] = undercut_frame
+        # (not packed initially — shown on demand by _refresh_layout)
+        for key, label, unit, lo_, hi_, inc in (
+                ('neck_diameter',  "Neck diameter",  "mm", 0.01, 200.0, 0.5),
+                ('neck_length',    "Neck length",    "mm", 0.0, 500.0, 1.0),
+                ('shank_diameter', "Shank diameter", "mm", 0.0, 200.0, 0.5),
+                ('head_height',    "Head height",    "mm", 0.01, 100.0, 0.5),
+                ('dovetail_angle', "Dovetail angle", "°", 1.0, 89.0, 5.0)):
+            le = LabeledEntry(undercut_frame, label, unit, DEFAULTS[f"step_{key}"],
+                              minval=lo_, maxval=hi_, increment=inc)
+            le.pack(fill=tk.X, pady=2)
+            step[key] = le
+
         # ── Raster step-down controls (shown for Raster Scan only) ───────
         stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"],
                                 minval=0.01, maxval=50.0, increment=0.1)
@@ -1523,6 +1548,13 @@ class GCodeGeneratorApp:
 
             if family != "Registration Holes":
                 step['reghole_frame'].pack_forget()
+            if family != "Undercut":
+                step['undercut_frame'].pack_forget()
+                step['stepdown'].set_label("Max step-down")
+                if not step['raster_offset'].winfo_manager():
+                    step['raster_offset'].pack(fill=tk.X, pady=2, after=step['stepover'])
+                if not step['raster_dir_row'].winfo_manager():
+                    step['raster_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_offset'])
 
             if family == "V-Carving":
                 step['raster_frame'].pack_forget()
@@ -1626,6 +1658,33 @@ class GCodeGeneratorApp:
                 else:
                     step['reghole_spacing'].pack_forget()
                 self._sync_reghole_fields(step)
+            elif family == "Undercut":
+                # Uniform depth levels (Max step-down, relabeled) and ring
+                # spacing (Step-over); no Process Region, path-order or
+                # air-cut options -- see undercut.py.
+                for key in ('vcarve_frame', 'contour_frame', 'cutout_frame', 'vbit_frame',
+                            'raster_final_stepdown', 'pocket_boundary_offset',
+                            'min_fw', 'max_fw', 'gating_frame', 'tsp_frame',
+                            'raster_offset', 'raster_dir_row'):
+                    step[key].pack_forget()
+                step['profile_cb'].config(state="readonly", values=_UNDERCUT_PROFILES)
+                if profile not in _UNDERCUT_PROFILES:
+                    step['profile_var'].set(_UNDERCUT_PROFILES[0])
+                    profile = _UNDERCUT_PROFILES[0]
+                step['undercut_frame'].pack(fill=tk.X, after=step['diameter'])
+                if profile in ("T-Slot", "Dovetail"):
+                    step['head_height'].pack(fill=tk.X, pady=2, after=step['shank_diameter'])
+                else:
+                    step['head_height'].pack_forget()
+                if profile == "Dovetail":
+                    step['dovetail_angle'].pack(fill=tk.X, pady=2, after=step['head_height'])
+                else:
+                    step['dovetail_angle'].pack_forget()
+                step['stepdown'].set_label("Level step-down")
+                step['stepdown'].pack(fill=tk.X, pady=2, after=step['undercut_frame'])
+                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
+                step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
             elif family == "Pocket":   # Pocket, V-Carving Clean-up
                 step['vcarve_frame'].pack_forget()
                 step['contour_frame'].pack_forget()
@@ -1784,7 +1843,7 @@ class GCodeGeneratorApp:
             self._refresh_library_link(step)
 
         for key in ('diameter', 'vbit_angle', 'feed_rate', 'plunge_rate',
-                    'spindle_rpm') + STEPDOWN_FIELDS:
+                    'spindle_rpm') + STEPDOWN_FIELDS + _UNDERCUT_KEYS:
             step[key].committed_var.trace_add("write", _on_tool_value_changed)
         for var in (step['profile_var'], algorithm_var,
                     step['library_tool_id_var'], step['library_tool_name_var']):
@@ -2509,19 +2568,29 @@ class GCodeGeneratorApp:
             spindle_rpm     = tp.metadata.get('spindle_rpm', 0.0),
             spindle_dwell_s = self._settings['spindle_dwell_s'],
         )
-        step['info_var'].set(
-            f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
-            f"Est. time: {_fmt_time(stats['est_minutes'])}"
-            f" @ {feed_rate:.0f} mm/min")
+        text = (f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+                f"Est. time: {_fmt_time(stats['est_minutes'])}"
+                f" @ {feed_rate:.0f} mm/min")
+        for warning in tp.metadata.get('warnings', ()):
+            text += f"\n⚠ {warning}"
+        step['info_var'].set(text)
+
+    @staticmethod
+    def _sideways_only(step):
+        """True for steps whose cuts sit under overhangs, where ramp-in and
+        back-off (which move sideways while rising) could hit the part."""
+        return ALGORITHM_FAMILY[step['algorithm_var'].get()] == "Undercut"
 
     def _ramp_settings(self, step):
-        return RampSettings(enabled=step['ramp_in_enabled_var'].get(),
+        return RampSettings(enabled=(step['ramp_in_enabled_var'].get()
+                                     and not self._sideways_only(step)),
                              angle_deg=step['ramp_angle_deg_var'].get(),
                              max_length_mm=step['ramp_max_length_mm_var'].get(),
                              start_z_mm=step['ramp_start_z_mm_var'].get())
 
     def _backoff_settings(self, step):
-        return BackoffSettings(enabled=step['backoff_enabled_var'].get(),
+        return BackoffSettings(enabled=(step['backoff_enabled_var'].get()
+                                        and not self._sideways_only(step)),
                                 distance_mm=step['backoff_distance_mm_var'].get())
 
     def _arc_settings(self, step):
@@ -2651,7 +2720,7 @@ class GCodeGeneratorApp:
         values = {'profile': step['profile_var'].get(),
                   'profile_nodes': step['profile_nodes']}
         for key in ('diameter', 'vbit_angle', 'feed_rate', 'plunge_rate',
-                    'spindle_rpm') + STEPDOWN_FIELDS:
+                    'spindle_rpm') + STEPDOWN_FIELDS + _UNDERCUT_KEYS:
             values[key] = step[key].get()
         return values
 
@@ -2851,6 +2920,7 @@ class GCodeGeneratorApp:
             'max_fw':               step['max_fw'].get(),
             'max_fw_auto':          bool(step['max_fw'].auto_var.get()),
             'pocket_boundary_offset': step['pocket_boundary_offset'].get(),
+            **{key: step[key].get() for key in _UNDERCUT_KEYS},
             'gating_mode':          step['gating_mode_var'].get(),
             'ramp_in_enabled':      step['ramp_in_enabled_var'].get(),
             'ramp_angle_deg':       step['ramp_angle_deg_var'].get(),
@@ -2920,6 +2990,8 @@ class GCodeGeneratorApp:
         step['max_fw'].set(d.get('max_fw', DEFAULTS['step_max_fw']))
         step['pocket_boundary_offset'].set(d.get(
             'pocket_boundary_offset', DEFAULTS['step_pocket_boundary_offset']))
+        for key in _UNDERCUT_KEYS:
+            step[key].set(d.get(key, DEFAULTS[f'step_{key}']))
         step['gating_mode_var'].set(d.get('gating_mode', DEFAULTS['step_gating_mode']))
         step['ramp_in_enabled_var'].set(bool(d.get(
             'ramp_in_enabled', bool(int(DEFAULTS['step_ramp_in_enabled'])))))
@@ -3634,6 +3706,32 @@ class GCodeGeneratorApp:
                                         else geo['spacing_mm']),
                 'cut_direction':       step['cut_dir_var'].get(),
             })
+        elif ALGORITHM_FAMILY[algorithm] == "Undercut":
+            _profile = step['profile_var'].get()
+            tool = Tool(_profile, float(step['diameter'].get()),
+                        neck_diameter_mm=float(step['neck_diameter'].get()),
+                        neck_length_mm=float(step['neck_length'].get()),
+                        shank_diameter_mm=float(step['shank_diameter'].get()),
+                        head_height_mm=(float(step['head_height'].get())
+                                        if _profile in ("T-Slot", "Dovetail") else 0.0),
+                        dovetail_angle_deg=(float(step['dovetail_angle'].get())
+                                            if _profile == "Dovetail" else 60.0))
+            W, H = self._canvas_shape_px()
+            pad_y, pad_x = self._margin_pad_px(H, W)
+            params.update({
+                'tool':              tool,
+                'z_increment_mm':    float(step['stepdown'].get()),
+                'stepover_pct':      float(step['stepover'].get()),
+                'cut_direction':     step['cut_dir_var'].get(),
+                # Read by _undercut_gaps off the main thread; Layer objects
+                # are plain data, so a snapshot of the list is enough.
+                'layers':            list(self.layers),
+                'canvas_shape':      (H, W),
+                'px_per_mm_x':       W / width_mm,
+                'px_per_mm_y':       H / height_mm,
+                'surface':           self.surface.get(),
+                'margin_pad':        (pad_y, pad_x),
+            })
         else:  # Raster
             tool     = self._step_tool(step)
             stepover = float(step['stepover'].get())
@@ -3716,6 +3814,31 @@ class GCodeGeneratorApp:
                 erosion_cache        = self._erosion_cache,
                 erosion_cache_key    = erosion_cache_key,
             )
+        elif ALGORITHM_FAMILY[algorithm] == "Undercut":
+            gaps, warnings = self._undercut_gaps(params, depth_map, progress_fn)
+            tp = compute_undercut_toolpath(
+                depth_map        = depth_map,
+                gaps             = gaps,
+                tool             = params['tool'],
+                z_increment_mm   = params['z_increment_mm'],
+                stepover_pct     = params['stepover_pct'],
+                max_depth        = params['max_depth'],
+                width_mm         = params['eff_width_mm'],
+                height_mm        = params['eff_height_mm'],
+                origin           = params['origin'],
+                feed_rate        = params['feed_rate'],
+                previous_result  = prev_tp.result if prev_tp is not None else None,
+                z_safe           = self._settings['z_safe'],
+                feed_rapid       = self._settings['feed_rapid'],
+                cut_direction    = params['cut_direction'],
+                extra_offset_mm  = params['extra_offset_mm'],
+                n_grey_levels    = n_grey_levels,
+                progress         = progress_fn,
+                erosion_cache    = self._erosion_cache,
+                erosion_cache_key = erosion_cache_key,
+            )
+            tp.metadata['warnings'] = warnings + tp.metadata.get('warnings', [])
+            return tp
         elif algorithm == "Contour":
             return compute_contour_toolpath(
                 depth_map        = depth_map,
@@ -4029,6 +4152,15 @@ class GCodeGeneratorApp:
                         f"Step {idx} has not been computed yet.\n\n"
                         "Without its result this step will treat the entire "
                         "depth map as unfinished.\n\nContinue anyway?"):
+                    return
+        elif ALGORITHM_FAMILY[algorithm] == "Undercut":
+            if idx > 0 and prev_tp is None:
+                if not messagebox.askyesno(
+                        "Previous step not computed",
+                        f"Step {idx} has not been computed yet.\n\n"
+                        "Undercut cuts sideways under overhangs and assumes the "
+                        "stock above them was already removed by earlier "
+                        "steps.\n\nContinue anyway?"):
                     return
         elif algorithm == "Cutout":
             pass  # Cutout cuts based on its own depth_map threshold regardless
@@ -4393,20 +4525,65 @@ class GCodeGeneratorApp:
         return ls.shade_rgb(base_rgb, elevation_mm, blend_mode="soft",
                             vert_exag=vert_exag, dx=dx, dy=dy)
 
-    def _pad_image(self, img):
-        """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
+    def _margin_pad_px(self, H, W):
+        """(pad_y, pad_x): the stock margin in pixels on each side of an
+        H x W canvas, or (0, 0) with no margin."""
         try:
             margin_mm = float(self.margin_mm.get())
-        except ValueError:
-            return img
-        if margin_mm <= 0.0:
-            return img
-        try:
-            H, W = img.shape
             width_mm  = float(self.width_mm.get())
             height_mm = float(self.height_mm.get())
-            pad_x = max(1, round(margin_mm * W / width_mm))
-            pad_y = max(1, round(margin_mm * H / height_mm))
+        except ValueError:
+            return 0, 0
+        if margin_mm <= 0.0 or width_mm <= 0.0 or height_mm <= 0.0:
+            return 0, 0
+        return (max(1, round(margin_mm * H / height_mm)),
+                max(1, round(margin_mm * W / width_mm)))
+
+    def _undercut_gaps(self, params, depth_map, progress_fn):
+        """The undercut gaps of the step's visible STL sources on the step's
+        (margin-padded) depth-map grid, and any warnings. Builds each STL
+        layer's dexels from its mesh first if missing or stale. Runs off the
+        main thread: it reads only *params* and Layer data."""
+        visibility = params['source_visibility']
+        stl_layers = [(i, layer) for i, layer in enumerate(params['layers'])
+                      if layer.source_kind == "stl"
+                      and (visibility[i] if i < len(visibility) else layer.visible)]
+        if not stl_layers:
+            raise ValueError("Undercut needs at least one visible STL source: "
+                             "image sources carry no undercut geometry.")
+        warnings = []
+        for _, layer in stl_layers:
+            key = (layer.path, tuple(sorted((layer.stl_params or {}).items())),
+                   layer.raw.shape)
+            if layer.dexels is not None and layer.dexels_key == key:
+                continue
+            progress_fn(0, f"Reading undercuts of {layer.name}…")
+            sp = layer.stl_params or {}
+            triangles = stl_mesh.load_stl(layer.path)
+            rotated = stl_mesh.apply_rotation(triangles, sp.get('rot_x', 0),
+                                              sp.get('rot_y', 0), sp.get('rot_z', 0))
+            H_l, W_l = layer.raw.shape
+            layer.dexels = stl_mesh.generate_dexels(rotated, W_l, H_l)
+            layer.dexels_key = key
+            if layer.dexels.n_invalid:
+                warnings.append(f"{layer.name}: {layer.dexels.n_invalid} mesh columns "
+                                f"are not watertight and are treated as solid.")
+        pad_y, pad_x = params['margin_pad']
+        H, W = params['canvas_shape']
+        composite_depth = depth_map[pad_y:pad_y + H, pad_x:pad_x + W].astype(np.float64)
+        gaps, gap_warnings = layers_mod.composite_gaps(
+            params['layers'], (H, W), params['px_per_mm_x'], params['px_per_mm_y'],
+            params['surface'], composite_depth, visibility_override=list(visibility),
+            origin=params['origin'])
+        return layers_mod.pad_gaps(gaps, pad_y, pad_x), warnings + gap_warnings
+
+    def _pad_image(self, img):
+        """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
+        H, W = img.shape
+        pad_y, pad_x = self._margin_pad_px(H, W)
+        if pad_y == 0 and pad_x == 0:
+            return img
+        try:
             depth_pct = float(self.margin_depth_pct.get()) / 100.0
             if self.surface.get() == "white":
                 pad_val = np.float32(1.0 - depth_pct)  # white = z=0; deeper cut → darker

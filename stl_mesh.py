@@ -1,5 +1,6 @@
 import os
 import re
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -186,6 +187,148 @@ def generate_heightmap(triangles, width, height):
     heightmap[np.isinf(heightmap)] = np.nan
 
     return heightmap
+
+
+_EDGE_TOL = 1e-9   # barycentric slack for rays through triangle edges
+
+
+@dataclass
+class Dexels:
+    """Every surface crossing of each pixel's vertical ray through a mesh.
+
+    Column i (row-major, row 0 = max Y, as normalize_and_orient orients a
+    heightmap) holds z[offsets[i]:offsets[i+1]] in descending order. Walking
+    down, the hits alternate entering and leaving the solid, so hits
+    (2m, 2m+1) bound the m-th solid interval. An odd count means the last
+    solid has no bottom: it runs down without end. Columns whose crossings
+    are inconsistent (an open or self-intersecting mesh) keep only their top
+    hit, which reads as solid from the top down -- the safe assumption.
+    """
+    shape: tuple
+    offsets: np.ndarray       # int64, H*W + 1
+    z: np.ndarray             # float64, descending within each column
+    top: np.ndarray           # float64 (H, W): highest raw hit, NaN where none --
+                              # exactly generate_heightmap's value
+    n_invalid: int = 0        # columns reduced to their top hit
+
+
+def generate_dexels(triangles, width, height, merge_eps=None):
+    """Rasterize triangles into Dexels on the same pixel grid as
+    generate_heightmap (pixel centres spanning the mesh's XY bounds).
+
+    A triangle facing up is where a downward ray enters the solid, one
+    facing down is where it leaves; facing comes from the triangle's
+    winding, flipped globally if most columns would otherwise start by
+    leaving the solid (a mesh wound inside-out). Hits within *merge_eps* of
+    each other are merged when they face the same way (a shared edge hit
+    by both neighbours) and cancelled when they face opposite ways (the ray
+    grazing a fold).
+    """
+    if width < 2 or height < 2:
+        raise ValueError("Width and height must each be at least 2.")
+    verts = triangles.reshape(-1, 3)
+    x_min, x_max = float(verts[:, 0].min()), float(verts[:, 0].max())
+    y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
+    z_min, z_max = float(verts[:, 2].min()), float(verts[:, 2].max())
+    if merge_eps is None:
+        merge_eps = max(z_max - z_min, 1e-9) * 1e-7
+
+    sx = (width  - 1) / (x_max - x_min) if x_max > x_min else 1.0
+    sy = (height - 1) / (y_max - y_min) if y_max > y_min else 1.0
+
+    pix_parts, z_parts, sgn_parts, strict_parts = [], [], [], []
+    for tri in triangles:
+        px = (tri[:, 0] - x_min) * sx
+        py = (tri[:, 1] - y_min) * sy
+
+        ix0 = max(0,         int(np.floor(px.min())))
+        ix1 = min(width - 1, int(np.ceil( px.max())))
+        iy0 = max(0,         int(np.floor(py.min())))
+        iy1 = min(height - 1, int(np.ceil(py.max())))
+        if ix0 > ix1 or iy0 > iy1:
+            continue
+
+        denom = ((py[1] - py[2]) * (px[0] - px[2]) +
+                 (px[2] - px[1]) * (py[0] - py[2]))
+        if abs(denom) < 1e-10:
+            continue
+
+        iy, ix = np.mgrid[iy0:iy1 + 1, ix0:ix1 + 1]
+        fx, fy = ix.astype(np.float64), iy.astype(np.float64)
+        w0 = ((py[1] - py[2]) * (fx - px[2]) +
+              (px[2] - px[1]) * (fy - py[2])) / denom
+        w1 = ((py[2] - py[0]) * (fx - px[2]) +
+              (px[0] - px[2]) * (fy - py[2])) / denom
+        w2 = 1.0 - w0 - w1
+        # A ray through an edge is taken by both neighbouring triangles (the
+        # duplicate is merged below) rather than risk rounding dropping it
+        # from both; strict marks the hits generate_heightmap itself takes.
+        inside = (w0 >= -_EDGE_TOL) & (w1 >= -_EDGE_TOL) & (w2 >= -_EDGE_TOL)
+        if not inside.any():
+            continue
+
+        z_vals = w0 * tri[0, 2] + w1 * tri[1, 2] + w2 * tri[2, 2]
+        # Row-flipped so row 0 is max Y, matching normalize_and_orient.
+        pix = (height - 1 - iy[inside]).astype(np.int64) * width + ix[inside]
+        pix_parts.append(pix)
+        z_parts.append(z_vals[inside])
+        strict_parts.append(((w0 >= 0) & (w1 >= 0) & (w2 >= 0))[inside])
+        # In pixel space (both axes scaled positively) denom has the sign of
+        # the triangle's XY winding, i.e. of its normal's Z component.
+        sgn_parts.append(np.full(pix.size, 1 if denom > 0 else -1, np.int8))
+
+    n_px = width * height
+    top = np.full(n_px, -np.inf)
+    if not pix_parts:
+        return Dexels((height, width), np.zeros(n_px + 1, np.int64),
+                      np.zeros(0, np.float64), np.full((height, width), np.nan), 0)
+    pix = np.concatenate(pix_parts)
+    z = np.concatenate(z_parts)
+    sgn = np.concatenate(sgn_parts)
+    strict = np.concatenate(strict_parts)
+    np.maximum.at(top, pix[strict], z[strict])
+    top[np.isinf(top)] = np.nan
+
+    order = np.lexsort((-z, pix))
+    pix, z, sgn = pix[order], z[order], sgn[order]
+
+    # Resolve each cluster of coincident hits (a ray through a shared edge
+    # or vertex, a grazed fold, two shells touching) independently of their
+    # order: hits facing one way collapse to one crossing, hits facing both
+    # ways cancel to none.
+    new_group = np.ones(pix.size, bool)
+    new_group[1:] = (pix[1:] != pix[:-1]) | (z[:-1] - z[1:] > merge_eps)
+    starts = np.flatnonzero(new_group)
+    has_up = np.maximum.reduceat((sgn > 0).astype(np.int8), starts) > 0
+    has_dn = np.maximum.reduceat((sgn < 0).astype(np.int8), starts) > 0
+    keep = has_up != has_dn
+    pix, z = pix[starts][keep], z[starts][keep]
+    sgn = np.where(has_up, 1, -1).astype(np.int8)[keep]
+
+    counts = np.bincount(pix, minlength=n_px)
+    offsets = np.zeros(n_px + 1, np.int64)
+    np.cumsum(counts, out=offsets[1:])
+    rank = np.arange(pix.size) - offsets[pix]
+
+    # Inside-out mesh: most columns would start by leaving the solid.
+    first = rank == 0
+    if np.count_nonzero(sgn[first] < 0) > np.count_nonzero(sgn[first] > 0):
+        sgn = -sgn
+
+    expected = np.where(rank % 2 == 0, 1, -1)
+    bad_hit = sgn != expected
+    bad_col = np.zeros(n_px, bool)
+    bad_col[pix[bad_hit]] = True
+    n_invalid = int(np.count_nonzero(bad_col))
+    if n_invalid:
+        keep = ~bad_col[pix] | first
+        pix, z = pix[keep], z[keep]
+        counts = np.bincount(pix, minlength=n_px)
+        offsets = np.zeros(n_px + 1, np.int64)
+        np.cumsum(counts, out=offsets[1:])
+
+    return Dexels((height, width), offsets, z.astype(np.float64),
+                  top.reshape(height, width), n_invalid)
 
 
 def normalize_and_orient(raw_heightmap):

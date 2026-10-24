@@ -1,4 +1,5 @@
-TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit", "Custom"]
+TOOL_PROFILES     = ["Ball", "End Mill", "V-Bit", "Custom",
+                     "Lollipop", "T-Slot", "Dovetail"]
 WOUND_DIRECTIONS  = ["Coil (Outside-In)", "Coil (Inside-Out)",
                      "Spiral (Outside-In)", "Spiral (Inside-Out)"]
 RASTER_DIRECTIONS = ["Horizontal", "Vertical", "Diagonal (45°)", "Diagonal (135°)"] \
@@ -13,7 +14,7 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
                      "V-Carving Clean-up",
-                     "Cutout", "Pocket", "Registration Holes"]
+                     "Cutout", "Pocket", "Registration Holes", "Undercut"]
 
 # Which compute_*_toolpath pipeline each Algorithm dropdown entry uses.
 # V-Carving Clean-up displays under the V-Carving group but is really a
@@ -32,6 +33,7 @@ ALGORITHM_FAMILY  = {
     "Cutout":                    "Cutout",
     "Pocket":                    "Pocket",
     "Registration Holes":        "Registration Holes",
+    "Undercut":                  "Undercut",
 }
 
 # Registration Holes flip axes (see algorithms.py's registration_flip_axis).
@@ -137,6 +139,13 @@ DEFAULTS = {
     "step_reghole_inset_auto":   "1",  # 1 = inset follows margin/2 (10 mm with no margin)
     "step_reghole_spacing":   "80.0",  # Diagonal L arm length (mm)
     "step_reghole_spacing_auto": "1",  # 1 = min(W, H) - 2 * inset
+    # Undercut-tool geometry (Lollipop / T-Slot / Dovetail, see tool.UNDERCUT_FIELDS);
+    # the Undercut level spacing reuses step_stepdown, its ring spacing step_stepover
+    "step_neck_diameter":     "3.0",   # neck directly above the head (mm); < head diameter
+    "step_neck_length":       "15.0",  # tip to where a wider shank starts (mm)
+    "step_shank_diameter":    "0.0",   # shank above the neck (mm); <= neck = no wider shank
+    "step_head_height":       "2.0",   # T-Slot disc / Dovetail head thickness (mm)
+    "step_dovetail_angle":    "60",    # angle between the flank and the bottom face (deg)
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     "step_avoid_air":             "0",   # 1 = drop toolpath runs that would cut only air

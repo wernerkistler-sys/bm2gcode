@@ -4,6 +4,8 @@ bm2gcode converts a depth map into CNC G-code for relief carving. The depth map 
 
 The central idea is an **adaptive multi-step workflow**. This allows multiple cutting steps to be defined using different algorithms and tools. Each step can be configured to process only the residual material left behind by previous steps, such as material that the previous step failed to remove, or regions that the previous tool geometry could not access. This makes it easy to combine strategies. For example, a large end mill could be used to rough out flat regions, followed by a ball bit to target curved surfaces, then a V-bit to cut fine details that the ball bit could not reach, and finally a Cutout pass to free the finished part from the surrounding stock. Each step can also choose which sources on the canvas it sees, so different steps can carve different subsets of the same composition.
 
+A depth map holds one height per point, so it can't describe an overhang. For STL sources, the **Undercut** step goes beyond that: with a cutter whose head is wider than its neck (a lollipop, T-slot or dovetail cutter), it reaches sideways under overhangs that no vertical plunge can reach — see [Step / Operation / Undercut](#step--operation--undercut).
+
 Generated toolpaths can be refined with optional **tool path dress-ups**: ramp-in eases the tool into the stock with a zig-zag descent instead of a straight plunge, back-off pulls the tool away from a just-cut wall before retracting to avoid rubbing marks, arc-rounding smooths a rapid move's sharp corners so the machine doesn't have to stop twice per rapid, and — for Cutout steps only — tabs leave short uncut bridges around the perimeter so the finished part stays attached to the surrounding stock. Each step has its own dress-up settings, configured via the **Dress-up…** button on that step's tab; a newly added step inherits the dress-up settings of the step it was added after.
 
 A set of visualization modes supports strategy planning. In addition to the 3D toolpath preview, available views include the simulated surface after each step, the material not removed by a step, regions inaccessible to the tool geometry, and a binary processing mask showing which areas the current gating configuration will cut. These views, together with the estimated machining time for each step, allow users to optimize the cutting strategy for a particular depth map.
@@ -243,6 +245,32 @@ Why this works: the back-side G-code needs its origin at the same physical point
 
 ---
 
+##### Step / Operation / Undercut
+
+Cuts sideways under overhangs: the flank of a cone standing on its narrow end, the underside of a lip, a dovetail groove. A depth map keeps only the highest surface of each point, so it can't show these regions, and no other step can cut them. Undercut reads the step's visible STL sources themselves, finding every surface crossing of each pixel's vertical line through the mesh. It needs a cutter whose head is wider than its neck: a **Lollipop** (sphere on a neck), **T-Slot** (disc on a neck) or **Dovetail** (angled disc on a neck) — see [Step / Tool](#step--tool). Image sources carry no undercut geometry: they still shape the top surface but have no overhangs.
+
+At each depth level, spaced Level step-down apart, the step cuts the material under the overhang in rings. It starts from open sky, moves one Step-over at a time toward the undercut wall, and ends with a waterline pass along the wall itself. Each chain of rings starts and ends with a sideways path at the level's depth out to open sky, so every plunge and retract happens where nothing is overhead. Levels are cut top-down, one undercut region at a time.
+
+How far the tool reaches:
+
+- **Sideways**: at most the head radius minus the neck radius beyond the overhang's edge, since the neck must stay clear of the overhang.
+- **Down**: with a shank wider than the neck, only as deep below the stock top as Neck length allows. The shank must stay above all material.
+
+Undercut regions the tool can't reach from open sky at their own depth are skipped, with a warning on the step's info line.
+
+| Parameter | Description |
+|---|---|
+| Step-over | Spacing between the rings at one level, as a percentage of the head diameter. |
+| Cut direction | Climb or Conventional sets which way every ring runs, by the same rule as [Contour](#step--operation--contour) — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either keeps the contour's own direction. |
+
+The Tool group's **Level step-down** sets the depth spacing between levels. **Extra offset** leaves that much stock on every surface, including the undersides of overhangs. Process Region, 2-opt and Avoid cutting air aren't offered. Ramp-in and back-off aren't applied either (see [Step / Dress-up](#step--dress-up)).
+
+Run Undercut after the 2.5D steps that clear the stock from above. It cuts only what lies under overhangs and assumes the material above has already been removed. Its result map is the previous step's, unchanged: an undercut never lowers the highest material at any point, which is all a result map records. The STL meshes must be closed (watertight). Wherever a pixel's line through the mesh doesn't alternate cleanly between entering and leaving the solid, that pixel is treated as solid down from its top, and the step's info line says how many such pixels there are.
+
+Compute time grows with the number of levels and with roughly the fourth power of the canvas density (px/mm), since every level runs two morphology passes with a tool-sized kernel. At the default 5 px/mm, a 60 mm part with 24 levels takes a couple of seconds.
+
+---
+
 ##### Step / Operation / Process Region
 
 The **Process Region** selector is the adaptive gating mechanism. It defines which areas of the depth map this step will process, based on what prior steps have already accomplished.
@@ -275,10 +303,15 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 
 | Parameter | Description |
 |---|---|
-| Library | The [Tool Library](#tool-library) tool this step uses, or (none). Lists only tools whose profile the step's algorithm accepts. Choosing a tool copies its profile, diameter, V-bit angle, custom profile curve and — for the project's Material — feed rate, plunge rate, spindle speed and step-down into the step's fields, and links the step to the tool. The fields stay editable. A status next to the field shows when the step no longer matches the library: **● modified** (cutting data differs), **● geometry differs** (profile, diameter, V-bit angle or custom profile curve differs — e.g. after switching to an algorithm that forces another profile), **● no data for *material*** (the tool has no cutting data for the project's Material; only the geometry was copied) or **● not in library** (the tool was deleted; the step keeps its values). The **⋯** button offers Re-apply from library, Update library tool from this step (writes the step's cutting data for the project's Material into the tool; never its geometry), Save as new library tool…, Unlink and Open Tool Library…. |
-| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V), Custom (any rotationally symmetric edge drawn in the [Tool Library](#custom-profiles)). Cutout and Registration Holes restrict this to End Mill only, and V-Carving (Hybrid) to V-Bit only; the other V-Carving modes accept V-Bit, Ball and Custom. A Custom curve is drawn and edited only in the Tool Library; choosing the tool in Library copies it into the step (use Re-apply from library after editing it). The step keeps its own copy of the curve, so a project still computes with the tool missing from the library. A Custom step with no curve can't be computed; choose a Custom tool from the Library first. |
-| Diameter | Cutter diameter in mm. With a Custom profile it comes from the curve and can't be edited. |
+| Library | The [Tool Library](#tool-library) tool this step uses, or (none). Lists only tools whose profile the step's algorithm accepts. Choosing a tool copies its profile, diameter, V-bit angle, custom profile curve, undercut geometry (neck, shank, head) and — for the project's Material — feed rate, plunge rate, spindle speed and step-down into the step's fields, and links the step to the tool. The fields stay editable. A status next to the field shows when the step no longer matches the library: **● modified** (cutting data differs), **● geometry differs** (profile, diameter, V-bit angle, custom profile curve or undercut geometry differs — e.g. after switching to an algorithm that forces another profile), **● no data for *material*** (the tool has no cutting data for the project's Material; only the geometry was copied) or **● not in library** (the tool was deleted; the step keeps its values). The **⋯** button offers Re-apply from library, Update library tool from this step (writes the step's cutting data for the project's Material into the tool; never its geometry), Save as new library tool…, Unlink and Open Tool Library…. |
+| Profile | Cutter shape: Ball (hemispherical tip), End Mill (flat tip), V-Bit (angled V), Custom (any rotationally symmetric edge drawn in the [Tool Library](#custom-profiles)). Cutout and Registration Holes restrict this to End Mill only, and V-Carving (Hybrid) to V-Bit only; the other V-Carving modes accept V-Bit, Ball and Custom. The undercut cutters are offered only for [Undercut](#step--operation--undercut), which accepts nothing else: **Lollipop** (a sphere on a neck), **T-Slot** (a flat disc on a neck) and **Dovetail** (a disc with an angled top flank on a neck). A Custom curve is drawn and edited only in the Tool Library; choosing the tool in Library copies it into the step (use Re-apply from library after editing it). The step keeps its own copy of the curve, so a project still computes with the tool missing from the library. A Custom step with no curve can't be computed; choose a Custom tool from the Library first. |
+| Diameter | Cutter diameter in mm. With a Custom profile it comes from the curve and can't be edited. For an undercut cutter, the head's (widest) diameter. |
 | V-bit angle | Included angle of the V-bit in degrees. Shown only when V-Bit is selected. |
+| Neck diameter | Undercut cutters only: diameter of the neck directly above the head, in mm. Must be smaller than the head diameter. The difference sets how far the tool reaches sideways under an overhang (half of it). |
+| Neck length | Undercut cutters only: distance from the tip to where a wider shank starts, in mm. Only matters when Shank diameter is larger than Neck diameter: the shank must stay above all material, so the tool can't cut deeper than this below the stock top. |
+| Shank diameter | Undercut cutters only: diameter of the shank above the neck, in mm. 0 (or anything not larger than Neck diameter) means the neck runs all the way up. |
+| Head height | T-Slot and Dovetail only: thickness of the head (the disc), in mm. |
+| Dovetail angle | Dovetail only: angle between the head's sloped top flank and its flat bottom face, in degrees. The flank narrows the head from Diameter at the bottom to the top of the head; the head must still be at least as wide as the neck there. |
 | Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. Not shown for Cutout or Pocket, which each have their own separate Boundary offset field instead — see [Step / Operation / Cutout](#step--operation--cutout) and [Step / Operation / Pocket](#step--operation--pocket). |
 | Feed rate | Cutting feed rate in mm/min. |
 | Plunge rate | Feed rate in mm/min for vertical descents: plunges, and pecks inside a cut (e.g. Registration Holes' pecked holes). Ramps keep the cutting feed, since they move mostly sideways. 0 = use Feed rate. |
@@ -311,11 +344,17 @@ Registration Holes shows only **Max step-down**, as its helix pitch (Z drop
 per revolution) or peck depth — see
 [Step / Operation / Registration Holes](#step--operation--registration-holes).
 
+Undercut shows the same field relabeled **Level step-down**: the depth
+spacing between its levels, each cut at one constant Z — see
+[Step / Operation / Undercut](#step--operation--undercut).
+
 ---
 
 #### Step / Dress-up
 
 The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add Step After** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
+
+Undercut steps don't use ramp-in or back-off: their checkboxes are greyed out and, if set, ignored. Both move the tool sideways along the cut while it rises, and under an overhang that could hit the part. Arc-rounding still applies, since it only rounds corners at safe height.
 
 **Ramp-in** — replaces a straight vertical plunge with a zig-zag ramp for the portion of the descent that lies below the ramp start Z (by default the stock surface, z = 0). Any travel above it remains a plain vertical plunge. The ramp retraces the upcoming cut path's own footprint — so it never cuts outside it — and never rises above the depth the final pass leaves at that position.
 
@@ -418,7 +457,7 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 The tool library is a list of cutting tools shared by all projects. It lives in one file outside any project: `%APPDATA%m2gcode	ool_library.json` on Windows, `~/.config/bm2gcode/tool_library.json` elsewhere. On first run it is created with a 6 mm end mill, a 3 mm ball nose and a 60° V-bit, with cutting data for Softwood, Hardwood and MDF. If the file can't be read, it is renamed to `tool_library.json.bak`, a warning is shown, and the starter library is used instead.
 
-Each tool has a name, tool number, profile, diameter, number of flutes, V-bit angle, custom profile curve, flute length, shank diameter, overall length, rated maximum spindle speed and notes, plus cutting data per material: feed rate, plunge rate, spindle speed and max step-down. A shank diameter of 0 means the shank is as wide as the cutter; an overall length of 0 means it isn't specified, and a maximum spindle speed of 0 means the tool sets no limit. Shank diameter and overall length only describe the tool and shape its preview, and the number of flutes and the maximum spindle speed are used only for [cutting recommendations](#cutting-recommendations) — none of them is copied into steps or affects toolpaths. Stepover isn't part of the library — it describes the finish a step wants, so it stays a step setting.
+Each tool has a name, tool number, profile, diameter, number of flutes, V-bit angle, custom profile curve, flute length, shank diameter, overall length, rated maximum spindle speed and notes, plus cutting data per material: feed rate, plunge rate, spindle speed and max step-down. A shank diameter of 0 means the shank is as wide as the cutter; an overall length of 0 means it isn't specified, and a maximum spindle speed of 0 means the tool sets no limit. Undercut cutters (Lollipop, T-Slot, Dovetail) also have a neck diameter, neck length, head height and dovetail angle, each editable only for the profiles that use it; for them, a shank diameter of 0 (or one no wider than the neck) means the neck runs all the way up, and these fields together with the shank diameter are copied into Undercut steps and shape their toolpaths. Otherwise, shank diameter and overall length only describe the tool and shape its preview, and the number of flutes and the maximum spindle speed are used only for [cutting recommendations](#cutting-recommendations); none of these is copied into steps or affects toolpaths. Stepover isn't part of the library — it describes the finish a step wants, so it stays a step setting.
 
 The editor's **Tools** tab lists the tools (New, Duplicate, Delete), shows the selected tool's geometry with a side-view preview of the whole tool (cutting part and shank, drawn to scale; the cutting part is the flute length measured from the tip, never shorter than the V-bit's cone or the ball, and the tip plus one radius (at least one diameter) when no flute length is set; without an overall length only a stub of the shank is drawn, open at the top), and its cutting data per material: pick a material, enter the values and press **Set**; **Remove** deletes the selected material's row; **Recommend…** computes cutting data for the chosen material (see below). For a Custom profile, **Edit profile…** opens the profile editor (see below). The **Materials** tab adds, renames and deletes materials; deleting one that tools have cutting data for asks first and removes that data too. It also holds each material's reference data for cutting recommendations: cutting speed vc, step-down per pass as a multiple of the cutter diameter, and the feed per tooth fz for cutter diameters of 1, 2, 3, 4, 5, 6, 8, 10 and 12 mm. **Load preset** fills them from one of nine materials (cast and wrought aluminium, soft and hard plastic, hardwood, softwood, MDF, brass/copper/bronze, steel); the values can then be edited. **Import…** merges another library file (tools already present by id can be replaced, kept alongside, or skipped); **Export…** writes the library to a file. **OK** saves the library; **Cancel** discards the changes.
 
@@ -450,7 +489,7 @@ The canvas shows the drawn curve (white) and its mirror image (grey), with the s
 
 Projects stay self-contained: a step copies the library values into its own fields and only remembers which tool (and material) they came from, so a project opens with the same values on a machine whose library lacks that tool. Editing the library doesn't change any step by itself — linked steps show **● modified** until re-applied. Library edits don't mark the project as changed; linking, unlinking or re-applying does.
 
-Each library value is written to all three step-down fields (Raster Scan / Pocket / Contour / Registration Holes, V-Carving, Cutout), so switching the step's algorithm later doesn't leave a stale value; the status only compares the field the current algorithm uses.
+Each library value is written to all three step-down fields (Raster Scan / Pocket / Contour / Registration Holes / Undercut, V-Carving, Cutout), so switching the step's algorithm later doesn't leave a stale value; the status only compares the field the current algorithm uses.
 
 ---
 
@@ -612,6 +651,53 @@ Like Cutout, Registration Holes is a flat, straight-wall End Mill cut with no ke
 3. **Result simulation** — Same as Raster, unioned with the previous step's result. A hole deeper than Max cut depth is marked as cut all the way through in the same separate channel Cutout uses (see [Cutout Pipeline](#cutout-pipeline)), so it shows as a hole in the Step Result view.
 
 The **Processing Mask** view shows the finished holes, placed exactly as this pipeline places them.
+
+---
+
+### Undercut Pipeline
+
+Undercut works in the same normalised depth as the depth map (0 = stock top, 1 = Max cut depth, larger = deeper). On top of the depth map it needs the **gaps**: the air below each pixel's top surface that only a sideways move can reach.
+
+**Dexels.** For each STL source, every surface crossing of each pixel's vertical line through the mesh is recorded. It uses the same pixel grid and barycentric hit test as the heightmap rasterizer. Its first (highest) crossing is the heightmap's value exactly, so the top surface stays bit-for-bit the same.
+- **Entering vs. leaving**: a crossing through an upward-facing triangle enters the solid, a downward-facing one leaves it. Facing comes from the triangle's winding, flipped globally if the mesh is wound inside-out.
+- **Coincident crossings** (a line through a shared edge, a grazed rim, two shells touching): crossings facing one way collapse to one, and crossings facing both ways cancel.
+- **Bad columns**: a column whose crossings then don't alternate enter/leave keeps only its top crossing, which reads as solid down from the top.
+- **Caching**: dexels are built on demand from the source's mesh when an Undercut step first needs them, and re-built when the source is re-rasterized. They aren't saved with the project.
+
+**Gaps.** Each source's crossings pass through the same chain that turns its heightmap into depth: normalisation by the top surface's z range, the z=0 colour, then Min/Max depth.
+- **Which pixels**: a source's gaps are used only at canvas pixels where that source alone produces the composite's top surface (full coverage and opacity, and its own placed depth equal to the composite's). This keeps the composite authoritative for the top surface whatever the blend modes, and lets a layer covering the STL hide its undercuts. Where several sources qualify, the topmost wins.
+- **Sampling**: gaps are taken from the nearest source pixel, with Offset, Rotation, Scale and Mirror applied as in compositing. Gaps are clipped at full depth and moved onto the margin-padded grid.
+- **Polarity**: a source whose polarity is inverted (deeper for higher z) contributes no gaps, with a warning.
+
+**Tool model.** With its tip at depth d, a rotationally symmetric cutter fills depths [d − hi(r), d − lo(r)] in each column at distance r from its axis. lo is the underside's height above the tip, hi the top's:
+
+- *Lollipop*: lo = R − √(R² − r²), hi = R + √(R² − r²)
+- *T-Slot*: lo = 0, hi = Head height
+- *Dovetail*: lo = 0, hi = min(Head height, (R − r)·tan(Dovetail angle))
+- Over the neck (r ≤ neck radius) hi is unbounded: the neck runs on upward. A shank wider than the neck is checked separately, as a flat cylinder that must stay above the top surface from Neck length above the tip upward.
+
+This model needs every vertical line through the tool to meet it in one stretch. That holds for any head whose widest point is followed by a neck that never widens. Extra offset grows the tool by a sphere of that radius (the exact Minkowski sum). Because the tool is rotationally symmetric, the nearest point of the tool to any point lies in that point's meridian plane, so the sum is taken on the (r, height) profile rather than on the pixel grid.
+
+1. **Plunge surface** — The depth map is grey-eroded with lo, exactly like the other algorithms' accessibility map. This gives the deepest tip depth a vertical plunge from above reaches at each pixel; with a wider shank, the shank's own limit is folded in. **Clear sky** at depth d is wherever this is at least d: there, the tool can move straight up and down.
+2. **Levels** — Uniform, Level step-down apart. Levels above every gap's ceiling are skipped.
+3. **Floor and ceiling** — At each pixel, the tip at depth d is in (or, inside solid, just below) the deepest gap whose ceiling is above d. That gap's floor and ceiling are the pixel's floor F and ceiling C. Pixels with no such gap have the top surface as floor and open sky above.
+4. **Clearance** — The tool fits between floor and ceiling where grey_erosion(F, lo) ≥ d (underside clear of the floor) and grey_dilation(C, hi) ≤ d (top and neck clear of the ceiling).
+   - **Field g**: the smaller margin of the two (and the shank's), or the clear-sky margin where that is larger, since the tool also fits wherever it can plunge. g ≥ 0 is the free set.
+   - **Safety**: each test only ever accepts positions where every part of the tool lies in air, so their union never gouges. It can be overcautious where a tool part would sit above a layer thinner than the tool.
+   - **Cost**: the two morphology passes run only in windows around pixels that use a gap. Elsewhere g is the clear-sky margin.
+5. **Undercut zone** — Free but not clear sky: positions that only a sideways move reaches.
+6. **Rings** — The waterline is the zero contour of g (`skimage.find_contours`, sub-pixel). Roughing rings are contours of the free set's distance transform at multiples of Step-over.
+   - **Which stretches**: only stretches inside the undercut zone are cut, each extended by one point into clear sky.
+   - **Orientation**: Climb reverses every contour, by Contour's rule.
+   - **Order**: at each level, rings are cut from the outermost (nearest open sky) inward, so each ring takes one Step-over and the waterline comes last.
+7. **Escape paths** — Per level, a minimum-cost path search (`skimage.graph.MCP_Geometric`) runs inside the free set, eroded by a pixel so links can't graze the part, from the clear-sky set, also eroded by a pixel.
+   - **Seams and lead paths**: every chain starts with the path from clear sky to a ring's cheapest seam, and ends with the path from its last point back out.
+   - **Links**: consecutive rings at one level are joined by a straight move when it stays free and is no longer than the larger of the tool diameter and the retract break-even length (see [Air-cut pruning](#air-cut-pruning)).
+   - **Unreachable stretches**: a stretch whose free region doesn't connect to clear sky at its depth is skipped and counted in a warning. A chain whose end has no escape retraces itself back to where it started.
+8. **Order** — Chains are grouped by connected undercut region and the regions are visited nearest-first; within a region, levels run top-down.
+9. **Simplification + result** — Ramer-Douglas-Peucker at half a pixel, so lead paths stay inside the eroded free set. The result map is the previous step's, unchanged, as explained in [Step / Operation / Undercut](#step--operation--undercut).
+
+Every segment starts and ends in clear sky at its own constant depth. [G-code generation](#g-code-generation)'s retract → rapid → plunge between segments is therefore always a vertical move in open air. Ramp-in and back-off are the exceptions: they would move sideways under the overhang while rising, so Undercut steps don't apply them.
 
 ---
 

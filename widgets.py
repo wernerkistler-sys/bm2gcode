@@ -8,6 +8,7 @@ import re
 import numpy as np
 
 from constants import DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, TOOL_PROFILES
+from tool import UNDERCUT_FIELDS
 from tool_library import (ToolLibrary, ToolDef, Material, CuttingData,
                           new_id, format_value, recommend_cutting,
                           FZ_DIAMETERS_MM, MATERIAL_PRESETS, PLUNGE_FRACTION)
@@ -623,9 +624,10 @@ class DressUpDialog(tk.Toplevel):
         du_sf.pack(fill=tk.X, pady=(0, 8))
 
         self._ramp_enabled_var = tk.BooleanVar(value=bool(settings.get('ramp_in_enabled', False)))
-        ttk.Checkbutton(du_sf, text="Ramp-in (replace vertical plunges with a zigzag ramp)",
-                        variable=self._ramp_enabled_var,
-                        command=self._on_ramp_toggle).pack(anchor=tk.W, pady=2)
+        self._ramp_checkbutton = ttk.Checkbutton(
+            du_sf, text="Ramp-in (replace vertical plunges with a zigzag ramp)",
+            variable=self._ramp_enabled_var, command=self._on_ramp_toggle)
+        self._ramp_checkbutton.pack(anchor=tk.W, pady=2)
 
         self._ramp_angle = LabeledEntry(du_sf, "Ramp angle", "deg",
                                         str(settings.get('ramp_angle_deg', 30.0)),
@@ -645,9 +647,10 @@ class DressUpDialog(tk.Toplevel):
         ttk.Separator(du_sf).pack(fill=tk.X, pady=4)
 
         self._backoff_enabled_var = tk.BooleanVar(value=bool(settings.get('backoff_enabled', False)))
-        ttk.Checkbutton(du_sf, text="Back off before retract",
-                        variable=self._backoff_enabled_var,
-                        command=self._on_backoff_toggle).pack(anchor=tk.W, pady=2)
+        self._backoff_checkbutton = ttk.Checkbutton(
+            du_sf, text="Back off before retract",
+            variable=self._backoff_enabled_var, command=self._on_backoff_toggle)
+        self._backoff_checkbutton.pack(anchor=tk.W, pady=2)
 
         self._backoff_dist = LabeledEntry(du_sf, "Back-off distance", "mm",
                                           str(settings.get('backoff_distance_mm', 0.5)),
@@ -712,6 +715,14 @@ class DressUpDialog(tk.Toplevel):
         self._on_tab_toggle()
         if self._algorithm is not None and self._algorithm != "Cutout":
             self._tab_checkbutton.config(state=tk.DISABLED)
+        if self._sideways_only():
+            self._ramp_checkbutton.config(state=tk.DISABLED)
+            self._backoff_checkbutton.config(state=tk.DISABLED)
+            ttk.Label(du_sf, text="Ramp-in and back-off are not used by Undercut: "
+                                  "both move sideways at cutting depth, which "
+                                  "under an overhang could hit the part.",
+                      foreground="#666666", wraplength=380, justify=tk.LEFT
+                      ).pack(fill=tk.X, pady=(4, 0))
 
         # ── Buttons ───────────────────────────────────────────────────
         btn_row = ttk.Frame(outer)
@@ -727,14 +738,19 @@ class DressUpDialog(tk.Toplevel):
 
         self.wait_window()
 
+    def _sideways_only(self):
+        return self._algorithm == "Undercut"
+
     def _on_ramp_toggle(self):
-        state = tk.NORMAL if self._ramp_enabled_var.get() else tk.DISABLED
+        on = self._ramp_enabled_var.get() and not self._sideways_only()
+        state = tk.NORMAL if on else tk.DISABLED
         self._ramp_angle.set_state(state)
         self._ramp_length.set_state(state)
         self._ramp_start_z.set_state(state)
 
     def _on_backoff_toggle(self):
-        self._backoff_dist.set_state(tk.NORMAL if self._backoff_enabled_var.get() else tk.DISABLED)
+        on = self._backoff_enabled_var.get() and not self._sideways_only()
+        self._backoff_dist.set_state(tk.NORMAL if on else tk.DISABLED)
 
     def _on_arc_toggle(self):
         state = tk.NORMAL if self._arc_enabled_var.get() else tk.DISABLED
@@ -1480,6 +1496,19 @@ class ToolLibraryDialog(tk.Toplevel):
         self._max_rpm = LabeledEntry(form, "Max speed (0 = no limit)", "RPM", "0",
                                      minval=0.0, maxval=100000.0, increment=1000.0)
         self._max_rpm.pack(fill=tk.X, pady=2)
+        # Undercut-profile geometry; each field is editable only for the
+        # profiles that use it (tool.UNDERCUT_FIELDS). Their shank is the
+        # Shank field above.
+        self._undercut_entries = {}
+        for attr, label, unit, default, lo_, hi_, inc in (
+                ('neck_diameter_mm',   "Neck diameter",  "mm", "3",  0.01, 200.0, 0.5),
+                ('neck_length_mm',     "Neck length",    "mm", "15", 0.0, 500.0, 1.0),
+                ('head_height_mm',     "Head height",    "mm", "2",  0.01, 100.0, 0.5),
+                ('dovetail_angle_deg', "Dovetail angle", "°",  "60", 1.0, 89.0, 5.0)):
+            le = LabeledEntry(form, label, unit, default,
+                              minval=lo_, maxval=hi_, increment=inc)
+            le.pack(fill=tk.X, pady=2)
+            self._undercut_entries[attr] = le
 
         self._notes_var = tk.StringVar()
         row = ttk.Frame(form)
@@ -1495,7 +1524,7 @@ class ToolLibraryDialog(tk.Toplevel):
         for var in (self._name_var, self._number_var, self._profile_var, self._notes_var):
             var.trace_add("write", self._on_geometry_changed)
         for le in (self._diam, self._flutes, self._max_rpm, self._angle, self._flute,
-                   self._shank, self._length):
+                   self._shank, self._length, *self._undercut_entries.values()):
             le.committed_var.trace_add("write", self._on_geometry_changed)
 
         # ── Cutting data ──────────────────────────────────────────────
@@ -1609,6 +1638,8 @@ class ToolLibraryDialog(tk.Toplevel):
                 self._flute.set(format_value(tool.flute_length_mm))
                 self._shank.set(format_value(tool.shank_diameter_mm))
                 self._length.set(format_value(tool.overall_length_mm))
+                for attr, le in self._undercut_entries.items():
+                    le.set(format_value(getattr(tool, attr)))
                 self._notes_var.set(tool.notes)
         finally:
             self._loading = False
@@ -1642,7 +1673,8 @@ class ToolLibraryDialog(tk.Toplevel):
         for le, attr in ((self._diam, 'diameter_mm'), (self._angle, 'vbit_angle_deg'),
                          (self._flute, 'flute_length_mm'),
                          (self._shank, 'shank_diameter_mm'),
-                         (self._length, 'overall_length_mm')):
+                         (self._length, 'overall_length_mm'),
+                         *((le, attr) for attr, le in self._undercut_entries.items())):
             try:
                 setattr(t, attr, float(le.get()))
             except ValueError:
@@ -1660,12 +1692,19 @@ class ToolLibraryDialog(tk.Toplevel):
 
     def _update_geometry_states(self):
         """Enable the fields that apply to the shown tool's profile: the V
-        angle for V-bits; for Custom profiles the curve sets the diameter
-        and is edited in the profile editor."""
+        angle for V-bits, the neck/head fields for undercut profiles; for
+        Custom profiles the curve sets the diameter and is edited in the
+        profile editor."""
         profile = self._tool.profile if self._tool is not None else None
         self._angle.set_state("normal" if profile == "V-Bit" else "disabled")
         self._diam.set_state("disabled" if profile == "Custom" else "normal")
         self._edit_profile_btn.config(state="normal" if profile == "Custom" else "disabled")
+        used = {attr for attr, _ in UNDERCUT_FIELDS.get(profile, ())}
+        for attr, le in self._undercut_entries.items():
+            le.set_state("normal" if attr in used else "disabled")
+        # An undercut cutter's shank only matters when wider than its neck.
+        self._shank.set_label("Shank Ø (0 = neck)" if profile in UNDERCUT_FIELDS
+                              else "Shank Ø (0 = Ø)")
 
     def _sync_custom_diameter(self):
         """Set the shown Custom tool's diameter from its curve."""
@@ -1693,6 +1732,35 @@ class ToolLibraryDialog(tk.Toplevel):
         self._tool_tree.item(t.id, values=self._tool_row(t))
         self._draw_preview()
 
+    def _undercut_outline(self, t):
+        """Side-view outline (x, height) in mm of an undercut cutter's head,
+        neck and shank, tip at height 0, right half then mirrored."""
+        R = t.diameter_mm / 2.0
+        rn = min(max(t.neck_diameter_mm / 2.0, 0.0), R)
+        if t.profile == "Lollipop":
+            n = 24
+            head_top = R + math.sqrt(max(0.0, R * R - rn * rn))
+            start = -math.pi / 2
+            stop = math.asin(min(1.0, (head_top - R) / R)) if R > 0 else 0.0
+            right = [(R * math.cos(start + (stop - start) * i / n),
+                      R + R * math.sin(start + (stop - start) * i / n)) for i in range(n + 1)]
+        elif t.profile == "T-Slot":
+            head_top = max(t.head_height_mm, 0.0)
+            right = [(0.0, 0.0), (R, 0.0), (R, head_top), (rn, head_top)]
+        else:   # Dovetail
+            head_top = max(t.head_height_mm, 0.0)
+            tan_a = math.tan(math.radians(max(1.0, min(89.0, t.dovetail_angle_deg))))
+            right = [(0.0, 0.0), (R, 0.0),
+                     (max(rn, R - head_top / tan_a), head_top), (rn, head_top)]
+        neck_top = max(t.neck_length_mm, head_top + R)
+        rs = t.shank_diameter_mm / 2.0
+        right += [(rn, neck_top)]
+        if rs > rn:
+            right += [(rs, neck_top), (rs, neck_top + 2.0 * R)]
+        else:
+            right += [(rn, neck_top + 2.0 * R)]
+        return right, max(rs, R)
+
     def _draw_preview(self):
         """Side view of the whole tool -- cutting part and shank -- scaled to
         fit the canvas. The cutting part is the flute length measured from
@@ -1711,6 +1779,19 @@ class ToolLibraryDialog(tk.Toplevel):
         if W <= 1 or H <= 1:    # not mapped yet
             W, H = self._PREVIEW_W, self._PREVIEW_H
         pad, label_h = 12, 14
+        if t.profile in UNDERCUT_FIELDS:
+            right, half_w = self._undercut_outline(t)
+            body_h = max(y for _, y in right)
+            scale = min((W - 2 * pad) / (2.0 * half_w), (H - 2 * pad - label_h) / body_h)
+            cx, bottom = W / 2.0, H - pad
+            outline = right + [(-x, y) for x, y in reversed(right)]
+            pts = []
+            for x, y in outline:
+                pts += [cx + x * scale, bottom - y * scale]
+            c.create_polygon(pts, fill="#7a8ca3", outline="#d0d8e0")
+            c.create_text(W / 2.0, pad / 2.0 + 2, text=f"Ø {format_value(t.diameter_mm)} mm",
+                          fill="#d0d8e0", font=("TkDefaultFont", 8))
+            return
         R  = t.diameter_mm / 2.0
         Rs = (t.shank_diameter_mm if t.shank_diameter_mm > 0 else t.diameter_mm) / 2.0
         if t.profile == "V-Bit":

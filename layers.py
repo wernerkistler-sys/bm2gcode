@@ -9,7 +9,7 @@ white/black Z=0-colour polarity. Callers are responsible for converting to
 and from raw grayscale (see ``to_depth``/``from_depth``).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -43,6 +43,12 @@ class Layer:
     mirror: str = "None"             # see constants.LAYER_MIRRORS; reflects
                                       # the placed layer across a stock flip
                                       # axis (see _mirror_axis_mm)
+    # STL layers only: the mesh's stl_mesh.Dexels on the same grid as raw,
+    # built on demand for Undercut steps and never serialised. dexels_key
+    # records the (path, stl_params) it was built from, so a re-rasterised
+    # layer is detected as stale.
+    dexels: Optional[object] = field(default=None, repr=False, compare=False)
+    dexels_key: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     def is_identity_placement(self) -> bool:
         return (self.offset_x_mm == 0.0 and self.offset_y_mm == 0.0
@@ -333,3 +339,188 @@ def compute_n_grey_levels(layers: List[Layer], composite_raw: np.ndarray) -> int
         return 256
     levels = int(round((float(composite_raw.max()) - float(composite_raw.min())) * 255)) + 1
     return max(levels, 1)
+
+
+# ── Undercut gaps ──────────────────────────────────────────────────────────
+
+@dataclass
+class Gaps:
+    """Air gaps below the top surface of each canvas column, in canonical
+    depth (0 = surface, 1 = full depth, larger = deeper).
+
+    Column i (row-major) holds gaps offsets[i]:offsets[i+1], shallowest
+    first: air from ceil (the underside of the solid above) down to floor
+    (the top of the solid below). Columns without gaps are solid from their
+    top surface down.
+    """
+    shape: tuple
+    offsets: np.ndarray       # int64, H*W + 1
+    ceil: np.ndarray          # float64
+    floor: np.ndarray         # float64
+
+    @property
+    def counts(self) -> np.ndarray:
+        return np.diff(self.offsets).reshape(self.shape)
+
+    @classmethod
+    def empty(cls, shape) -> "Gaps":
+        H, W = shape
+        return cls((H, W), np.zeros(H * W + 1, np.int64),
+                   np.zeros(0, np.float64), np.zeros(0, np.float64))
+
+    @classmethod
+    def from_lists(cls, shape, pix, ceil, floor) -> "Gaps":
+        """Build from flat per-gap arrays (pixel index, ceil, floor) in any
+        order; gaps of one column are sorted shallowest first."""
+        H, W = shape
+        pix = np.asarray(pix, np.int64)
+        ceil = np.asarray(ceil, np.float64)
+        floor = np.asarray(floor, np.float64)
+        order = np.lexsort((ceil, pix))
+        pix, ceil, floor = pix[order], ceil[order], floor[order]
+        offsets = np.zeros(H * W + 1, np.int64)
+        np.cumsum(np.bincount(pix, minlength=H * W), out=offsets[1:])
+        return cls((H, W), offsets, ceil, floor)
+
+    def pixel_index(self) -> np.ndarray:
+        """Pixel index of every gap, aligned with ceil/floor."""
+        return np.repeat(np.arange(self.offsets.size - 1), np.diff(self.offsets))
+
+
+def pad_gaps(gaps: Gaps, pad_y: int, pad_x: int) -> Gaps:
+    """*gaps* moved onto a grid padded by pad_y rows and pad_x columns on
+    every side (the stock margin), with no gaps in the padding."""
+    if pad_y <= 0 and pad_x <= 0:
+        return gaps
+    H, W = gaps.shape
+    pix = gaps.pixel_index()
+    rows, cols = pix // W, pix % W
+    H2, W2 = H + 2 * pad_y, W + 2 * pad_x
+    return Gaps.from_lists((H2, W2), (rows + pad_y) * W2 + cols + pad_x,
+                           gaps.ceil, gaps.floor)
+
+
+def _layer_depth_affine(layer: Layer, surface: str):
+    """(a, b) with layer depth = a * z + b for the layer's mesh z, following
+    the same chain composite() applies to the layer's raw heightmap:
+    normalise by the top surface's z range (normalize_and_orient), to_depth,
+    then the min/max depth % mapping. None if the top surface is flat."""
+    tops = layer.dexels.top
+    if not np.isfinite(tops).any():
+        return None
+    z_min, z_max = float(np.nanmin(tops)), float(np.nanmax(tops))
+    if z_max - z_min < 1e-12:
+        return None
+    # raw = (z - z_min) / range;  depth = 1 - raw (white) or raw (black)
+    a, b = 1.0 / (z_max - z_min), -z_min / (z_max - z_min)
+    if surface == "white":
+        a, b = -a, 1.0 - b
+    min_frac, max_frac = layer.min_depth_pct / 100.0, layer.max_depth_pct / 100.0
+    return (max_frac - min_frac) * a, min_frac + (max_frac - min_frac) * b
+
+
+def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
+                   px_per_mm_x: float, px_per_mm_y: float, surface: str,
+                   composite_depth: np.ndarray,
+                   visibility_override: Optional[List[bool]] = None,
+                   origin: str = "Bottom-Left",
+                   tol: float = 1e-4) -> Tuple[Gaps, List[str]]:
+    """The undercut gaps of the visible STL layers on the canvas grid.
+
+    composite_depth is composite()'s result in canonical depth (to_depth of
+    its raw output). A layer's gaps are adopted at a canvas pixel only where
+    that layer alone produces the composite's top surface there (its own
+    placed depth matches composite_depth within *tol*, at full coverage and
+    opacity), so the composite stays authoritative for the top surface
+    whatever the blend modes; where several layers qualify, the topmost
+    wins. Gaps are read from the nearest layer column (placement, rotation,
+    scale and Mirror as in resample_layer), clipped at full depth, and
+    dropped when they start at or below it.
+
+    Layers without dexels are ignored. Returns (gaps, warnings).
+    """
+    H, W = canvas_shape
+    warnings = []
+    owner = np.full(H * W, -1, np.int64)        # source column per canvas pixel
+    owner_layer = np.full(H * W, -1, np.int64)
+    affines = {}
+    for i, layer in enumerate(layers):
+        if visibility_override is not None and i < len(visibility_override):
+            visible = visibility_override[i]
+        else:
+            visible = layer.visible
+        if (not visible or layer.opacity_pct <= 0.0 or layer.source_kind != "stl"
+                or layer.dexels is None):
+            continue
+        if layer.dexels.shape != layer.raw.shape:
+            warnings.append(f"{layer.name}: undercut data is out of date; ignored.")
+            continue
+        ab = _layer_depth_affine(layer, surface)
+        if ab is None:
+            continue
+        if ab[0] >= 0.0:
+            warnings.append(f"{layer.name}: inverted depth polarity -- its "
+                            f"undercuts are ignored.")
+            continue
+        affines[i] = ab
+
+        resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x,
+                                             px_per_mm_y, origin)
+        min_frac, max_frac = layer.min_depth_pct / 100.0, layer.max_depth_pct / 100.0
+        depth = np.clip(min_frac + (max_frac - min_frac)
+                        * to_depth(resampled, surface, False), 0.0, 1.0)
+        wins = ((coverage >= 0.999) & (layer.opacity_pct >= 100.0)
+                & (np.abs(depth - composite_depth) <= tol)).ravel()
+        if not wins.any():
+            continue
+
+        H_l, W_l = layer.raw.shape
+        if layer.is_identity_placement() and (H_l, W_l) == (H, W):
+            src = np.arange(H * W)
+            ok = np.ones(H * W, bool)
+        else:
+            matrix, offset = _affine_params(layer, canvas_shape, px_per_mm_x,
+                                            px_per_mm_y, origin)
+            rr, cc = np.mgrid[0:H, 0:W]
+            pts = np.stack([rr.ravel(), cc.ravel()]).astype(np.float64)
+            src_rc = matrix @ pts + offset[:, None]
+            r_l = np.rint(src_rc[0]).astype(np.int64)
+            c_l = np.rint(src_rc[1]).astype(np.int64)
+            ok = (r_l >= 0) & (r_l < H_l) & (c_l >= 0) & (c_l < W_l)
+            src = np.where(ok, r_l * W_l + c_l, 0)
+        sel = wins & ok
+        owner[sel] = src[sel]
+        owner_layer[sel] = i
+
+    pix_out, ceil_out, floor_out = [], [], []
+    for i, (a, b) in affines.items():
+        canvas_pix = np.flatnonzero(owner_layer == i)
+        if canvas_pix.size == 0:
+            continue
+        dex = layers[i].dexels
+        src = owner[canvas_pix]
+        start = dex.offsets[src]
+        n_hits = dex.offsets[src + 1] - start
+        n_gaps = n_hits // 2            # every exit hit opens a gap
+        total = int(n_gaps.sum())
+        if total == 0:
+            continue
+        col = np.repeat(np.arange(canvas_pix.size), n_gaps)
+        m = np.arange(total) - np.repeat(np.cumsum(n_gaps) - n_gaps, n_gaps)
+        col_start = start[col]
+        exit_idx = col_start + 2 * m + 1
+        enter_pos = 2 * m + 2
+        has_floor = enter_pos < n_hits[col]
+        ceil = a * dex.z[exit_idx] + b
+        floor = np.full(total, np.inf)
+        floor[has_floor] = a * dex.z[col_start[has_floor] + enter_pos[has_floor]] + b
+        keep = ceil < 1.0
+        pix_out.append(canvas_pix[col[keep]])
+        ceil_out.append(np.maximum(ceil[keep], 0.0))
+        floor_out.append(np.minimum(floor[keep], 1.0))
+
+    if not pix_out:
+        return Gaps.empty((H, W)), warnings
+    return (Gaps.from_lists((H, W), np.concatenate(pix_out),
+                            np.concatenate(ceil_out), np.concatenate(floor_out)),
+            warnings)
