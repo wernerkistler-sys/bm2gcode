@@ -26,6 +26,7 @@ class RampSettings:
     enabled: bool = False
     angle_deg: float = 30.0
     max_length_mm: float = 15.0
+    start_z_mm: float = 0.0       # Z where the zig-zag begins (stock top); plain plunge above
     max_legs: int = 20            # internal safety cap, not exposed in UI
 
 

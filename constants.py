@@ -143,6 +143,7 @@ DEFAULTS = {
     "step_ramp_in_enabled":     "0",
     "step_ramp_angle_deg":      "30.0",
     "step_ramp_max_length_mm":  "15.0",
+    "step_ramp_start_z_mm":     "0.0",
     "step_backoff_enabled":     "0",
     "step_backoff_distance_mm": "0.5",
     "step_arc_rapids_enabled":  "0",

@@ -9,19 +9,20 @@ from dressup import generate_ramp, compute_backoff_path, generate_corner_arc
 def _ramp_plan(points, z_from, ramp):
     """Plan the descent from z_from down to points[0]'s Z (points[0][2]).
 
-    Ramp-in only ever replaces the portion of a plunge that is inside the
-    stock (z < 0) -- the air above the stock surface (z = 0) is always a
-    plain vertical plunge. Returns (split_z, ramp_pts):
+    Ramp-in only ever replaces the portion of a plunge below the ramp's
+    start Z (``ramp.start_z_mm``, default 0.0 = the stock surface) -- the air
+    above it is always a plain vertical plunge. Returns (split_z, ramp_pts):
 
-    - split_z = min(z_from, 0.0), the Z at which the vertical-in-air leg (if
-      any) hands off to the zig-zag (if any).
+    - split_z = min(z_from, start_z), the Z at which the vertical-in-air leg
+      (if any) hands off to the zig-zag (if any).
     - ramp_pts = generate_ramp(points, split_z, ramp) when there's actually
       material below split_z to ramp into (points[0][2] < split_z), else
       [points[0]] (nothing to ramp -- the caller should do a single plain
       plunge for the whole z_from -> points[0][2] descent).
     """
     z0 = points[0][2]
-    split_z = min(z_from, 0.0)
+    start_z = ramp.start_z_mm if ramp is not None else 0.0
+    split_z = min(z_from, start_z)
     if z0 < split_z:
         return split_z, generate_ramp(points, split_z, ramp)
     return split_z, [points[0]]
@@ -136,10 +137,10 @@ class ToolPath:
         instances (or ``None``/disabled, which reproduces the plain
         retract → traverse → plunge behaviour).
 
-        Ramp-in only ever replaces the portion of a plunge that is inside
-        the stock (z < 0) with a zig-zag; any air above the stock surface
-        (z = 0) is always a plain vertical plunge down to z = 0 first (see
-        ``_ramp_plan``/``_emit_plunge_ramp``).
+        Ramp-in only ever replaces the portion of a plunge below the ramp's
+        start Z (``RampSettings.start_z_mm``, normally the stock top) with a
+        zig-zag; any air above it is always a plain vertical plunge down to
+        that Z first (see ``_ramp_plan``/``_emit_plunge_ramp``).
         """
         segs = segments if segments is not None else self.segments
         prev_points = None
@@ -205,8 +206,8 @@ class ToolPath:
                         z_from = z_safe
 
                     # Ramp-in only ever replaces the portion of the descent
-                    # that is inside the stock (z < 0); the air above the
-                    # stock surface is always a plain vertical plunge.
+                    # below the ramp's start Z; the air above it is always a
+                    # plain vertical plunge.
                     split_z, ramp_pts = _ramp_plan(points, z_from, ramp)
                     yield from _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts)
                 else:

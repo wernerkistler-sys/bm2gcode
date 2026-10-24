@@ -338,6 +338,25 @@ kinds_deep_arc = [k for k, _ in moves_deep_arc]
 check("corner B is arced even when ramp-in is active",
       kinds_deep_arc.count('arc') == 2)
 
+# Raised ramp start Z (stock extending above z=0): the vertical air plunge
+# stops at start_z_mm and the zig-zag covers everything below it.
+raised_ramp = RampSettings(enabled=True, angle_deg=30.0, max_length_mm=15.0,
+                           start_z_mm=2.0)
+moves_raised = moves_for_second_segment(tp_deep, z_safe=5.0, ramp=raised_ramp)
+plunge_raised = next(pts for k, pts in moves_raised if k == 'plunge')
+ramp_raised = next(pts for k, pts in moves_raised if k == 'ramp')
+check("raised start Z: air plunge stops at start_z_mm",
+      abs(plunge_raised[0][2] - 5.0) < 1e-9 and abs(plunge_raised[-1][2] - 2.0) < 1e-9)
+check("raised start Z: ramp runs from start_z_mm to the target depth",
+      abs(ramp_raised[0][2] - 2.0) < 1e-9 and abs(ramp_raised[-1][2] - (-8.0)) < 1e-9)
+check("raised start Z: no ramp waypoint rises above start_z_mm",
+      all(p[2] <= 2.0 + 1e-9 for p in ramp_raised))
+
+# A surface-level target is ramped into when the start Z is above it.
+moves_surface_raised = moves_for_second_segment(tp_surface, z_safe=5.0, ramp=raised_ramp)
+check("raised start Z: surface-level (z=0) target is ramped into",
+      'ramp' in [k for k, _ in moves_surface_raised])
+
 
 def implied_radius(arc_pts, z_safe):
     """Both corner arcs' Z ranges span [z_safe - r, z_safe], so the implied

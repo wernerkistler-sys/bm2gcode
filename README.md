@@ -317,12 +317,13 @@ per revolution) or peck depth — see
 
 The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add Step After** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
 
-**Ramp-in** — replaces a straight vertical plunge with a zig-zag ramp for the portion of the descent that lies inside the stock (below the surface, z < 0). Any travel above the surface remains a plain vertical plunge. The ramp retraces the upcoming cut path's own footprint — so it never cuts outside it — and never rises above the depth the final pass leaves at that position.
+**Ramp-in** — replaces a straight vertical plunge with a zig-zag ramp for the portion of the descent that lies below the ramp start Z (by default the stock surface, z = 0). Any travel above it remains a plain vertical plunge. The ramp retraces the upcoming cut path's own footprint — so it never cuts outside it — and never rises above the depth the final pass leaves at that position.
 
 | Parameter | Description |
 |---|---|
 | Ramp angle | Target descent angle of the zig-zag, in degrees. |
 | Max ramp length | How far ahead along the upcoming cut path the zig-zag is allowed to range, in mm. |
+| Ramp start Z | Height, in mm, at which the zig-zag begins; the tool plunges vertically only down to here. Default 0 (the stock surface). Set it to the highest point of the stock when the stock extends above z = 0 (e.g. uneven or oversized blanks), so the vertical plunge never enters material. Must be below the safe height. |
 
 **Back off before retract** — before retracting to safe height, backs the tool away a short distance from the wall it just cut by retracing its own path backwards, to avoid rubbing or burning the surface while lifting. If the last move had too little lateral travel to cover the distance (e.g. a near-vertical raise), the back-off continues into the moves before it. It rises at 45° while backing off, but never drops below the surface the tool just cut — where the path came down more steeply than that, the back-off follows the path's own slope instead.
 
@@ -702,7 +703,7 @@ The medial axis (`skimage.morphology.medial_axis`) is the set of centres of all 
 
 Iterates over the ordered segments. Consecutive segments whose endpoints touch are joined as G1 feed moves. Gaps trigger a retract (G0 to safe height), a rapid to the next entry XY position, and a plunge (G1 to entry Z). Three optional per-step dress-ups (see [Step / Dress-up](#step--dress-up), off by default) modify this base behaviour without changing the underlying cut geometry:
 
-- **Ramp-in** replaces the plunge below the stock surface (z < 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
+- **Ramp-in** replaces the plunge below the ramp start Z (default: the stock surface, z = 0) with a zig-zag that retraces the upcoming cut path's own footprint; any travel above the surface stays a plain vertical plunge.
 - **Back off before retract** inserts a short move away from the wall just cut, immediately before each retract. It retraces the just-cut path's XY footprint backwards (across as many prior moves as needed to cover the distance), emitted as G1 X/Y/Z moves whose Z rises at 45° but is never lower than the path's own Z at that XY — so every waypoint sits directly above a position the tool already occupied.
 - **Arc-round rapid corners** replaces the retract → traverse → plunge rapid's two sharp 90° corners with tangent arcs sized to the available clearance (never exceeding the safe height), so both corners always share one radius. The arc's waypoints are emitted as G1 moves at its own configured feed (rather than G0), since G0 doesn't guarantee coordinated linear interpolation between waypoints on every controller — G1 is what makes the polyline actually trace the intended arc instead of a per-axis independent rapid.
 
