@@ -22,7 +22,7 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         simulate_toolpath_result, compute_raster_toolpath,
                         registration_flip_axis, registration_hole_centers,
                         registration_auto_spacing, bore_hole_segments,
-                        compute_registration_holes_toolpath)
+                        compute_registration_holes_toolpath, _spiral_px)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -997,7 +997,8 @@ def _path_len(tp):
                for s in tp.segments if len(s) > 1)
 
 
-for rdir in ("Horizontal", "Diagonal (45°)", "Spiral (Outside-In)"):
+for rdir in ("Horizontal", "Diagonal (45°)", "Coil (Outside-In)",
+             "Spiral (Outside-In)"):
     tp_off, tp_on = _raster(False, rdir), _raster(True, rdir)
     deficit = float(np.max(np.minimum(tp_off.result, tp_off.accessible)
                            - maximum_filter(tp_on.result, size=3)))
@@ -1012,7 +1013,8 @@ print("avoid_air in compute_pocket_toolpath")
 # Two disjoint pocket regions, the left one's left half already cleared to
 # the floor: splitting must keep each piece's region id so regions are
 # still never interleaved.
-for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Spiral (Outside-In)"):
+for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Coil (Outside-In)",
+             "Spiral (Outside-In)"):
     prev_two = np.zeros((30, 30), dtype=np.float32)
     prev_two[:, :6] = 1.0
     tp_two_air = compute_pocket_toolpath(
@@ -1031,6 +1033,145 @@ for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Spiral (Outside-In)"):
         # plus once between passes.
         check(f"{rdir}: regions are still never interleaved within a pass",
               passes_switches <= 3)
+
+
+print("Spiral (morphed from the coil)")
+
+# A flat depth map, so the path is never gated: one continuous curve that
+# covers the whole stock no worse than the rectangular coil does, without
+# its 90-degree corners.
+MS_PX, MS_STEP = 4.0, 2.5           # px/mm, mm
+
+
+def _spiral_raster(raster_dir, w_mm, h_mm, cut_direction="Climb"):
+    flat = np.full((int(h_mm * MS_PX), int(w_mm * MS_PX)), 0.5, dtype=np.float32)
+    return compute_raster_toolpath(
+        flat, n_grey_levels=256, tool=Tool(profile="End Mill", diameter_mm=1.0),
+        step_mm=MS_STEP, stepdown_mm=5.0, max_depth=5.0, width_mm=w_mm, height_mm=h_mm,
+        raster_dir=raster_dir, origin="Bottom-Left", cut_direction=cut_direction,
+        progress=_noop_progress)
+
+
+def _max_gap_px(tp, shape):
+    """Largest distance (px) from any stock pixel to the path."""
+    from scipy.ndimage import distance_transform_edt
+    H, W = shape
+    free = np.ones(shape, dtype=bool)
+    for seg in tp.segments:
+        a = np.asarray(seg)[:, :2]
+        for p, q in zip(a[:-1], a[1:]):
+            n = int(np.ceil(np.hypot(*(q - p)) * MS_PX * 2)) + 1
+            xy = p + np.linspace(0.0, 1.0, n)[:, None] * (q - p)
+            free[np.clip(np.rint(H - 1 - xy[:, 1] * MS_PX).astype(int), 0, H - 1),
+                 np.clip(np.rint(xy[:, 0] * MS_PX).astype(int), 0, W - 1)] = False
+    return float(distance_transform_edt(free).max())
+
+
+def _curvature_radii(rc, k=3):
+    """Circumradius through every sample and its k-th neighbours."""
+    a, b, c = rc[:-2 * k], rc[k:-k], rc[2 * k:]
+    ab, bc, ca = (np.hypot(*(q - p).T) for p, q in ((a, b), (b, c), (c, a)))
+    cross = np.abs((b - a)[:, 0] * (c - a)[:, 1] - (b - a)[:, 1] * (c - a)[:, 0])
+    return ab * bc * ca / np.maximum(2.0 * cross, 1e-12), b
+
+
+def _first_ring_area(pts, perimeter):
+    """Signed area (CCW positive) of the path's first `perimeter` mm."""
+    a = np.asarray(pts)[:, :2]
+    n = int(np.searchsorted(np.cumsum(np.hypot(*np.diff(a, axis=0).T)), perimeter))
+    a = a[:n + 2]
+    return 0.5 * float(np.sum(a[:-1, 0] * a[1:, 1] - a[1:, 0] * a[:-1, 1]))
+
+
+for w_mm, h_mm in ((40.0, 25.0), (30.0, 30.0)):
+    tag = f"{w_mm:.0f}x{h_mm:.0f} mm"
+    shape = (int(h_mm * MS_PX), int(w_mm * MS_PX))
+    W_mm, H_mm = (shape[1] - 1) / MS_PX, (shape[0] - 1) / MS_PX
+    tp_out = _spiral_raster("Spiral (Outside-In)", w_mm, h_mm)
+    tp_in = _spiral_raster("Spiral (Inside-Out)", w_mm, h_mm)
+    tp_rect = _spiral_raster("Coil (Outside-In)", w_mm, h_mm)
+    check(f"{tag}: one continuous segment", len(tp_out.segments) == 1)
+    pts = np.asarray(tp_out.segments[0])
+    check(f"{tag}: path stays on the stock",
+          pts[:, 0].min() >= -1e-9 and pts[:, 0].max() <= W_mm + 1e-9
+          and pts[:, 1].min() >= -1e-9 and pts[:, 1].max() <= H_mm + 1e-9)
+    check(f"{tag}: Outside-In starts at the top-left corner",
+          np.allclose(pts[0, :2], (0.0, H_mm), atol=1e-6))
+    check(f"{tag}: Inside-Out is the reversal of Outside-In",
+          len(tp_in.segments) == 1
+          and np.allclose(np.asarray(tp_in.segments[0])[::-1, :2], pts[:, :2], atol=1e-6))
+    gap, gap_rect = _max_gap_px(tp_out, shape), _max_gap_px(tp_rect, shape)
+    check(f"{tag}: no gap wider than the rectangular coil's corners "
+          f"({gap / (MS_STEP * MS_PX):.3f} vs {gap_rect / (MS_STEP * MS_PX):.3f} step)",
+          gap <= 0.586 * MS_STEP * MS_PX + 1.0)
+    # Away from the stock's own sharp-cornered outer rings and the final
+    # half-turn into the centre, the curve's radius never drops below
+    # about one step-over.
+    step_px = MS_STEP * MS_PX
+    radii, mid = _curvature_radii(_spiral_px(0, shape[0] - 1, 0, shape[1] - 1,
+                                                   step_px, "CW"))
+    to_edge = np.minimum.reduce([mid[:, 0], shape[0] - 1 - mid[:, 0],
+                                 mid[:, 1], shape[1] - 1 - mid[:, 1]])
+    inner = (to_edge >= 2.0 * step_px) & (to_edge <= (min(shape) - 1) / 2 - 1.5 * step_px)
+    check(f"{tag}: no tight corners inside the outer rings "
+          f"(min radius {radii[inner].min() / step_px:.2f} step)",
+          radii[inner].min() >= 0.9 * step_px)
+    rect_radii, _ = _curvature_radii(np.concatenate(
+        [np.asarray(sg)[:, :2] for sg in tp_rect.segments]) * MS_PX, k=1)
+    check(f"{tag}: rectangular coil does have sharp corners",
+          rect_radii.min() < 1.0)
+    ratio = _path_len(tp_out) / _path_len(tp_rect)
+    check(f"{tag}: path length within 1.35x the rectangular coil ({ratio:.2f}x)",
+          ratio < 1.35)
+    perim = 2.0 * (W_mm + H_mm)
+    check(f"{tag}: Climb Outside-In winds clockwise",
+          _first_ring_area(pts, perim) < 0.0)
+    pts_conv = _spiral_raster("Spiral (Outside-In)", w_mm, h_mm,
+                             "Conventional").segments[0]
+    check(f"{tag}: Conventional Outside-In winds counter-clockwise",
+          _first_ring_area(pts_conv, perim) > 0.0)
+
+# Line offset: a 50% spiral runs midway between the turns of the 0% one,
+# halving the uncovered gap of the two together; 100% is the 0% path.
+for w_mm, h_mm in ((40.0, 25.0), (30.0, 30.0)):
+    tag = f"{w_mm:.0f}x{h_mm:.0f} mm, 50% line offset"
+    shape = (int(h_mm * MS_PX), int(w_mm * MS_PX))
+    step_px = MS_STEP * MS_PX
+    box = (0, shape[0] - 1, 0, shape[1] - 1)
+    sp0 = _spiral_px(*box, step_px, "CW", 0.0)
+    sp50 = _spiral_px(*box, step_px, "CW", 50.0)
+    check(f"{tag}: 100% offset gives the 0% path",
+          np.allclose(_spiral_px(*box, step_px, "CW", 100.0), sp0))
+    check(f"{tag}: starts at the same corner as the 0% path",
+          np.allclose(sp50[0], sp0[0]))
+    tp0 = ToolPath(segments=[[(c / MS_PX, (shape[0] - 1 - r) / MS_PX, 0.0) for r, c in sp]
+                             for sp in (sp0,)])
+    tp_both = ToolPath(segments=[[(c / MS_PX, (shape[0] - 1 - r) / MS_PX, 0.0) for r, c in sp]
+                                 for sp in (sp0, sp50)])
+    gap1, gap2 = _max_gap_px(tp0, shape), _max_gap_px(tp_both, shape)
+    check(f"{tag}: both paths together halve the gap "
+          f"({gap1 / step_px:.3f} -> {gap2 / step_px:.3f} step)",
+          gap2 <= 0.5 * gap1 + 1.0)
+    from scipy.spatial import cKDTree
+    centre = np.array([(shape[0] - 1) / 2, (shape[1] - 1) / 2])
+    to_edge = np.minimum.reduce([sp50[:, 0], shape[0] - 1 - sp50[:, 0],
+                                 sp50[:, 1], shape[1] - 1 - sp50[:, 1]])
+    away = (to_edge >= step_px) & (np.abs(sp50 - centre).max(axis=1)
+                                   >= (abs(shape[1] - shape[0]) / 2 + step_px))
+    d, _ = cKDTree(sp0).query(sp50[away])
+    check(f"{tag}: runs between the 0% turns, never on them "
+          f"(closest {d.min() / step_px:.2f} step)", d.min() >= 0.25 * step_px)
+
+tp_two_morph = compute_pocket_toolpath(
+    depth_two, n_grey_levels=256, tool=zz_tool,
+    step_mm=1.0, stepdown_mm=2.0, max_depth=5.0,
+    width_mm=30.0, height_mm=30.0, raster_dir="Spiral (Inside-Out)",
+    target_z_mm=2.0, cut_direction="Climb", progress=_noop_progress)
+sides = ["A" if sg[0][0] < 11.0 else "B" for sg in tp_two_morph.segments]
+check("pocket: Spiral clears both regions",
+      len(tp_two_morph.segments) > 0 and set(sides) == {"A", "B"})
+check("pocket: Spiral never interleaves regions",
+      sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1]) <= 1)
 
 
 # --------------------------------------------------------------------------

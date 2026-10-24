@@ -1077,7 +1077,7 @@ def _grid_line_ids(boundary_px, px_per_mm, step_mm, raster_offset_pct):
     raster_offset_pct of the adjusted step.
 
     Shared by Horizontal/Vertical raster lines (one axis) and both axes of
-    the Spiral grid.
+    the Coil grid.
 
     Returns
     -------
@@ -1099,7 +1099,7 @@ def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
                   center_depth_contour_raster, prior_mask, resid_tol,
                   px_per_mm, H, _ox, _oy, max_depth):
     """Build zero or more point-list segments along one raster line (or a
-    sub-range of a line, for spiral legs), gated by prior_mask/mask_spans.
+    sub-range of a line, for coil legs), gated by prior_mask/mask_spans.
 
     direction : "X" (fixed row, points vary across columns lo_idx..hi_idx)
                 or "Y" (fixed column, points vary across rows lo_idx..hi_idx)
@@ -1243,7 +1243,7 @@ def _diag_line_points(family, k, t_lo, t_hi, reverse,
     return segs
 
 
-def _spiral_index_pairs_cw(ny, nx):
+def _coil_index_pairs_cw(ny, nx):
     """(row_idx, col_idx) ARRAY-position pairs in outside-in clockwise
     order: top row L→R, right col T→B, bottom row R→L, left col B→T,
     each ring shrinking inward. Standard 'spiral matrix' traversal,
@@ -1265,8 +1265,8 @@ def _spiral_index_pairs_cw(ny, nx):
     return order
 
 
-def _spiral_index_pairs_ccw(ny, nx):
-    """Mirror of _spiral_index_pairs_cw: left col T→B, bottom row L→R,
+def _coil_index_pairs_ccw(ny, nx):
+    """Mirror of _coil_index_pairs_cw: left col T→B, bottom row L→R,
     right col B→T, top row R→L, each ring shrinking inward.
     """
     top, bottom, left, right = 0, ny - 1, 0, nx - 1
@@ -1287,11 +1287,11 @@ def _spiral_index_pairs_ccw(ny, nx):
 
 def _rle_into_legs(pts):
     """Run-length-encode a sequence of axis-aligned adjacent grid points
-    (real pixel coordinates, as produced by _spiral_index_pairs_cw/ccw
+    (real pixel coordinates, as produced by _coil_index_pairs_cw/ccw
     applied to row_ids/col_ids) into maximal straight legs.
 
     Two consecutive points always share either their row or their column
-    (never both, except when the whole spiral is a single point). This
+    (never both, except when the whole coil is a single point). This
     automatically absorbs the "ring shrinks to 1 pixel wide" edge case
     into whichever neighbouring run the corner pixel belongs to, with no
     special-casing needed.
@@ -1328,24 +1328,246 @@ def _rle_into_legs(pts):
     return legs
 
 
-def _spiral_legs(row_ids, col_ids, sense):
-    """Perimeter-tracing spiral traversal of a (row_ids × col_ids) grid,
+def _coil_legs(row_ids, col_ids, sense):
+    """Perimeter-tracing coil traversal of a (row_ids × col_ids) grid,
     outside-in, in the given rotational `sense` ("CW" or "CCW"). Handles
     ny==1, nx==1, ny==nx==1, and non-square ny/nx transparently — see
     _rle_into_legs.
     """
     ny, nx = len(row_ids), len(col_ids)
-    index_order = (_spiral_index_pairs_cw(ny, nx) if sense == "CW"
-                   else _spiral_index_pairs_ccw(ny, nx))
+    index_order = (_coil_index_pairs_cw(ny, nx) if sense == "CW"
+                   else _coil_index_pairs_ccw(ny, nx))
     pts = [(row_ids[r], col_ids[c]) for r, c in index_order]
     return _rle_into_legs(pts)
+
+
+# Largest corner gap the rectangular Coil leaves between two of its
+# own sharp-cornered rings one step apart (the diameter of the biggest
+# circle fitting in the L-shaped band at a corner), as a multiple of the
+# step: the Spiral's ring spacing never leaves a wider one.
+_SPIRAL_CORNER_GAP_FACTOR = 2.0 * np.sqrt(2.0) / (1.0 + np.sqrt(2.0))
+
+
+def _spiral_corner_radius(t, m):
+    """Corner radius of the Spiral ring at level t (0..m): equal
+    to t near the centre (circles/stadiums, a linear spiral) and falling
+    back to 0 at t = m (the work box's own sharp-cornered rectangle)."""
+    if m <= 0.0:
+        return np.zeros_like(np.asarray(t, dtype=np.float64))
+    t = np.clip(np.asarray(t, dtype=np.float64), 0.0, m)
+    return t * (1.0 - t / m)
+
+
+def _spiral_ring_points(ex, ey, t, rho, u):
+    """Points on Spiral rings: rounded rectangles of half-extents
+    (ex + t, ey + t) and corner radius rho, at arc-length fraction u in
+    [0, 1) of each ring's perimeter. u = 0 is the midpoint of the top-left
+    corner arc and u increases clockwise as displayed (top side, right
+    side, bottom side, left side). t, rho and u are broadcast together.
+
+    Returns
+    -------
+    (dy, dx) — pixel offsets from the work box's centre, row axis pointing
+    down; arrays of the broadcast shape.
+    """
+    t, rho, u = np.broadcast_arrays(np.asarray(t, dtype=np.float64),
+                                    np.asarray(rho, dtype=np.float64),
+                                    np.asarray(u, dtype=np.float64))
+    A, B = ex + t, ey + t
+    a, b = A - rho, B - rho                  # straight half-lengths
+    q = 0.25 * np.pi * rho                   # arc length of 45 degrees
+    # (length, point-at-fraction) per piece, clockwise from the TL arc's
+    # midpoint; arc angles are in the y-down frame, where increasing angle
+    # is clockwise on screen.
+    def arc(cx, cy, th0, th1):
+        return lambda f: (cy + rho * np.sin(th0 + f * (th1 - th0)),
+                          cx + rho * np.cos(th0 + f * (th1 - th0)))
+    d = np.pi / 180.0
+    pieces = [
+        (q,      arc(-a, -b, 225 * d, 270 * d)),
+        (2 * a,  lambda f: (-B + 0 * f, -a + 2 * a * f)),
+        (2 * q,  arc(a, -b, 270 * d, 360 * d)),
+        (2 * b,  lambda f: (-b + 2 * b * f, A + 0 * f)),
+        (2 * q,  arc(a, b, 0 * d, 90 * d)),
+        (2 * a,  lambda f: (B + 0 * f, a - 2 * a * f)),
+        (2 * q,  arc(-a, b, 90 * d, 180 * d)),
+        (2 * b,  lambda f: (b - 2 * b * f, -A + 0 * f)),
+        (q,      arc(-a, -b, 180 * d, 225 * d)),
+    ]
+    perim = sum(length for length, _ in pieces)
+    s = u * perim
+    dy, dx = pieces[0][1](np.zeros_like(u))
+    dy, dx = dy.copy(), dx.copy()
+    start = np.zeros_like(u)
+    for length, point in pieces:
+        safe = np.where(length > 0.0, length, 1.0)
+        f = np.clip((s - start) / safe, 0.0, 1.0)
+        py, px = point(f)
+        take = (s >= start) & (length > 0.0)
+        dy = np.where(take, py, dy)
+        dx = np.where(take, px, dx)
+        start = start + length
+    return dy, dx
+
+
+def _spiral_corner_gap(t_out, delta, m):
+    """Width of the band between the Spiral rings at levels t_out
+    and t_out - delta: the larger of delta (the gap along the straight
+    sides) and the diameter of the largest circle fitting between the two
+    rings at a corner."""
+    t_in = np.maximum(t_out - delta, 0.0)
+    rho_o = _spiral_corner_radius(t_out, m)
+    rho_i = _spiral_corner_radius(t_in, m)
+    s2 = np.sqrt(2.0)
+    # Circle touching both corner arcs on the diagonal ...
+    r1 = (s2 * delta - (s2 - 1.0) * (rho_o - rho_i)) / 2.0
+    # ... or, once that circle is wider than the outer arc, sitting in the
+    # outer corner against both outer straight sides and the inner arc.
+    r2 = (s2 * delta + (s2 - 1.0) * rho_i) / (1.0 + s2)
+    r = np.where(r1 <= rho_o, r1, r2)
+    return np.maximum(delta, 2.0 * r)
+
+
+def _spiral_max_spacing(t, m, step_px, iters=40):
+    """Largest per-turn level increment at each level t such that the gap
+    to the next ring inward is at most step_px along the sides and at most
+    _SPIRAL_CORNER_GAP_FACTOR * step_px at the corners (bisection)."""
+    t = np.asarray(t, dtype=np.float64)
+    corner_cap = _SPIRAL_CORNER_GAP_FACTOR * step_px
+    lo = np.zeros_like(t)
+    hi = np.full_like(t, float(step_px))
+    ok_full = _spiral_corner_gap(t, hi, m) <= corner_cap + 1e-12
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        ok = _spiral_corner_gap(t, mid, m) <= corner_cap
+        lo = np.where(ok, mid, lo)
+        hi = np.where(ok, hi, mid)
+    return np.where(ok_full, float(step_px), np.maximum(lo, 1e-3 * step_px))
+
+
+def _spiral_px(r_lo, r_hi, c_lo, c_hi, step_px, sense,
+               raster_offset_pct=0.0, sample_px=1.0):
+    """Outside-in Spiral over the pixel box [r_lo, r_hi] x [c_lo, c_hi]:
+    one continuous path inward to the box's centre point (square box) or
+    centre segment (oblong box), whose rings morph from the box's own
+    rectangle to circles/stadiums -- see _spiral_corner_radius. Turn
+    spacing follows _spiral_max_spacing, rescaled so a whole number of
+    turns n ends exactly at the centre.
+
+    The path is P(level(s), u) for ring position u (see
+    _spiral_ring_points) and a turn coordinate s that runs 0 -> n, level(s)
+    falling from the box's outer level at s = 0 to the centre at s = n.
+    raster_offset_pct = 100*o shifts the turn coordinate to s = turn + u + o,
+    so at every ring position the path sits the fraction o of the way
+    between two neighbouring turns of the unshifted path (o = 0.5: midway,
+    the same as rotating a linear spiral by 180 degrees). The first turn
+    instead uses s = o*u, running from the outer level to level(o): for
+    o = 0 that is one closed ring around the outer level, so the box's
+    edge is cut completely, and for o > 0 it sits between that ring and
+    the unshifted path's first turn, the same way.
+
+    sense : "CW" or "CCW" as displayed, both starting at the top-left
+            (CW along the top side first, CCW down the left side first).
+            Paths interleave under raster_offset_pct only when they share
+            a sense; opposite senses wind in opposite directions and cross.
+
+    Returns
+    -------
+    (N, 2) float array of (row, col) pixel coordinates, sampled about
+    sample_px apart along the path.
+    """
+    cr, cc = 0.5 * (r_lo + r_hi), 0.5 * (c_lo + c_hi)
+    hy, hx = 0.5 * (r_hi - r_lo), 0.5 * (c_hi - c_lo)
+    m = min(hx, hy)
+    ex, ey = hx - m, hy - m
+    step_px = max(float(step_px), 1e-6)
+    o = (float(raster_offset_pct) / 100.0) % 1.0
+
+    def perimeter(t):
+        rho = _spiral_corner_radius(t, m)
+        return 4.0 * (ex + ey + 2.0 * t) - (8.0 - 2.0 * np.pi) * rho
+
+    if m > 0.0:
+        t_grid = np.linspace(0.0, m, 2001)
+        inv = 1.0 / _spiral_max_spacing(t_grid, m, step_px)
+        phi = np.concatenate(([0.0], np.cumsum(0.5 * (inv[1:] + inv[:-1])
+                                               * np.diff(t_grid))))
+        total = phi[-1]
+        n_turns = max(1, int(np.ceil(total - 1e-6)))
+
+        def level(s):
+            return np.interp(total * (1.0 - s / n_turns), phi, t_grid)
+    else:
+        n_turns = 1
+
+        def level(s):
+            return np.zeros_like(np.asarray(s, dtype=np.float64))
+
+    # Path coordinate q: the first turn is q in [0, 1), every later turn
+    # q in [k, k + 1); u = frac(q) throughout, ending where s reaches n.
+    def turn_coord(q):
+        return np.where(q < 1.0, o * q, q - 1.0 + o)
+
+    q_end = n_turns + 1.0 - o
+    q_parts = []
+    for k in range(int(np.ceil(q_end - 1e-9))):
+        nk = max(8, int(np.ceil(float(perimeter(level(turn_coord(float(k)))))
+                                / sample_px)))
+        qk = k + np.arange(nk) / nk
+        q_parts.append(qk[qk < q_end - 1e-9])
+    q_parts.append(np.array([q_end]))
+    q = np.concatenate(q_parts)
+    t_all = level(np.minimum(turn_coord(q), n_turns))
+    u_all = q - np.floor(q)
+
+    if sense == "CCW":
+        u_all = (1.0 - u_all) % 1.0
+    dy, dx = _spiral_ring_points(ex, ey, t_all,
+                                 _spiral_corner_radius(t_all, m), u_all)
+    rows = np.clip(cr + dy, r_lo, r_hi)
+    cols = np.clip(cc + dx, c_lo, c_hi)
+    return np.column_stack((rows, cols))
+
+
+def _curve_points(rc, depth, prior_mask, resid_tol,
+                  px_per_mm, H, _ox, _oy, max_depth):
+    """Sub-pixel counterpart to _line_points for an arbitrary polyline rc
+    ((N, 2) float array of (row, col)), gated by prior_mask/mask_spans at
+    each sample's nearest pixel exactly as _line_points gates a line. Z is
+    sampled bilinearly from depth, the same linear interpolation a G1 move
+    between two neighbouring raster samples already makes.
+
+    Returns
+    -------
+    list of point-lists — [[(x_mm, y_mm, -z_mm), ...], ...] — one element
+    for an ungated curve, or several when prior_mask/mask_spans splits it.
+    """
+    from scipy.ndimage import map_coordinates
+    if len(rc) == 0:
+        return []
+    Hd, Wd = depth.shape
+    ri = np.clip(np.rint(rc[:, 0]).astype(np.intp), 0, Hd - 1)
+    ci = np.clip(np.rint(rc[:, 1]).astype(np.intp), 0, Wd - 1)
+    if prior_mask is not None:
+        effective = (depth[ri, ci] * prior_mask[ri, ci]).astype(np.float32)
+        spans = mask_spans(effective > resid_tol)
+    else:
+        spans = [(0, len(rc) - 1)]
+
+    z = map_coordinates(depth.astype(np.float64, copy=False), rc.T,
+                        order=1, mode="nearest") * max_depth
+    x = rc[:, 1] / px_per_mm - _ox
+    y = (H - 1 - rc[:, 0]) / px_per_mm - _oy
+    return [list(zip(x[s:e + 1].tolist(), y[s:e + 1].tolist(),
+                     (-z[s:e + 1]).tolist()))
+            for s, e in spans]
 
 
 def _is_contiguous_chain(segs, tol_mm=1e-6):
     """True if segs (in list order) form one unbroken chain: each
     segment's last point is within tol_mm of the next segment's first
     point (in XY). Used to detect whether a pass's segments are still a
-    single continuous path (e.g. an unfragmented spiral coil), in which
+    single continuous path (e.g. an unfragmented coil or spiral), in which
     case there is no travel to optimise and reordering only risks harm.
     """
     for i in range(len(segs) - 1):
@@ -1850,7 +2072,7 @@ def _ring_chain_to_points(chain_px, z_mm, px_per_mm, H, _ox, _oy):
     point of an onion-skin chain already lies inside the pocket mask by
     construction (it comes from repeatedly eroding that same mask), so no
     mask_spans clipping is needed the way _line_points needs it for
-    straight raster/spiral lines.
+    straight raster/coil lines.
     """
     return [(col / px_per_mm - _ox, (H - 1 - row) / px_per_mm - _oy, -z_mm)
             for row, col in chain_px]
@@ -2004,21 +2226,26 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     width_mm          : physical image width in mm
     height_mm         : physical image height in mm
     raster_dir        : "Horizontal" | "Vertical" | "Diagonal (45°)" |
-                        "Diagonal (135°)" | "Spiral (Outside-In)" |
+                        "Diagonal (135°)" | "Coil (Outside-In)" |
+                        "Coil (Inside-Out)" | "Spiral (Outside-In)" |
                         "Spiral (Inside-Out)" — Horizontal/Vertical/Diagonal
-                        scan in parallel lines at 0°/90°/45°/135°; the
-                        Spiral patterns trace the depth map's perimeter
-                        inward in concentric rectangular rings (Outside-In)
-                        or the reverse, starting near the center
-                        (Inside-Out), without lifting the tool. Horizontal/
+                        scan in parallel lines at 0°/90°/45°/135°; the Coil
+                        patterns trace the depth map's perimeter inward in
+                        concentric rectangular rings (Outside-In) or the
+                        reverse, starting near the center (Inside-Out),
+                        without lifting the tool. Spiral is one continuous
+                        curve whose rings morph from the rectangular
+                        perimeter into a linear spiral at the center, with
+                        no sharp corners inside the outermost rings (see
+                        _spiral_px). Horizontal/
                         Vertical always start at the top-left corner and use
                         independent row/column step-overs, so non-square
                         depth maps are fully covered on both axes; Diagonal
                         lines are similarly spaced and clipped to cover the
                         full canvas along both diagonals. See cut_direction
                         for how Climb/Conventional map onto each scan
-                        direction's travel sense (or the spiral's clockwise/
-                        counter-clockwise sense).
+                        direction's travel sense (or the coil's/spiral's
+                        clockwise/counter-clockwise sense).
     raster_offset_pct : percentage [0, 100) to shift raster lines relative to the
                         step-over distance; e.g. 50 shifts every line by half a step,
                         useful when combining with a previous raster step at 0%.
@@ -2164,23 +2391,25 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
     RASTER_ANGLE_FAMILY = {"Horizontal": "X", "Vertical": "Y",
                            "Diagonal (45°)": "D45", "Diagonal (135°)": "D135"}
+    IS_COIL   = raster_dir in ("Coil (Outside-In)", "Coil (Inside-Out)")
     IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
-    direction = None if IS_SPIRAL else RASTER_ANGLE_FAMILY[raster_dir]
+    IS_WOUND  = IS_COIL or IS_SPIRAL      # one continuous wound path per area
+    direction = None if IS_WOUND else RASTER_ANGLE_FAMILY[raster_dir]
 
     # Forces every scan line/leg onto a single fixed travel direction (climb
     # keeps uncut material on the right of travel, conventional on the
     # left, for a clockwise spindle). "Either" leaves the default pixel-scan
     # order untouched and lets the ordering pass below reverse segments
     # freely for shorter travel. For Horizontal/Vertical/Diagonal this flips
-    # each line's own point order (FORCE_REVERSE); for Spiral it instead
-    # selects which rotational sense (CW/CCW) the whole spiral is generated
-    # in, which achieves the same "uncut material on a fixed side" guarantee
+    # each line's own point order (FORCE_REVERSE); for Coil and Spiral it
+    # instead selects which rotational sense (CW/CCW) the whole path is
+    # generated in, which achieves the same "uncut material on a fixed side" guarantee
     # for every leg without needing a per-leg reversal (see
-    # SPIRAL_OUTSIDE_IN_SENSE and _spiral_legs() in Phase 1 below;
+    # WOUND_OUTSIDE_IN_SENSE, _coil_legs() and _spiral_px() in Phase 1 below;
     # Inside-Out is a whole-path reversal on top of that).
     FORCE_REVERSE = {"Climb":        {"X": False, "Y": True, "D45": True,  "D135": True},
                       "Conventional": {"X": True,  "Y": False, "D45": False, "D135": False}}
-    SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
+    WOUND_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
     lock_direction = cut_direction in FORCE_REVERSE
 
     progress(40, f"{n_passes} depth pass{'es' if n_passes != 1 else ''}  "
@@ -2210,16 +2439,25 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     full_depth_segs = []
 
     if IS_SPIRAL:
+        sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
+        rc = _spiral_px(0, H - 1, 0, W - 1, step_mm * px_per_mm, sense,
+                              raster_offset_pct)
+        if raster_dir == "Spiral (Inside-Out)":
+            rc = rc[::-1]       # same whole-path reversal as Coil's Inside-Out
+        full_depth_segs.extend(
+            _curve_points(rc, center_depth_contour_raster, prior_mask, resid_tol,
+                          px_per_mm, H, _ox, _oy, max_depth))
+    elif IS_COIL:
         row_ids, adj_step_y_mm = _grid_line_ids(H - 1, px_per_mm, step_mm, raster_offset_pct)
         col_ids, adj_step_x_mm = _grid_line_ids(W - 1, px_per_mm, step_mm, raster_offset_pct)
-        sense = SPIRAL_OUTSIDE_IN_SENSE[cut_direction]
-        legs = _spiral_legs(row_ids, col_ids, sense)
-        if raster_dir == "Spiral (Inside-Out)":
+        sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
+        legs = _coil_legs(row_ids, col_ids, sense)
+        if raster_dir == "Coil (Inside-Out)":
             # Inside-Out is the point-reversal of Outside-In generated in
             # the sense that yields the same Climb/Conventional label:
             # reversing a path both reverses leg order and flips the
             # perceived rotational sense, so this reuses
-            # SPIRAL_OUTSIDE_IN_SENSE instead of needing a second table.
+            # WOUND_OUTSIDE_IN_SENSE instead of needing a second table.
             legs = [(axis, fixed, e, s) for axis, fixed, s, e in reversed(legs)]
 
         for axis, fixed_idx, start_idx, end_idx in legs:
@@ -2282,34 +2520,34 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
         # Phase 3: per-pass ordering (locked direction vs. free)
         cur = (float(tool_pos[0]), float(tool_pos[1]))
-        if lock_direction and IS_SPIRAL:
+        if lock_direction and IS_WOUND:
             # Phase 1 already emits one continuous, correctly-sensed
-            # perimeter walk (see SPIRAL_OUTSIDE_IN_SENSE above);
+            # perimeter walk (see WOUND_OUTSIDE_IN_SENSE above);
             # reordering would break that. _order_locked_raster_pass's
             # single-coordinate grouping assumes one axis-aligned line
-            # family and doesn't generalize to a spiral's alternating
-            # row/column legs, so pass make_multipass's output straight
-            # through unreordered. Phase 4 below still bridges any gaps a
+            # family and doesn't generalize to a coil's alternating
+            # row/column legs or a spiral's curve, so pass
+            # make_multipass's output straight through unreordered. Phase 4 below still bridges any gaps a
             # masked/gated refining pass introduces, same as it already
             # does for Horizontal/Vertical.
             ordered_segs = pass_segs
         elif lock_direction:
             ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
-        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
-            # This pass is still one genuinely unbroken coil (the common
+        elif IS_WOUND and _is_contiguous_chain(pass_segs):
+            # This pass is still one genuinely unbroken coil/spiral (the common
             # case: full-depth single pass, or a multi-pass/masked pass
             # that happened not to fragment) — skip reordering. This is
             # never a loss (an already-contiguous chain has zero
             # inter-segment travel to optimise) and avoids a real bug:
             # _order_free_raster_pass's greedy walk starts from the
             # tool's world origin (0,0), which can coincide exactly with
-            # a NON-initial vertex of the spiral depending on the G-code
+            # a NON-initial vertex of the coil depending on the G-code
             # origin setting (e.g. Bottom-Left origin puts (0,0) on the
             # ring-0/ring-1 boundary corner). That exact-zero-distance tie
             # makes greedy pick the wrong leg first and chain backwards
             # through more zero-distance ties, closing each ring into a
             # rectangle linked to the next by a diagonal jump instead of
-            # a spiral. When make_multipass or mask-based gating DOES
+            # a coil. When make_multipass or mask-based gating DOES
             # fragment a pass into disconnected pieces, this check is
             # False and we fall through to genuine nearest-neighbour
             # reordering below, same as any other pattern — there is no
@@ -2333,7 +2571,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                 nxt_dist = np.hypot(x_entry - tool_pos[0],
                                     y_entry - tool_pos[1])
 
-                # Consecutive Spiral legs share their corner pixel exactly
+                # Consecutive Coil legs share their corner pixel exactly
                 # (nxt_dist == 0.0); skip link insertion when segments are
                 # already contiguous to avoid a spurious zero-length link
                 # between every leg.
@@ -2524,7 +2762,7 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     if target_z_mm is None:
         target_z_mm = max_depth
     # Floored just above 0 rather than allowed to land exactly there: Zig-Zag
-    # and Spiral (see compute_pocket_toolpath) reuse compute_raster_toolpath's
+    # and Coil (see compute_pocket_toolpath) reuse compute_raster_toolpath's
     # own _line_points/_diag_line_points to build scan lines, which decide
     # which pixels are active by multiplying this normalised depth by the
     # region mask and comparing against a tolerance -- the same real
@@ -2574,9 +2812,10 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     without its footprint overhanging shallower material (i.e. the tool-
     centre erosion, not the dilated/opened accessible surface) is treated as
     pocket interior; that interior is cleared flat at target_z_mm using the
-    same scan-line/spiral infill machinery as compute_raster_toolpath, one
-    tool-accessibility-bounded connected region at a time so a Spiral pattern
-    forms a coil centred on and sized to each pocket rather than the stock.
+    same scan-line/coil/spiral infill machinery as compute_raster_toolpath,
+    one tool-accessibility-bounded connected region at a time so a Coil or
+    Spiral pattern is centred on and sized to each pocket rather than the
+    stock.
 
     Parameters
     ----------
@@ -2589,7 +2828,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     width_mm          : physical image width in mm
     height_mm         : physical image height in mm
     raster_dir        : "Zig-Zag (0°)" | "Zig-Zag (45°)" | "Zig-Zag (90°)" |
-                        "Zig-Zag (135°)" | "Spiral (Outside-In)" |
+                        "Zig-Zag (135°)" | "Coil (Outside-In)" |
+                        "Coil (Inside-Out)" | "Spiral (Outside-In)" |
                         "Spiral (Inside-Out)" | "Onion Skin (Outside-In)" /
                         "(Inside-Out)". Zig-Zag scans parallel lines at the
                         given angle within each region, same line-generation
@@ -2600,9 +2840,12 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         boundary contour wherever both gap endpoints lie on
                         it, falling back to the same geodesic search Raster
                         uses otherwise (e.g. a gap spanning two different
-                        regions). Spiral traces the region's perimeter
+                        regions). Coil traces the region's perimeter
                         inward in concentric rectangular rings (Outside-In)
-                        or the reverse (Inside-Out). Onion Skin instead
+                        or the reverse (Inside-Out); Spiral does the
+                        same with rings that morph from the region's bounding
+                        rectangle into a linear spiral at its center (see
+                        _spiral_px). Onion Skin instead
                         offsets concentric rings inward from each region's
                         own boundary by step_mm, stitched into one
                         continuous chain per undivided island, so the
@@ -2739,9 +2982,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         )
 
     # ── Stage 4 · Per-region infill generation (40–70 %) ─────────────────
-    # Each connected pocket region gets its own grid/coil, sized and centred
-    # on that region's own bounding box rather than the full stock, so a
-    # Spiral pattern forms a coil concentric with the pocket, not the
+    # Each connected pocket region gets its own grid/coil/spiral, sized and
+    # centred on that region's own bounding box rather than the full stock,
+    # so a Coil or Spiral pattern is concentric with the pocket, not the
     # canvas. Gating uses the region's own label mask (not the pooled
     # pocket_mask) so two disjoint regions with overlapping bounding boxes
     # never double-generate a line over each other's pixels.
@@ -2750,14 +2993,16 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
 
     POCKET_ZIGZAG_FAMILY = {"Zig-Zag (0°)": "X", "Zig-Zag (45°)": "D45",
                             "Zig-Zag (90°)": "Y", "Zig-Zag (135°)": "D135"}
+    IS_COIL   = raster_dir in ("Coil (Outside-In)", "Coil (Inside-Out)")
     IS_SPIRAL = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
+    IS_WOUND  = IS_COIL or IS_SPIRAL      # one continuous wound path per area
     IS_ONION  = raster_dir in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)")
     IS_ZIGZAG = raster_dir in POCKET_ZIGZAG_FAMILY
-    direction = POCKET_ZIGZAG_FAMILY.get(raster_dir)   # None for Spiral/Onion Skin
+    direction = POCKET_ZIGZAG_FAMILY.get(raster_dir)   # None for Coil/Spiral/Onion Skin
 
     FORCE_REVERSE = {"Climb":        {"X": False, "Y": True, "D45": True,  "D135": True},
                       "Conventional": {"X": True,  "Y": False, "D45": False, "D135": False}}
-    SPIRAL_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
+    WOUND_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
     lock_direction = cut_direction in FORCE_REVERSE
 
     labeled_regions, n_regions = label(pocket_mask)
@@ -2772,8 +3017,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     # Skin's erosion forked into sibling branches) from each other or
     # disturbing their deliberate depth/visiting sequence. Populated by the
     # IS_ONION branch (one entry per onion-skin chain) and the IS_ZIGZAG
-    # branch (one entry per zig-zag line segment); left empty for Spiral,
-    # whose own generation order already keeps each region's legs together.
+    # branch (one entry per zig-zag line segment); left empty for Coil and
+    # Spiral, whose own generation order already keeps each region's
+    # segments together.
     seg_region_ids = []
     # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
     # per interior hole/island), used by Stage 6 to bridge gaps by walking
@@ -2796,13 +3042,22 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
             ]
 
         if IS_SPIRAL:
+            sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
+            rc = _spiral_px(r_lo, r_hi, c_lo, c_hi, step_mm * px_per_mm,
+                                  sense, raster_offset_pct)
+            if raster_dir == "Spiral (Inside-Out)":
+                rc = rc[::-1]
+            full_depth_segs.extend(
+                _curve_points(rc, flat_depth, region_mask_f, mask_resid_tol,
+                              px_per_mm, H, _ox, _oy, max_depth))
+        elif IS_COIL:
             local_row_ids, _ = _grid_line_ids(r_hi - r_lo, px_per_mm, step_mm, raster_offset_pct)
             local_col_ids, _ = _grid_line_ids(c_hi - c_lo, px_per_mm, step_mm, raster_offset_pct)
             row_ids = [r + r_lo for r in local_row_ids]
             col_ids = [c + c_lo for c in local_col_ids]
-            sense = SPIRAL_OUTSIDE_IN_SENSE[cut_direction]
-            legs = _spiral_legs(row_ids, col_ids, sense)
-            if raster_dir == "Spiral (Inside-Out)":
+            sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
+            legs = _coil_legs(row_ids, col_ids, sense)
+            if raster_dir == "Coil (Inside-Out)":
                 legs = [(axis, fixed, e, s) for axis, fixed, s, e in reversed(legs)]
             for axis, fixed_idx, start_idx, end_idx in legs:
                 lo, hi = (start_idx, end_idx) if start_idx <= end_idx else (end_idx, start_idx)
@@ -2823,7 +3078,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                 # split) and each chain's own point order (so within a
                 # chain, cutting starts at its own deepest ring and works
                 # back out) -- same "reverse the whole path, order and
-                # direction together" idea as Spiral's Inside-Out.
+                # direction together" idea as Coil's and Spiral's Inside-Out.
                 chains = [c[::-1] for c in reversed(chains)]
             offset = np.array([r_lo, c_lo])
             for chain in chains:
@@ -2933,7 +3188,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         # Onion Skin's own correctness (winding sense, Outside-In vs.
         # Inside-Out) is fully decided at generation time (algorithms.py's
         # IS_ONION branch above), never by visiting order -- so, unlike
-        # Horizontal/Vertical/Spiral, its ordering is independent of
+        # Horizontal/Vertical/Coil/Spiral, its ordering is independent of
         # lock_direction: a chain is only ever left untouched or permuted
         # by _order_fixed_orientation_pass, never reversed, in both cases.
         if IS_ONION and _is_contiguous_chain(pass_segs):
@@ -2946,11 +3201,11 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         elif IS_ZIGZAG:
             ordered_segs = _order_zigzag_pass(pass_segs, pass_region_ids[pi], direction, cur,
                                               lock_direction)
-        elif lock_direction and IS_SPIRAL:
+        elif lock_direction and IS_WOUND:
             ordered_segs = pass_segs
         elif lock_direction:
             ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
-        elif IS_SPIRAL and _is_contiguous_chain(pass_segs):
+        elif IS_WOUND and _is_contiguous_chain(pass_segs):
             ordered_segs = pass_segs
         else:
             ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,

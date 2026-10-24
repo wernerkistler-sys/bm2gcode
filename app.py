@@ -30,7 +30,7 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 _HOLE_FACECOLOR = "#d9534f"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, SPIRAL_DIRECTIONS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, WOUND_DIRECTIONS,
     CUT_DIRECTIONS, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
@@ -1695,13 +1695,13 @@ class GCodeGeneratorApp:
             locked = ((family != "V-Carving") or alg == "V-Carving (Hybrid)") \
                      and step['cut_dir_var'].get() != "Either"
             # Pocket's own per-pass ordering (see compute_pocket_toolpath's
-            # Stage 6) only ever consults use_2opt for a Spiral scan
+            # Stage 6) only ever consults use_2opt for a Coil or Spiral scan
             # direction -- Zig-Zag and Onion Skin each use their own
             # dedicated ordering (_order_zigzag_pass /
             # _order_fixed_orientation_pass) that never reads it, so the
             # checkbox has nothing to do there regardless of Cut direction.
             pocket_2opt_moot = (family == "Pocket"
-                                 and step['raster_dir_var'].get() not in SPIRAL_DIRECTIONS)
+                                 and step['raster_dir_var'].get() not in WOUND_DIRECTIONS)
             step['tsp_2opt_cb'].config(
                 state="disabled" if (locked or pocket_2opt_moot) else "normal")
 
@@ -3198,7 +3198,7 @@ class GCodeGeneratorApp:
             d['path_rel'] = self._make_rel_path(layer.path, path)
             layers_out.append(d)
         project = {
-            'version': 5,
+            'version': 6,
             'layers': layers_out,
             'canvas': snapshot['canvas'],
             'global': snapshot['global'],
@@ -3230,7 +3230,7 @@ class GCodeGeneratorApp:
             return
 
         version = project.get('version', 1)
-        if version not in (1, 2, 3, 4, 5):
+        if version not in (1, 2, 3, 4, 5, 6):
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
@@ -3317,6 +3317,15 @@ class GCodeGeneratorApp:
             self._remove_step(self.steps[-1])
         while len(self.steps) < len(step_dicts):
             self._add_step()
+
+        # Project files before version 6 name the rectangular coil scan
+        # directions "Spiral (...)"; from version 6 on, "Spiral" is the
+        # rounded spiral and the coil is "Coil (...)".
+        if version < 6:
+            for d in step_dicts:
+                rdir = d.get('raster_dir', '')
+                if rdir in ("Spiral (Outside-In)", "Spiral (Inside-Out)"):
+                    d['raster_dir'] = "Coil" + rdir[len("Spiral"):]
 
         for step, d in zip(self.steps, step_dicts):
             self._apply_step_dict(step, d)
