@@ -390,12 +390,16 @@ def cutting_for(tool, material_id):
     return tool.cutting.get(material_id)
 
 
-def stepdown_field_for(family) -> str:
-    """The step-down field the given algorithm family reads."""
+def stepdown_field_for(family):
+    """The step-down field the given algorithm family reads, or None for
+    Undercut, whose Level step-down is an operation setting outside the
+    library's cutting data."""
     if family == "V-Carving":
         return 'vcarve_stepdown'
     if family == "Cutout":
         return 'cutout_stepdown'
+    if family == "Undercut":
+        return None
     return 'stepdown'
 
 
@@ -442,7 +446,8 @@ def sync_state(step_values, tool, cutting, family) -> str:
     (strings or numbers). *tool* is None when the linked tool is not in
     the library; *cutting* is None when the tool has no data for the
     project material. Geometry is checked before cutting data, and only
-    the step-down field *family* actually reads is compared.
+    the step-down field *family* actually reads is compared (none for
+    Undercut).
     """
     if tool is None:
         return SYNC_MISSING
@@ -461,10 +466,12 @@ def sync_state(step_values, tool, cutting, family) -> str:
             return SYNC_GEOMETRY_DIFFERS
     if cutting is None:
         return SYNC_NO_DATA
-    expected = (('feed_rate',   cutting.feed_rate),
+    expected = [('feed_rate',   cutting.feed_rate),
                 ('plunge_rate', cutting.plunge_rate),
-                ('spindle_rpm', cutting.spindle_rpm),
-                (stepdown_field_for(family), cutting.stepdown_mm))
+                ('spindle_rpm', cutting.spindle_rpm)]
+    stepdown_key = stepdown_field_for(family)
+    if stepdown_key is not None:
+        expected.append((stepdown_key, cutting.stepdown_mm))
     for key, value in expected:
         if not _same(step_values.get(key), value):
             return SYNC_MODIFIED
@@ -474,12 +481,20 @@ def sync_state(step_values, tool, cutting, family) -> str:
 def update_cutting_from_step(tool, material_id, step_values, family):
     """A copy of *tool* whose cutting data for *material_id* is taken from
     the step. Geometry (profile, diameter, V angle, custom curve,
-    neck/head) is left unchanged.
+    neck/head) is left unchanged. A family that reads no step-down field
+    keeps the tool's step-down for the material, or takes the step's plain
+    step-down field when the tool has none.
     Raises ValueError if a step value is not a number."""
     updated = copy.deepcopy(tool)
+    stepdown_key = stepdown_field_for(family)
+    existing = tool.cutting.get(material_id)
+    if stepdown_key is None and existing is not None:
+        stepdown_mm = existing.stepdown_mm
+    else:
+        stepdown_mm = float(step_values[stepdown_key or 'stepdown'])
     updated.cutting[material_id] = CuttingData(
         feed_rate=float(step_values['feed_rate']),
-        stepdown_mm=float(step_values[stepdown_field_for(family)]),
+        stepdown_mm=stepdown_mm,
         plunge_rate=float(step_values.get('plunge_rate') or 0.0),
         spindle_rpm=float(step_values.get('spindle_rpm') or 0.0))
     return updated

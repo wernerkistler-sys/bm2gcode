@@ -1078,7 +1078,8 @@ class GCodeGeneratorApp:
                     'contour_z_increment', 'contour_lateral_tol', 'feed_rate',
                     'plunge_rate', 'spindle_rpm', 'threshold',
                     'min_fw', 'max_fw', 'pocket_boundary_offset',
-                    'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing'
+                    'reghole_diameter', 'reghole_depth', 'reghole_inset', 'reghole_spacing',
+                    'undercut_z_increment'
                     ) + _UNDERCUT_KEYS:
             # Auto first, like _apply_step_dict: an Auto sync fired by the
             # value write must see the copied Auto state, not the default.
@@ -1235,6 +1236,14 @@ class GCodeGeneratorApp:
                                            minval=0.0, maxval=50.0, increment=0.05)
         contour_lateral_tol.pack(fill=tk.X, pady=2)
         step['contour_lateral_tol'] = contour_lateral_tol
+
+        # ── Undercut-only op control (hidden unless Undercut algorithm) ──
+        # Not part of the library's cutting data, unlike Max step-down.
+        undercut_z_increment = LabeledEntry(operation_lf, "Level step-down", "mm",
+                                            DEFAULTS["step_undercut_z_increment"],
+                                            minval=0.01, maxval=50.0, increment=0.1)
+        step['undercut_z_increment'] = undercut_z_increment
+        # (not packed initially — shown on demand by _refresh_layout)
 
         # ── Registration-Holes-only controls (hidden unless that algorithm)
         reghole_frame = ttk.Frame(operation_lf)
@@ -1550,7 +1559,7 @@ class GCodeGeneratorApp:
                 step['reghole_frame'].pack_forget()
             if family != "Undercut":
                 step['undercut_frame'].pack_forget()
-                step['stepdown'].set_label("Max step-down")
+                step['undercut_z_increment'].pack_forget()
                 if not step['raster_offset'].winfo_manager():
                     step['raster_offset'].pack(fill=tk.X, pady=2, after=step['stepover'])
                 if not step['raster_dir_row'].winfo_manager():
@@ -1659,11 +1668,11 @@ class GCodeGeneratorApp:
                     step['reghole_spacing'].pack_forget()
                 self._sync_reghole_fields(step)
             elif family == "Undercut":
-                # Uniform depth levels (Max step-down, relabeled) and ring
-                # spacing (Step-over); no Process Region, path-order or
-                # air-cut options -- see undercut.py.
+                # Uniform depth levels (Level step-down) and ring spacing
+                # (Step-over); no Process Region, path-order or air-cut
+                # options -- see undercut.py.
                 for key in ('vcarve_frame', 'contour_frame', 'cutout_frame', 'vbit_frame',
-                            'raster_final_stepdown', 'pocket_boundary_offset',
+                            'stepdown', 'raster_final_stepdown', 'pocket_boundary_offset',
                             'min_fw', 'max_fw', 'gating_frame', 'tsp_frame',
                             'raster_offset', 'raster_dir_row'):
                     step[key].pack_forget()
@@ -1680,10 +1689,9 @@ class GCodeGeneratorApp:
                     step['dovetail_angle'].pack(fill=tk.X, pady=2, after=step['head_height'])
                 else:
                     step['dovetail_angle'].pack_forget()
-                step['stepdown'].set_label("Level step-down")
-                step['stepdown'].pack(fill=tk.X, pady=2, after=step['undercut_frame'])
-                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
-                step['raster_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['undercut_frame'])
+                step['undercut_z_increment'].pack(fill=tk.X, pady=2, after=step['alg_row'])
+                step['raster_frame'].pack(fill=tk.X, after=step['undercut_z_increment'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
             elif family == "Pocket":   # Pocket, V-Carving Clean-up
                 step['vcarve_frame'].pack_forget()
@@ -1891,6 +1899,7 @@ class GCodeGeneratorApp:
         step['contour_z_increment'].set(DEFAULTS["step_contour_z_increment"])
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
+        step['undercut_z_increment'].set(DEFAULTS["step_undercut_z_increment"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
         step['avoid_air_var'].set(bool(int(DEFAULTS["step_avoid_air"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
@@ -2906,6 +2915,7 @@ class GCodeGeneratorApp:
             'contour_z_increment':  step['contour_z_increment'].get(),
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
+            'undercut_z_increment': step['undercut_z_increment'].get(),
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'avoid_air':            step['avoid_air_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
@@ -2975,6 +2985,12 @@ class GCodeGeneratorApp:
         step['contour_z_increment'].set(d.get('contour_z_increment', DEFAULTS['step_contour_z_increment']))
         step['contour_adaptive_var'].set(bool(d.get('contour_adaptive', False)))
         step['contour_lateral_tol'].set(d.get('contour_lateral_tol', DEFAULTS['step_contour_lateral_tol']))
+        # Projects without the field took an Undercut step's level spacing
+        # from Max step-down.
+        step['undercut_z_increment'].set(d.get(
+            'undercut_z_increment',
+            d.get('stepdown', DEFAULTS['step_undercut_z_increment'])
+            if d.get('algorithm') == "Undercut" else DEFAULTS['step_undercut_z_increment']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['avoid_air_var'].set(bool(d.get('avoid_air', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
@@ -3720,7 +3736,7 @@ class GCodeGeneratorApp:
             pad_y, pad_x = self._margin_pad_px(H, W)
             params.update({
                 'tool':              tool,
-                'z_increment_mm':    float(step['stepdown'].get()),
+                'z_increment_mm':    float(step['undercut_z_increment'].get()),
                 'stepover_pct':      float(step['stepover'].get()),
                 'cut_direction':     step['cut_dir_var'].get(),
                 # Read by _undercut_gaps off the main thread; Layer objects

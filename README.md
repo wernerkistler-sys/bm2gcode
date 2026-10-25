@@ -260,10 +260,11 @@ Undercut regions the tool can't reach from open sky at their own depth are skipp
 
 | Parameter | Description |
 |---|---|
+| Level step-down | Depth spacing between levels (mm). It isn't part of the [Tool Library](#tool-library)'s cutting data: choosing a library tool leaves it unchanged. |
 | Step-over | Spacing between the rings at one level, as a percentage of the head diameter. |
 | Cut direction | Climb or Conventional sets which way every ring runs, by the same rule as [Contour](#step--operation--contour) — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either keeps the contour's own direction. |
 
-The Tool group's **Level step-down** sets the depth spacing between levels. **Extra offset** leaves that much stock on every surface, including the undersides of overhangs. Process Region, 2-opt and Avoid cutting air aren't offered. Ramp-in and back-off aren't applied either (see [Step / Dress-up](#step--dress-up)).
+The Tool group's **Extra offset** leaves that much stock on every surface, including the undersides of overhangs. Process Region, 2-opt and Avoid cutting air aren't offered. Ramp-in and back-off aren't applied either (see [Step / Dress-up](#step--dress-up)).
 
 Run Undercut after the 2.5D steps that clear the stock from above. It cuts only what lies under overhangs and assumes the material above has already been removed. Its result map is the previous step's, unchanged: an undercut never lowers the highest material at any point, which is all a result map records. The STL meshes must be closed (watertight). Wherever a pixel's line through the mesh doesn't alternate cleanly between entering and leaving the solid, that pixel is treated as solid down from its top, and the step's info line says how many such pixels there are.
 
@@ -344,8 +345,8 @@ Registration Holes shows only **Max step-down**, as its helix pitch (Z drop
 per revolution) or peck depth — see
 [Step / Operation / Registration Holes](#step--operation--registration-holes).
 
-Undercut shows the same field relabeled **Level step-down**: the depth
-spacing between its levels, each cut at one constant Z — see
+Undercut shows no step-down field here. Its level spacing is the
+**Level step-down** field under
 [Step / Operation / Undercut](#step--operation--undercut).
 
 ---
@@ -489,7 +490,7 @@ The canvas shows the drawn curve (white) and its mirror image (grey), with the s
 
 Projects stay self-contained: a step copies the library values into its own fields and only remembers which tool (and material) they came from, so a project opens with the same values on a machine whose library lacks that tool. Editing the library doesn't change any step by itself — linked steps show **● modified** until re-applied. Library edits don't mark the project as changed; linking, unlinking or re-applying does.
 
-Each library value is written to all three step-down fields (Raster Scan / Pocket / Contour / Registration Holes / Undercut, V-Carving, Cutout), so switching the step's algorithm later doesn't leave a stale value; the status only compares the field the current algorithm uses.
+Each library value is written to all three step-down fields (Raster Scan / Pocket / Contour / Registration Holes, V-Carving, Cutout), so switching the step's algorithm later doesn't leave a stale value; the status only compares the field the current algorithm uses. An Undercut step's Level step-down isn't a step-down field in this sense: the library never writes it and the status doesn't compare it, and updating the library tool from an Undercut step keeps the tool's step-down for the material.
 
 ---
 

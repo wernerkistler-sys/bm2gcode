@@ -2,6 +2,7 @@
 
 Run with: python tests/test_tool_library.py
 """
+import copy
 import os
 import sys
 import tempfile
@@ -495,7 +496,19 @@ built = tool_from_step("from step", dict(vals, feed_rate="500", plunge_rate="0",
 check("tool_from_step keeps the undercut geometry",
       (built.profile, built.neck_diameter_mm, built.head_height_mm,
        built.dovetail_angle_deg) == ("Dovetail", 4.0, 3.0, 45.0))
-check("Undercut reads the plain step-down field", stepdown_field_for("Undercut") == 'stepdown')
+check("Undercut reads no step-down field", stepdown_field_for("Undercut") is None)
+ucut = CuttingData(feed_rate=500.0, stepdown_mm=2.0, plunge_rate=0.0, spindle_rpm=0.0)
+uvals = dict(vals, feed_rate="500", plunge_rate="0", spindle_rpm="0", stepdown="9")
+check("Undercut sync ignores the step-down fields",
+      sync_state(uvals, dove, ucut, "Undercut") == SYNC_IN_SYNC)
+dove_cut = copy.deepcopy(dove)
+dove_cut.cutting['mat-oak'] = ucut
+check("Undercut update keeps the tool's step-down",
+      update_cutting_from_step(dove_cut, 'mat-oak', uvals, "Undercut")
+      .cutting['mat-oak'].stepdown_mm == 2.0)
+check("Undercut update without data takes the plain step-down",
+      update_cutting_from_step(dove, 'mat-oak', uvals, "Undercut")
+      .cutting['mat-oak'].stepdown_mm == 9.0)
 
 
 print()
