@@ -22,6 +22,7 @@ from toolpath import ToolPath
 
 SKY  = -2.0e6   # ceiling of a column with nothing overhead
 NECK = 1.0e6    # tool top over the neck: the neck runs up without end
+MAX_BANDS = 8   # underside-height bands a footprint is split into at most
 
 
 def equivalent_2p5d_tool(tool):
@@ -109,12 +110,30 @@ def _shank_limit(depth_map, tool, px_per_mm, max_depth, allowance_mm):
     return top + (tool.neck_length_mm - allowance_mm) / max_depth
 
 
+def _lo_bands(lo, footprint, step):
+    """Split *footprint* into bands whose underside heights lo span at most
+    *step*: [(lo_mid, band footprint)], lo_mid the middle of the band's lo
+    range. A flat underside (T-Slot, Dovetail) is one band."""
+    vals = lo[footprint]
+    lo_min = float(vals.min())
+    n = max(1, int(np.ceil((float(vals.max()) - lo_min) / step)))
+    idx = np.minimum(((lo - lo_min) / step).astype(np.int64), n - 1)
+    bands = []
+    for j in range(n):
+        band = footprint & (idx == j)
+        if band.any():
+            v = lo[band]
+            bands.append((0.5 * (float(v.min()) + float(v.max())), band))
+    return bands
+
+
 def _floor_ceil_at(gaps, gap_pix, top, d):
-    """Per-column floor and ceiling bounding the air the tool is in at
-    depth d: the deepest gap starting above d (the solid containing d, or
-    the air just above it, lies below that gap's ceiling). Columns with no
-    such gap have the top surface as floor and open sky above. Returns
-    (F, C, active) with active marking the columns that use a gap."""
+    """Per-column floor and ceiling bounding the air at depth d (the
+    tool's underside in that column): the deepest gap starting above d
+    (the solid containing d, or the air just above it, lies below that
+    gap's ceiling). Columns with no such gap have the top surface as floor
+    and open sky above. Returns (F, C, active) with active marking the
+    columns that use a gap."""
     F = top.astype(np.float64).copy()
     C = np.full(top.shape, SKY)
     active = np.zeros(top.shape, bool)
@@ -347,8 +366,9 @@ def compute_undercut_toolpath(
                      this step's result (see README.md)
 
     At each level d the tool fits at a pixel if its underside clears the
-    floor below and its top (and neck) clears the ceiling above, both taken
-    from the gap the tip is in (_floor_ceil_at), or if it can reach d by a
+    floor below and its top (and neck) clears the ceiling above, in each
+    column both taken from the gap the tool's underside is in there
+    (_floor_ceil_at, per band of underside height), or if it can reach d by a
     vertical plunge from above (clear sky). g, the larger of the two
     clearances, is >= 0 exactly where the tool fits; its zero contour is the
     waterline and its distance transform gives the roughing rings. Only
@@ -426,6 +446,14 @@ def compute_undercut_toolpath(
             erosion_cache[cache_key] = (center25, accessible)
     shank = _shank_limit(depth_map, tool, px_per_mm, max_depth, extra_offset_mm)
     sky_limit = center25 if shank is None else np.minimum(center25, shank)
+    # A Lollipop's underside rises up to R above its tip, so a column at the
+    # head's rim can lie in a gap above the one the tip is in. Each band of
+    # the footprint picks its gaps at its own underside depth. A wrong pick
+    # only rejects positions next to solid thinner than half a band, so
+    # bands are a pixel's worth of depth thick, but at most MAX_BANDS.
+    lo_span = float(lo[fp].max() - lo[fp].min())
+    bands = _lo_bands(lo, fp, max(1.0 / (px_per_mm * max_depth), lo_span / MAX_BANDS))
+    band_lo = np.array([b[0] for b in bands])
 
     gap_pix = gaps.pixel_index()
     if gap_pix.size == 0:
@@ -446,17 +474,28 @@ def compute_undercut_toolpath(
     for li, d in enumerate(levels):
         progress(5 + 85 * li / len(levels),
                  f"Level {li + 1}/{len(levels)} ({d * max_depth:.2f} mm)…")
-        if gap_pix.size == 0 or not np.any(gaps.ceil < d):
+        b_min, b_max = d - band_lo.max(), d - band_lo.min()
+        if gap_pix.size == 0 or not np.any(gaps.ceil < b_max):
             continue
-        F, C, active = _floor_ceil_at(gaps, gap_pix, depth_map, d)
+        # Bands pick the same gaps wherever no ceiling lies between their
+        # underside depths; then one pass over the whole footprint does.
+        if np.any((gaps.ceil >= b_min) & (gaps.ceil < b_max)):
+            picks = [_floor_ceil_at(gaps, gap_pix, depth_map, d - lo_mid) + (band,)
+                     for lo_mid, band in bands]
+        else:
+            picks = [_floor_ceil_at(gaps, gap_pix, depth_map, b_max) + (fp,)]
+        active = np.logical_or.reduce([p[2] for p in picks])
         g_sky = sky_limit - d
         g = g_sky.copy()
         for r0, r1, c0, c1 in _windows(active, k_rad + 1, (H, W)):
             R0, R1 = max(0, r0 - k_rad), min(H, r1 + k_rad)
             C0, C1 = max(0, c0 - k_rad), min(W, c1 + k_rad)
-            Fw, Cw = F[R0:R1, C0:C1], C[R0:R1, C0:C1]
-            center_k = grey_erosion(Fw, footprint=fp, structure=-lo)
-            ceil_k = grey_dilation(Cw, footprint=fp, structure=hi)
+            center_k = ceil_k = None
+            for F, C, _, band in picks:
+                e = grey_erosion(F[R0:R1, C0:C1], footprint=band, structure=-lo)
+                c = grey_dilation(C[R0:R1, C0:C1], footprint=band, structure=hi)
+                center_k = e if center_k is None else np.minimum(center_k, e)
+                ceil_k = c if ceil_k is None else np.maximum(ceil_k, c)
             g_gap = np.minimum(center_k - d, d - ceil_k)
             if shank is not None:
                 g_gap = np.minimum(g_gap, shank[R0:R1, C0:C1] - d)

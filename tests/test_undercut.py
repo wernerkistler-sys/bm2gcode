@@ -543,6 +543,38 @@ check("one-sided overhang: no tool/part collision along the plain wall",
       collisions(tp_h_left, tool, 0.15, solid=half_cone_solid) == 0)
 
 
+print("undercut toolpath: two stacked grooves")
+# A pulley of radius 15 mm, 16 mm tall, with two semicircular grooves of
+# radius 3.5 mm about the rim at depths 4 and 12: a 1 mm middle flange at
+# depth 7.5-8.5 between them. Cutting the upper groove's lower arm puts the
+# Lollipop's tip below the middle flange, while its head stays in the upper
+# groove.
+RP, RG, HP = 15.0, 3.5, 16.0
+depth_p = np.where(_r < RP, 0.0, 1.0).astype(np.float32)
+_pix = np.flatnonzero(((_r > RP - RG) & (_r < RP)).ravel())
+_h = np.sqrt(RG * RG - (RP - _r.ravel()[_pix]) ** 2)
+gaps_p = Gaps.from_lists((N_PX, N_PX), np.r_[_pix, _pix],
+                         np.r_[4.0 - _h, 12.0 - _h] / HP, np.r_[4.0 + _h, 12.0 + _h] / HP)
+
+
+def pulley_solid(xs, ys, zs):
+    rr_ = np.hypot(xs - AXIS[0], ys - AXIS[1])
+    d_ = -zs
+    return (((rr_ <= RP) & (d_ >= 0) & (np.hypot(RP - rr_, d_ - 4.0) >= RG)
+             & (np.hypot(RP - rr_, d_ - 12.0) >= RG)) | (d_ > HP))
+
+
+tool_p = Tool("Lollipop", 5.0, neck_diameter_mm=2.0)
+tp_p = compute_undercut_toolpath(depth_p, gaps_p, tool_p, 0.5, 40.0, HP, SIZE_MM, SIZE_MM,
+                                 previous_result=depth_p.copy())
+levels_p = {round(-s[0][2], 6) for s in tp_p.segments}
+check("the upper groove's lower arm is cut with the tip below the middle flange",
+      {9.0, 9.5, 10.0} <= levels_p)
+# 0.3 mm: the rim's vertical face falls between pixel centres.
+check("stacked grooves: no tool/part collision",
+      collisions(tp_p, tool_p, 0.3, solid=pulley_solid) == 0)
+
+
 print("undercut toolpath: stock to leave")
 tp_a = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
                                  previous_result=prev, extra_offset_mm=0.5)
