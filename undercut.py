@@ -133,10 +133,8 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
     tool's underside in that column): the deepest gap starting above d
     (the solid containing d, or the air just above it, lies below that
     gap's ceiling). Columns with no such gap have the top surface as floor
-    and open sky above. A gap whose ceiling is the top surface itself
-    (within TOP_EPS) has open sky above it too: no solid lies between.
-    Returns (F, C, active) with active marking the columns that use a
-    gap."""
+    and open sky above. Returns (F, C, active) with active marking the
+    columns that use a gap."""
     F = top.astype(np.float64).copy()
     C = np.full(top.shape, SKY)
     active = np.zeros(top.shape, bool)
@@ -144,12 +142,43 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
     if idx.size:
         pix = gap_pix[idx]
         last = idx[np.r_[pix[1:] != pix[:-1], True]]
-        cols = gap_pix[last]
-        ceil = gaps.ceil[last]
-        F.flat[cols] = gaps.floor[last]
-        C.flat[cols] = np.where(np.abs(ceil - top.flat[cols]) <= TOP_EPS, SKY, ceil)
-        active.flat[cols] = True
+        F.flat[gap_pix[last]] = gaps.floor[last]
+        C.flat[gap_pix[last]] = gaps.ceil[last]
+        active.flat[gap_pix[last]] = True
     return F, C, active
+
+
+def _open_to_sky(depth_map, gaps):
+    """(depth_map, gaps) with every gap that starts at its column's top
+    surface (within TOP_EPS) merged into the open sky above it: no solid
+    lies between, so the column's top drops to the gap's floor and the gap
+    is dropped -- repeatedly, down a column. Such gaps are where the
+    composite's top is not solid: a partly covered outline pixel, whose top
+    blends the source with what lies beneath, or a grazed rim of zero
+    thickness. Merged, the plunge-from-above surface, which reads the depth
+    map, agrees with the gaps there."""
+    from layers import Gaps
+    pix = gaps.pixel_index()
+    if pix.size == 0:
+        return depth_map, gaps
+    top = depth_map.astype(np.float64).ravel()
+    rank = np.arange(pix.size) - gaps.offsets[pix]
+    open_col = np.ones(top.size, bool)          # still open down from the top
+    merged = np.zeros(pix.size, bool)
+    for k in range(int(rank.max()) + 1):
+        i = np.flatnonzero(rank == k)
+        i = i[open_col[pix[i]]]
+        hit = np.abs(gaps.ceil[i] - top[pix[i]]) <= TOP_EPS
+        top[pix[i[hit]]] = gaps.floor[i[hit]]
+        merged[i[hit]] = True
+        open_col[pix[i[~hit]]] = False
+        if not hit.any():
+            break
+    if not merged.any():
+        return depth_map, gaps
+    keep = ~merged
+    return (top.reshape(depth_map.shape).astype(depth_map.dtype),
+            Gaps.from_lists(gaps.shape, pix[keep], gaps.ceil[keep], gaps.floor[keep]))
 
 
 def _gather_gaps(gaps, src_pix, new_shape):
@@ -402,6 +431,8 @@ def compute_undercut_toolpath(
     def warn(msg, pct):
         warnings.append(msg)
         progress(pct, "Warning: " + msg)
+
+    depth_map, gaps = _open_to_sky(depth_map, gaps)
 
     # ── Square pixels ─────────────────────────────────────────────────────
     H, W = depth_map.shape

@@ -20,7 +20,7 @@ from stl_mesh import (load_stl, generate_dexels, generate_heightmap, mesh_z_boun
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
 from undercut import (build_undercut_kernels, compute_undercut_toolpath,
-                      NECK, _floor_ceil_at, _head_profile, _resample_gaps)
+                      NECK, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
 
 FAILURES = []
 
@@ -195,11 +195,16 @@ check("depth inside gap 1 uses gap 1", F[0, 1] == 0.8 and C[0, 1] == 0.6)
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.25)
 check("depth above every gap ceiling: no gap", F[0, 2] == 0.1 and not act[0, 2])
 
-g_top = Gaps.from_lists((1, 2), [0, 1], [0.3, 0.2], [0.9, 0.9])
-F, C, act = _floor_ceil_at(g_top, g_top.pixel_index(), np.array([[0.3, 0.3]]), 0.5)
-check("a gap starting at the top surface has open sky above",
-      F[0, 0] == 0.9 and C[0, 0] < -1e5 and act[0, 0])
-check("a gap starting above the top surface keeps its ceiling", C[0, 1] == 0.2)
+# Column 0: a gap at the top, then one starting at that gap's floor; column
+# 1: a gap starting above its top (not merged); column 2: a gap at the top,
+# then solid, then another gap.
+g_top = Gaps.from_lists((1, 3), [0, 0, 1, 2, 2], [0.3, 0.5, 0.2, 0.4, 0.8],
+                        [0.5, 0.9, 0.9, 0.6, 1.0])
+d_top, g_open = _open_to_sky(np.array([[0.3, 0.3, 0.4]], np.float32), g_top)
+check("gaps starting at the top surface merge into the sky, down the column",
+      np.allclose(d_top, [[0.9, 0.3, 0.6]]) and list(g_open.counts[0]) == [0, 1, 1])
+check("a gap below solid keeps its ceiling and floor",
+      np.allclose(g_open.ceil, [0.2, 0.8]) and np.allclose(g_open.floor, [0.9, 1.0]))
 
 rg = _resample_gaps(g, (1, 5))
 check("nearest resample keeps each column's gaps",
@@ -641,6 +646,38 @@ check("the upper groove's lower arm is cut with the tip below the middle flange"
 # 0.3 mm: the rim's vertical face falls between pixel centres.
 check("stacked grooves: no tool/part collision",
       collisions(tp_p, tool_p, 0.3, solid=pulley_solid) == 0)
+
+
+print("undercut toolpath: scaled STL layer")
+# The bicone lens scaled to 99 %: its outline pixels are partly covered, and
+# their gaps start at the blended top. Merged into the sky, the plunge test
+# agrees with them, and no false undercut zone rings the outline.
+raw_s, alpha_s = normalize_and_orient(generate_heightmap(bic, 80, 80), mesh_z_bounds(bic))
+lens_s = Layer(name="lens", raw=raw_s, source_kind="stl", alpha=alpha_s, scale_pct=99.0)
+lens_s.dexels = generate_dexels(bic, 80, 80)
+comp_s = to_depth(composite([lens_s], (80, 80), 4.0, 4.0, "white", background_depth=1.0),
+                  "white", False)
+g_s, _ = composite_gaps([lens_s], (80, 80), 4.0, 4.0, "white", comp_s, background_depth=1.0)
+comp_sp = np.pad(comp_s, 40, constant_values=1.0).astype(np.float32)
+tool_s = Tool("Lollipop", 4.0, neck_diameter_mm=1.5)
+tp_sc = compute_undercut_toolpath(comp_sp, pad_gaps(g_s, 40, 40), tool_s, 0.5, 30.0, 10.0,
+                                  40.0, 40.0, previous_result=comp_sp.copy(), origin="Center")
+per_level = {}
+for s in tp_sc.segments:
+    per_level[s[0][2]] = per_level.get(s[0][2], 0) + 1
+check("scaled layer: one chain per level", len(per_level) >= 4
+      and set(per_level.values()) == {1} and tp_sc.metadata['warnings'] == [])
+
+
+def lens_solid(xs, ys, zs):
+    """The bicone at 99 %, its rim 5 mm down (max depth 10 mm)."""
+    return np.abs(zs + 5.0) <= 5.0 * (1.0 - np.hypot(xs, ys) / 9.9)
+
+
+# 0.35 mm: the outline pixels' blended top leaves the outermost fraction of
+# a pixel of the knife-edge rim unseen, as it does for every planner.
+check("scaled layer: no tool/part collision",
+      collisions(tp_sc, tool_s, 0.35, solid=lens_solid) == 0)
 
 
 print("undercut toolpath: stock to leave")
