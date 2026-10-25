@@ -131,9 +131,20 @@ def rotate_bounds(xy_bounds, z_bounds, rot_x=0, rot_y=0, rot_z=0):
 _EDGE_TOL = 1e-9   # barycentric slack for rays through triangle edges
 
 
+def _cell_scale(lo, hi, n):
+    """(scale, shift) mapping a mesh coordinate c to the pixel index
+    (c - lo) * scale - shift: *n* pixel cells tile [lo, hi], each sampled at
+    its centre, as every canvas pixel is a cell 1 / px_per_mm wide. A flat
+    extent puts its one coordinate on pixel 0."""
+    if hi > lo:
+        return n / (hi - lo), 0.5
+    return 1.0, 0.0
+
+
 def generate_heightmap(triangles, width, height):
     """Rasterize triangles into a heightmap via per-triangle barycentric
-    z-buffering (keeps the max Z at each pixel).
+    z-buffering (keeps the max Z at each pixel). The pixels are cells tiling
+    the mesh's XY bounds, each sampled at its centre (_cell_scale).
 
     Returns a 2-D float64 (height, width) array of raw Z values; pixels
     covered by no triangle are NaN. Row 0 corresponds to the mesh's
@@ -147,15 +158,15 @@ def generate_heightmap(triangles, width, height):
     x_min, x_max = float(verts[:, 0].min()), float(verts[:, 0].max())
     y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
 
-    sx = (width  - 1) / (x_max - x_min) if x_max > x_min else 1.0
-    sy = (height - 1) / (y_max - y_min) if y_max > y_min else 1.0
+    sx, hx = _cell_scale(x_min, x_max, width)
+    sy, hy = _cell_scale(y_min, y_max, height)
 
     heightmap = np.full((height, width), -np.inf)
 
     for tri in triangles:
         # Project the three vertices to pixel coordinates (float)
-        px = (tri[:, 0] - x_min) * sx
-        py = (tri[:, 1] - y_min) * sy
+        px = (tri[:, 0] - x_min) * sx - hx
+        py = (tri[:, 1] - y_min) * sy - hy
 
         ix0 = max(0,         int(np.floor(px.min())))
         ix1 = min(width - 1, int(np.ceil( px.max())))
@@ -179,9 +190,8 @@ def generate_heightmap(triangles, width, height):
         w2 = 1.0 - w0 - w1
 
         # A ray through an edge is taken by every triangle sharing it, so
-        # rounding can't drop it from the upper of two faces meeting there:
-        # the outermost pixel centres lie on the mesh's XY bounds, exactly on
-        # the silhouette edges where a top and a bottom face meet.
+        # rounding can't drop it from the upper of two faces meeting there,
+        # as on a silhouette edge where a top and a bottom face meet.
         inside = (w0 >= -_EDGE_TOL) & (w1 >= -_EDGE_TOL) & (w2 >= -_EDGE_TOL)
         if not inside.any():
             continue
@@ -220,7 +230,8 @@ class Dexels:
 
 def generate_dexels(triangles, width, height, merge_eps=None):
     """Rasterize triangles into Dexels on the same pixel grid as
-    generate_heightmap (pixel centres spanning the mesh's XY bounds).
+    generate_heightmap (pixel cells tiling the mesh's XY bounds, sampled at
+    their centres).
 
     A triangle facing up is where a downward ray enters the solid, one
     facing down is where it leaves; facing comes from the triangle's
@@ -239,13 +250,13 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     if merge_eps is None:
         merge_eps = max(z_max - z_min, 1e-9) * 1e-7
 
-    sx = (width  - 1) / (x_max - x_min) if x_max > x_min else 1.0
-    sy = (height - 1) / (y_max - y_min) if y_max > y_min else 1.0
+    sx, hx = _cell_scale(x_min, x_max, width)
+    sy, hy = _cell_scale(y_min, y_max, height)
 
     pix_parts, z_parts, sgn_parts = [], [], []
     for tri in triangles:
-        px = (tri[:, 0] - x_min) * sx
-        py = (tri[:, 1] - y_min) * sy
+        px = (tri[:, 0] - x_min) * sx - hx
+        py = (tri[:, 1] - y_min) * sy - hy
 
         ix0 = max(0,         int(np.floor(px.min())))
         ix1 = min(width - 1, int(np.ceil( px.max())))
@@ -307,8 +318,8 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     has_up = np.maximum.reduceat((sgn > 0).astype(np.int8), starts) > 0
     has_dn = np.maximum.reduceat((sgn < 0).astype(np.int8), starts) > 0
     keep = has_up != has_dn
-    # A column's highest cluster cancelling (a ray grazing the silhouette,
-    # as at the mesh's XY bounds) still sets the heightmap's top there: it
+    # A column's highest cluster cancelling (a ray grazing the silhouette at
+    # a vertex or edge) still sets the heightmap's top there: it
     # becomes a solid of zero thickness, entered and left at that z, so the
     # column keeps that top and the air below it.
     g_pix = pix[starts]

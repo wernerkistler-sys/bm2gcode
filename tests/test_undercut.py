@@ -255,6 +255,16 @@ def _frustum_and_plate(n=96, plate=20.0, hp=2.0):
                            orient(cone, np.array([0, 0, hp + HC / 2]))])
 
 
+def _box(x0, x1, y0, y1, z0, z1):
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    out = []
+    for a, b, c_, d_ in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+                         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+        out += [(v[a], v[b], v[c_]), (v[a], v[c_], v[d_])]
+    return np.array(out, np.float64)
+
+
 def _write_ascii_stl(path, tris):
     with open(path, 'w') as f:
         f.write("solid t\n")
@@ -270,14 +280,14 @@ with tempfile.TemporaryDirectory() as tmp:
     stl_path = os.path.join(tmp, "cone.stl")
     _write_ascii_stl(stl_path, _frustum_and_plate())
     tris = load_stl(stl_path)
-n_mesh = 161                                   # 40 mm / 0.25 mm + 1
+n_mesh = 160                                   # 40 mm in 0.25 mm cells
 dex = generate_dexels(tris, n_mesh, n_mesh)
 hm = generate_heightmap(tris, n_mesh, n_mesh)
 counts = np.diff(dex.offsets).reshape(dex.shape)
 check("Dexels.top is exactly the heightmap",
       np.array_equal(np.isnan(dex.top), np.isnan(np.flipud(hm)))
       and np.array_equal(dex.top[~np.isnan(dex.top)], np.flipud(hm)[~np.isnan(dex.top)]))
-mm = np.linspace(-20, 20, n_mesh)
+mm = -20.0 + (np.arange(n_mesh) + 0.5) * 40.0 / n_mesh   # cell centres
 rows, cols = np.mgrid[0:n_mesh, 0:n_mesh]
 xx, yy = mm[cols], mm[::-1][rows]
 rr = np.hypot(xx, yy)
@@ -325,17 +335,20 @@ def _bicone(n=64, r=10.0, h=5.0):
     return np.array(tris)
 
 
-# Rays through the bounds' pixel centres graze the rim at one vertex: the
-# upper and lower cone's hits cancel, yet the heightmap has a top there.
+# A ray through a rim vertex grazes it: the upper and lower cone's hits
+# cancel, yet the heightmap has a top there. A small cube beside the bicone
+# widens the x bounds to -10..14, so with 81 cells across them the rim
+# vertex at (10, 0) is cell 67's centre (-10 + 67.5 * 24 / 81), on row 40.
 bic = _bicone()
-dex_b = generate_dexels(bic, 81, 81)
+bic_g = np.concatenate([bic, _box(13.5, 14.0, -1.0, 1.0, -1.0, 1.0)])
+dex_b = generate_dexels(bic_g, 81, 81)
 nb = np.diff(dex_b.offsets)
 first_b = np.full(nb.size, np.nan)
 first_b[nb > 0] = dex_b.z[dex_b.offsets[:-1][nb > 0]]
 cov_b = ~np.isnan(dex_b.top.ravel())
 check("a grazed rim keeps the heightmap's top as the first crossing",
       np.array_equal(first_b[cov_b], dex_b.top.ravel()[cov_b]) and not np.any(nb[~cov_b]))
-i_b = 40 * 81 + 80                                # (x, y) = (10, 0), the rim's tip
+i_b = 40 * 81 + 67                                # (x, y) = (10, 0), the rim's tip
 check("a grazed rim is a zero-thickness solid with air below",
       list(dex_b.z[dex_b.offsets[i_b]:dex_b.offsets[i_b + 1]]) == [0.0, 0.0]
       and dex_b.n_invalid == 0)
@@ -417,24 +430,24 @@ check("a floating mesh: open-bottom under its bottom face, closed under the flan
 # Partial coverage: the bicone (a floating lens: its lower half overhangs
 # open air) shifted by a fraction of a pixel, so its outline pixels are
 # partly covered and blend with what lies beneath.
-raw_b, alpha_b = normalize_and_orient(generate_heightmap(bic, 81, 81), mesh_z_bounds(bic))
+raw_b, alpha_b = normalize_and_orient(generate_heightmap(bic, 80, 80), mesh_z_bounds(bic))
 lens = Layer(name="lens", raw=raw_b, source_kind="stl", alpha=alpha_b, offset_x_mm=0.1)
-lens.dexels = dex_b
+lens.dexels = generate_dexels(bic, 80, 80)
 ppm_b = 80 / 20.0
-_, cov_l = __import__("layers").resample_layer(lens, (81, 81), ppm_b, ppm_b)
+_, cov_l = __import__("layers").resample_layer(lens, (80, 80), ppm_b, ppm_b)
 edge_l = (cov_l > 1e-3) & (cov_l < 0.999)
 for bg in (1.0, 0.0):
-    comp_l = to_depth(composite([lens], (81, 81), ppm_b, ppm_b, "white", background_depth=bg),
+    comp_l = to_depth(composite([lens], (80, 80), ppm_b, ppm_b, "white", background_depth=bg),
                       "white", False)
-    gl, _ = composite_gaps([lens], (81, 81), ppm_b, ppm_b, "white", comp_l,
+    gl, _ = composite_gaps([lens], (80, 80), ppm_b, ppm_b, "white", comp_l,
                            background_depth=bg)
     pix_l = gl.pixel_index()
     on_edge = edge_l.ravel()[pix_l]
     if bg == 1.0:
-        open_to_bed = np.zeros(81 * 81, bool)
+        open_to_bed = np.zeros(80 * 80, bool)
         open_to_bed[pix_l[gl.floor >= 1.0]] = True
         check("partly covered outline over a full-depth background: air down to it",
-              edge_l.sum() > 20 and np.all(open_to_bed.reshape(81, 81)[edge_l]))
+              edge_l.sum() > 20 and np.all(open_to_bed.reshape(80, 80)[edge_l]))
         check("partly covered outline: gaps start at or below the composite top",
               np.all(gl.ceil[on_edge] >= comp_l.ravel()[pix_l[on_edge]] - 1e-9))
     else:
@@ -442,18 +455,7 @@ for bg in (1.0, 0.0):
               not on_edge.any() and gl.counts[~edge_l & (cov_l >= 0.999)].sum() > 0)
 
 
-def _box(x0, x1, y0, y1, z0, z1):
-    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
-         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
-    out = []
-    for a, b, c_, d_ in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
-                         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
-        out += [(v[a], v[b], v[c_]), (v[a], v[c_], v[d_])]
-    return np.array(out, np.float64)
-
-
-# The outermost pixel centres lie on the mesh's XY bounds, exactly on the
-# silhouette edges where the top and bottom faces meet: they see the top.
+# Every cell centre, the outermost ones included, lies on the top face.
 for n in (41, 57):
     box = _box(0, 10, 0, 10, 1.234, 9.876)
     hm_b = generate_heightmap(box, n, n)
