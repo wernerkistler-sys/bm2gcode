@@ -500,6 +500,14 @@ All visualization modes show data for the currently active step. Cut moves, rapi
 
 **Show shading** (**S**) renders any of the 2D modes below as a hillshaded relief — simulated raking light and shadow over the mode's own colours — instead of a flat colour ramp, with vertical exaggeration auto-scaled from the max cut depth vs. the canvas footprint so shallow relief remains visible. It has no effect in Step Path (3D) mode.
 
+**Show overhangs** (**U**) shades, in the Original and Step Result modes, every pixel where a visible STL source has air below its top surface (see [Step / Operation / Undercut](#step--operation--undercut)). Image sources have no overhangs. Pixels are coloured by the kind of air below them:
+
+- **Magenta** — enclosed: the source's own solid lies below the air, above Max cut depth. Only an Undercut step can cut it.
+- **Amber** — open below: every gap reaches Max cut depth, the stock's bottom face, as under a model scaled to float above full depth. It can be machined from the back after turning the stock over.
+- **Blue** — reached: the part of either kind that the computed Undercut steps up to the displayed step reach. It is a top-down outline: the head radius around every position where the tool fits under an overhang at some level, so a blue pixel may still hold uncut air at another depth.
+
+The first time the overlay is shown for an STL source, its mesh is read for the surface crossings, which can take a moment for a large mesh.
+
 | Mode | Hotkey | Shows |
 |---|---|---|
 | Step Path (3D) | 0 | 3D visualization of the computed toolpath. |

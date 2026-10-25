@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from layers import Layer, Gaps, composite, composite_gaps, pad_gaps, to_depth
+from layers import (Layer, Gaps, composite, composite_gaps, overhang_masks, pad_gaps,
+                    to_depth)
 from stl_mesh import (load_stl, generate_dexels, generate_heightmap,
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
@@ -355,6 +356,24 @@ gi, warns_i = composite_gaps([inv], shape, ppm, ppm, "white", comp_i)
 check("inverted polarity is ignored with a warning",
       gi.counts.sum() == 0 and len(warns_i) == 1)
 
+# The plate top lies above full depth (the mesh's lowest top, on its
+# outline, is the plate bottom), so the air under the flank is enclosed.
+closed, open_bottom = overhang_masks(gp)
+check("overhang over the plate is closed",
+      np.all(closed[under]) and not open_bottom.any()
+      and not closed[~((rr > RB - 0.3) & (rr < RT + 0.3))].any())
+# With the layer's Max depth at 80 % the whole mesh floats above full depth:
+# air from its bottom face down to the stock's bottom face is open-bottom.
+shallow = Layer(name="cone", raw=raw, source_kind="stl", alpha=alpha, max_depth_pct=80.0)
+shallow.dexels = dex
+comp_sh = to_depth(composite([shallow], shape, ppm, ppm, "white"), "white", False)
+gsh, _ = composite_gaps([shallow], shape, ppm, ppm, "white", comp_sh)
+closed_sh, open_sh = overhang_masks(gsh)
+plate_only = (rr > RT + 0.3) & (np.abs(xx) < 19.5) & (np.abs(yy) < 19.5)
+check("a floating mesh: open-bottom under its bottom face, closed under the flank",
+      np.all(open_sh[plate_only]) and np.all(closed_sh[under])
+      and not (open_sh & closed_sh).any())
+
 
 # --------------------------------------------------------------------------
 # Undercut toolpath on the analytic cone with a Lollipop
@@ -382,6 +401,15 @@ zs = [s[0][2] for s in tp.segments]
 check("levels are cut top-down", all(a >= b - 1e-9 for a, b in zip(zs, zs[1:])))
 check("the previous result is passed through unchanged", np.array_equal(tp.result, prev))
 check("no warnings on a reachable undercut", tp.metadata['warnings'] == [])
+_r_px = np.hypot(np.mgrid[0:N_PX, 0:N_PX][1] / PX - AXIS[0],
+                 (N_PX - 1 - np.mgrid[0:N_PX, 0:N_PX][0]) / PX - AXIS[1])
+reach = tp.undercut_reach
+check("undercut_reach is on the depth map's grid",
+      reach is not None and reach.shape == depth.shape and reach.dtype == bool)
+check("undercut_reach covers the lip's outer band",
+      np.all(reach[(_r_px > RT - 0.75) & (_r_px < RT - 0.25)]))
+check("undercut_reach stays near the lip",
+      not reach[_r_px < RB].any() and not reach[_r_px > RT + 6.5].any())
 
 # Rings within a level: cut from open sky toward the wall (small step-over).
 tp_r = compute_undercut_toolpath(depth, gaps, tool, 0.5, 8.0, HC,
@@ -524,6 +552,8 @@ tp_ns = compute_undercut_toolpath(depth_ns, gaps_ns, tool, 1.0, 30.0, HC,
                                   previous_result=depth_ns.copy())
 check("non-square pixels still produce chains", len(tp_ns.segments) > 0)
 check("non-square pixels: no tool/part collision", collisions(tp_ns, tool, 0.25) == 0)
+check("non-square pixels: undercut_reach on the input grid",
+      tp_ns.undercut_reach.shape == depth_ns.shape and tp_ns.undercut_reach.any())
 
 
 print()

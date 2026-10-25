@@ -355,7 +355,7 @@ def compute_undercut_toolpath(
     ring stretches outside clear sky are cut; every chain of them starts and
     ends with an escape path to clear sky at the level's depth.
     """
-    from scipy.ndimage import distance_transform_edt, label
+    from scipy.ndimage import binary_dilation, distance_transform_edt, label
     from grey_morphology import grey_dilation, grey_erosion
     from skimage.measure import find_contours
     from algorithms import _build_kernel, _retract_breakeven_mm, simplify_line
@@ -380,6 +380,7 @@ def compute_undercut_toolpath(
 
     # ── Square pixels ─────────────────────────────────────────────────────
     H, W = depth_map.shape
+    in_shape = (H, W)
     px_per_mm_x = W / width_mm
     px_per_mm_y = H / height_mm
     if px_per_mm_x != px_per_mm_y:
@@ -631,6 +632,20 @@ def compute_undercut_toolpath(
         pts = [(float(x), float(y), z) for x, y in zip(xs, ys)]
         segments.append(simplify_line(pts, rdp_tol))
 
+    # Material the head sweeps: within its radius of every position where
+    # the tool fits under an overhang, on the caller's grid.
+    reach_px = max(tool.diameter_mm / 2.0 - extra_offset_mm, 0.0) * px_per_mm
+    if u_union.any() and reach_px >= 1.0:
+        n = int(reach_px)
+        yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
+        reach = binary_dilation(u_union, structure=yy ** 2 + xx ** 2 <= reach_px ** 2)
+    else:
+        reach = u_union.copy()
+    if reach.shape != in_shape:
+        rows = np.minimum((np.arange(in_shape[0]) + 0.5) * H / in_shape[0], H - 1)
+        cols = np.minimum((np.arange(in_shape[1]) + 0.5) * W / in_shape[1], W - 1)
+        reach = reach[np.ix_(rows.astype(np.int64), cols.astype(np.int64))]
+
     result = (previous_result.astype(np.float32).copy() if previous_result is not None
               else np.zeros((H, W), np.float32))
     n_cut_levels = len({ch['level'] for ch in chains})
@@ -638,6 +653,7 @@ def compute_undercut_toolpath(
                   f"on {n_cut_levels} level{'s' if n_cut_levels != 1 else ''}.")
     return ToolPath(
         segments=segments, result=result, accessible=accessible,
+        undercut_reach=reach,
         metadata={
             'algorithm':       'Undercut',
             'profile':         tool.profile,

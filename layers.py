@@ -387,6 +387,23 @@ class Gaps:
         return np.repeat(np.arange(self.offsets.size - 1), np.diff(self.offsets))
 
 
+def overhang_masks(gaps: Gaps, tol: float = 1e-4) -> Tuple[np.ndarray, np.ndarray]:
+    """(closed, open_bottom) pixel masks of *gaps*.
+
+    closed: pixels with a gap bounded below by solid above full depth --
+    air enclosed by the source, reachable only by an undercut. open_bottom:
+    pixels whose gaps all reach full depth (the stock's bottom face), such
+    as under an object floating above it -- reachable from the back once the
+    stock is turned over.
+    """
+    H, W = gaps.shape
+    pix = gaps.pixel_index()
+    is_closed = gaps.floor < 1.0 - tol
+    closed = np.bincount(pix[is_closed], minlength=H * W).reshape(H, W) > 0
+    any_gap = gaps.counts > 0
+    return closed, any_gap & ~closed
+
+
 def pad_gaps(gaps: Gaps, pad_y: int, pad_x: int) -> Gaps:
     """*gaps* moved onto a grid padded by pad_y rows and pad_x columns on
     every side (the stock margin), with no gaps in the padding."""

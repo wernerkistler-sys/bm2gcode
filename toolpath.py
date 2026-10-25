@@ -86,6 +86,13 @@ class ToolPath:
     # render holes in a distinct colour.
     alpha: np.ndarray = None
 
+    # 2-D bool array (same shape as depth_map), populated only by the
+    # Undercut algorithm: pixels within the head radius of a position where
+    # the tool fits under an overhang at some level -- a top-down outline of
+    # the undercut material the step reaches. Consumed only by the 2D views'
+    # overhang overlay.
+    undercut_reach: np.ndarray = None
+
     metadata: dict = field(default_factory=dict)
 
     def resample(self, spacing_mm: float) -> 'np.ndarray':

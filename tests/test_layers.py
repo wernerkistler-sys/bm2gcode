@@ -11,7 +11,7 @@ import numpy as np
 
 from layers import (Layer, to_depth, from_depth, to_grayscale, resize_raw,
                     resample_layer, composite, compute_n_grey_levels,
-                    _mirror_axis_mm)
+                    _mirror_axis_mm, Gaps, overhang_masks)
 from algorithms import registration_flip_axis
 
 FAILURES = []
@@ -361,6 +361,22 @@ for mirror, pattern, dd in [("Vertical axis", "Vertical axis", "+45°"),
         on_line = abs((pr[0] - pm[0]) * dm[1] - (pr[1] - pm[1]) * dm[0]) < 1e-9
         check(f"{mirror} through {origin} uses the Registration Holes flip axis",
               same_dir and on_line)
+
+
+# --------------------------------------------------------------------------
+# overhang_masks: gaps enclosed by the source vs. open down to full depth
+# --------------------------------------------------------------------------
+print("overhang_masks")
+
+# Pixel 0: closed gap; 1: open-bottom gap; 2: both; 3: no gap.
+g = Gaps.from_lists((1, 4), [0, 1, 2, 2], [0.2, 0.3, 0.1, 0.7], [0.6, 1.0, 0.5, 1.0])
+closed, open_bottom = overhang_masks(g)
+check("a gap with a floor above full depth is closed", closed[0, 0] and not open_bottom[0, 0])
+check("a gap down to full depth is open-bottom", open_bottom[0, 1] and not closed[0, 1])
+check("a pixel with both kinds counts as closed", closed[0, 2] and not open_bottom[0, 2])
+check("a pixel without gaps is neither", not closed[0, 3] and not open_bottom[0, 3])
+check("empty gaps give empty masks",
+      not any(m.any() for m in overhang_masks(Gaps.empty((3, 3)))))
 
 
 print()

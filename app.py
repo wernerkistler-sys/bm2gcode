@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import copy
+import hashlib
 import json
 import os
 import matplotlib.colors as mcolors
@@ -28,6 +29,11 @@ _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
 # ordinary grayscale "Step Result" colormap never produces a saturated hue,
 # so this always reads clearly as "this is a hole," not a depth value.
 _HOLE_FACECOLOR = "#d9534f"
+# Overhang overlay (View → Show overhangs): air enclosed by the source, air
+# open down to full depth, and overhangs a computed Undercut step reaches.
+_OVERHANG_CLOSED_COLOR  = "#ff2bd6"
+_OVERHANG_OPEN_COLOR    = "#ffc400"
+_OVERHANG_REACHED_COLOR = "#2ea8ff"
 
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, WOUND_DIRECTIONS,
@@ -142,6 +148,7 @@ class GCodeGeneratorApp:
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
+        self._overhang_cache = {}  # see _overhang_masks
 
         # Zoom / pan state (2D)
         self._pan_origin     = None
@@ -181,6 +188,7 @@ class GCodeGeneratorApp:
         self.show_tabs_var      = tk.BooleanVar(value=True)
         self.show_reg_holes_var = tk.BooleanVar(value=True)
         self.show_shading_var   = tk.BooleanVar(value=False)
+        self.show_overhangs_var = tk.BooleanVar(value=False)
 
         menubar   = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -274,6 +282,10 @@ class GCodeGeneratorApp:
                                         accelerator="S",
                                         variable=self.show_shading_var,
                                         command=self._on_display_mode_changed)
+        self._view_menu.add_checkbutton(label="Show overhangs",
+                                        accelerator="U",
+                                        variable=self.show_overhangs_var,
+                                        command=self._on_display_mode_changed)
         self._view_menu.add_separator()
         self._view_menu.add_command(label="Reset Zoom  (double-click)",
                                     command=self._reset_zoom_and_render)
@@ -317,6 +329,7 @@ class GCodeGeneratorApp:
         self.root.bind("<Key-t>", _make_toggle_handler(self.show_tabs_var))
         self.root.bind("<Key-h>", _make_toggle_handler(self.show_reg_holes_var))
         self.root.bind("<Key-s>", _make_toggle_handler(self.show_shading_var))
+        self.root.bind("<Key-u>", _make_toggle_handler(self.show_overhangs_var))
 
     # ------------------------------------------------------------------ #
     #  Top-level layout
@@ -4560,15 +4573,29 @@ class GCodeGeneratorApp:
         (margin-padded) depth-map grid, and any warnings. Builds each STL
         layer's dexels from its mesh first if missing or stale. Runs off the
         main thread: it reads only *params* and Layer data."""
-        visibility = params['source_visibility']
-        stl_layers = [(i, layer) for i, layer in enumerate(params['layers'])
-                      if layer.source_kind == "stl"
-                      and (visibility[i] if i < len(visibility) else layer.visible)]
+        stl_layers = self._visible_stl_layers(params)
         if not stl_layers:
             raise ValueError("Undercut needs at least one visible STL source: "
                              "image sources carry no undercut geometry.")
+        warnings = self._ensure_dexels(stl_layers, progress_fn)
+        gaps, gap_warnings = self._composite_gaps_padded(params, depth_map)
+        return gaps, warnings + gap_warnings
+
+    @staticmethod
+    def _visible_stl_layers(params):
+        """The STL layers of params['layers'] visible under
+        params['source_visibility']."""
+        visibility = params['source_visibility']
+        return [layer for i, layer in enumerate(params['layers'])
+                if layer.source_kind == "stl"
+                and (visibility[i] if i < len(visibility) else layer.visible)]
+
+    @staticmethod
+    def _ensure_dexels(stl_layers, progress_fn):
+        """Build the dexels of every layer in *stl_layers* whose dexels are
+        missing or stale; returns warnings about non-watertight meshes."""
         warnings = []
-        for _, layer in stl_layers:
+        for layer in stl_layers:
             key = (layer.path, tuple(sorted((layer.stl_params or {}).items())),
                    layer.raw.shape)
             if layer.dexels is not None and layer.dexels_key == key:
@@ -4584,14 +4611,128 @@ class GCodeGeneratorApp:
             if layer.dexels.n_invalid:
                 warnings.append(f"{layer.name}: {layer.dexels.n_invalid} mesh columns "
                                 f"are not watertight and are treated as solid.")
+        return warnings
+
+    @staticmethod
+    def _composite_gaps_padded(params, depth_map):
+        """layers.composite_gaps of params' layers on the margin-padded grid
+        of *depth_map*, and its warnings. Dexels must already be built."""
         pad_y, pad_x = params['margin_pad']
         H, W = params['canvas_shape']
         composite_depth = depth_map[pad_y:pad_y + H, pad_x:pad_x + W].astype(np.float64)
         gaps, gap_warnings = layers_mod.composite_gaps(
             params['layers'], (H, W), params['px_per_mm_x'], params['px_per_mm_y'],
-            params['surface'], composite_depth, visibility_override=list(visibility),
+            params['surface'], composite_depth,
+            visibility_override=list(params['source_visibility']),
             origin=params['origin'])
-        return layers_mod.pad_gaps(gaps, pad_y, pad_x), warnings + gap_warnings
+        return layers_mod.pad_gaps(gaps, pad_y, pad_x), gap_warnings
+
+    def _overhang_masks(self, visibility, depth_map):
+        """(closed, open_bottom) overhang masks (see layers.overhang_masks)
+        of the STL sources visible under *visibility*, on *depth_map*'s
+        margin-padded grid; None without a visible STL source or when the
+        canvas fields don't parse. Cached by everything the gaps depend on."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+            W, H = self._canvas_shape_px()
+        except (ValueError, ZeroDivisionError):
+            return None
+        if width_mm <= 0.0 or height_mm <= 0.0:
+            return None
+        visibility = list(visibility) if visibility is not None else [
+            layer.visible for layer in self.layers]
+        params = {
+            'layers':            list(self.layers),
+            'source_visibility': visibility,
+            'canvas_shape':      (H, W),
+            'px_per_mm_x':       W / width_mm,
+            'px_per_mm_y':       H / height_mm,
+            'surface':           self.surface.get(),
+            'origin':            self.origin_var.get(),
+            'margin_pad':        self._margin_pad_px(H, W),
+        }
+        stl_layers = self._visible_stl_layers(params)
+        if not stl_layers:
+            return None
+        key = (tuple(visibility), params['canvas_shape'], params['px_per_mm_x'],
+               params['px_per_mm_y'], params['surface'], params['origin'],
+               params['margin_pad'], self.n_grey_levels,
+               tuple((id(layer), layer.path, repr(layer.stl_params)) for layer in stl_layers),
+               hashlib.blake2b(np.ascontiguousarray(depth_map)).digest())
+        cached = self._overhang_cache.get(key)
+        if cached is not None:
+            return cached
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            self._ensure_dexels(stl_layers, lambda pct, msg: None)
+            gaps, _ = self._composite_gaps_padded(params, depth_map)
+        except (OSError, ValueError):
+            return None
+        finally:
+            self.root.config(cursor="")
+        if gaps.shape != depth_map.shape:
+            return None
+        tol = 0.5 / max(self.n_grey_levels - 1, 1)
+        masks = layers_mod.overhang_masks(gaps, tol)
+        if len(self._overhang_cache) >= 8:
+            self._overhang_cache.clear()
+        self._overhang_cache[key] = masks
+        return masks
+
+    def _overhang_reach(self, step_idx, shape):
+        """Union of the undercut_reach masks of the computed Undercut steps
+        up to and including *step_idx* that match *shape*, or None."""
+        reach = None
+        for tp in self.toolpaths[:step_idx + 1]:
+            if tp is None or tp.undercut_reach is None or tp.undercut_reach.shape != shape:
+                continue
+            reach = tp.undercut_reach.copy() if reach is None else reach | tp.undercut_reach
+        return reach
+
+    def _overlay_overhangs(self, img, mode, step_idx):
+        """Shade the overhangs of the visible STL sources over the Original
+        or Step Result view: amber where every gap reaches full depth (open
+        bottom, reachable from the back), magenta where a gap is enclosed by
+        the source, blue where computed Undercut steps reach. Returns the title
+        suffix to append, or ''."""
+        if not self.show_overhangs_var.get():
+            return ""
+        if mode == DISPLAY_ORIGINAL:
+            step = self._current_step()
+            visibility = step['source_visibility'] if step is not None else None
+            depth_map, _ = self._get_depth_map()
+        elif 0 <= step_idx < len(self.steps):
+            step = self.steps[step_idx]
+            visibility = step.get('source_visibility')
+            depth_map, _ = self._get_depth_map_for_step(step)
+        else:
+            return ""
+        if depth_map.shape != img.shape[:2]:
+            return ""
+        masks = self._overhang_masks(visibility, depth_map)
+        if masks is None:
+            return ""
+        closed, open_bottom = masks
+        if not (closed.any() or open_bottom.any()):
+            return " · no overhangs"
+        reach = self._overhang_reach(step_idx, depth_map.shape)
+        rgba = np.zeros(depth_map.shape + (4,), np.float32)
+        rgba[open_bottom] = mcolors.to_rgba(_OVERHANG_OPEN_COLOR, 0.35)
+        rgba[closed]      = mcolors.to_rgba(_OVERHANG_CLOSED_COLOR, 0.5)
+        parts = []
+        if closed.any():
+            parts.append("magenta enclosed")
+        if open_bottom.any():
+            parts.append("amber open below")
+        if reach is not None:
+            reached = reach & (closed | open_bottom)
+            rgba[reached] = mcolors.to_rgba(_OVERHANG_REACHED_COLOR, 0.55)
+            if reached.any():
+                parts.append("blue reached")
+        self.ax.imshow(rgba, interpolation="none", aspect="equal")
+        return " · overhangs: " + " / ".join(parts)
 
     def _pad_image(self, img):
         """Return *img* padded with the stock margin, or *img* unchanged when margin is 0."""
@@ -5197,6 +5338,8 @@ class GCodeGeneratorApp:
         self.fig.patch.set_facecolor(hole_color)
         self.ax.imshow(display_data, interpolation="none", aspect="equal",
                        cmap=cmap, vmin=vmin, vmax=vmax, alpha=img_alpha)
+        if mode in (DISPLAY_ORIGINAL, DISPLAY_STEP_RESULT):
+            title += self._overlay_overhangs(img, mode, step_idx)
         self._overlay_toolpath_2d(img, step_idx)
         self._overlay_registration_holes(img)
         self.ax.axis("off")
