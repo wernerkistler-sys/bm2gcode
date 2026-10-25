@@ -55,11 +55,11 @@ The Canvas tab is the notebook's permanent first tab, above the source tabs. Its
 | Effective resolution | Read-only: the pixel grid size and density the canvas actually settled on, between the Min. px/mm floor and the Max Megapixels ceiling. Recomputed when a source is added, when Width/Height/Min. px/mm/Max Megapixels change, via **Compute → Recompute Canvas Resolution**, or automatically before each Compute Step — not continuously while dragging a source's Scale/Offset. |
 | Max cut depth | Maximum cut depth in mm. The pixel representing full depth (black when z=0 colour = "white", white when z=0 colour = "black") is carved to this depth. |
 | Material | The workpiece material, chosen from the [Tool Library](#tool-library)'s materials. It decides which cutting data a step linked to a library tool receives. Choosing a different material lists the linked steps and asks which of them should receive that material's cutting data; nothing changes without confirmation. Saved with the project. |
-| Stock margin | Flat uncarved border around the canvas, in mm. |
+| Stock margin | Flat uncarved border around the canvas, in mm. It's added in whole pixels at the canvas's own resolution, so each side may come out up to half a pixel wider or narrower than entered; the carving keeps its exact scale. |
 | Margin depth | How deep to cut the stock margin, as a percentage of Max cut depth. |
 | Background depth | Depth, as a percentage of Max cut depth, given to any canvas pixel that no source covers. |
 | z=0 colour | Which pixel colour represents the uncut surface. "white": white = surface (z = 0), black = deepest cut. "black": the reverse. |
-| G-code origin | Which corner — or the center — of the work area corresponds to X0 Y0 in the G-code output. |
+| G-code origin | Which corner — or the center — of the work area corresponds to X0 Y0 in the G-code output. Toolpaths run through pixel centres, so a corner origin is the centre of that corner's pixel: half a pixel (0.5 / px per mm) in from both stock edges, which is where to zero the machine, not on the stock's corner itself. Center is the stock's exact centre. |
 
 The **Add Source** button at the bottom of the Canvas tab adds a new source at the bottom of the stack (or establishes the base source if the canvas is empty) — see [Sources](#sources).
 
@@ -229,7 +229,7 @@ A hole the tool's own diameter is plunged straight down, pecked in Max step-down
 | Diagonal direction | Which 45° line a Diagonal flip uses: +45° (rising to the right) or −45°. Shown only for a Center G-code origin; with a corner origin the direction follows from the corner (+45° through Bottom-Left/Top-Right, −45° through Top-Left/Bottom-Right). |
 | Hole diameter | Finished hole diameter, in mm. Must be at least the tool diameter. |
 | Hole depth | Absolute hole depth, in mm — independent of Max cut depth. |
-| Edge inset | Distance from the stock edge (margin included) to each hole centre, in mm. **Auto** uses half the Stock margin — the middle of the margin strip, clear of the artwork — or 10 mm with no margin. |
+| Edge inset | Distance from the stock edge (margin included) to each hole centre, in mm, measured like every stock coordinate from the outermost pixel centres, half a pixel inside the edge. **Auto** uses half the Stock margin — the middle of the margin strip, clear of the artwork — or 10 mm with no margin. |
 | Spacing | Diagonal only: length of each arm of the L, from the corner hole to each arm hole, in mm. **Auto** uses the shorter stock side minus twice the Edge inset, so both arm holes sit the same inset from the edges as the corner hole. |
 | Cut direction | Winding of a helical bore: Climb (and Either) run counter-clockwise, Conventional clockwise — for a clockwise spindle, counter-clockwise travel along an inside wall is climb milling. |
 

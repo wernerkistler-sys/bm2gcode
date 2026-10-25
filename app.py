@@ -3631,8 +3631,7 @@ class GCodeGeneratorApp:
         height_mm     = float(self.height_mm.get())
         margin_mm     = float(self.margin_mm.get())
         max_depth    = float(self.max_depth.get())
-        eff_width_mm  = width_mm  + 2.0 * margin_mm
-        eff_height_mm = height_mm + 2.0 * margin_mm
+        eff_width_mm, eff_height_mm = self._stock_size_mm()
         origin       = self.origin_var.get()
 
         threshold_mm = float(step['threshold'].get())
@@ -4827,6 +4826,19 @@ class GCodeGeneratorApp:
         depth_map, _ = self._get_depth_map_for_step(step)
         threshold.set(f"{float(np.max(depth_map)) * max_depth:.3f}")
 
+    def _stock_size_mm(self):
+        """(width_mm, height_mm) of the stock, margin included, as the
+        toolpaths measure it. The margin is padded in whole pixels
+        (_margin_pad_px), so the stock is the canvas plus 2 * pad pixels at
+        the canvas's own px per mm -- each side within half a pixel of Stock
+        margin -- and the padded depth map keeps exactly the canvas's pixel
+        size. Raises ValueError if Width/Height don't parse."""
+        width_mm  = float(self.width_mm.get())
+        height_mm = float(self.height_mm.get())
+        W, H = self._canvas_shape_px()
+        pad_y, pad_x = self._margin_pad_px(H, W)
+        return width_mm * (W + 2 * pad_x) / W, height_mm * (H + 2 * pad_y) / H
+
     def _reghole_geometry(self, step):
         """Resolve a Registration Holes step's hole layout from its current
         fields as a dict: stock size W_mm/H_mm (margin included), origin,
@@ -4835,8 +4847,7 @@ class GCodeGeneratorApp:
         -- or 10 mm with no margin; auto spacing is
         registration_auto_spacing. Raises ValueError on unparsable input."""
         margin_mm = float(self.margin_mm.get())
-        W_mm = float(self.width_mm.get())  + 2.0 * margin_mm
-        H_mm = float(self.height_mm.get()) + 2.0 * margin_mm
+        W_mm, H_mm = self._stock_size_mm()
         if step['reghole_inset'].auto_var.get():
             inset_mm = margin_mm / 2.0 if margin_mm > 0.0 else 10.0
         else:
@@ -5377,25 +5388,26 @@ class GCodeGeneratorApp:
     def _overlay_px_transform(self, img):
         """(H, W, sx, sy, ox, oy) for drawing stock-mm geometry over the 2D
         view's *img* (which spans the stock, margin included): sx/sy are
-        px per mm, ox/oy the G-code origin's offset from the stock's
-        bottom-left corner in mm. None if the canvas fields don't parse."""
+        px per mm, ox/oy the G-code origin's offset from the bottom-left
+        pixel's centre in mm, as the toolpath algorithms place it. None if
+        the canvas fields don't parse."""
         try:
-            margin_mm = float(self.margin_mm.get())
-            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
-            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
+            width_mm, height_mm = self._stock_size_mm()
         except ValueError:
             return None
-        if width_mm == 0 or height_mm == 0:
+        if width_mm <= 0 or height_mm <= 0:
             return None
         H, W = img.shape[:2]
+        sx, sy = W / width_mm, H / height_mm
+        W_mm, H_mm = (W - 1) / sx, (H - 1) / sy
         origin = self.origin_var.get()
-        ox = {"Bottom-Left": 0,          "Bottom-Right": width_mm,
-              "Top-Left":    0,          "Top-Right":    width_mm,
-              "Center":      width_mm  / 2}.get(origin, 0)
-        oy = {"Bottom-Left": 0,          "Bottom-Right": 0,
-              "Top-Left":    height_mm, "Top-Right":    height_mm,
-              "Center":      height_mm / 2}.get(origin, 0)
-        return H, W, W / width_mm, H / height_mm, ox, oy
+        ox = {"Bottom-Left": 0,       "Bottom-Right": W_mm,
+              "Top-Left":    0,       "Top-Right":    W_mm,
+              "Center":      W_mm / 2}.get(origin, 0)
+        oy = {"Bottom-Left": 0,       "Bottom-Right": 0,
+              "Top-Left":    H_mm,    "Top-Right":    H_mm,
+              "Center":      H_mm / 2}.get(origin, 0)
+        return H, W, sx, sy, ox, oy
 
     def _overlay_registration_holes(self, img):
         """Outline every Registration Holes step's holes and draw its flip
@@ -5667,24 +5679,15 @@ class GCodeGeneratorApp:
         row = int(np.clip(round(ydata), 0, H - 1))
 
         try:
-            margin_mm = float(self.margin_mm.get())
-            width_mm  = float(self.width_mm.get())  + 2.0 * margin_mm
-            height_mm = float(self.height_mm.get()) + 2.0 * margin_mm
             max_depth = float(self.max_depth.get())
         except ValueError:
             self.coord_var.set("")
             return
-
-        px_per_mm_x = W / width_mm
-        px_per_mm_y = H / height_mm
-
-        origin = self.origin_var.get()
-        _ox = {"Bottom-Left": 0,         "Bottom-Right": width_mm,
-               "Top-Left":    0,         "Top-Right":    width_mm,
-               "Center":      width_mm / 2}.get(origin, 0)
-        _oy = {"Bottom-Left": 0,         "Bottom-Right": 0,
-               "Top-Left":    height_mm, "Top-Right":    height_mm,
-               "Center":      height_mm / 2}.get(origin, 0)
+        transform = self._overlay_px_transform(img)
+        if transform is None:
+            self.coord_var.set("")
+            return
+        _, _, px_per_mm_x, px_per_mm_y, _ox, _oy = transform
 
         x_mm = col / px_per_mm_x - _ox
         y_mm = (H - 1 - row) / px_per_mm_y - _oy
