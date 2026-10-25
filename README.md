@@ -122,6 +122,7 @@ Each cutting step appears as a numbered tab. Use the **Add Step After** and **Re
 | [Cutout](#step--operation--cutout) | Cuts straight down around the outer silhouette, through the full stock thickness, with optional tabs. | Freeing the finished part from the stock. |
 | [Pocket](#step--operation--pocket) | Clears a flat-bottomed recess at a fixed Target depth with zig-zag, coil, spiral, or onion-skin infill. | Flat recesses, or facing/flattening the whole stock. |
 | [Registration Holes](#step--operation--registration-holes) | Bores pin holes symmetric about a flip axis, independent of the depth map. | Aligning the stock for two-sided milling. |
+| [Undercut](#step--operation--undercut) | Cuts sideways under the overhangs of STL sources in rings at each depth level, with a cutter whose head is wider than its neck (Lollipop, T-Slot or Dovetail), plunging and retracting only in open sky. | Undercut walls, lips and dovetail grooves no vertical plunge can reach. |
 
 ---
 
