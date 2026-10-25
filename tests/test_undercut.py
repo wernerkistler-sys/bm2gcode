@@ -16,7 +16,7 @@ import numpy as np
 
 from layers import (Layer, Gaps, composite, composite_gaps, overhang_masks, pad_gaps,
                     to_depth)
-from stl_mesh import (load_stl, generate_dexels, generate_heightmap,
+from stl_mesh import (load_stl, generate_dexels, generate_heightmap, mesh_z_bounds,
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
 from undercut import (build_undercut_kernels, compute_undercut_toolpath,
@@ -307,7 +307,7 @@ check("an inside-out mesh gives the same dexels",
 # composite_gaps: the STL layer's gaps land where the composite top is its own
 # --------------------------------------------------------------------------
 print("composite_gaps")
-raw, alpha = normalize_and_orient(hm)
+raw, alpha = normalize_and_orient(hm, mesh_z_bounds(tris))
 layer = Layer(name="cone", raw=raw, source_kind="stl", alpha=alpha)
 layer.dexels = dex
 shape = (n_mesh, n_mesh)
@@ -319,7 +319,8 @@ check("one gap per column under the overhang", np.all(gc[under] == 1) and not wa
 check("no gaps outside the overhang", gc[~((rr > RB - 0.3) & (rr < RT + 0.3))].sum() == 0)
 j = int(np.flatnonzero((under & (np.abs(rr - 11.0) < 0.2)).ravel())[0])
 k = gp.offsets[j]
-# depth = 1 - (z - plate_top) / HC with the plate top (z = 2) at full depth
+# depth = 1 - z / 8 over the mesh's z bounds: the plate bottom (z = 0) at
+# full depth, the plate top (z = 2) at 0.75
 from layers import _layer_depth_affine
 a_, b_ = _layer_depth_affine(layer, "white")
 flank_z = 2.0 + HC * (rr.ravel()[j] - RB) / (RT - RB)
@@ -356,8 +357,8 @@ gi, warns_i = composite_gaps([inv], shape, ppm, ppm, "white", comp_i)
 check("inverted polarity is ignored with a warning",
       gi.counts.sum() == 0 and len(warns_i) == 1)
 
-# The plate top lies above full depth (the mesh's lowest top, on its
-# outline, is the plate bottom), so the air under the flank is enclosed.
+# The plate top lies above full depth (the plate bottom, the mesh's lowest
+# point, is at full depth), so the air under the flank is enclosed.
 closed, open_bottom = overhang_masks(gp)
 check("overhang over the plate is closed",
       np.all(closed[under]) and not open_bottom.any()
@@ -373,6 +374,48 @@ plate_only = (rr > RT + 0.3) & (np.abs(xx) < 19.5) & (np.abs(yy) < 19.5)
 check("a floating mesh: open-bottom under its bottom face, closed under the flank",
       np.all(open_sh[plate_only]) and np.all(closed_sh[under])
       and not (open_sh & closed_sh).any())
+
+
+def _box(x0, x1, y0, y1, z0, z1):
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    out = []
+    for a, b, c_, d_ in [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+                         (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+        out += [(v[a], v[b], v[c_]), (v[a], v[c_], v[d_])]
+    return np.array(out, np.float64)
+
+
+# The outermost pixel centres lie on the mesh's XY bounds, exactly on the
+# silhouette edges where the top and bottom faces meet: they see the top.
+for n in (41, 57):
+    box = _box(0, 10, 0, 10, 1.234, 9.876)
+    hm_b = generate_heightmap(box, n, n)
+    dex_b = generate_dexels(box, n, n)
+    check(f"cube {n}x{n}: every pixel's height is the top face, edges included",
+          np.allclose(hm_b, 9.876, rtol=0, atol=1e-9)
+          and np.allclose(dex_b.top, 9.876, rtol=0, atol=1e-9))
+    raw_b, _ = normalize_and_orient(hm_b, mesh_z_bounds(box))
+    check(f"cube {n}x{n}: a flat top normalises to the top of the mesh's z bounds",
+          np.all(raw_b == 1.0) and dex_b.z_bounds == (1.234, 9.876))
+
+# A cube's bottom face maps to full depth only up to rounding (z 3..13 gives
+# 1 - 2e-16): it rests on the stock's bottom face and leaves no gap there.
+for z0, z1 in [(3.0, 13.0), (-12.7, 3.3), (1.234, 9.876), (-3.3, -0.7)]:
+    box = _box(0, 10, 0, 10, z0, z1)
+    raw_b, alpha_b = normalize_and_orient(generate_heightmap(box, 41, 41), mesh_z_bounds(box))
+    for pct, floating in ((100.0, False), (80.0, True)):
+        lb = Layer(name="cube", raw=raw_b, source_kind="stl", alpha=alpha_b,
+                   max_depth_pct=pct)
+        lb.dexels = generate_dexels(box, 41, 41)
+        comp_b = to_depth(composite([lb], (41, 41), 4.1, 4.1, "white"), "white", False)
+        gb, _ = composite_gaps([lb], (41, 41), 4.1, 4.1, "white", comp_b)
+        closed_b, open_b = overhang_masks(gb)
+        if floating:
+            check(f"cube z {z0}..{z1} at 80 % Max depth floats (open-bottom)",
+                  open_b.all() and not closed_b.any())
+        else:
+            check(f"cube z {z0}..{z1} on full depth has no gaps", gb.counts.sum() == 0)
 
 
 # --------------------------------------------------------------------------

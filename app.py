@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -2050,7 +2051,8 @@ class GCodeGeneratorApp:
         try:
             rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
             raw     = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-            image, alpha = stl_mesh.normalize_and_orient(raw)
+            image, alpha = stl_mesh.normalize_and_orient(
+                raw, stl_mesh.mesh_z_bounds(rotated))
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
             return None
@@ -3121,7 +3123,8 @@ class GCodeGeneratorApp:
                 triangles = stl_mesh.load_stl(resolved)
                 rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
                 raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                image, alpha = stl_mesh.normalize_and_orient(raw)
+                image, alpha = stl_mesh.normalize_and_orient(
+                    raw, stl_mesh.mesh_z_bounds(rotated))
                 new_stl_params = {'width_px': width_px, 'height_px': height_px,
                                   'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z}
                 if 'mesh_w_mm' in stl_params and 'mesh_h_mm' in stl_params:
@@ -3543,7 +3546,8 @@ class GCodeGeneratorApp:
                     triangles = stl_mesh.load_stl(resolved_stl_path)
                     rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
                     raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                    image, alpha = stl_mesh.normalize_and_orient(raw)
+                    image, alpha = stl_mesh.normalize_and_orient(
+                        raw, stl_mesh.mesh_z_bounds(rotated))
                     layer = layers_mod.Layer(
                         name=os.path.basename(resolved_stl_path), raw=image, alpha=alpha,
                         source_kind='stl', path=resolved_stl_path,
@@ -4132,7 +4136,8 @@ class GCodeGeneratorApp:
                 rot_z = layer.stl_params.get('rot_z', 0)
                 rotated = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
                 raw     = stl_mesh.generate_heightmap(rotated, target_w, target_h)
-                image, alpha = stl_mesh.normalize_and_orient(raw)
+                image, alpha = stl_mesh.normalize_and_orient(
+                    raw, stl_mesh.mesh_z_bounds(rotated))
             except Exception as exc:
                 messagebox.showerror("Re-rasterize Error",
                                      f"Could not re-rasterize {layer.name}:\n{exc}")
@@ -4658,7 +4663,7 @@ class GCodeGeneratorApp:
         key = (tuple(visibility), params['canvas_shape'], params['px_per_mm_x'],
                params['px_per_mm_y'], params['surface'], params['origin'],
                params['margin_pad'], self.n_grey_levels,
-               tuple((id(layer), layer.path, repr(layer.stl_params)) for layer in stl_layers),
+               tuple(self._layer_gap_signature(layer) for layer in params['layers']),
                hashlib.blake2b(np.ascontiguousarray(depth_map)).digest())
         cached = self._overhang_cache.get(key)
         if cached is not None:
@@ -4680,6 +4685,16 @@ class GCodeGeneratorApp:
             self._overhang_cache.clear()
         self._overhang_cache[key] = masks
         return masks
+
+    @staticmethod
+    def _layer_gap_signature(layer):
+        """Everything of *layer* that composite_gaps reads: its raw and
+        alpha arrays by identity, every placement/blend/depth field by
+        value."""
+        return ((id(layer.raw), id(layer.alpha))
+                + tuple((f.name, repr(getattr(layer, f.name)))
+                        for f in dataclasses.fields(layer)
+                        if f.name not in ('raw', 'alpha', 'dexels', 'dexels_key')))
 
     def _overhang_reach(self, step_idx, shape):
         """Union of the undercut_reach masks of the computed Undercut steps

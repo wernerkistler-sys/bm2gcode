@@ -673,7 +673,7 @@ Undercut works in the same normalised depth as the depth map (0 = stock top, 1 =
 - **Bad columns**: a column whose crossings then don't alternate enter/leave keeps only its top crossing, which reads as solid down from the top.
 - **Caching**: dexels are built on demand from the source's mesh when an Undercut step first needs them, and re-built when the source is re-rasterized. They aren't saved with the project.
 
-**Gaps.** Each source's crossings pass through the same chain that turns its heightmap into depth: normalisation by the top surface's z range, the z=0 colour, then Min/Max depth.
+**Gaps.** Each source's crossings pass through the same chain that turns its heightmap into depth: normalisation by the mesh's bounding-box z range (its lowest point at Max cut depth, its highest at the surface), the z=0 colour, then Min/Max depth. A gap that starts at full depth to within rounding, under a bottom face resting on it, is no gap.
 - **Which pixels**: a source's gaps are used only at canvas pixels where that source alone produces the composite's top surface (full coverage and opacity, and its own placed depth equal to the composite's). This keeps the composite authoritative for the top surface whatever the blend modes, and lets a layer covering the STL hide its undercuts. Where several sources qualify, the topmost wins.
 - **Sampling**: gaps are taken from the nearest source pixel, with Offset, Rotation, Scale and Mirror applied as in compositing. Gaps are clipped at full depth and moved onto the margin-padded grid.
 - **Polarity**: a source whose polarity is inverted (deeper for higher z) contributes no gaps, with a warning.

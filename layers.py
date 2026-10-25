@@ -420,12 +420,16 @@ def pad_gaps(gaps: Gaps, pad_y: int, pad_x: int) -> Gaps:
 def _layer_depth_affine(layer: Layer, surface: str):
     """(a, b) with layer depth = a * z + b for the layer's mesh z, following
     the same chain composite() applies to the layer's raw heightmap:
-    normalise by the top surface's z range (normalize_and_orient), to_depth,
-    then the min/max depth % mapping. None if the top surface is flat."""
-    tops = layer.dexels.top
-    if not np.isfinite(tops).any():
-        return None
-    z_min, z_max = float(np.nanmin(tops)), float(np.nanmax(tops))
+    normalise by the mesh's z bounds (normalize_and_orient; the top
+    surface's range for dexels without them), to_depth, then the min/max
+    depth % mapping. None if that range is flat."""
+    if layer.dexels.z_bounds is not None:
+        z_min, z_max = layer.dexels.z_bounds
+    else:
+        tops = layer.dexels.top
+        if not np.isfinite(tops).any():
+            return None
+        z_min, z_max = float(np.nanmin(tops)), float(np.nanmax(tops))
     if z_max - z_min < 1e-12:
         return None
     # raw = (z - z_min) / range;  depth = 1 - raw (white) or raw (black)
@@ -452,7 +456,9 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
     whatever the blend modes; where several layers qualify, the topmost
     wins. Gaps are read from the nearest layer column (placement, rotation,
     scale and Mirror as in resample_layer), clipped at full depth, and
-    dropped when they start at or below it.
+    dropped when they start within *tol* of it or below it -- a bottom face
+    resting on full depth maps to it only up to rounding, and must not
+    leave a zero-height gap there.
 
     Layers without dexels are ignored. Returns (gaps, warnings).
     """
@@ -531,7 +537,7 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
         ceil = a * dex.z[exit_idx] + b
         floor = np.full(total, np.inf)
         floor[has_floor] = a * dex.z[col_start[has_floor] + enter_pos[has_floor]] + b
-        keep = ceil < 1.0
+        keep = ceil < 1.0 - tol
         pix_out.append(canvas_pix[col[keep]])
         ceil_out.append(np.maximum(ceil[keep], 0.0))
         floor_out.append(np.minimum(floor[keep], 1.0))

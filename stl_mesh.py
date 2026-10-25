@@ -128,6 +128,9 @@ def rotate_bounds(xy_bounds, z_bounds, rot_x=0, rot_y=0, rot_z=0):
             (float(new_min[2]), float(new_max[2])))
 
 
+_EDGE_TOL = 1e-9   # barycentric slack for rays through triangle edges
+
+
 def generate_heightmap(triangles, width, height):
     """Rasterize triangles into a heightmap via per-triangle barycentric
     z-buffering (keeps the max Z at each pixel).
@@ -175,7 +178,11 @@ def generate_heightmap(triangles, width, height):
               (px[0] - px[2]) * (fy - py[2])) / denom
         w2 = 1.0 - w0 - w1
 
-        inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+        # A ray through an edge is taken by every triangle sharing it, so
+        # rounding can't drop it from the upper of two faces meeting there:
+        # the outermost pixel centres lie on the mesh's XY bounds, exactly on
+        # the silhouette edges where a top and a bottom face meet.
+        inside = (w0 >= -_EDGE_TOL) & (w1 >= -_EDGE_TOL) & (w2 >= -_EDGE_TOL)
         if not inside.any():
             continue
 
@@ -187,9 +194,6 @@ def generate_heightmap(triangles, width, height):
     heightmap[np.isinf(heightmap)] = np.nan
 
     return heightmap
-
-
-_EDGE_TOL = 1e-9   # barycentric slack for rays through triangle edges
 
 
 @dataclass
@@ -210,6 +214,8 @@ class Dexels:
     top: np.ndarray           # float64 (H, W): highest raw hit, NaN where none --
                               # exactly generate_heightmap's value
     n_invalid: int = 0        # columns reduced to their top hit
+    z_bounds: tuple = None    # (z_min, z_max) of the mesh's vertices, the
+                              # range normalize_and_orient maps to [0, 1]
 
 
 def generate_dexels(triangles, width, height, merge_eps=None):
@@ -236,7 +242,7 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     sx = (width  - 1) / (x_max - x_min) if x_max > x_min else 1.0
     sy = (height - 1) / (y_max - y_min) if y_max > y_min else 1.0
 
-    pix_parts, z_parts, sgn_parts, strict_parts = [], [], [], []
+    pix_parts, z_parts, sgn_parts = [], [], []
     for tri in triangles:
         px = (tri[:, 0] - x_min) * sx
         py = (tri[:, 1] - y_min) * sy
@@ -262,7 +268,7 @@ def generate_dexels(triangles, width, height, merge_eps=None):
         w2 = 1.0 - w0 - w1
         # A ray through an edge is taken by both neighbouring triangles (the
         # duplicate is merged below) rather than risk rounding dropping it
-        # from both; strict marks the hits generate_heightmap itself takes.
+        # from both, as in generate_heightmap.
         inside = (w0 >= -_EDGE_TOL) & (w1 >= -_EDGE_TOL) & (w2 >= -_EDGE_TOL)
         if not inside.any():
             continue
@@ -272,7 +278,6 @@ def generate_dexels(triangles, width, height, merge_eps=None):
         pix = (height - 1 - iy[inside]).astype(np.int64) * width + ix[inside]
         pix_parts.append(pix)
         z_parts.append(z_vals[inside])
-        strict_parts.append(((w0 >= 0) & (w1 >= 0) & (w2 >= 0))[inside])
         # In pixel space (both axes scaled positively) denom has the sign of
         # the triangle's XY winding, i.e. of its normal's Z component.
         sgn_parts.append(np.full(pix.size, 1 if denom > 0 else -1, np.int8))
@@ -281,12 +286,12 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     top = np.full(n_px, -np.inf)
     if not pix_parts:
         return Dexels((height, width), np.zeros(n_px + 1, np.int64),
-                      np.zeros(0, np.float64), np.full((height, width), np.nan), 0)
+                      np.zeros(0, np.float64), np.full((height, width), np.nan), 0,
+                      (z_min, z_max))
     pix = np.concatenate(pix_parts)
     z = np.concatenate(z_parts)
     sgn = np.concatenate(sgn_parts)
-    strict = np.concatenate(strict_parts)
-    np.maximum.at(top, pix[strict], z[strict])
+    np.maximum.at(top, pix, z)
     top[np.isinf(top)] = np.nan
 
     order = np.lexsort((-z, pix))
@@ -328,13 +333,19 @@ def generate_dexels(triangles, width, height, merge_eps=None):
         np.cumsum(counts, out=offsets[1:])
 
     return Dexels((height, width), offsets, z.astype(np.float64),
-                  top.reshape(height, width), n_invalid)
+                  top.reshape(height, width), n_invalid, (z_min, z_max))
 
 
-def normalize_and_orient(raw_heightmap):
+def normalize_and_orient(raw_heightmap, z_bounds=None):
     """Convert a raw rasterized heightmap (row 0 = min Y, per
     generate_heightmap) into bm2gcode's image convention: row 0 = max Y,
     float32, normalized to [0, 1].
+
+    *z_bounds* (z_min, z_max) is the range mapped to [0, 1]: the mesh's
+    bounding box (mesh_z_bounds of the rasterized triangles), so the mesh's
+    lowest point lands on 0 -- Max cut depth, as the import dialog sizes it
+    -- even where no ray sees it from above, as under a cube's flat top.
+    None uses the heightmap's own range.
 
     Returns (gray, alpha): holes (NaN, pixels no triangle covered) are
     excluded via alpha=0.0 (gray is set to 0.0 there too, but is moot since
@@ -349,8 +360,10 @@ def normalize_and_orient(raw_heightmap):
     oriented = np.flipud(raw_heightmap)
     has_holes = np.isnan(oriented).any()
     alpha = (~np.isnan(oriented)).astype(np.float32) if has_holes else None
-    z_min = np.nanmin(oriented)
-    z_max = np.nanmax(oriented)
+    if z_bounds is None:
+        z_min, z_max = np.nanmin(oriented), np.nanmax(oriented)
+    else:
+        z_min, z_max = z_bounds
     z_range = z_max - z_min
     if z_range < 1e-12:
         z_norm = np.zeros_like(oriented)
