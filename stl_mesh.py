@@ -307,7 +307,15 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     has_up = np.maximum.reduceat((sgn > 0).astype(np.int8), starts) > 0
     has_dn = np.maximum.reduceat((sgn < 0).astype(np.int8), starts) > 0
     keep = has_up != has_dn
-    pix, z = pix[starts][keep], z[starts][keep]
+    # A column's highest cluster cancelling (a ray grazing the silhouette,
+    # as at the mesh's XY bounds) still sets the heightmap's top there: it
+    # becomes a solid of zero thickness, entered and left at that z, so the
+    # column keeps that top and the air below it.
+    g_pix = pix[starts]
+    first_group = np.r_[True, g_pix[1:] != g_pix[:-1]]
+    graze = first_group & has_up & has_dn
+    graze_pix, graze_z = g_pix[graze], z[starts][graze]
+    pix, z = g_pix[keep], z[starts][keep]
     sgn = np.where(has_up, 1, -1).astype(np.int8)[keep]
 
     counts = np.bincount(pix, minlength=n_px)
@@ -319,6 +327,19 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     first = rank == 0
     if np.count_nonzero(sgn[first] < 0) > np.count_nonzero(sgn[first] > 0):
         sgn = -sgn
+
+    if graze_pix.size:
+        pix = np.concatenate([pix, graze_pix, graze_pix])
+        z = np.concatenate([z, graze_z, graze_z])
+        sgn = np.concatenate([sgn, np.ones(graze_pix.size, np.int8),
+                              -np.ones(graze_pix.size, np.int8)])
+        order = np.lexsort((-sgn, -z, pix))     # entering before leaving
+        pix, z, sgn = pix[order], z[order], sgn[order]
+        counts = np.bincount(pix, minlength=n_px)
+        offsets = np.zeros(n_px + 1, np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        rank = np.arange(pix.size) - offsets[pix]
+        first = rank == 0
 
     expected = np.where(rank % 2 == 0, 1, -1)
     bad_hit = sgn != expected

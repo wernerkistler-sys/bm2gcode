@@ -669,7 +669,7 @@ Undercut works in the same normalised depth as the depth map (0 = stock top, 1 =
 
 **Dexels.** For each STL source, every surface crossing of each pixel's vertical line through the mesh is recorded. It uses the same pixel grid and barycentric hit test as the heightmap rasterizer. Its first (highest) crossing is the heightmap's value exactly, so the top surface stays bit-for-bit the same.
 - **Entering vs. leaving**: a crossing through an upward-facing triangle enters the solid, a downward-facing one leaves it. Facing comes from the triangle's winding, flipped globally if the mesh is wound inside-out.
-- **Coincident crossings** (a line through a shared edge, a grazed rim, two shells touching): crossings facing one way collapse to one, and crossings facing both ways cancel.
+- **Coincident crossings** (a line through a shared edge, a grazed rim, two shells touching): crossings facing one way collapse to one, and crossings facing both ways cancel. A column's highest crossings cancelling (a line grazing the silhouette, as at the mesh's XY bounds, where pixel centres lie) still set the heightmap's top there, so they become a solid of zero thickness at that height: the column keeps its top, and the air below it stays a gap.
 - **Bad columns**: a column whose crossings then don't alternate enter/leave keeps only its top crossing, which reads as solid down from the top.
 - **Caching**: dexels are built on demand from the source's mesh when an Undercut step first needs them, and re-built when the source is re-rasterized. They aren't saved with the project.
 

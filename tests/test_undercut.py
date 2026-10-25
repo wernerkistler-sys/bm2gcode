@@ -303,6 +303,38 @@ check("an inside-out mesh gives the same dexels",
       np.array_equal(flipped.offsets, dex.offsets) and np.allclose(flipped.z, dex.z))
 
 
+def _bicone(n=64, r=10.0, h=5.0):
+    """Closed triangles (outward winding) of two cones base to base: a rim
+    of radius r at z = 0, apexes at z = +-h. Rim vertices at 0, 90, 180 and
+    270 degrees lie on the mesh's XY bounds."""
+    a = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    rim = np.stack([r * np.cos(a), r * np.sin(a), np.zeros(n)], axis=1)
+    rim[np.abs(rim) < 1e-12] = 0.0
+    up, dn = np.array([0.0, 0.0, h]), np.array([0.0, 0.0, -h])
+    tris = []
+    for i in range(n):
+        p, q = rim[i], rim[(i + 1) % n]
+        tris.append([p, q, up])
+        tris.append([q, p, dn])
+    return np.array(tris)
+
+
+# Rays through the bounds' pixel centres graze the rim at one vertex: the
+# upper and lower cone's hits cancel, yet the heightmap has a top there.
+bic = _bicone()
+dex_b = generate_dexels(bic, 81, 81)
+nb = np.diff(dex_b.offsets)
+first_b = np.full(nb.size, np.nan)
+first_b[nb > 0] = dex_b.z[dex_b.offsets[:-1][nb > 0]]
+cov_b = ~np.isnan(dex_b.top.ravel())
+check("a grazed rim keeps the heightmap's top as the first crossing",
+      np.array_equal(first_b[cov_b], dex_b.top.ravel()[cov_b]) and not np.any(nb[~cov_b]))
+i_b = 40 * 81 + 80                                # (x, y) = (10, 0), the rim's tip
+check("a grazed rim is a zero-thickness solid with air below",
+      list(dex_b.z[dex_b.offsets[i_b]:dex_b.offsets[i_b + 1]]) == [0.0, 0.0]
+      and dex_b.n_invalid == 0)
+
+
 # --------------------------------------------------------------------------
 # composite_gaps: the STL layer's gaps land where the composite top is its own
 # --------------------------------------------------------------------------
