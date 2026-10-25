@@ -711,7 +711,7 @@ This model needs every vertical line through the tool to meet it in one stretch.
    - **Links**: consecutive rings at one level are joined by a straight move when it stays free and is no longer than the larger of the tool diameter and the retract break-even length (see [Air-cut pruning](#air-cut-pruning)).
    - **Unreachable stretches**: a stretch whose free region doesn't connect to clear sky at its depth is skipped and counted in a warning. A chain whose end has no escape retraces itself back to where it started.
 8. **Order** — Chains are grouped by connected undercut region and the regions are visited nearest-first; within a region, levels run top-down.
-9. **Simplification + result** — Ramer-Douglas-Peucker at half a pixel, so lead paths stay inside the eroded free set. The result map is the previous step's, unchanged, as explained in [Step / Operation / Undercut](#step--operation--undercut).
+9. **Simplification + result** — Ramer-Douglas-Peucker at one pixel along the rings and links, like Contour: a contour along a wall that the pixel grid can only place on whole pixels comes out as a staircase of about half a pixel, which this tolerance smooths away. Lead paths are simplified at half a pixel, so they stay inside the free set eroded by a pixel that they were searched in. The result map is the previous step's, unchanged, as explained in [Step / Operation / Undercut](#step--operation--undercut).
 
 Every segment starts and ends in clear sky at its own constant depth. [G-code generation](#g-code-generation)'s retract → rapid → plunge between segments is therefore always a vertical move in open air. Ramp-in and back-off are the exceptions: they would move sideways under the overhang while rising, so Undercut steps don't apply them.
 

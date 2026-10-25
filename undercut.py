@@ -312,6 +312,21 @@ def _split_runs(pts, in_u, closed, max_gap):
     return runs
 
 
+def _simplify_parts(pts, lead, tol, lead_tol):
+    """simplify_line over each stretch of *pts* whose *lead* flag doesn't
+    change, at *lead_tol* on lead paths and *tol* elsewhere. Each stretch
+    runs on to the next one's first point, so the pieces join exactly."""
+    from algorithms import simplify_line
+    edges = np.flatnonzero(lead[1:] != lead[:-1]) + 1
+    out = []
+    for a, b in zip(np.r_[0, edges], np.r_[edges, len(pts)]):
+        piece = pts[a:min(b + 1, len(pts))]
+        if len(piece) >= 2:
+            piece = simplify_line(piece, lead_tol if lead[a] else tol)
+        out.extend(piece if not out else piece[1:])
+    return out
+
+
 class _Level:
     """Free-space data of one depth level, on a crop of the canvas."""
 
@@ -412,7 +427,7 @@ def compute_undercut_toolpath(
     from scipy.ndimage import binary_dilation, distance_transform_edt, label
     from grey_morphology import grey_dilation, grey_erosion
     from skimage.measure import find_contours
-    from algorithms import _build_kernel, _retract_breakeven_mm, simplify_line
+    from algorithms import _build_kernel, _retract_breakeven_mm
 
     if progress is None:
         progress = lambda pct, msg: None
@@ -585,23 +600,28 @@ def compute_undercut_toolpath(
             # Chains: greedy nearest within each ring, linked straight when
             # the link stays free and short, else escaped to open sky.
             cur = None          # current chain's points (crop coords)
+            cur_lead = None     # per point: on a lead path to or from open sky
             cur_pos = None
 
             def close_chain():
-                nonlocal cur
+                nonlocal cur, cur_lead
                 if cur is None:
                     return
                 out = lev.connect(cur[-1])
                 # With no escape from the chain's end, retrace the chain
                 # itself back to the open sky it started from.
-                tail = out[1][::-1] if out is not None else cur[-2::-1]
+                if out is not None:
+                    tail, tail_lead = out[1][::-1], np.ones(len(out[1]), bool)
+                else:
+                    tail, tail_lead = cur[-2::-1], cur_lead[-2::-1]
                 pts = np.vstack([cur, tail])
                 rep = cur[len(cur) // 2]
                 chains.append({'level': li,
                                'pts': pts + (r0, c0),
+                               'lead': np.concatenate([cur_lead, tail_lead]),
                                'rep': (int(round(rep[0])) + r0,
                                        int(round(rep[1])) + c0)})
-                cur = None
+                cur = cur_lead = None
 
             for runs_j in ring_runs:
                 remaining = list(runs_j)
@@ -658,8 +678,11 @@ def compute_undercut_toolpath(
                         ring = pts
                     if linked:
                         cur = np.vstack([cur, ring])
+                        cur_lead = np.concatenate([cur_lead, np.zeros(len(ring), bool)])
                     else:
                         cur = np.vstack([route[1], ring])
+                        cur_lead = np.concatenate([np.ones(len(route[1]), bool),
+                                                   np.zeros(len(ring), bool)])
                     cur_pos = cur[-1]
             close_chain()
 
@@ -697,7 +720,12 @@ def compute_undercut_toolpath(
             pos = ordered[-1]['pts'][-1]
         chains = ordered
 
-    rdp_tol = 0.5 / px_per_mm
+    # Rings and links at a pixel, like Contour: that swallows the half-pixel
+    # stair-steps of a contour along a wall the pixel grid can only place on
+    # whole pixels. Lead paths at half a pixel, so they stay inside the free
+    # set eroded by a pixel that they were searched in.
+    rdp_tol = 1.0 / px_per_mm
+    rdp_lead_tol = 0.5 / px_per_mm
     segments = []
     for ch in chains:
         rc = ch['pts']
@@ -705,7 +733,7 @@ def compute_undercut_toolpath(
         xs = rc[:, 1] / px_per_mm - ox
         ys = (H - 1 - rc[:, 0]) / px_per_mm - oy
         pts = [(float(x), float(y), z) for x, y in zip(xs, ys)]
-        segments.append(simplify_line(pts, rdp_tol))
+        segments.append(_simplify_parts(pts, ch['lead'], rdp_tol, rdp_lead_tol))
 
     # Material the head sweeps: within its radius of every position where
     # the tool fits under an overhang, on the caller's grid.
@@ -744,4 +772,5 @@ def compute_undercut_toolpath(
             'width_mm':        width_mm,
             'height_mm':       height_mm,
             'rdp_tolerance':   rdp_tol,
+            'rdp_lead_tolerance': rdp_lead_tol,
         })

@@ -648,6 +648,19 @@ check("stacked grooves: no tool/part collision",
       collisions(tp_p, tool_p, 0.3, solid=pulley_solid) == 0)
 
 
+def zigzags_per_mm(seg):
+    """How often a path's turning direction flips, per mm: a contour along
+    a wall keeps the pixel grid's stair-steps unless simplified away."""
+    a = np.array(seg)[:, :2]
+    v = np.diff(a, axis=0)
+    turn = np.sign(v[:-1, 0] * v[1:, 1] - v[:-1, 1] * v[1:, 0])
+    return np.count_nonzero(turn[1:] * turn[:-1] < 0) / np.hypot(*v.T).sum()
+
+
+check("rings along a vertical rim are simplified smooth, like Contour's",
+      max(zigzags_per_mm(s) for s in tp_p.segments if len(s) > 20) < 0.3)
+
+
 print("undercut toolpath: scaled STL layer")
 # The bicone lens scaled to 99 %: its outline pixels are partly covered, and
 # their gaps start at the blended top. Merged into the sky, the plunge test
