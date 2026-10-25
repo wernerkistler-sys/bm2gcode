@@ -436,18 +436,18 @@ check("retract never ends below the stock surface (its start is the cut depth, w
 print("plunge rate / spindle speed")
 
 g_plain = tp.to_gcode(feed_rate=800, feed_rapid=1500, z_safe=5.0)
-check("no S word or dwell when RPM is 0",
-      not any(ln.startswith(('S', 'G4')) for ln in g_plain.splitlines()))
+check("no spindle command or dwell when RPM is 0",
+      not any(ln.startswith(('M3', 'S', 'G4')) for ln in g_plain.splitlines()))
 check("plunge runs at the cutting feed when plunge rate is 0",
       all('F800' in ln for ln in g_plain.splitlines() if '; plunge' in ln))
 
 g_rpm = tp.to_gcode(feed_rate=800, feed_rapid=1500, z_safe=5.0,
                     plunge_rate=300, spindle_rpm=18000, spindle_dwell_s=2.5)
 rpm_lines = g_rpm.splitlines()
-s_idx = next(i for i, ln in enumerate(rpm_lines) if ln.startswith('S18000'))
-check("S word follows the safe-height move",
+s_idx = next(i for i, ln in enumerate(rpm_lines) if ln.startswith('M3 S18000'))
+check("M3 S word follows the safe-height move",
       rpm_lines[s_idx - 1].startswith('G0 Z5.000'))
-check("dwell follows the S word", rpm_lines[s_idx + 1].startswith('G4 P2.5'))
+check("dwell follows the M3 S word", rpm_lines[s_idx + 1].startswith('G4 P2.5'))
 check("plunge lines use the plunge rate",
       all('F300' in ln for ln in rpm_lines if '; plunge' in ln))
 step_down_line = next(ln for ln in rpm_lines if ln.startswith('G1 X20.000 Y0.000 Z-10.000'))

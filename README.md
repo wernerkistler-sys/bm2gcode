@@ -317,7 +317,7 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 | Extra offset | Stock-to-leave allowance (mm), applied both laterally (x/y) and vertically (z). The step deliberately stops this far short of the target depth map, so a following step (typically the same tool with Extra offset = 0) can refine the result. 0 = none. Not shown for Cutout or Pocket, which each have their own separate Boundary offset field instead — see [Step / Operation / Cutout](#step--operation--cutout) and [Step / Operation / Pocket](#step--operation--pocket). |
 | Feed rate | Cutting feed rate in mm/min. |
 | Plunge rate | Feed rate in mm/min for vertical descents: plunges, and pecks inside a cut (e.g. Registration Holes' pecked holes). Ramps keep the cutting feed, since they move mostly sideways. 0 = use Feed rate. |
-| Spindle speed | Spindle speed in RPM. When > 0, the step's G-code starts with an `S` word followed by the spin-up dwell from [Settings](#file-menu); consecutive exported steps at the same speed don't repeat it. 0 = no `S` word (the preamble's speed applies). |
+| Spindle speed | Spindle speed in RPM. When > 0, the step's G-code starts the spindle with `M3 S…` (clockwise at this speed, which also changes the speed of a spindle already running) followed by the spin-up dwell from [Settings](#file-menu); consecutive exported steps at the same speed don't repeat it. 0 = no spindle command (the preamble's `M3` and speed apply). |
 
 **Step-down controls (Raster Scan and V-Carving):**
 
@@ -431,7 +431,7 @@ Adding an STL as an additional source (via a source tab's or the Canvas tab's **
 | Safe height | Z height used for all rapid travel moves between cuts (mm). |
 | Rapid feed | Feed rate for rapid moves, used only for time estimates (mm/min). |
 | Max acceleration | Machine acceleration, used only for time estimates (mm/s²). |
-| Spindle spin-up dwell | Pause in seconds emitted as `G4 P…` after each step's `S` word, so the spindle reaches its new speed before cutting. 0 = no pause. `G4 P` is in seconds on GRBL and LinuxCNC; some controllers read it as milliseconds — check yours. |
+| Spindle spin-up dwell | Pause in seconds emitted as `G4 P…` after each step's `M3 S…` spindle start, so the spindle reaches its new speed before cutting. 0 = no pause. `G4 P` is in seconds on GRBL and LinuxCNC; some controllers read it as milliseconds — check yours. |
 | Max spindle speed | Highest speed your spindle runs, in RPM. The Tool Library's [cutting recommendations](#cutting-recommendations) never suggest a faster spindle speed. 0 = no limit. |
 | Min spindle speed | Lowest speed your spindle runs reliably, in RPM; below it a router spindle has little torque. [Cutting recommendations](#cutting-recommendations) never suggest a slower spindle speed. 0 = no limit. |
 | Max feed rate | Highest cutting feed your machine moves at, in mm/min. [Cutting recommendations](#cutting-recommendations) never suggest a faster feed. 0 = no limit. |

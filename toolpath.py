@@ -423,7 +423,7 @@ class ToolPath:
         # does not rely on the preamble having done this.
         lines.append(f"G0 Z{z_safe:.3f}  ; move to safe height")
         if spindle_rpm > 0:
-            lines.append(f"S{spindle_rpm:.0f}  ; spindle speed")
+            lines.append(f"M3 S{spindle_rpm:.0f}  ; spindle on (clockwise) at speed")
             if spindle_dwell_s > 0:
                 lines.append(f"G4 P{spindle_dwell_s:g}  ; wait for spindle to reach speed")
 
