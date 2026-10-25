@@ -14,9 +14,22 @@ memory stays at a few image-sized arrays regardless of kernel size. Flat
 rows use minimum_filter1d, whose cost doesn't depend on the row width, and
 a row whose mirror row (same footprint and structure) exists is filtered
 once and applied at both offsets.
+
+The output is split into tiles of rows computed in parallel on a shared
+thread pool: each tile needs only its own input rows plus the footprint's
+half-height above and below, and scipy releases the GIL while it filters.
 """
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from scipy import ndimage as ndi
+
+_POOL = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+# A tile at least this many footprint heights tall, so the rows it shares
+# with its neighbours stay a small part of its work.
+_MIN_TILE_KERNELS = 2
+_MIN_TILE_ROWS = 64
 
 
 def _row_erosion(padded, row, srow, kw):
@@ -30,24 +43,10 @@ def _row_erosion(padded, row, srow, kw):
                             structure=srow[None, :])
 
 
-def grey_erosion(input, footprint, structure=None):
-    """Same result as scipy.ndimage.grey_erosion(input, footprint=footprint,
-    structure=structure) for a 2-D input and an odd-sized footprint:
-    min over d in footprint of input(x + d) - structure(d).
-    structure None means flat (all zeros)."""
-    input = np.asarray(input)
-    footprint = np.asarray(footprint, dtype=bool)
+def _rows_erosion(padded, footprint, structure, H):
+    """Erosion of the H output rows whose input is *padded*, which holds
+    them plus the footprint's half-height of rows above and below."""
     kh, kw = footprint.shape
-    if input.ndim != 2 or kh % 2 == 0 or kw % 2 == 0:
-        raise ValueError("grey_erosion needs a 2-D input and an odd-sized footprint.")
-    if structure is None:
-        structure = np.zeros(footprint.shape, dtype=np.float64)
-    else:
-        structure = np.asarray(structure)
-    ry = kh // 2
-    H = input.shape[0]
-    # numpy's "symmetric" padding is scipy's "reflect" border mode.
-    padded = np.pad(input, ((ry, ry), (0, 0)), mode="symmetric")
     out = None
     done = set()
     for i in range(kh):
@@ -66,8 +65,40 @@ def grey_erosion(input, footprint, structure=None):
                 out = e[k:k + H].copy()
             else:
                 np.minimum(out, e[k:k + H], out=out)
-    if out is None:
+    return out
+
+
+def grey_erosion(input, footprint, structure=None):
+    """Same result as scipy.ndimage.grey_erosion(input, footprint=footprint,
+    structure=structure) for a 2-D input and an odd-sized footprint:
+    min over d in footprint of input(x + d) - structure(d).
+    structure None means flat (all zeros)."""
+    input = np.asarray(input)
+    footprint = np.asarray(footprint, dtype=bool)
+    kh, kw = footprint.shape
+    if input.ndim != 2 or kh % 2 == 0 or kw % 2 == 0:
+        raise ValueError("grey_erosion needs a 2-D input and an odd-sized footprint.")
+    if not footprint.any():
         raise ValueError("grey_erosion needs a footprint with at least one True element.")
+    if structure is None:
+        structure = np.zeros(footprint.shape, dtype=np.float64)
+    else:
+        structure = np.asarray(structure)
+    ry = kh // 2
+    H = input.shape[0]
+    # numpy's "symmetric" padding is scipy's "reflect" border mode.
+    padded = np.pad(input, ((ry, ry), (0, 0)), mode="symmetric")
+    tile = max(_MIN_TILE_KERNELS * kh, _MIN_TILE_ROWS, -(-H // _POOL._max_workers))
+    if tile >= H:
+        return _rows_erosion(padded, footprint, structure, H)
+    # scipy's result has the input's dtype.
+    out = np.empty(input.shape, dtype=padded.dtype)
+
+    def tile_job(r0):
+        r1 = min(H, r0 + tile)
+        out[r0:r1] = _rows_erosion(padded[r0:r1 + 2 * ry], footprint, structure, r1 - r0)
+
+    list(_POOL.map(tile_job, range(0, H, tile)))
     return out
 
 

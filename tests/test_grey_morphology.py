@@ -99,6 +99,31 @@ for rad in (1, 5, 20):
               np.array_equal(gm.grey_opening(img, fp),
                              ndi.grey_opening(img, footprint=fp)))
 
+print("Matches scipy when split into row tiles")
+# Tall enough for several tiles whatever the core count; the last tile is
+# shorter than the others.
+_, fp_ball = _build_kernel(Tool("Ball", 2.0), px_per_mm, max_depth)
+ball = -_build_kernel(Tool("Ball", 2.0), px_per_mm, max_depth)[0].astype(np.float64)
+for H in (gm._MIN_TILE_ROWS * 3 + 17, 1000):
+    tall = rng.random((H, 90))
+    n_tiles = -(-H // max(gm._MIN_TILE_KERNELS * fp_ball.shape[0], gm._MIN_TILE_ROWS,
+                          -(-H // gm._POOL._max_workers)))
+    check(f"{H} rows split into {n_tiles} tiles", n_tiles > 1)
+    check(f"erosion  ball {H} rows",
+          np.array_equal(gm.grey_erosion(tall, fp_ball, ball),
+                         ndi.grey_erosion(tall, footprint=fp_ball, structure=ball)))
+    check(f"dilation ball {H} rows",
+          np.array_equal(gm.grey_dilation(tall, fp_ball, ball),
+                         ndi.grey_dilation(tall, footprint=fp_ball, structure=ball)))
+    check(f"erosion  flat disk {H} rows",
+          np.array_equal(gm.grey_erosion(tall, disk(12).astype(bool)),
+                         ndi.grey_erosion(tall, footprint=disk(12).astype(bool))))
+tall32 = rng.random((1000, 90)).astype(np.float32)
+check("tiled float32 in, float32 out, matches scipy",
+      gm.grey_erosion(tall32, fp_ball, ball).dtype == np.float32
+      and np.array_equal(gm.grey_erosion(tall32, fp_ball, ball),
+                         ndi.grey_erosion(tall32, footprint=fp_ball, structure=ball)))
+
 print("Keeps the input dtype")
 img32 = rng.random((40, 40)).astype(np.float32)
 fp = disk(4).astype(bool)
