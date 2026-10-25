@@ -688,7 +688,8 @@ This model needs every vertical line through the tool to meet it in one stretch.
    - **Cost**: the two morphology passes run only in windows around pixels that use a gap. Elsewhere g is the clear-sky margin.
 5. **Undercut zone** — Free but not clear sky: positions that only a sideways move reaches.
 6. **Rings** — The waterline is the zero contour of g (`skimage.find_contours`, sub-pixel). Roughing rings are contours of the free set's distance transform at multiples of Step-over.
-   - **Which stretches**: only stretches inside the undercut zone are cut, each extended by one point into clear sky.
+   - **Which stretches**: only stretches inside the undercut zone are cut, each extended by one point into clear sky. A contour point counts as inside where it isn't clear sky and the gap gives it more room than a plunge (g above the clear-sky margin). Testing the clear-sky margin alone would fail on a waterline that clear sky forms by itself (an ordinary wall next to an overhang): there g equals the clear-sky margin and both sit at the threshold, so the test flips from point to point and breaks the wall into tiny stretches.
+   - **Bridging**: a stretch outside the zone between two cut stretches of one contour is cut along the contour too, if it's no longer than the link limit below. Every contour point is free, and following the contour is cheaper than an escape, retract, plunge and re-entry.
    - **Orientation**: Climb reverses every contour, by Contour's rule.
    - **Order**: at each level, rings are cut from the outermost (nearest open sky) inward, so each ring takes one Step-over and the waterline comes last.
 7. **Escape paths** — Per level, a minimum-cost path search (`skimage.graph.MCP_Geometric`) runs inside the free set, eroded by a pixel so links can't graze the part, from the clear-sky set, also eroded by a pixel.

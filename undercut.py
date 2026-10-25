@@ -207,12 +207,41 @@ def _segment_free(field, p, q, thr):
     return bool(np.all(_sample(field, p + (q - p) * t) >= thr))
 
 
-def _split_runs(pts, in_u, closed):
+def _bridge_gaps(pts, in_u, closed, max_len):
+    """in_u with every stretch outside the zone that lies between two points
+    inside it and spans at most max_len of contour arc length marked inside.
+    For a closed contour pts holds each point once and wraps around."""
+    n = len(pts)
+    if in_u.all() or not in_u.any():
+        return in_u
+    nxt = np.roll(pts, -1, axis=0) if closed else pts[1:]
+    seg = np.hypot(*(nxt - pts[:len(nxt)]).T)
+    t = int(np.argmax(in_u)) if closed else 0
+    order = (np.arange(n) + t) % n
+    u = in_u[order]
+    cum = np.r_[0.0, np.cumsum(seg[order] if closed else seg)]
+    edges = np.diff(np.r_[0, (~u).astype(np.int8), 0])
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        if a == 0 or (b == n and not closed):
+            continue
+        if cum[b] - cum[a - 1] <= max_len:
+            u[a:b] = True
+    out = np.empty_like(in_u)
+    out[order] = u
+    return out
+
+
+def _split_runs(pts, in_u, closed, max_gap):
     """Split a contour into runs of points inside the undercut zone, each
     extended by one neighbouring point outside it (which lies in clear sky)
-    where there is one. Returns [(points, is_closed)]."""
+    where there is one. Stretches outside the zone of at most max_gap arc
+    length between two runs are kept in the run: the contour is free
+    throughout, and following it is cheaper than an escape and re-entry.
+    Returns [(points, is_closed)]."""
     if closed:
         pts, in_u = pts[:-1], in_u[:-1]
+    in_u = _bridge_gaps(pts, in_u, closed, max_gap)
+    if closed:
         if in_u.all():
             return [(pts, True)]
         k = int(np.argmin(in_u))            # first point outside the zone
@@ -463,10 +492,15 @@ def compute_undercut_toolpath(
                     if reverse:
                         c = c[::-1]
                     closed = np.allclose(c[0], c[-1])
-                    in_u = _sample(lev.g_sky, c) < -eps
+                    # Undercut only where the gap gives more room than a
+                    # plunge: on a waterline the sky alone forms, g and
+                    # g_sky are equal and sit at the threshold, where a test
+                    # of g_sky alone flips from point to point.
+                    gs = _sample(lev.g_sky, c)
+                    in_u = (gs < -eps) & (_sample(lev.g, c) - gs > eps)
                     if not in_u.any():
                         continue
-                    runs_j.extend(_split_runs(c, in_u, closed))
+                    runs_j.extend(_split_runs(c, in_u, closed, link_max_px))
                 if runs_j:
                     ring_runs.append(runs_j)
             if not ring_runs:

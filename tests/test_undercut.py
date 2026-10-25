@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -90,15 +91,15 @@ def tool_sample_points(tool, shrink):
     return np.array(pts)
 
 
-def collisions(tp, tool, shrink, dz=0.0):
+def collisions(tp, tool, shrink, dz=0.0, solid=cone_solid):
     """Path points at which the sampled tool (its tip *dz* mm below the
-    path's tip) intersects the cone."""
+    path's tip) intersects *solid*."""
     body = tool_sample_points(tool, shrink)
     hits = 0
     for seg in tp.segments:
         for x, y, z in seg:
-            hits += int(cone_solid(body[:, 0] + x, body[:, 1] + y,
-                                   body[:, 2] + z + dz).any())
+            hits += int(solid(body[:, 0] + x, body[:, 1] + y,
+                              body[:, 2] + z + dz).any())
     return hits
 
 
@@ -436,6 +437,39 @@ for t_tool in (Tool("T-Slot", 6.0, neck_diameter_mm=3.0, head_height_mm=1.5),
     check(f"{t_tool.profile}: chains start and end plunge-clear",
           all(plunge_ok(*s_[0], t_tool, 0.15) and plunge_ok(*s_[-1], t_tool, 0.15)
               for s_ in tp_t.segments))
+
+
+print("undercut toolpath: overhang on one side only")
+# Right half overhangs as before; the left half is a plain vertical wall at
+# RB, whose waterline clear sky forms by itself.
+_rows, _cols = np.mgrid[0:N_PX, 0:N_PX]
+_x, _y = _cols / PX, (N_PX - 1 - _rows) / PX
+_r = np.hypot(_x - AXIS[0], _y - AXIS[1])
+_right = _x > AXIS[0]
+depth_h = np.where((_r < RB) | ((_r < RT) & _right), 0.0, 1.0).astype(np.float32)
+_pix = np.flatnonzero(((_r > RB) & (_r < RT) & _right).ravel())
+gaps_h = Gaps.from_lists((N_PX, N_PX), _pix, 1.0 - (_r.ravel()[_pix] - RB) / (RT - RB),
+                         np.ones(_pix.size))
+
+
+def half_cone_solid(xs, ys, zs):
+    """The cone on its right half, a cylinder of radius RB on its left; the
+    face between them half a pixel right of the axis, where the pixel grid
+    puts it."""
+    zr = zs + HC
+    in_cyl = (zr >= 0) & (zs <= 0) & (np.hypot(xs - AXIS[0], ys - AXIS[1]) <= RB)
+    return np.where(xs > AXIS[0] + 0.5 / PX, cone_solid(xs, ys, zs), (zr < 0) | in_cyl)
+
+
+tp_h = compute_undercut_toolpath(depth_h, gaps_h, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                 previous_result=depth_h.copy())
+lens_h = [np.hypot(*np.diff(np.array(s)[:, :2], axis=0).T).sum() for s in tp_h.segments]
+check("one chain per level, not fragments along the plain wall",
+      len(tp_h.segments) == len({s[0][2] for s in tp_h.segments}) and min(lens_h) > 20.0)
+# The overhang side is the cone test's; check the plain-wall side here.
+tp_h_left = SimpleNamespace(segments=[[p for p in s if p[0] < AXIS[0]] for s in tp_h.segments])
+check("one-sided overhang: no tool/part collision along the plain wall",
+      collisions(tp_h_left, tool, 0.15, solid=half_cone_solid) == 0)
 
 
 print("undercut toolpath: stock to leave")
