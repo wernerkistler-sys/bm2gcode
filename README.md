@@ -438,6 +438,8 @@ Adding an STL as an additional source (via a source tab's or the Canvas tab's **
 | G-code Preamble | G-code inserted before the cutting program (spindle start, dwell, etc.). |
 | G-code Postamble | G-code inserted after cutting (spindle stop, return to home, etc.). |
 
+These settings are saved with the project, and opening a project restores them. **Save as Default** saves the dialog's current values as the user-wide defaults, which apply at startup and to every **New Project**. They're stored in `%APPDATA%\bm2gcode\machine_defaults.json` on Windows and in `~/.config/bm2gcode/machine_defaults.json` elsewhere. **Use Defaults** loads the saved defaults into the dialog, for example to update an older project; they take effect when you click OK. Until defaults are saved, the built-in values are used. If the file can't be read, it is renamed to `machine_defaults.json.bak`, a warning is shown, and the built-in values are used instead. A project file that lacks a setting gets it from the defaults.
+
 Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step instead, via the **Dress-up…** button on each step's tab — see [Step / Dress-up](#step--dress-up) above.
 
 ---
@@ -459,7 +461,7 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 ##### Tool Library
 
-The tool library is a list of cutting tools shared by all projects. It lives in one file outside any project: `%APPDATA%m2gcode	ool_library.json` on Windows, `~/.config/bm2gcode/tool_library.json` elsewhere. On first run it is created with a 6 mm end mill, a 3 mm ball nose and a 60° V-bit, with cutting data for Softwood, Hardwood and MDF. If the file can't be read, it is renamed to `tool_library.json.bak`, a warning is shown, and the starter library is used instead.
+The tool library is a list of cutting tools shared by all projects. It lives in one file outside any project: `%APPDATA%\bm2gcode\tool_library.json` on Windows, `~/.config/bm2gcode/tool_library.json` elsewhere. On first run it is created with a 6 mm end mill, a 3 mm ball nose and a 60° V-bit, with cutting data for Softwood, Hardwood and MDF. If the file can't be read, it is renamed to `tool_library.json.bak`, a warning is shown, and the starter library is used instead.
 
 Each tool has a name, tool number, profile, diameter, number of flutes, V-bit angle, custom profile curve, flute length, shank diameter, overall length, rated maximum spindle speed and notes, plus cutting data per material: feed rate, plunge rate, spindle speed and max step-down. A shank diameter of 0 means the shank is as wide as the cutter; an overall length of 0 means it isn't specified, and a maximum spindle speed of 0 means the tool sets no limit. Undercut cutters (Lollipop, T-Slot, Dovetail) also have a neck diameter, neck length, head height and dovetail angle, each editable only for the profiles that use it; for them, a shank diameter of 0 (or one no wider than the neck) means the neck runs all the way up, and these fields together with the shank diameter are copied into Undercut steps and shape their toolpaths. Otherwise, shank diameter and overall length only describe the tool and shape its preview, and the number of flutes and the maximum spindle speed are used only for [cutting recommendations](#cutting-recommendations); none of these is copied into steps or affects toolpaths. Stepover isn't part of the library — it describes the finish a step wants, so it stays a step setting.
 

@@ -12,6 +12,7 @@ from tool import UNDERCUT_FIELDS
 from tool_library import (ToolLibrary, ToolDef, Material, CuttingData,
                           new_id, format_value, recommend_cutting,
                           FZ_DIAMETERS_MM, MATERIAL_PRESETS, PLUNGE_FRACTION)
+import machine_defaults
 import stl_mesh
 import tool_profile
 
@@ -413,9 +414,13 @@ def _fmt_time(minutes):
 class SettingsDialog(tk.Toplevel):
     """Modal dialog for editing global G-code settings (z_safe, feed_rapid,
     acceleration, spindle spin-up dwell, spindle speed range, max feed rate,
-    preamble, postamble).  Modifies *settings* dict in-place on OK."""
+    preamble, postamble).  Modifies *settings* dict in-place on OK.
 
-    def __init__(self, parent, settings):
+    *defaults* holds the user-wide default machine settings: Save as Default
+    writes the dialog's values to *defaults_path* and into *defaults*, Use
+    Defaults fills the dialog with them."""
+
+    def __init__(self, parent, settings, defaults, defaults_path):
         super().__init__(parent)
         self.title("Settings")
         self.resizable(True, True)
@@ -424,6 +429,8 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
 
         self._settings = settings
+        self._defaults = defaults
+        self._defaults_path = defaults_path
         self.confirmed = False
 
         outer = ttk.Frame(self, padding=16)
@@ -501,6 +508,10 @@ class SettingsDialog(tk.Toplevel):
         btn_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Save as Default",
+                   command=self._save_as_default).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Use Defaults",
+                   command=self._use_defaults).pack(side=tk.LEFT, padx=(6, 0))
 
         # Centre on parent
         self.update_idletasks()
@@ -544,7 +555,9 @@ class SettingsDialog(tk.Toplevel):
         self._post_text.delete('1.0', tk.END)
         self._post_text.insert('1.0', self._default_postamble())
 
-    def _confirm(self):
+    def _read_fields(self):
+        """The dialog's values as a settings dict, or None (after an error
+        message) when a numeric field isn't a number."""
         try:
             z_safe      = float(self._z_safe.get())
             feed_rapid  = float(self._feed_rapid.get())
@@ -559,7 +572,7 @@ class SettingsDialog(tk.Toplevel):
                                  "spindle spin-up dwell, spindle speeds and max "
                                  "feed rate must be numbers.",
                                  parent=self)
-            return
+            return None
 
         preamble  = self._pre_text.get('1.0', tk.END).rstrip('\n')
         postamble = self._post_text.get('1.0', tk.END).rstrip('\n')
@@ -571,15 +584,53 @@ class SettingsDialog(tk.Toplevel):
         if postamble == self._default_postamble():
             postamble = ''
 
-        self._settings['z_safe']      = z_safe
-        self._settings['feed_rapid']  = feed_rapid
-        self._settings['accel_mm_s2'] = accel_mm_s2
-        self._settings['spindle_dwell_s'] = max(0.0, dwell_s)
-        self._settings['spindle_max_rpm'] = max(0.0, max_rpm)
-        self._settings['spindle_min_rpm'] = max(0.0, min_rpm)
-        self._settings['feed_max']        = max(0.0, feed_max)
-        self._settings['preamble']    = preamble
-        self._settings['postamble']   = postamble
+        return {
+            'z_safe':          z_safe,
+            'feed_rapid':      feed_rapid,
+            'accel_mm_s2':     accel_mm_s2,
+            'spindle_dwell_s': max(0.0, dwell_s),
+            'spindle_max_rpm': max(0.0, max_rpm),
+            'spindle_min_rpm': max(0.0, min_rpm),
+            'feed_max':        max(0.0, feed_max),
+            'preamble':        preamble,
+            'postamble':       postamble,
+        }
+
+    def _save_as_default(self):
+        values = self._read_fields()
+        if values is None:
+            return
+        try:
+            machine_defaults.save(self._defaults_path, values)
+        except OSError as exc:
+            messagebox.showerror("Save as Default",
+                                 f"The default settings could not be saved:\n{exc}",
+                                 parent=self)
+            return
+        self._defaults.update(values)
+        messagebox.showinfo("Save as Default",
+                            "These settings are now the defaults for new "
+                            "projects.", parent=self)
+
+    def _use_defaults(self):
+        d = self._defaults
+        self._z_safe.set(str(d['z_safe']))
+        self._feed_rapid.set(str(d['feed_rapid']))
+        self._accel.set(str(d['accel_mm_s2']))
+        self._dwell.set(str(d['spindle_dwell_s']))
+        self._max_rpm.set(str(d['spindle_max_rpm']))
+        self._min_rpm.set(str(d['spindle_min_rpm']))
+        self._feed_max.set(str(d['feed_max']))
+        self._pre_text.delete('1.0', tk.END)
+        self._pre_text.insert('1.0', d['preamble'] or self._default_preamble())
+        self._post_text.delete('1.0', tk.END)
+        self._post_text.insert('1.0', d['postamble'] or self._default_postamble())
+
+    def _confirm(self):
+        values = self._read_fields()
+        if values is None:
+            return
+        self._settings.update(values)
         self.confirmed = True
         self.grab_release()
         self.destroy()
@@ -729,6 +780,10 @@ class DressUpDialog(tk.Toplevel):
         btn_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Save as Default",
+                   command=self._save_as_default).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Use Defaults",
+                   command=self._use_defaults).pack(side=tk.LEFT, padx=(6, 0))
 
         # Centre on parent
         self.update_idletasks()
@@ -2479,6 +2534,10 @@ class ExportToolpathDialog(tk.Toplevel):
         btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Save as Default",
+                   command=self._save_as_default).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Use Defaults",
+                   command=self._use_defaults).pack(side=tk.LEFT, padx=(6, 0))
 
         # Centre on parent
         self.update_idletasks()

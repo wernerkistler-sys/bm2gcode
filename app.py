@@ -68,6 +68,7 @@ from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state
                           SYNC_MISSING, SYNC_NO_DATA)
 from dressup import RampSettings, BackoffSettings, ArcSettings, TabSettings
 import layers as layers_mod
+import machine_defaults
 import stl_mesh
 import tool_profile
 
@@ -118,17 +119,12 @@ class GCodeGeneratorApp:
         self.root.geometry("1240x780")
         self.root.minsize(940, 560)
 
-        self._settings = {
-            'z_safe':      float(DEFAULTS['z_safe']),
-            'feed_rapid':  float(DEFAULTS['feed_rapid']),
-            'accel_mm_s2': float(DEFAULTS['accel_mm_s2']),
-            'spindle_dwell_s': float(DEFAULTS['spindle_dwell_s']),
-            'spindle_max_rpm': float(DEFAULTS['spindle_max_rpm']),
-            'spindle_min_rpm': float(DEFAULTS['spindle_min_rpm']),
-            'feed_max':        float(DEFAULTS['feed_max']),
-            'preamble':    DEFAULTS['preamble'],
-            'postamble':   DEFAULTS['postamble'],
-        }
+        # User-wide default machine settings, which seed the settings of the
+        # startup project and of every new project.
+        self._machine_defaults_path = machine_defaults.default_path()
+        self._machine_defaults, defaults_warning = machine_defaults.load(
+            self._machine_defaults_path)
+        self._settings = dict(self._machine_defaults)
 
         # User-wide tool library (outside any project) and the project's
         # material, which picks each linked step's cutting data.
@@ -177,6 +173,9 @@ class GCodeGeneratorApp:
         if library_warning:
             self.root.after(200, lambda: messagebox.showwarning(
                 "Tool Library", library_warning))
+        if defaults_warning:
+            self.root.after(200, lambda: messagebox.showwarning(
+                "Settings", defaults_warning))
 
     # ------------------------------------------------------------------ #
     #  Menu
@@ -2496,7 +2495,8 @@ class GCodeGeneratorApp:
             f"{len(triangles)} triangles")
 
     def _open_settings(self):
-        dlg = SettingsDialog(self.root, self._settings)
+        dlg = SettingsDialog(self.root, self._settings, self._machine_defaults,
+                             self._machine_defaults_path)
         if dlg.confirmed:
             self._refresh_stats_and_view()
 
@@ -3247,15 +3247,7 @@ class GCodeGeneratorApp:
         self.origin_var.set(DEFAULTS['origin'])
         self._set_project_material(*self._default_material())
 
-        self._settings['z_safe']      = float(DEFAULTS['z_safe'])
-        self._settings['feed_rapid']  = float(DEFAULTS['feed_rapid'])
-        self._settings['accel_mm_s2'] = float(DEFAULTS['accel_mm_s2'])
-        self._settings['spindle_dwell_s'] = float(DEFAULTS['spindle_dwell_s'])
-        self._settings['spindle_max_rpm'] = float(DEFAULTS['spindle_max_rpm'])
-        self._settings['spindle_min_rpm'] = float(DEFAULTS['spindle_min_rpm'])
-        self._settings['feed_max']        = float(DEFAULTS['feed_max'])
-        self._settings['preamble']    = DEFAULTS['preamble']
-        self._settings['postamble']   = DEFAULTS['postamble']
+        self._settings.update(self._machine_defaults)
 
         while len(self.steps) > 1:
             self._remove_step(self.steps[-1])
@@ -3389,18 +3381,8 @@ class GCodeGeneratorApp:
 
         # ── Machine settings ──────────────────────────────────────────
         m = project.get('machine', {})
-        self._settings['z_safe']      = m.get('z_safe',      self._settings['z_safe'])
-        self._settings['feed_rapid']  = m.get('feed_rapid',  self._settings['feed_rapid'])
-        self._settings['accel_mm_s2'] = m.get('accel_mm_s2', self._settings['accel_mm_s2'])
-        self._settings['spindle_dwell_s'] = m.get('spindle_dwell_s',
-                                                  float(DEFAULTS['spindle_dwell_s']))
-        self._settings['spindle_max_rpm'] = m.get('spindle_max_rpm',
-                                                  float(DEFAULTS['spindle_max_rpm']))
-        self._settings['spindle_min_rpm'] = m.get('spindle_min_rpm',
-                                                  float(DEFAULTS['spindle_min_rpm']))
-        self._settings['feed_max']        = m.get('feed_max', float(DEFAULTS['feed_max']))
-        self._settings['preamble']    = m.get('preamble',    self._settings['preamble'])
-        self._settings['postamble']   = m.get('postamble',   self._settings['postamble'])
+        for k in machine_defaults.KEYS:
+            self._settings[k] = m.get(k, self._machine_defaults[k])
 
         # ── Steps ─────────────────────────────────────────────────────
         step_dicts = project.get('steps', [])
