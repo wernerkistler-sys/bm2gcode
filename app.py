@@ -2109,6 +2109,15 @@ class GCodeGeneratorApp:
             return self.steps[idx]
         return None
 
+    def _background_depth(self):
+        """Canvas background depth as a fraction of full depth (the field's
+        default while it doesn't parse)."""
+        try:
+            background_depth_pct = float(self.background_depth_pct.get())
+        except ValueError:
+            background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
+        return background_depth_pct / 100.0
+
     def _composite_with_visibility(self, visibility):
         """Composite self.layers onto the current canvas shape, gating
         source visibility via *visibility* (a list index-aligned with
@@ -2125,14 +2134,9 @@ class GCodeGeneratorApp:
             width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
         px_per_mm_x = W / width_mm if width_mm > 1e-9 else 1.0
         px_per_mm_y = H / height_mm if height_mm > 1e-9 else 1.0
-        try:
-            background_depth_pct = float(self.background_depth_pct.get())
-        except ValueError:
-            background_depth_pct = float(DEFAULTS["canvas_background_depth_pct"])
-
         composite_raw = layers_mod.composite(
             self.layers, (H, W), px_per_mm_x, px_per_mm_y, self.surface.get(),
-            background_depth=background_depth_pct / 100.0,
+            background_depth=self._background_depth(),
             visibility_override=visibility,
             origin=self.origin_var.get())
         n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, composite_raw)
@@ -3763,6 +3767,7 @@ class GCodeGeneratorApp:
                 'px_per_mm_x':       W / width_mm,
                 'px_per_mm_y':       H / height_mm,
                 'surface':           self.surface.get(),
+                'background_depth':  self._background_depth(),
                 'margin_pad':        (pad_y, pad_x),
             })
         else:  # Raster
@@ -4629,7 +4634,7 @@ class GCodeGeneratorApp:
             params['layers'], (H, W), params['px_per_mm_x'], params['px_per_mm_y'],
             params['surface'], composite_depth,
             visibility_override=list(params['source_visibility']),
-            origin=params['origin'])
+            origin=params['origin'], background_depth=params['background_depth'])
         return layers_mod.pad_gaps(gaps, pad_y, pad_x), gap_warnings
 
     def _overhang_masks(self, visibility, depth_map):
@@ -4655,6 +4660,7 @@ class GCodeGeneratorApp:
             'px_per_mm_y':       H / height_mm,
             'surface':           self.surface.get(),
             'origin':            self.origin_var.get(),
+            'background_depth':  self._background_depth(),
             'margin_pad':        self._margin_pad_px(H, W),
         }
         stl_layers = self._visible_stl_layers(params)

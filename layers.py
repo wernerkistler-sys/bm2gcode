@@ -445,20 +445,30 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
                    composite_depth: np.ndarray,
                    visibility_override: Optional[List[bool]] = None,
                    origin: str = "Bottom-Left",
-                   tol: float = 1e-4) -> Tuple[Gaps, List[str]]:
+                   tol: float = 1e-4,
+                   background_depth: float = 0.0) -> Tuple[Gaps, List[str]]:
     """The undercut gaps of the visible STL layers on the canvas grid.
 
     composite_depth is composite()'s result in canonical depth (to_depth of
-    its raw output). A layer's gaps are adopted at a canvas pixel only where
-    that layer alone produces the composite's top surface there (its own
-    placed depth matches composite_depth within *tol*, at full coverage and
-    opacity), so the composite stays authoritative for the top surface
-    whatever the blend modes; where several layers qualify, the topmost
-    wins. Gaps are read from the nearest layer column (placement, rotation,
-    scale and Mirror as in resample_layer), clipped at full depth, and
-    dropped when they start within *tol* of it or below it -- a bottom face
-    resting on full depth maps to it only up to rounding, and must not
-    leave a zero-height gap there.
+    its raw output), and background_depth the one it was built with. A
+    layer's gaps are adopted at a canvas pixel only where that layer
+    produces the composite's top surface there, so the composite stays
+    authoritative for the top surface whatever the blend modes; where
+    several layers qualify, the topmost wins. At full coverage (and full
+    opacity) that is where its own placed depth matches composite_depth
+    within *tol*. At partial coverage c, as along the layer's outline when
+    it is resampled, it is where composite_depth is c times its depth plus
+    1 - c times the composite of the layers beneath it (the background
+    alone for the bottom layer): the layer replacing what is beneath over
+    part of the pixel. What is beneath is taken as solid from its top down,
+    so there the layer's air (above its top and in its gaps) only counts
+    between composite_depth and that top.
+
+    Gaps are read from the nearest layer column (placement, rotation, scale
+    and Mirror as in resample_layer; none outside the layer's raster),
+    clipped at full depth, and dropped when they start within *tol* of it
+    or below it -- a bottom face resting on full depth maps to it only up
+    to rounding, and must not leave a zero-height gap there.
 
     Layers without dexels are ignored. Returns (gaps, warnings).
     """
@@ -466,6 +476,8 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
     warnings = []
     owner = np.full(H * W, -1, np.int64)        # source column per canvas pixel
     owner_layer = np.full(H * W, -1, np.int64)
+    owner_cap = np.full(H * W, np.inf)          # top of the solid beneath, partial coverage
+    flat_depth = composite_depth.ravel()
     affines = {}
     for i, layer in enumerate(layers):
         if visibility_override is not None and i < len(visibility_override):
@@ -486,14 +498,26 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
                             f"undercuts are ignored.")
             continue
         affines[i] = ab
+        if layer.opacity_pct < 100.0:
+            continue
 
         resampled, coverage = resample_layer(layer, canvas_shape, px_per_mm_x,
                                              px_per_mm_y, origin)
         min_frac, max_frac = layer.min_depth_pct / 100.0, layer.max_depth_pct / 100.0
         depth = np.clip(min_frac + (max_frac - min_frac)
                         * to_depth(resampled, surface, False), 0.0, 1.0)
-        wins = ((coverage >= 0.999) & (layer.opacity_pct >= 100.0)
-                & (np.abs(depth - composite_depth) <= tol)).ravel()
+        wins = (coverage >= 0.999) & (np.abs(depth - composite_depth) <= tol)
+        partial = (coverage > tol) & (coverage < 1.0) & ~wins
+        below = None
+        if partial.any():
+            below_vis = (list(visibility_override[:i]) if visibility_override is not None
+                         else None)
+            below = to_depth(composite(layers[:i], canvas_shape, px_per_mm_x, px_per_mm_y,
+                                       surface, background_depth, below_vis, origin),
+                             surface, False)
+            partial &= (np.abs(coverage * depth + (1.0 - coverage) * below
+                               - composite_depth) <= tol)
+        wins = (wins | partial).ravel()
         if not wins.any():
             continue
 
@@ -511,36 +535,68 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
             c_l = np.rint(src_rc[1]).astype(np.int64)
             ok = (r_l >= 0) & (r_l < H_l) & (c_l >= 0) & (c_l < W_l)
             src = np.where(ok, r_l * W_l + c_l, 0)
-        sel = wins & ok
-        owner[sel] = src[sel]
+        partial = partial.ravel()
+        sel = wins & (ok | partial)
+        owner[sel] = np.where(ok[sel], src[sel], -1)
         owner_layer[sel] = i
+        owner_cap[sel] = np.inf
+        if below is not None:
+            p = sel & partial
+            owner_cap[p] = below.ravel()[p]
 
     pix_out, ceil_out, floor_out = [], [], []
     for i, (a, b) in affines.items():
-        canvas_pix = np.flatnonzero(owner_layer == i)
-        if canvas_pix.size == 0:
-            continue
+        mine = owner_layer == i
         dex = layers[i].dexels
+
+        # Full coverage: the column's gaps below its top.
+        canvas_pix = np.flatnonzero(mine & np.isinf(owner_cap))
         src = owner[canvas_pix]
         start = dex.offsets[src]
         n_hits = dex.offsets[src + 1] - start
         n_gaps = n_hits // 2            # every exit hit opens a gap
         total = int(n_gaps.sum())
-        if total == 0:
+        if total:
+            col = np.repeat(np.arange(canvas_pix.size), n_gaps)
+            m = np.arange(total) - np.repeat(np.cumsum(n_gaps) - n_gaps, n_gaps)
+            col_start = start[col]
+            exit_idx = col_start + 2 * m + 1
+            enter_pos = 2 * m + 2
+            has_floor = enter_pos < n_hits[col]
+            ceil = a * dex.z[exit_idx] + b
+            floor = np.full(total, np.inf)
+            floor[has_floor] = a * dex.z[col_start[has_floor] + enter_pos[has_floor]] + b
+            keep = ceil < 1.0 - tol
+            pix_out.append(canvas_pix[col[keep]])
+            ceil_out.append(np.maximum(ceil[keep], 0.0))
+            floor_out.append(np.minimum(floor[keep], 1.0))
+
+        # Partial coverage: the column's air -- above its top (all of it for
+        # a column without hits) and in its gaps -- between the composite's
+        # top and the solid beneath.
+        canvas_pix = np.flatnonzero(mine & np.isfinite(owner_cap))
+        if canvas_pix.size == 0:
             continue
-        col = np.repeat(np.arange(canvas_pix.size), n_gaps)
-        m = np.arange(total) - np.repeat(np.cumsum(n_gaps) - n_gaps, n_gaps)
-        col_start = start[col]
-        exit_idx = col_start + 2 * m + 1
-        enter_pos = 2 * m + 2
-        has_floor = enter_pos < n_hits[col]
-        ceil = a * dex.z[exit_idx] + b
-        floor = np.full(total, np.inf)
-        floor[has_floor] = a * dex.z[col_start[has_floor] + enter_pos[has_floor]] + b
-        keep = ceil < 1.0 - tol
+        src = owner[canvas_pix]
+        has_src = src >= 0
+        start = np.where(has_src, dex.offsets[np.maximum(src, 0)], 0)
+        n_hits = np.where(has_src, dex.offsets[np.maximum(src, 0) + 1] - start, 0)
+        n_air = n_hits // 2 + 1
+        col = np.repeat(np.arange(canvas_pix.size), n_air)
+        m = np.arange(col.size) - np.repeat(np.cumsum(n_air) - n_air, n_air)
+        col_start, col_hits = start[col], n_hits[col]
+        ceil = np.full(col.size, -np.inf)
+        above = m > 0
+        ceil[above] = a * dex.z[col_start[above] + 2 * m[above] - 1] + b
+        floor = np.full(col.size, np.inf)
+        has_floor = 2 * m < col_hits
+        floor[has_floor] = a * dex.z[col_start[has_floor] + 2 * m[has_floor]] + b
+        ceil = np.maximum(ceil, flat_depth[canvas_pix[col]])
+        floor = np.minimum(np.minimum(floor, owner_cap[canvas_pix[col]]), 1.0)
+        keep = (floor > ceil) & (ceil < 1.0 - tol)
         pix_out.append(canvas_pix[col[keep]])
         ceil_out.append(np.maximum(ceil[keep], 0.0))
-        floor_out.append(np.minimum(floor[keep], 1.0))
+        floor_out.append(floor[keep])
 
     if not pix_out:
         return Gaps.empty((H, W)), warnings

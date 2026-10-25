@@ -195,6 +195,12 @@ check("depth inside gap 1 uses gap 1", F[0, 1] == 0.8 and C[0, 1] == 0.6)
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.25)
 check("depth above every gap ceiling: no gap", F[0, 2] == 0.1 and not act[0, 2])
 
+g_top = Gaps.from_lists((1, 2), [0, 1], [0.3, 0.2], [0.9, 0.9])
+F, C, act = _floor_ceil_at(g_top, g_top.pixel_index(), np.array([[0.3, 0.3]]), 0.5)
+check("a gap starting at the top surface has open sky above",
+      F[0, 0] == 0.9 and C[0, 0] < -1e5 and act[0, 0])
+check("a gap starting above the top surface keeps its ceiling", C[0, 1] == 0.2)
+
 rg = _resample_gaps(g, (1, 5))
 check("nearest resample keeps each column's gaps",
       list(rg.counts[0]) == [0, 0, 2, 1, 1]
@@ -406,6 +412,34 @@ plate_only = (rr > RT + 0.3) & (np.abs(xx) < 19.5) & (np.abs(yy) < 19.5)
 check("a floating mesh: open-bottom under its bottom face, closed under the flank",
       np.all(open_sh[plate_only]) and np.all(closed_sh[under])
       and not (open_sh & closed_sh).any())
+
+
+# Partial coverage: the bicone (a floating lens: its lower half overhangs
+# open air) shifted by a fraction of a pixel, so its outline pixels are
+# partly covered and blend with what lies beneath.
+raw_b, alpha_b = normalize_and_orient(generate_heightmap(bic, 81, 81), mesh_z_bounds(bic))
+lens = Layer(name="lens", raw=raw_b, source_kind="stl", alpha=alpha_b, offset_x_mm=0.1)
+lens.dexels = dex_b
+ppm_b = 80 / 20.0
+_, cov_l = __import__("layers").resample_layer(lens, (81, 81), ppm_b, ppm_b)
+edge_l = (cov_l > 1e-3) & (cov_l < 0.999)
+for bg in (1.0, 0.0):
+    comp_l = to_depth(composite([lens], (81, 81), ppm_b, ppm_b, "white", background_depth=bg),
+                      "white", False)
+    gl, _ = composite_gaps([lens], (81, 81), ppm_b, ppm_b, "white", comp_l,
+                           background_depth=bg)
+    pix_l = gl.pixel_index()
+    on_edge = edge_l.ravel()[pix_l]
+    if bg == 1.0:
+        open_to_bed = np.zeros(81 * 81, bool)
+        open_to_bed[pix_l[gl.floor >= 1.0]] = True
+        check("partly covered outline over a full-depth background: air down to it",
+              edge_l.sum() > 20 and np.all(open_to_bed.reshape(81, 81)[edge_l]))
+        check("partly covered outline: gaps start at or below the composite top",
+              np.all(gl.ceil[on_edge] >= comp_l.ravel()[pix_l[on_edge]] - 1e-9))
+    else:
+        check("partly covered outline over uncut stock: no air below its top",
+              not on_edge.any() and gl.counts[~edge_l & (cov_l >= 0.999)].sum() > 0)
 
 
 def _box(x0, x1, y0, y1, z0, z1):

@@ -23,6 +23,7 @@ from toolpath import ToolPath
 SKY  = -2.0e6   # ceiling of a column with nothing overhead
 NECK = 1.0e6    # tool top over the neck: the neck runs up without end
 MAX_BANDS = 8   # underside-height bands a footprint is split into at most
+TOP_EPS = 1e-6  # a gap ceiling this close to the top surface opens to the sky
 
 
 def equivalent_2p5d_tool(tool):
@@ -132,8 +133,10 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
     tool's underside in that column): the deepest gap starting above d
     (the solid containing d, or the air just above it, lies below that
     gap's ceiling). Columns with no such gap have the top surface as floor
-    and open sky above. Returns (F, C, active) with active marking the
-    columns that use a gap."""
+    and open sky above. A gap whose ceiling is the top surface itself
+    (within TOP_EPS) has open sky above it too: no solid lies between.
+    Returns (F, C, active) with active marking the columns that use a
+    gap."""
     F = top.astype(np.float64).copy()
     C = np.full(top.shape, SKY)
     active = np.zeros(top.shape, bool)
@@ -141,9 +144,11 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
     if idx.size:
         pix = gap_pix[idx]
         last = idx[np.r_[pix[1:] != pix[:-1], True]]
-        F.flat[gap_pix[last]] = gaps.floor[last]
-        C.flat[gap_pix[last]] = gaps.ceil[last]
-        active.flat[gap_pix[last]] = True
+        cols = gap_pix[last]
+        ceil = gaps.ceil[last]
+        F.flat[cols] = gaps.floor[last]
+        C.flat[cols] = np.where(np.abs(ceil - top.flat[cols]) <= TOP_EPS, SKY, ceil)
+        active.flat[cols] = True
     return F, C, active
 
 
