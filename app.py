@@ -4166,6 +4166,7 @@ class GCodeGeneratorApp:
         self._settle_auto_resolution()
         if not self._confirm_stale_stl_sources():
             return
+        self._place_stl_sources()
 
         idx = self.steps.index(step)
         try:
@@ -4266,6 +4267,7 @@ class GCodeGeneratorApp:
             return
         if not self.steps:
             return
+        self._place_stl_sources()
 
         # Validate every step upfront so the dialog never opens on bad input,
         # and precompute each step's own depth map here on the main thread
@@ -4586,7 +4588,7 @@ class GCodeGeneratorApp:
         if not stl_layers:
             raise ValueError("Undercut needs at least one visible STL source: "
                              "image sources carry no undercut geometry.")
-        warnings = self._ensure_dexels(stl_layers, progress_fn)
+        warnings = self._ensure_dexels(stl_layers, params, progress_fn)
         gaps, gap_warnings = self._composite_gaps_padded(params, depth_map)
         return gaps, warnings + gap_warnings
 
@@ -4600,25 +4602,85 @@ class GCodeGeneratorApp:
                 and (visibility[i] if i < len(visibility) else layer.visible)]
 
     @staticmethod
-    def _ensure_dexels(stl_layers, progress_fn):
+    def _rotated_mesh(layer):
+        """The STL layer's mesh, loaded from its file and rotated as its
+        raster was (stl_params rot_x/rot_y/rot_z)."""
+        sp = layer.stl_params or {}
+        return stl_mesh.apply_rotation(stl_mesh.load_stl(layer.path), sp.get('rot_x', 0),
+                                       sp.get('rot_y', 0), sp.get('rot_z', 0))
+
+    def _place_stl_sources(self):
+        """Rasterize every STL source whose placement isn't 1:1 directly on
+        the canvas grid at that placement (layers.place_stl_layer), unless
+        its placed raster is still current, so a step is computed against
+        exact samples of the mesh rather than its raster resampled -- which
+        interpolates heights where the surface jumps, and leaves only part
+        of each outline pixel covered. Called on the main thread before a
+        step's depth map is built; the live preview keeps resampling while
+        a placement is being edited."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            return
+        W, H = self._canvas_shape_px()
+        if width_mm <= 0.0 or height_mm <= 0.0:
+            return
+        ppm_x, ppm_y = W / width_mm, H / height_mm
+        origin = self.origin_var.get()
+        todo = [layer for layer in self.layers
+                if layer.source_kind == "stl" and layer.path
+                and not (layer.is_identity_placement() and layer.raw.shape == (H, W))
+                and layers_mod.placed_raster(layer, (H, W), ppm_x, ppm_y, origin) is None]
+        if not todo:
+            return
+        self.root.config(cursor="watch")
+        try:
+            for layer in todo:
+                self.status_var.set(f"Rasterizing {layer.name} at its placement…")
+                self.root.update_idletasks()
+                try:
+                    layers_mod.place_stl_layer(layer, self._rotated_mesh(layer), (H, W),
+                                               ppm_x, ppm_y, origin)
+                except (OSError, ValueError) as exc:
+                    messagebox.showerror("Rasterize Error",
+                                         f"Could not rasterize {layer.name} at its "
+                                         f"placement:\n{exc}")
+        finally:
+            self.root.config(cursor="")
+            self.status_var.set("")
+        self._recompute_composite()
+        self._erosion_cache.clear()
+        self._render()
+
+    @classmethod
+    def _ensure_dexels(cls, stl_layers, params, progress_fn):
         """Build the dexels of every layer in *stl_layers* whose dexels are
-        missing or stale; returns warnings about non-watertight meshes."""
+        missing or stale -- for a layer with a placed raster current on
+        params' canvas, that raster's own dexels; returns warnings about
+        non-watertight meshes."""
         warnings = []
         for layer in stl_layers:
-            key = (layer.path, tuple(sorted((layer.stl_params or {}).items())),
-                   layer.raw.shape)
-            if layer.dexels is not None and layer.dexels_key == key:
-                continue
-            progress_fn(0, f"Reading undercuts of {layer.name}…")
-            sp = layer.stl_params or {}
-            triangles = stl_mesh.load_stl(layer.path)
-            rotated = stl_mesh.apply_rotation(triangles, sp.get('rot_x', 0),
-                                              sp.get('rot_y', 0), sp.get('rot_z', 0))
-            H_l, W_l = layer.raw.shape
-            layer.dexels = stl_mesh.generate_dexels(rotated, W_l, H_l)
-            layer.dexels_key = key
-            if layer.dexels.n_invalid:
-                warnings.append(f"{layer.name}: {layer.dexels.n_invalid} mesh columns "
+            placed = layers_mod.placed_raster(
+                layer, params['canvas_shape'], params['px_per_mm_x'],
+                params['px_per_mm_y'], params['origin'])
+            if placed is not None:
+                if placed.dexels is not None:
+                    continue
+                progress_fn(0, f"Reading undercuts of {layer.name}…")
+                dexels = layers_mod.add_placed_dexels(layer, cls._rotated_mesh(layer))
+            else:
+                key = (layer.path, tuple(sorted((layer.stl_params or {}).items())),
+                       layer.raw.shape)
+                if layer.dexels is not None and layer.dexels_key == key:
+                    continue
+                progress_fn(0, f"Reading undercuts of {layer.name}…")
+                H_l, W_l = layer.raw.shape
+                layer.dexels = stl_mesh.generate_dexels(cls._rotated_mesh(layer), W_l, H_l)
+                layer.dexels_key = key
+                dexels = layer.dexels
+            if dexels.n_invalid:
+                warnings.append(f"{layer.name}: {dexels.n_invalid} mesh columns "
                                 f"are not watertight and are treated as solid.")
         return warnings
 
@@ -4676,7 +4738,7 @@ class GCodeGeneratorApp:
         self.root.config(cursor="watch")
         self.root.update_idletasks()
         try:
-            self._ensure_dexels(stl_layers, lambda pct, msg: None)
+            self._ensure_dexels(stl_layers, params, lambda pct, msg: None)
             gaps, _ = self._composite_gaps_padded(params, depth_map)
         except (OSError, ValueError):
             return None

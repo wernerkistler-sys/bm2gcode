@@ -680,6 +680,65 @@ check("scaled layer: no tool/part collision",
       collisions(tp_sc, tool_s, 0.35, solid=lens_solid) == 0)
 
 
+print("placed STL rasters")
+from layers import place_stl_layer, placed_raster, resample_layer
+# 1:1: placed on the canvas grid, the cone is its own raster, bit for bit.
+raw_c, alpha_c = normalize_and_orient(generate_heightmap(tris, n_mesh, n_mesh),
+                                      mesh_z_bounds(tris))
+cone_l = Layer(name="cone", raw=raw_c, source_kind="stl", alpha=alpha_c, path="cone.stl")
+pr_c = place_stl_layer(cone_l, tris, (n_mesh, n_mesh), 4.0, 4.0, with_dexels=True)
+dex_c = generate_dexels(tris, n_mesh, n_mesh)
+check("1:1 placement: the placed raster is the raster itself",
+      np.array_equal(pr_c.raw, raw_c)
+      and ((pr_c.alpha is None and alpha_c is None) or np.array_equal(pr_c.alpha, alpha_c))
+      and np.array_equal(pr_c.dexels.offsets, dex_c.offsets)
+      and np.array_equal(pr_c.dexels.z, dex_c.z))
+cone_l.scale_pct = 90.0
+check("a placement change leaves the placed raster stale",
+      placed_raster(cone_l, (n_mesh, n_mesh), 4.0, 4.0) is None)
+
+# Scaled, rotated and mirrored: still exact samples, so every canvas pixel
+# is either fully covered or not at all, and the mirrored winding still
+# gives consistent crossings.
+lens_m = Layer(name="lens", raw=raw_s, source_kind="stl", alpha=alpha_s, path="lens.stl",
+               scale_pct=90.0, rotation_deg=20.0, mirror="Vertical axis")
+pm = place_stl_layer(lens_m, bic, (80, 80), 4.0, 4.0, with_dexels=True)
+_, cov_m = resample_layer(lens_m, (80, 80), 4.0, 4.0)
+nm = np.diff(pm.dexels.offsets)
+first_m = np.full(nm.size, np.nan)
+first_m[nm > 0] = pm.dexels.z[pm.dexels.offsets[:-1][nm > 0]]
+cov_mm = ~np.isnan(pm.dexels.top.ravel())
+check("placed raster: every pixel fully covered or not at all",
+      set(np.unique(cov_m).tolist()) <= {0.0, 1.0} and cov_m.sum() > 1000)
+check("mirrored placement: consistent crossings, the first one the top",
+      pm.dexels.n_invalid == 0
+      and np.array_equal(first_m[cov_mm], pm.dexels.top.ravel()[cov_mm]))
+comp_m = to_depth(composite([lens_m], (80, 80), 4.0, 4.0, "white", background_depth=1.0),
+                  "white", False)
+g_m, _ = composite_gaps([lens_m], (80, 80), 4.0, 4.0, "white", comp_m, background_depth=1.0)
+check("placed raster: its own dexels give the floating lens air below everywhere",
+      (g_m.counts[cov_m == 1.0] > 0).mean() > 0.99)
+
+# The lens at 99 %, placed: Undercut cuts one chain per level, now within
+# one pixel of the exact shape.
+lens_p = Layer(name="lens", raw=raw_s, source_kind="stl", alpha=alpha_s, path="lens.stl",
+               scale_pct=99.0)
+place_stl_layer(lens_p, bic, (80, 80), 4.0, 4.0, with_dexels=True)
+comp_p = to_depth(composite([lens_p], (80, 80), 4.0, 4.0, "white", background_depth=1.0),
+                  "white", False)
+g_p, _ = composite_gaps([lens_p], (80, 80), 4.0, 4.0, "white", comp_p, background_depth=1.0)
+comp_pp = np.pad(comp_p, 40, constant_values=1.0).astype(np.float32)
+tp_pl = compute_undercut_toolpath(comp_pp, pad_gaps(g_p, 40, 40), tool_s, 0.5, 30.0, 10.0,
+                                  40.0, 40.0, previous_result=comp_pp.copy(), origin="Center")
+per_level_p = {}
+for s in tp_pl.segments:
+    per_level_p[s[0][2]] = per_level_p.get(s[0][2], 0) + 1
+check("placed 99 % lens: one chain per level", len(per_level_p) >= 4
+      and set(per_level_p.values()) == {1} and tp_pl.metadata['warnings'] == [])
+check("placed 99 % lens: no tool/part collision",
+      collisions(tp_pl, tool_s, 0.25, solid=lens_solid) == 0)
+
+
 print("undercut toolpath: stock to leave")
 tp_a = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
                                  previous_result=prev, extra_offset_mm=0.5)

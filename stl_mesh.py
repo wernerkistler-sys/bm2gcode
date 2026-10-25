@@ -131,7 +131,7 @@ def rotate_bounds(xy_bounds, z_bounds, rot_x=0, rot_y=0, rot_z=0):
 _EDGE_TOL = 1e-9   # barycentric slack for rays through triangle edges
 
 
-def _cell_scale(lo, hi, n):
+def cell_scale(lo, hi, n):
     """(scale, shift) mapping a mesh coordinate c to the pixel index
     (c - lo) * scale - shift: *n* pixel cells tile [lo, hi], each sampled at
     its centre, as every canvas pixel is a cell 1 / px_per_mm wide. A flat
@@ -141,10 +141,34 @@ def _cell_scale(lo, hi, n):
     return 1.0, 0.0
 
 
-def generate_heightmap(triangles, width, height):
+def _project(triangles, width, height, pixel_xy):
+    """(px, py, flip): every vertex's pixel coordinates -- column, and row
+    counted up from the bottom row -- as (n, 3) arrays, and whether the map
+    mirrors the XY plane (reversing every triangle's winding). *pixel_xy*
+    None means pixel cells tiling the mesh's XY bounds, each sampled at its
+    centre (cell_scale); otherwise it is (M, t), the affine map M @ [x, y]
+    + t from mesh XY to those pixel coordinates."""
+    xy = triangles[:, :, :2].astype(np.float64)
+    if pixel_xy is None:
+        verts = xy.reshape(-1, 2)
+        x_min, x_max = float(verts[:, 0].min()), float(verts[:, 0].max())
+        y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
+        sx, hx = cell_scale(x_min, x_max, width)
+        sy, hy = cell_scale(y_min, y_max, height)
+        M = np.array([[sx, 0.0], [0.0, sy]])
+        t = np.array([-x_min * sx - hx, -y_min * sy - hy])
+    else:
+        M, t = (np.asarray(a, np.float64) for a in pixel_xy)
+    p = xy @ M.T + t
+    return p[:, :, 0], p[:, :, 1], np.linalg.det(M) < 0
+
+
+def generate_heightmap(triangles, width, height, pixel_xy=None):
     """Rasterize triangles into a heightmap via per-triangle barycentric
     z-buffering (keeps the max Z at each pixel). The pixels are cells tiling
-    the mesh's XY bounds, each sampled at its centre (_cell_scale).
+    the mesh's XY bounds, each sampled at its centre (cell_scale), unless
+    *pixel_xy* = (M, t) maps mesh XY to pixel coordinates (_project): a
+    source placed on the canvas, rasterized on the canvas's own grid.
 
     Returns a 2-D float64 (height, width) array of raw Z values; pixels
     covered by no triangle are NaN. Row 0 corresponds to the mesh's
@@ -154,19 +178,11 @@ def generate_heightmap(triangles, width, height):
     """
     if width < 2 or height < 2:
         raise ValueError("Width and height must each be at least 2.")
-    verts = triangles.reshape(-1, 3)
-    x_min, x_max = float(verts[:, 0].min()), float(verts[:, 0].max())
-    y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
-
-    sx, hx = _cell_scale(x_min, x_max, width)
-    sy, hy = _cell_scale(y_min, y_max, height)
+    PX, PY, _ = _project(triangles, width, height, pixel_xy)
 
     heightmap = np.full((height, width), -np.inf)
 
-    for tri in triangles:
-        # Project the three vertices to pixel coordinates (float)
-        px = (tri[:, 0] - x_min) * sx - hx
-        py = (tri[:, 1] - y_min) * sy - hy
+    for tri, px, py in zip(triangles, PX, PY):
 
         ix0 = max(0,         int(np.floor(px.min())))
         ix1 = min(width - 1, int(np.ceil( px.max())))
@@ -228,10 +244,10 @@ class Dexels:
                               # range normalize_and_orient maps to [0, 1]
 
 
-def generate_dexels(triangles, width, height, merge_eps=None):
+def generate_dexels(triangles, width, height, merge_eps=None, pixel_xy=None):
     """Rasterize triangles into Dexels on the same pixel grid as
-    generate_heightmap (pixel cells tiling the mesh's XY bounds, sampled at
-    their centres).
+    generate_heightmap with the same *pixel_xy* (by default pixel cells
+    tiling the mesh's XY bounds, sampled at their centres).
 
     A triangle facing up is where a downward ray enters the solid, one
     facing down is where it leaves; facing comes from the triangle's
@@ -244,19 +260,13 @@ def generate_dexels(triangles, width, height, merge_eps=None):
     if width < 2 or height < 2:
         raise ValueError("Width and height must each be at least 2.")
     verts = triangles.reshape(-1, 3)
-    x_min, x_max = float(verts[:, 0].min()), float(verts[:, 0].max())
-    y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
     z_min, z_max = float(verts[:, 2].min()), float(verts[:, 2].max())
     if merge_eps is None:
         merge_eps = max(z_max - z_min, 1e-9) * 1e-7
-
-    sx, hx = _cell_scale(x_min, x_max, width)
-    sy, hy = _cell_scale(y_min, y_max, height)
+    PX, PY, flip = _project(triangles, width, height, pixel_xy)
 
     pix_parts, z_parts, sgn_parts = [], [], []
-    for tri in triangles:
-        px = (tri[:, 0] - x_min) * sx - hx
-        py = (tri[:, 1] - y_min) * sy - hy
+    for tri, px, py in zip(triangles, PX, PY):
 
         ix0 = max(0,         int(np.floor(px.min())))
         ix1 = min(width - 1, int(np.ceil( px.max())))
@@ -289,9 +299,9 @@ def generate_dexels(triangles, width, height, merge_eps=None):
         pix = (height - 1 - iy[inside]).astype(np.int64) * width + ix[inside]
         pix_parts.append(pix)
         z_parts.append(z_vals[inside])
-        # In pixel space (both axes scaled positively) denom has the sign of
-        # the triangle's XY winding, i.e. of its normal's Z component.
-        sgn_parts.append(np.full(pix.size, 1 if denom > 0 else -1, np.int8))
+        # denom has the sign of the triangle's winding in pixel space: that
+        # of its normal's Z component, reversed by a mirroring map.
+        sgn_parts.append(np.full(pix.size, 1 if (denom > 0) != flip else -1, np.int8))
 
     n_px = width * height
     top = np.full(n_px, -np.inf)

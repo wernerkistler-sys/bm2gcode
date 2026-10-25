@@ -49,11 +49,105 @@ class Layer:
     # layer is detected as stale.
     dexels: Optional[object] = field(default=None, repr=False, compare=False)
     dexels_key: Optional[tuple] = field(default=None, repr=False, compare=False)
+    # STL layers only: the mesh rasterized directly on the canvas grid at
+    # the layer's current placement (PlacedRaster, see place_stl_layer),
+    # never serialised. Wherever its key still matches (placement_key) it
+    # stands in for resampling raw, so every canvas pixel is one exact
+    # sample of the mesh instead of an interpolation between samples.
+    placed: Optional[object] = field(default=None, repr=False, compare=False)
 
     def is_identity_placement(self) -> bool:
         return (self.offset_x_mm == 0.0 and self.offset_y_mm == 0.0
                 and self.rotation_deg == 0.0 and self.scale_pct == 100.0
                 and self.mirror == "None")
+
+
+@dataclass
+class PlacedRaster:
+    """An STL layer rasterized on the canvas grid at one placement."""
+    key: tuple                      # placement_key it was built for
+    raw: np.ndarray                 # canvas-shaped, as normalize_and_orient
+    alpha: Optional[np.ndarray]     # 0/1 per canvas pixel, None if all covered
+    pixel_xy: tuple                 # (M, t): mesh XY -> canvas pixel coords
+    dexels: Optional[object] = field(default=None, repr=False)   # same grid
+
+
+def placement_key(layer: Layer, canvas_shape: Tuple[int, int],
+                  px_per_mm_x: float, px_per_mm_y: float, origin: str) -> tuple:
+    """Everything a PlacedRaster of *layer* depends on: its mesh (path and
+    rotation), the raster raw it is placed relative to, its placement, and
+    the canvas grid."""
+    return (layer.path, tuple(sorted((layer.stl_params or {}).items())), layer.raw.shape,
+            layer.offset_x_mm, layer.offset_y_mm, layer.rotation_deg, layer.scale_pct,
+            layer.mirror, tuple(canvas_shape), px_per_mm_x, px_per_mm_y, origin)
+
+
+def placed_raster(layer: Layer, canvas_shape: Tuple[int, int],
+                  px_per_mm_x: float, px_per_mm_y: float,
+                  origin: str = "Bottom-Left") -> Optional[PlacedRaster]:
+    """layer.placed if it was built for this placement and canvas, else None."""
+    placed = layer.placed
+    if placed is not None and placed.key == placement_key(
+            layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin):
+        return placed
+    return None
+
+
+def stl_pixel_xy(layer: Layer, xy_bounds, canvas_shape: Tuple[int, int],
+                 px_per_mm_x: float, px_per_mm_y: float, origin: str = "Bottom-Left"):
+    """(M, t), the affine map M @ [x, y] + t from an STL layer's mesh XY to
+    canvas pixel coordinates (column, row counted up from the bottom row --
+    stl_mesh's pixel_xy convention), placing the mesh exactly where
+    resample_layer places its raster raw.
+
+    raw's pixels are cells tiling the (rotated) mesh's *xy_bounds*
+    (stl_mesh.cell_scale), row 0 at max Y; _affine_params maps canvas pixels
+    to raw pixels. The map is the inverse of the latter after the former."""
+    from stl_mesh import cell_scale
+    x_min, x_max, y_min, y_max = xy_bounds
+    H_l, W_l = layer.raw.shape
+    H = canvas_shape[0]
+    sx, hx = cell_scale(x_min, x_max, W_l)
+    sy, hy = cell_scale(y_min, y_max, H_l)
+    # [r_l, c_l] = L @ [x, y] + l0
+    L = np.array([[0.0, -sy], [sx, 0.0]])
+    l0 = np.array([H_l - 1 + y_min * sy + hy, -x_min * sx - hx])
+    A, o = _affine_params(layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
+    A_inv = np.linalg.inv(A)
+    # [column, row up] = P @ [r_c, c_c] + p0
+    P = np.array([[0.0, 1.0], [-1.0, 0.0]])
+    p0 = np.array([0.0, H - 1.0])
+    return P @ A_inv @ L, P @ A_inv @ (l0 - o) + p0
+
+
+def place_stl_layer(layer: Layer, triangles: np.ndarray, canvas_shape: Tuple[int, int],
+                    px_per_mm_x: float, px_per_mm_y: float,
+                    origin: str = "Bottom-Left", with_dexels: bool = False) -> PlacedRaster:
+    """Rasterize the STL layer's mesh *triangles* (rotated as its raster
+    was) on the canvas grid at the layer's placement, store the result as
+    layer.placed and return it; with_dexels also builds its dexels
+    (add_placed_dexels)."""
+    import stl_mesh
+    H, W = canvas_shape
+    pixel_xy = stl_pixel_xy(layer, stl_mesh.mesh_xy_bounds(triangles), canvas_shape,
+                            px_per_mm_x, px_per_mm_y, origin)
+    hm = stl_mesh.generate_heightmap(triangles, W, H, pixel_xy=pixel_xy)
+    raw, alpha = stl_mesh.normalize_and_orient(hm, stl_mesh.mesh_z_bounds(triangles))
+    layer.placed = PlacedRaster(
+        placement_key(layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin),
+        raw, alpha, pixel_xy)
+    if with_dexels:
+        add_placed_dexels(layer, triangles)
+    return layer.placed
+
+
+def add_placed_dexels(layer: Layer, triangles: np.ndarray):
+    """Build layer.placed's dexels from the same *triangles*, on its grid."""
+    import stl_mesh
+    placed = layer.placed
+    H, W = placed.raw.shape
+    placed.dexels = stl_mesh.generate_dexels(triangles, W, H, pixel_xy=placed.pixel_xy)
+    return placed.dexels
 
 
 def to_grayscale(raw: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -245,6 +339,11 @@ def resample_layer(layer: Layer, canvas_shape: Tuple[int, int],
     footprint AND the layer's own alpha channel (if any) is opaque there,
     0.0 where either is absent (fractional near an anti-aliased edge).
     """
+    placed = placed_raster(layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
+    if placed is not None:
+        coverage = (placed.alpha if placed.alpha is not None
+                    else np.ones(canvas_shape, dtype=np.float32))
+        return placed.raw, coverage
     if layer.is_identity_placement() and layer.raw.shape == canvas_shape:
         coverage = (layer.alpha if layer.alpha is not None
                     else np.ones(canvas_shape, dtype=np.float32))
@@ -417,16 +516,18 @@ def pad_gaps(gaps: Gaps, pad_y: int, pad_x: int) -> Gaps:
                            gaps.ceil, gaps.floor)
 
 
-def _layer_depth_affine(layer: Layer, surface: str):
+def _layer_depth_affine(layer: Layer, surface: str, dexels=None):
     """(a, b) with layer depth = a * z + b for the layer's mesh z, following
     the same chain composite() applies to the layer's raw heightmap:
     normalise by the mesh's z bounds (normalize_and_orient; the top
     surface's range for dexels without them), to_depth, then the min/max
-    depth % mapping. None if that range is flat."""
-    if layer.dexels.z_bounds is not None:
-        z_min, z_max = layer.dexels.z_bounds
+    depth % mapping. None if that range is flat. *dexels* defaults to
+    layer.dexels."""
+    dexels = layer.dexels if dexels is None else dexels
+    if dexels.z_bounds is not None:
+        z_min, z_max = dexels.z_bounds
     else:
-        tops = layer.dexels.top
+        tops = dexels.top
         if not np.isfinite(tops).any():
             return None
         z_min, z_max = float(np.nanmin(tops)), float(np.nanmax(tops))
@@ -465,12 +566,15 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
     between composite_depth and that top.
 
     Gaps are read from the nearest layer column (placement, rotation, scale
-    and Mirror as in resample_layer; none outside the layer's raster),
-    clipped at full depth, and dropped when they start within *tol* of it
-    or below it -- a bottom face resting on full depth maps to it only up
-    to rounding, and must not leave a zero-height gap there.
+    and Mirror as in resample_layer; none outside the layer's raster) -- or,
+    for a layer whose placed raster matches (placed_raster), from that
+    raster's own dexels at the same canvas pixel -- clipped at full depth,
+    and dropped when they start within *tol* of it or below it -- a bottom
+    face resting on full depth maps to it only up to rounding, and must not
+    leave a zero-height gap there.
 
-    Layers without dexels are ignored. Returns (gaps, warnings).
+    Layers without dexels (for a placed raster: without its dexels) are
+    ignored. Returns (gaps, warnings).
     """
     H, W = canvas_shape
     warnings = []
@@ -479,18 +583,22 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
     owner_cap = np.full(H * W, np.inf)          # top of the solid beneath, partial coverage
     flat_depth = composite_depth.ravel()
     affines = {}
+    dexels = {}
     for i, layer in enumerate(layers):
         if visibility_override is not None and i < len(visibility_override):
             visible = visibility_override[i]
         else:
             visible = layer.visible
-        if (not visible or layer.opacity_pct <= 0.0 or layer.source_kind != "stl"
-                or layer.dexels is None):
+        if not visible or layer.opacity_pct <= 0.0 or layer.source_kind != "stl":
             continue
-        if layer.dexels.shape != layer.raw.shape:
+        placed = placed_raster(layer, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
+        dex = placed.dexels if placed is not None else layer.dexels
+        if dex is None:
+            continue
+        if placed is None and dex.shape != layer.raw.shape:
             warnings.append(f"{layer.name}: undercut data is out of date; ignored.")
             continue
-        ab = _layer_depth_affine(layer, surface)
+        ab = _layer_depth_affine(layer, surface, dex)
         if ab is None:
             continue
         if ab[0] >= 0.0:
@@ -498,6 +606,7 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
                             f"undercuts are ignored.")
             continue
         affines[i] = ab
+        dexels[i] = dex
         if layer.opacity_pct < 100.0:
             continue
 
@@ -522,7 +631,7 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
             continue
 
         H_l, W_l = layer.raw.shape
-        if layer.is_identity_placement() and (H_l, W_l) == (H, W):
+        if placed is not None or (layer.is_identity_placement() and (H_l, W_l) == (H, W)):
             src = np.arange(H * W)
             ok = np.ones(H * W, bool)
         else:
@@ -547,7 +656,7 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
     pix_out, ceil_out, floor_out = [], [], []
     for i, (a, b) in affines.items():
         mine = owner_layer == i
-        dex = layers[i].dexels
+        dex = dexels[i]
 
         # Full coverage: the column's gaps below its top.
         canvas_pix = np.flatnonzero(mine & np.isinf(owner_cap))
