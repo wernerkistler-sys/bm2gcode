@@ -389,6 +389,19 @@ def _simplify_parts(pts, lead, tol, lead_tol):
     return out
 
 
+def _disk_dilation(mask, radius_px):
+    """binary_dilation of *mask* by the disk of pixel offsets (i, j) with
+    i^2 + j^2 <= radius_px^2. A pixel is in it when its nearest pixel of
+    *mask* is, by their exact integer squared offset. The distance
+    transform that finds the nearest pixel costs the same for any radius,
+    where a binary dilation's cost grows with the disk's area."""
+    from scipy.ndimage import distance_transform_edt
+    near = distance_transform_edt(~mask, return_distances=False,
+                                  return_indices=True)
+    ii, jj = np.indices(mask.shape)
+    return (ii - near[0]) ** 2 + (jj - near[1]) ** 2 <= radius_px ** 2
+
+
 class _Level:
     """Free-space data of one depth level, on a crop of the canvas."""
 
@@ -515,7 +528,7 @@ def compute_undercut_toolpath(
     ring stretches outside clear sky are cut; every chain of them starts and
     ends with an escape path to clear sky at the level's depth.
     """
-    from scipy.ndimage import binary_dilation, distance_transform_edt, label
+    from scipy.ndimage import distance_transform_edt, label
     from grey_morphology import (banded_grey_dilation, banded_grey_erosion,
                                  grey_dilation, grey_erosion)
     from skimage.measure import find_contours
@@ -857,11 +870,10 @@ def compute_undercut_toolpath(
 
     # Material the head sweeps: within its radius of every position where
     # the tool fits under an overhang, on the caller's grid.
+    progress(95, "Computing reached overhangs…")
     reach_px = max(tool.diameter_mm / 2.0 - extra_offset_mm, 0.0) * px_per_mm
     if u_union.any() and reach_px >= 1.0:
-        n = int(reach_px)
-        yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
-        reach = binary_dilation(u_union, structure=yy ** 2 + xx ** 2 <= reach_px ** 2)
+        reach = _disk_dilation(u_union, reach_px)
     else:
         reach = u_union.copy()
     if reach.shape != in_shape:

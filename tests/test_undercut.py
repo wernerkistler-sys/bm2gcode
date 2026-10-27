@@ -20,7 +20,7 @@ from stl_mesh import (load_stl, generate_dexels, generate_heightmap, mesh_z_boun
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
 from undercut import (build_undercut_kernels, compute_undercut_toolpath,
-                      NECK, _GapPicker, _Level, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
+                      NECK, _GapPicker, _Level, _disk_dilation, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
 
 FAILURES = []
 
@@ -285,6 +285,22 @@ lev_r = _Level(0.5, 0, 0, g_r, np.where(np.hypot(yy - 30, xx - 30) <= 10, -1.0, 
 check("a pocket alone in its own window has no escape",
       lev_r.reachable and np.isinf(lev_r.cum[30, 30]) and lev_r.connect((30.0, 30.0)) is None)
 
+
+# --------------------------------------------------------------------------
+# Reached-overhang dilation: the same as a binary dilation by the disk
+# --------------------------------------------------------------------------
+print("disk dilation")
+from scipy.ndimage import binary_dilation
+_rng = np.random.default_rng(3)
+for _name, _mask in [("sparse points", _rng.random((90, 70)) < 0.01),
+                     ("dense blobs", _rng.random((90, 70)) < 0.4),
+                     ("single pixel at the border", np.pad(np.ones((1, 1), bool), ((0, 89), (69, 0))))]:
+    for _r in (1.0, 2.5, 5.0, 7.3, 12.0, 30.0):
+        _n = int(_r)
+        _yy, _xx = np.mgrid[-_n:_n + 1, -_n:_n + 1]
+        check(f"{_name}, radius {_r} px",
+              np.array_equal(_disk_dilation(_mask, _r),
+                             binary_dilation(_mask, structure=_yy ** 2 + _xx ** 2 <= _r ** 2)))
 
 # --------------------------------------------------------------------------
 # Dexels from a mesh: the inverted cone on a plate, as an ASCII STL
