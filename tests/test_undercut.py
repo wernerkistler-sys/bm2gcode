@@ -635,6 +635,10 @@ for z, segs in lvl.items():
         ordered_ok &= r_u[:half].mean() > r_u[half:].mean()
 check("some level has more than one ring", n_multi > 0)
 check("rings run from open sky inward, waterline last", ordered_ok)
+# One undercut region: its chains run top-down from the very first one,
+# although some chains' lead paths and edge points lie outside the region.
+zs_r = [s[0][2] for s in tp_r.segments]
+check("one region: chains top-down from the first", zs_r == sorted(zs_r, reverse=True))
 
 # Climb: uncut material (the cone axis side) on the right of travel.
 seg = max(tp.segments, key=len)

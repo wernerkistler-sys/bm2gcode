@@ -639,7 +639,7 @@ def compute_undercut_toolpath(
     reverse = (cut_direction == "Climb")
     thr_link = -2.0 * eps - 1e-9
 
-    chains = []          # dict(level, pts (global row, col), rep pixel)
+    chains = []          # dict(level, pts (global row, col), lead mask)
     u_union = np.zeros((H, W), bool)
     n_unreachable = 0
 
@@ -748,12 +748,9 @@ def compute_undercut_toolpath(
                 else:
                     tail, tail_lead = cur[-2::-1], cur_lead[-2::-1]
                 pts = np.vstack([cur, tail])
-                rep = cur[len(cur) // 2]
                 chains.append({'level': li,
                                'pts': pts + (r0, c0),
-                               'lead': np.concatenate([cur_lead, tail_lead]),
-                               'rep': (int(round(rep[0])) + r0,
-                                       int(round(rep[1])) + c0)})
+                               'lead': np.concatenate([cur_lead, tail_lead])})
                 cur = cur_lead = None
 
             for runs_j in ring_runs:
@@ -831,8 +828,20 @@ def compute_undercut_toolpath(
     progress(90, "Ordering…")
     if chains:
         lab, _ = label(u_union, structure=np.ones((3, 3), bool))
+        # A chain belongs to the region most of its cutting points lie in,
+        # each point taken at its nearest undercut pixel: rings run on
+        # sub-pixel contours along the region's edge, so a point's own pixel
+        # may lie just outside it.
+        near_r, near_c = distance_transform_edt(lab == 0, return_distances=False,
+                                                return_indices=True)
         for ch in chains:
-            ch['region'] = int(lab[ch['rep']])
+            cut = ch['pts'][~ch['lead']]
+            if not len(cut):
+                cut = ch['pts']
+            r = np.clip(np.rint(cut[:, 0]).astype(np.int64), 0, H - 1)
+            c = np.clip(np.rint(cut[:, 1]).astype(np.int64), 0, W - 1)
+            regions = lab[near_r[r, c], near_c[r, c]]
+            ch['region'] = int(np.bincount(regions).argmax())
         by_region = {}
         for i, ch in enumerate(chains):
             by_region.setdefault(ch['region'], []).append(i)
