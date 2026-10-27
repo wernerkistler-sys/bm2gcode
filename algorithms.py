@@ -7,8 +7,7 @@ import tool_profile
 
 
 def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
-                     link_threshold=0.0, per_rapid_overhead=0.0,
-                     seg_z=None, z_jump_weight=0.0):
+                     link_threshold=0.0, per_rapid_overhead=0.0):
     """Return (order, flipped) permutation that minimises rapid travel cost.
 
     seg_entries[i], seg_exits[i]: (x, y) G-code mm for the i-th segment's
@@ -20,10 +19,6 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
         link_threshold, representing the retract + plunge distance overhead
         (typically 2 × z_safe).  Without this the optimiser may break several
         cheap stitches to save a few mm of traverse.
-    seg_z: optional list of z-values (mm, negative) for each segment.  When
-        provided, z_jump_weight * |Δz| is added to every transition cost,
-        discouraging large depth jumps across z-levels.
-    z_jump_weight: cost per mm of z-jump (applies regardless of link_threshold).
 
     Returns parallel lists — order (indices into the original lists) and
     flipped (bool: whether to reverse that segment's traversal direction).
@@ -37,31 +32,20 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
     order   = list(range(n))
     flipped = [False] * n
 
-    use_z = seg_z is not None and z_jump_weight > 0.0
-    ent_z = list(seg_z) if use_z else None
-    ext_z = list(seg_z) if use_z else None
-    origin_z = 0.0
-
-    def edge_cost(a, b, za=0.0, zb=0.0):
+    def edge_cost(a, b):
         d = ((a[0] - b[0])**2 + (a[1] - b[1])**2) ** 0.5
-        z_cost = z_jump_weight * abs(za - zb) if use_z else 0.0
-        return z_cost if d < link_threshold else per_rapid_overhead + d + z_cost
+        return 0.0 if d < link_threshold else per_rapid_overhead + d
 
     for _ in range(max_passes):
         improved = False
         for i in range(-1, n - 2):
             prev_ext = origin if i == -1 else ext[i]
-            pz = (origin_z if i == -1 else ext_z[i]) if use_z else 0.0
             for j in range(i + 2, n):
-                old = edge_cost(prev_ext, ent[i + 1], pz, ent_z[i + 1] if use_z else 0.0)
-                new = edge_cost(prev_ext, ext[j],     pz, ext_z[j]     if use_z else 0.0)
+                old = edge_cost(prev_ext, ent[i + 1])
+                new = edge_cost(prev_ext, ext[j])
                 if j + 1 < n:
-                    old += edge_cost(ext[j],     ent[j + 1],
-                                     ext_z[j]     if use_z else 0.0,
-                                     ent_z[j + 1] if use_z else 0.0)
-                    new += edge_cost(ent[i + 1], ent[j + 1],
-                                     ent_z[i + 1] if use_z else 0.0,
-                                     ent_z[j + 1] if use_z else 0.0)
+                    old += edge_cost(ext[j],     ent[j + 1])
+                    new += edge_cost(ent[i + 1], ent[j + 1])
                 if new < old - 1e-9:
                     lo, hi = i + 1, j + 1
                     block_e = ent[lo:hi]
@@ -70,10 +54,6 @@ def _two_opt_reorder(seg_entries, seg_exits, origin=(0.0, 0.0), max_passes=5,
                     ext[lo:hi]     = list(reversed(block_e))
                     order[lo:hi]   = list(reversed(order[lo:hi]))
                     flipped[lo:hi] = [not f for f in reversed(flipped[lo:hi])]
-                    if use_z:
-                        block_z = ent_z[lo:hi]
-                        ent_z[lo:hi] = list(reversed(block_z))
-                        ext_z[lo:hi] = list(reversed(block_z))
                     improved = True
         if not improved:
             break
@@ -4027,8 +4007,8 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
         # 2-opt is applied to it alone (rather than to the combined list
         # below) since a combined-list 2-opt works purely on XY proximity
         # and would freely interleave skeleton strokes with deep contour
-        # rings, undoing the Z-aware ordering the contour stage already
-        # applied internally.
+        # rings, undoing the top-down order of the contour graph that the
+        # rings get from _order_contours_graph.
         skeleton_segs = _two_opt_pass(full_depth_segs, _pass_origin(all_segments))
 
         # Waterline contour rings from stepdown_mm to max_depth, added
@@ -4047,13 +4027,10 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
             center_depth_contour_synth, deep_levels_norm, n_grey_levels,
             cut_direction=cut_direction)
         all_z_contours = _clip_contours_to_mask(all_z_contours, mask_vcarve)
-        contour_segs, _ = _order_contours_windowed(
-            all_z_contours, deep_levels_norm,
-            max_depth=max_depth, z_increment_mm=stepdown_mm,
-            max_step_down_mm=stepdown_mm,
+        contour_segs, _ = _order_contours_graph(
+            all_z_contours, deep_levels_norm, center_depth_contour_synth, n_grey_levels,
+            max_depth=max_depth,
             px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
-            link_threshold_mm=tool.diameter_mm,
-            use_2opt=use_2opt,
             lock_direction=cut_direction in ("Climb", "Conventional"),
             current_pos=(0.0, 0.0),
             progress=progress, progress_lo=80, progress_hi=88)
@@ -4379,6 +4356,18 @@ def _clip_contours_to_mask(all_z_contours, mask, min_pts=3):
     return clipped
 
 
+def _contour_threshold(z_norm, n_grey_levels):
+    """find_contours threshold of the contours at normalised level z_norm.
+
+    Half a grey-level step below z_norm: that keeps flat-region pixels
+    firmly "inside" even when z_norm lands at or just above their exact
+    value (e.g. from CDF quantile rounding). Without it the contour jumps to
+    the inner wall of a flat step and the tool cuts air above the
+    neighbouring deeper region.
+    """
+    return max(z_norm - 0.5 / max(n_grey_levels - 1, 1), 0.0)
+
+
 def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb"):
     """Extract raw iso-depth contour polylines at each Z-level.
 
@@ -4395,13 +4384,6 @@ def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb")
     """
     from skimage.measure import find_contours
 
-    # Half a grey-level step in normalised units.  Subtracting this from the
-    # find_contours threshold keeps flat-region pixels firmly "inside" even
-    # when z_norm lands at or just above their exact value (e.g. from CDF
-    # quantile rounding).  Without it the contour jumps to the inner wall of
-    # a flat step and the tool cuts air above the neighbouring deeper region.
-    _contour_eps = 0.5 / max(n_grey_levels - 1, 1)
-
     # find_contours' native (unreversed) direction keeps higher surface
     # values -- i.e. deeper-cut (valley) pixels, since surface is a depth
     # map where 1.0 = max cut depth -- consistently on the right of the
@@ -4414,7 +4396,7 @@ def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb")
     reverse_contours = (cut_direction == "Climb")
     all_z_contours = {}
     for z_norm in z_levels:
-        raw = find_contours(surface, max(z_norm - _contour_eps, 0.0))
+        raw = find_contours(surface, _contour_threshold(z_norm, n_grey_levels))
         kept = [c for c in raw if len(c) >= 3]
         if reverse_contours:
             kept = [c[::-1] for c in kept]
@@ -4422,29 +4404,117 @@ def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb")
     return all_z_contours
 
 
-def _order_contours_windowed(all_z_contours, z_levels, *,
-                              max_depth, z_increment_mm, max_step_down_mm,
-                              px_per_mm, H, ox, oy,
-                              link_threshold_mm,
-                              use_2opt, lock_direction,
-                              current_pos,
-                              z_safe=5.0,
-                              progress=None, progress_lo=55, progress_hi=80):
-    """Greedy nearest-neighbour ordering of per-level contour rings.
+def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
+    """The contour graph: which contours must be cut before which.
 
-    A contour's climb/conventional correctness comes entirely from
-    find_contours' own per-contour orientation guarantee, independent of
-    visiting order or Z-level — unlike raster, where correctness depends on
-    visiting adjacent lines in sequence. So the greedy step may freely draw
-    candidates from anywhere in the max_step_down_mm window regardless of
-    lock state; only 2-opt (which reverses segments/blocks) needs to stay
-    gated by not lock_direction.
+    At level k, the material L_k = {surface < threshold_k} and the air
+    D_k = {surface >= threshold_k} are each split into 8-connected
+    components. Every contour at level k runs between one L_k component and
+    one D_k component, so a node is such a pair (k, l, d) of components
+    meeting across a pixel edge. Material only grows with depth
+    (L_k is inside L_{k+1}) and air only shrinks (D_{k+1} is inside D_k),
+    so every L_k component lies in one L_{k+1} component and every D_{k+1}
+    component in one D_k component. Node (k, l, d) must be cut before node
+    (k+1, l', d') when l lies in l' and d' lies in d: separate hills are
+    told apart by their material, separate craters by their air, and no
+    ring of either level separates two nodes so joined. Hills merging below
+    a saddle give a node several parents, a crater floor splitting gives
+    several children. On a vertical wall, where the contours of several
+    levels coincide, the same pixel pair carries every level's labels, so
+    those contours are joined too. 8-connectivity can only merge
+    components, i.e. add precedence, never drop it.
 
-    Levels are grouped into windows of
-    max(1, round(max_step_down_mm / z_increment_mm)) consecutive z_levels
-    (or one window covering everything if max_step_down_mm is None/<=0 or
-    z_increment_mm<=0), bounding how far apart in Z the greedy/2-opt passes
-    may mix contours — this only affects travel efficiency, not validity.
+    Each piece (a whole ring, or a run left by pruning or clipping) is
+    assigned from the labels of the pixels around its own points: the pair
+    most of its points lie between. A piece whose points match no node
+    (which a contour of the same surface and threshold can't produce) waits
+    for every node of a shallower level.
+
+    Returns (parents, piece_node): parents[n] lists the nodes that must be
+    complete before node n is cut; piece_node[z_norm][i] is the node of
+    all_z_contours[z_norm][i]. Nodes without pieces stay in the graph, so
+    precedence passes through levels a piece was pruned from.
+    """
+    from scipy.ndimage import label
+
+    eight = np.ones((3, 3), bool)
+    H, W = surface.shape
+    parents = []
+    piece_node = {}
+    prev = None    # (material, L labels, D labels, n_D, nodes by key) one level up
+    for z_norm in z_levels:
+        mat = surface < _contour_threshold(z_norm, n_grey_levels)
+        L, _ = label(mat, structure=eight)
+        D, n_d = label(~mat, structure=eight)
+        pairs = []
+        for a, b in ((np.s_[:, :-1], np.s_[:, 1:]), (np.s_[:-1, :], np.s_[1:, :])):
+            for la, db in ((L[a], D[b]), (L[b], D[a])):
+                m = (la > 0) & (db > 0)
+                pairs.append(la[m].astype(np.int64) * (n_d + 1) + db[m])
+        keys = np.unique(np.concatenate(pairs))
+        first = len(parents)
+        nodes = {int(key): first + i for i, key in enumerate(keys)}
+        parents.extend([] for _ in range(len(keys)))
+
+        if prev is not None:
+            mat_p, L_p, D_p, n_d_p, nodes_p = prev
+            parent_l = np.zeros(L_p.max() + 1, np.int64)
+            parent_l[L_p[mat_p]] = L[mat_p]
+            parent_d = np.zeros(n_d + 1, np.int64)
+            parent_d[D[~mat]] = D_p[~mat]
+            above = {}
+            for key, n in nodes_p.items():
+                l, d = divmod(key, n_d_p + 1)
+                above.setdefault((int(parent_l[l]), d), []).append(n)
+            for key, n in nodes.items():
+                l, d = divmod(key, n_d + 1)
+                parents[n] = above.get((l, int(parent_d[d])), [])
+
+        assigned = []
+        for c in all_z_contours.get(z_norm, []):
+            rows = (np.clip(np.floor(c[:, 0]), 0, H - 1).astype(np.int64),
+                    np.clip(np.ceil(c[:, 0]), 0, H - 1).astype(np.int64))
+            cols = (np.clip(np.floor(c[:, 1]), 0, W - 1).astype(np.int64),
+                    np.clip(np.ceil(c[:, 1]), 0, W - 1).astype(np.int64))
+            # The material (and the air) pixels of a 2x2 cell are 8-connected,
+            # so they carry one label each and the maximum picks it.
+            l = np.max([L[r, cc] for r in rows for cc in cols], axis=0).astype(np.int64)
+            d = np.max([D[r, cc] for r in rows for cc in cols], axis=0)
+            ok = (l > 0) & (d > 0)
+            vals, counts = np.unique(l[ok] * (n_d + 1) + d[ok], return_counts=True)
+            node = None
+            for k in np.argsort(-counts):
+                node = nodes.get(int(vals[k]))
+                if node is not None:
+                    break
+            if node is None:
+                node = len(parents)
+                parents.append(list(range(first)))
+            assigned.append(node)
+        piece_node[z_norm] = assigned
+        prev = (mat, L, D, n_d, nodes)
+    return parents, piece_node
+
+
+def _order_contours_graph(all_z_contours, z_levels, surface, n_grey_levels, *,
+                          max_depth, px_per_mm, H, ox, oy,
+                          lock_direction, current_pos,
+                          progress=None, progress_lo=55, progress_hi=80):
+    """Order contour pieces top-down per feature, nearest-first across features.
+
+    A piece may be cut once every node its node depends on in the contour
+    graph (_contour_graph) is complete, i.e. all of its pieces are cut: each
+    hill and each crater is cut strictly top-down, its next ring only after
+    the ring above it, while separate features are independent. Among the
+    pieces that may be cut, greedy nearest-neighbour picks the next one, so
+    the tool follows one feature down until it reaches a join (hills merging
+    below a saddle), then the nearest other branch. A closed piece may start
+    at any of about 20 points along itself. Open pieces start at either end
+    and closed ones run either way unless lock_direction is set: a contour's
+    climb/conventional sense comes entirely from its own orientation.
+
+    surface is the achievable-depth surface the contours were extracted
+    from, at the thresholds of _contour_threshold.
 
     current_pos : (x, y) tool position before the first segment.
 
@@ -4457,118 +4527,91 @@ def _order_contours_windowed(all_z_contours, z_levels, *,
     if progress is None:
         progress = lambda pct, msg: None
 
-    all_segments      = []
-    current_pos       = np.array(current_pos, dtype=float)
-    z_jump_weight_mm  = z_increment_mm * 1.5
-    _msd = max_step_down_mm if (max_step_down_mm is not None
-                                 and max_step_down_mm > 0) else None
-    win_size     = (max(1, round(_msd / z_increment_mm))
-                     if _msd and z_increment_mm > 0 else len(z_levels))
-    n_windows    = max(1, -(-len(z_levels) // win_size))   # ceiling division
+    progress(progress_lo, "Building the contour graph…")
+    parents, piece_node = _contour_graph(surface, z_levels, n_grey_levels, all_z_contours)
+    n_nodes = len(parents)
+    children = [[] for _ in range(n_nodes)]
+    for n, ps in enumerate(parents):
+        for p in ps:
+            children[p].append(n)
+    waiting = [len(ps) for ps in parents]
 
-    for win_idx, win_start in enumerate(range(0, len(z_levels), win_size)):
-        win_levels = z_levels[win_start : win_start + win_size]
-        remaining  = [(c, -z_norm * max_depth)
-                      for z_norm in win_levels
-                      for c in all_z_contours.get(z_norm, [])]
-        if not remaining:
-            continue
-        progress(progress_lo + (progress_hi - progress_lo) * win_idx // n_windows,
-                 f"Ordering window {win_idx + 1}/{n_windows} "
-                 f"({len(remaining)} contour(s))…")
-
-        # Shallowest Z in this window: once a candidate requires a real rapid
-        # anyway (d >= link_threshold_mm), prefer whichever is closest to
-        # this depth, so forced long jumps still trend top-to-bottom instead
-        # of landing at an arbitrary depth. Short hops stay pure-XY.
-        win_z_top = -win_levels[0] * max_depth
-
-        # Greedy nearest-neighbour ordering across every contour in the
-        # window. For closed contours any rotation of the loop is valid, so
-        # we sample candidate start points; for open contours only the two
-        # endpoints are considered (flip=True covers the other end).
-        # Segments are collected into win_segs so that optional 2-opt can
-        # reorder them before they are committed to all_segments.
-        win_cur  = current_pos.copy()
-        win_segs = []
-        while remaining:
-            best_idx  = 0
-            best_flip = False
-            best_rot  = 0
-            best_cost = float('inf')
-
-            for i, (c, z_mm) in enumerate(remaining):
-                n         = len(c)
-                is_closed = np.linalg.norm(c[0] - c[-1]) < 1.5
-                rot_cands = range(0, n, max(1, n // 20)) if is_closed else [0]
-                flip_cands = (False,) if lock_direction else (False, True)
-                for flip in flip_cands:
-                    orient = c[::-1] if flip else c
-                    for j in rot_cands:
-                        row0, col0 = orient[j]
-                        x0 = col0 / px_per_mm - ox
-                        y0 = (H - 1 - row0) / px_per_mm - oy
-                        dx, dy = x0 - win_cur[0], y0 - win_cur[1]
-                        d = (dx * dx + dy * dy) ** 0.5
-                        cost = d if d < link_threshold_mm else (
-                            d + z_jump_weight_mm * (win_z_top - z_mm))
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_idx  = i
-                            best_flip = flip
-                            best_rot  = j
-
-            c_chosen, z_mm = remaining.pop(best_idx)
-            is_closed = np.linalg.norm(c_chosen[0] - c_chosen[-1]) < 1.5
-            if best_flip:
-                c_chosen = c_chosen[::-1]
-            if best_rot > 0:
-                c_chosen = np.roll(c_chosen, -best_rot, axis=0)
-            if is_closed:
-                c_chosen = np.vstack([c_chosen, c_chosen[0:1]])
-
-            points = [(col / px_per_mm - ox,
-                       (H - 1 - row) / px_per_mm - oy,
-                       z_mm)
-                      for row, col in c_chosen]
-            if len(points) < 2:
+    pieces = []        # (Nx2 pixel polyline, z_mm, node, closed)
+    by_node = [[] for _ in range(n_nodes)]
+    for z_norm in z_levels:
+        for c, n in zip(all_z_contours.get(z_norm, []), piece_node.get(z_norm, [])):
+            if len(c) < 2:
                 continue
+            by_node[n].append(len(pieces))
+            pieces.append((c, -z_norm * max_depth, n,
+                           bool(np.linalg.norm(c[0] - c[-1]) < 1.5)))
+    left = [len(b) for b in by_node]
 
-            win_segs.append(points)
-            last = points[-1]
-            win_cur[0] = last[0]
-            win_cur[1] = last[1]
+    # Start candidates of every piece: (piece, flip, index into the
+    # oriented polyline) and their position in mm.
+    cand_piece, cand_flip, cand_idx, cand_xy = [], [], [], []
+    for i, (c, _, _, closed) in enumerate(pieces):
+        n = len(c)
+        idx = np.arange(0, n, max(1, n // 20)) if closed else np.array([0])
+        for flip in ((False,) if lock_direction else (False, True)):
+            rc = c[::-1] if flip else c
+            cand_piece.append(np.full(len(idx), i))
+            cand_flip.append(np.full(len(idx), flip))
+            cand_idx.append(idx)
+            cand_xy.append(np.column_stack([rc[idx, 1] / px_per_mm - ox,
+                                            (H - 1 - rc[idx, 0]) / px_per_mm - oy]))
+    if pieces:
+        cand_piece = np.concatenate(cand_piece)
+        cand_flip = np.concatenate(cand_flip)
+        cand_idx = np.concatenate(cand_idx)
+        cand_xy = np.vstack(cand_xy)
+    available = np.zeros(len(pieces), bool)
 
-        if not win_segs:
-            continue
+    def release(n):
+        stack = [n]
+        while stack:
+            n = stack.pop()
+            if left[n]:
+                available[by_node[n]] = True
+                continue
+            for ch in children[n]:
+                waiting[ch] -= 1
+                if waiting[ch] == 0:
+                    stack.append(ch)
 
-        # Optional 2-opt reorder across the whole window, guided by a
-        # z-jump penalty to discourage rapids that straddle levels more
-        # than necessary. Skipped when locked, since its block-reversal
-        # move would undo the forced direction.
-        if use_2opt and len(win_segs) >= 3 and not lock_direction:
-            win_z  = [s[0][2] for s in win_segs]
-            ent_xy = [(s[0][0],  s[0][1])  for s in win_segs]
-            ext_xy = [(s[-1][0], s[-1][1]) for s in win_segs]
-            order, flips = _two_opt_reorder(
-                ent_xy, ext_xy,
-                origin=(float(current_pos[0]), float(current_pos[1])),
-                link_threshold=link_threshold_mm,
-                per_rapid_overhead=2.0 * z_safe,
-                seg_z=win_z,
-                z_jump_weight=z_jump_weight_mm)
-            win_segs = [
-                list(reversed(win_segs[i])) if flips[k] else win_segs[i]
-                for k, i in enumerate(order)
-            ]
+    for n in range(n_nodes):
+        if waiting[n] == 0:
+            release(n)
 
-        all_segments.extend(win_segs)
-        last = win_segs[-1][-1]
-        current_pos[0] = last[0]
-        current_pos[1] = last[1]
+    progress(progress_lo, f"Ordering {len(pieces)} contour piece(s)…")
+    segments = []
+    cur = np.array(current_pos, dtype=float)
+    n_report = max(1, len(pieces) // 20)
+    for step in range(len(pieces)):
+        if step % n_report == 0:
+            progress(progress_lo + (progress_hi - progress_lo) * step // len(pieces),
+                     f"Ordering contours ({step}/{len(pieces)})…")
+        d2 = np.sum((cand_xy - cur) ** 2, axis=1)
+        d2[~available[cand_piece]] = np.inf
+        k = int(np.argmin(d2))
+        i = int(cand_piece[k])
+        c, z_mm, n, closed = pieces[i]
+        if cand_flip[k]:
+            c = c[::-1]
+        if cand_idx[k] > 0:
+            c = np.roll(c, -int(cand_idx[k]), axis=0)
+        if closed:
+            c = np.vstack([c, c[:1]])
+        segments.append([(col / px_per_mm - ox, (H - 1 - row) / px_per_mm - oy, z_mm)
+                         for row, col in c])
+        cur = np.array(segments[-1][-1][:2])
+        available[i] = False
+        left[n] -= 1
+        if left[n] == 0:
+            release(n)
 
-    progress(progress_hi, f"Ordering complete ({len(all_segments)} segments).")
-    return all_segments, (float(current_pos[0]), float(current_pos[1]))
+    progress(progress_hi, f"Ordering complete ({len(segments)} segments).")
+    return segments, (float(cur[0]), float(cur[1]))
 
 
 def compute_contour_toolpath(
@@ -4584,7 +4627,6 @@ def compute_contour_toolpath(
     lateral_tol_mm=0.0,
     z_safe=5.0,
     feed_rapid=3000.0,
-    use_2opt=False,
     cut_direction="Climb",
     max_step_down_mm=None,
     extra_offset_mm=0.0,
@@ -4643,13 +4685,9 @@ def compute_contour_toolpath(
         contour are considered redundant and omitted.  0.0 disables pruning.
     max_step_down_mm : float or None
         Maximum Z increment, in mm, that redundancy pruning is allowed to
-        create between one retained cut and the next, and the window (in
-        z-levels) that cross-level 2-opt is allowed to mix contours across.
-        Both are derived from this single value: the pruning bound is used
-        directly (see _prune_contours), and the mixing window is
-        round(max_step_down_mm / z_increment_mm) levels.  None or <= 0 means
-        unconstrained — pruning may collapse any number of redundant levels
-        and 2-opt may mix across the full level range.
+        create between one retained cut and the next (see _prune_contours).
+        None or <= 0 means unconstrained — pruning may collapse any number
+        of redundant levels.
     extra_offset_mm : float
         Stock-to-leave allowance (mm) applied laterally and vertically, so a
         subsequent step (typically with extra_offset_mm=0) can refine the
@@ -4671,8 +4709,8 @@ def compute_contour_toolpath(
         For a clockwise spindle, forces every contour to travel in the
         direction that keeps uncut material on the tool's right (Climb) or
         left (Conventional). "Either" preserves the default behaviour: no
-        forced direction, and the ordering/2-opt passes below are free to
-        reverse contours for shorter travel.
+        forced direction, and the ordering below is free to reverse
+        contours for shorter travel.
     erosion_cache : dict, optional
         Used to memoise the grey-erosion/grey-dilation achievable-depth surface
         (keyed by erosion_cache_key), so a subsequent call with the same tool
@@ -4689,8 +4727,7 @@ def compute_contour_toolpath(
     from grey_morphology import grey_erosion, grey_dilation
     from skimage.measure import find_contours
 
-    # None/<=0 both mean "unconstrained" — normalise once, used for both the
-    # pruning depth bound and the cross-level 2-opt mixing window below.
+    # None/<=0 both mean "unconstrained" for the pruning depth bound.
     _msd = max_step_down_mm if (max_step_down_mm is not None
                                  and max_step_down_mm > 0) else None
 
@@ -4822,23 +4859,19 @@ def compute_contour_toolpath(
             lambda depth_mm: _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm))
         progress(52, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
 
-    # ── Stage 4c · Ordering — greedy per max_step_down window, optional 2-opt
+    # ── Stage 4c · Ordering — top-down per feature along the contour graph
     link_threshold_mm = tool.diameter_mm
-    all_segments, _ = _order_contours_windowed(
-        all_z_contours, z_levels,
-        max_depth=max_depth, z_increment_mm=z_increment_mm,
-        max_step_down_mm=_msd,
+    all_segments, _ = _order_contours_graph(
+        all_z_contours, z_levels, center_depth_contour, n_grey_levels,
+        max_depth=max_depth,
         px_per_mm=px_per_mm, H=H, ox=_ox, oy=_oy,
-        link_threshold_mm=link_threshold_mm,
-        use_2opt=use_2opt, lock_direction=lock_direction,
+        lock_direction=lock_direction,
         current_pos=(0.0, 0.0),
-        z_safe=z_safe,
         progress=progress, progress_lo=55, progress_hi=80)
 
     # ── Stage 4d · Terrain-link insertion ──────────────────────────────────
     # Walk all_segments once and splice geodesic links wherever consecutive
-    # segments are within link_threshold_mm of each other. Done as a separate
-    # stage so cross-window boundaries are also covered.
+    # segments are within link_threshold_mm of each other.
     cut_segs    = all_segments
     all_segments = []
     n_links      = 0
@@ -4878,8 +4911,8 @@ def compute_contour_toolpath(
     # RDP-simplify every segment — cut contours and terrain links alike —
     # now that ordering is finalised. Simplification never moves a segment's
     # first/last point (see simplify_line), so deferring it to here rather
-    # than per-contour during ordering has no effect on entry-point choice,
-    # 2-opt, or terrain-link endpoints; it just needs to happen somewhere
+    # than per-contour during ordering has no effect on entry-point choice
+    # or terrain-link endpoints; it just needs to happen somewhere
     # after every segment (including links, built above) exists.
     all_segments = [simplify_line(pts, rdp_tol, rdp_z_tol) for pts in all_segments]
 
@@ -4908,7 +4941,6 @@ def compute_contour_toolpath(
             'radius_mm':       tool.diameter_mm / 2,
             'z_increment_mm':  z_increment_mm,
             'adaptive_levels': adaptive_levels,
-            'use_2opt':           use_2opt,
             'max_step_down_mm':   _msd,
             'extra_offset_mm':    extra_offset_mm,
             'lateral_tol_mm':     lateral_tol_mm,
@@ -5393,7 +5425,7 @@ def _compute_cutout_from_rings(
 
         # Optional 2-opt reorder within the pass. Skipped when locked, since
         # its block-reversal move would undo the forced climb/conventional
-        # direction. No z_jump term -- every loop in this pass shares one Z.
+        # direction.
         if use_2opt and len(pass_ordered) >= 3 and not lock_direction:
             ent_xy = [(s[0][0],  s[0][1])  for s in pass_ordered]
             ext_xy = [(s[-1][0], s[-1][1]) for s in pass_ordered]

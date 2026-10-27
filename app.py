@@ -1340,9 +1340,11 @@ class GCodeGeneratorApp:
 
         avoid_air_var = tk.BooleanVar(
             value=bool(int(DEFAULTS["step_avoid_air"])))
-        ttk.Checkbutton(tsp_frame, text="Avoid cutting air",
-                        variable=avoid_air_var).pack(anchor=tk.W, pady=2)
+        avoid_air_cb = ttk.Checkbutton(tsp_frame, text="Avoid cutting air",
+                                       variable=avoid_air_var)
+        avoid_air_cb.pack(anchor=tk.W, pady=2)
         step['avoid_air_var'] = avoid_air_var
+        step['avoid_air_cb'] = avoid_air_cb
 
         gating_frame = ttk.Frame(operation_lf)
         gating_frame.pack(fill=tk.X)
@@ -1798,6 +1800,11 @@ class GCodeGeneratorApp:
                                  and step['raster_dir_var'].get() not in WOUND_DIRECTIONS)
             step['tsp_2opt_cb'].config(
                 state="disabled" if (locked or pocket_2opt_moot) else "normal")
+            # Contour orders its rings along the contour graph, never by 2-opt.
+            if alg == "Contour":
+                step['tsp_2opt_cb'].pack_forget()
+            elif not step['tsp_2opt_cb'].winfo_manager():
+                step['tsp_2opt_cb'].pack(anchor=tk.W, pady=2, before=step['avoid_air_cb'])
 
             if hasattr(self, '_view_menu'):
                 self._on_display_mode_changed()
@@ -3897,7 +3904,6 @@ class GCodeGeneratorApp:
                 lateral_tol_mm   = params['contour_lateral_tol'],
                 z_safe             = self._settings['z_safe'],
                 feed_rapid         = self._settings['feed_rapid'],
-                use_2opt           = params['use_2opt'],
                 cut_direction      = params['cut_direction'],
                 max_step_down_mm   = params['contour_max_step_down'],
                 extra_offset_mm    = params['extra_offset_mm'],

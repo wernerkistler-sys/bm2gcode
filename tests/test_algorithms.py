@@ -22,7 +22,8 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         simulate_toolpath_result, compute_raster_toolpath,
                         registration_flip_axis, registration_hole_centers,
                         registration_auto_spacing, bore_hole_segments,
-                        compute_registration_holes_toolpath, _spiral_px)
+                        compute_registration_holes_toolpath, _spiral_px,
+                        _extract_z_contours, _order_contours_graph)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1330,6 +1331,111 @@ check("toolpath: hole the tool's own size is plunged",
       tp_tr.metadata['cut_method'] == 'plunge')
 check("toolpath: a hole shallower than max depth is not marked cut through",
       tp_tr.alpha is None)
+
+
+print("_order_contours_graph")
+N_C = 121
+_rr, _cc = np.mgrid[0:N_C, 0:N_C]
+
+
+def _dist_px(center):
+    return np.hypot(_rr - center[0], _cc - center[1])
+
+
+def _order_graph(surface, levels, pieces=None, lock=False):
+    contours = pieces if pieces is not None else _extract_z_contours(
+        surface, levels, 256, cut_direction="Climb" if lock else "Either")
+    segs, _ = _order_contours_graph(contours, levels, surface, 256, max_depth=10.0,
+                                    px_per_mm=1.0, H=N_C, ox=0.0, oy=0.0,
+                                    lock_direction=lock, current_pos=(0.0, 0.0))
+    return segs
+
+
+def _feature(seg, centers):
+    """Index of the centre (row, col) nearest the segment's centroid."""
+    p = np.array(seg)
+    r, c = N_C - 1 - p[:, 1].mean(), p[:, 0].mean()
+    return int(np.argmin([np.hypot(r - cr, c - cc) for cr, cc in centers]))
+
+
+def _top_down(zs):
+    return all(a >= b - 1e-9 for a, b in zip(zs, zs[1:]))
+
+
+def _features_in_turn(segs, centers):
+    """Top-down within each feature, and each feature cut in one go."""
+    feats = [_feature(s, centers) for s in segs]
+    runs = [f for i, f in enumerate(feats) if i == 0 or f != feats[i - 1]]
+    per_feature = all(_top_down([s[0][2] for s, f in zip(segs, feats) if f == k])
+                      for k in set(feats))
+    return per_feature, len(runs) == len(set(feats)), len(set(feats))
+
+
+LEVELS = [k / 10 for k in range(1, 11)]
+CENTERS = [(60, 30), (60, 90)]
+hills = np.clip(np.minimum(_dist_px(CENTERS[0]), _dist_px(CENTERS[1])) / 28.0,
+                0, 1).astype(np.float32)
+for name, surf in [("two hills", hills), ("two craters", 1.0 - hills)]:
+    for lock in (False, True):
+        segs = _order_graph(surf, LEVELS, lock=lock)
+        td, in_turn, n_f = _features_in_turn(segs, CENTERS)
+        tag = f"{name}{' (locked)' if lock else ''}"
+        check(f"{tag}: both features cut", n_f == 2)
+        check(f"{tag}: top-down within each feature", td)
+        check(f"{tag}: one feature after the other", in_turn)
+
+# Pruned/clipped pieces: every ring split into open runs, given shuffled.
+contours = _extract_z_contours(hills, LEVELS, 256)
+rng = np.random.default_rng(1)
+pieces = {}
+for z, cs in contours.items():
+    runs = [r for c in cs for r in np.array_split(c, 3) if len(r) >= 3]
+    pieces[z] = [runs[i] for i in rng.permutation(len(runs))]
+segs = _order_graph(hills, LEVELS, pieces=pieces)
+td, in_turn, n_f = _features_in_turn(segs, CENTERS)
+check("open pieces: top-down within each feature", td and n_f == 2)
+check("open pieces: one feature after the other", in_turn)
+
+# Crater with a central peak: the peak's rings follow only the peak's own.
+r0 = _dist_px((60, 60))
+peak = np.where(r0 < 12, r0 / 12.0, np.clip((40.0 - r0) / 15.0, 0, 1)).astype(np.float32)
+segs = _order_graph(peak, LEVELS)
+feats = ["peak" if np.hypot(*(np.array(s)[:, :2] - (60, 60)).T).mean() < 18 else "crater"
+         for s in segs]
+check("crater with central peak: top-down within each feature",
+      all(_top_down([s[0][2] for s, f in zip(segs, feats) if f == k])
+          for k in ("peak", "crater")))
+check("crater with central peak: one feature after the other",
+      sum(1 for a, b in zip(feats, feats[1:]) if a != b) == 1)
+
+# Two hills merging below a saddle: each hill top-down, the merged rings
+# only after both hills' rings above the saddle. Below the saddle the merged
+# material spans the canvas, splitting the air into the halves above and
+# below it: two branches, each top-down.
+merge = np.clip(np.minimum(_dist_px(CENTERS[0]), _dist_px(CENTERS[1])) / 50.0,
+                0, 1).astype(np.float32)          # saddle at 30/50 = 0.6
+segs = _order_graph(merge, LEVELS)
+feats = []
+for s in segs:
+    p = np.array(s)
+    merged = p[:, 0].min() < 55 and p[:, 0].max() > 65
+    feats.append(("merged", p[:, 1].mean() > 60) if merged else _feature(s, CENTERS))
+last_hill = max(i for i, f in enumerate(feats) if f in (0, 1))
+first_merged = min(i for i, f in enumerate(feats) if f not in (0, 1))
+check("hills merging: each hill top-down",
+      all(_top_down([s[0][2] for s, f in zip(segs, feats) if f == k]) for k in (0, 1)))
+check("hills merging: merged rings after both hills", first_merged > last_hill)
+check("hills merging: merged rings top-down on each side",
+      all(_top_down([s[0][2] for s, f in zip(segs, feats) if f == ("merged", side)])
+          for side in (False, True)))
+
+# Vertical-walled bosses: the rings of every level coincide on the wall.
+bosses = np.where(np.minimum(_dist_px(CENTERS[0]), _dist_px(CENTERS[1])) < 15,
+                  0.0, 1.0).astype(np.float32)
+segs = _order_graph(bosses, LEVELS)
+td, in_turn, n_f = _features_in_turn(segs, CENTERS)
+check("vertical-walled bosses: top-down within each boss", td and n_f == 2)
+check("vertical-walled bosses: one boss after the other", in_turn)
 
 
 print()
