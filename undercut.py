@@ -361,7 +361,7 @@ class _Level:
     """Free-space data of one depth level, on a crop of the canvas."""
 
     def __init__(self, d, r0, c0, g, g_sky, eps):
-        from scipy.ndimage import binary_erosion
+        from scipy.ndimage import binary_dilation, binary_erosion
         from skimage.graph import MCP_Geometric
         self.d, self.r0, self.c0 = d, r0, c0
         self.g, self.g_sky, self.eps = g, g_sky, eps
@@ -374,13 +374,28 @@ class _Level:
         self.reachable = starts.any()
         self.cum = None
         if self.reachable:
-            costs = np.where(domain, 1.0, np.inf)
-            self.mcp = MCP_Geometric(costs, fully_connected=True)
             # Every path into the sky set enters through its frontier, so
-            # only those pixels need to be seeds; the rest are sky already.
+            # the search runs only through the free pixels outside the sky
+            # (the band) and seeds at the frontier pixels next to it; the
+            # rest of the sky is reached already. Each window of the band
+            # gets its own search.
+            band = domain & ~starts
             frontier = starts & ~binary_erosion(starts, structure=square)
-            cum, _ = self.mcp.find_costs(list(zip(*np.nonzero(frontier))))
-            self.cum = np.where(starts, 0.0, cum)
+            seeds = frontier & binary_dilation(band, structure=square)
+            passable = band | seeds
+            self.cum = np.where(starts, 0.0, np.inf)
+            self.searches = []
+            for b0, b1, b2, b3 in _windows(band, 1, g.shape):
+                win = (slice(b0, b1), slice(b2, b3))
+                win_seeds = list(zip(*np.nonzero(seeds[win])))
+                if not win_seeds:
+                    continue        # enclosed: no escape, cum stays inf
+                mcp = MCP_Geometric(np.where(passable[win], 1.0, np.inf),
+                                    fully_connected=True)
+                cum, _ = mcp.find_costs(win_seeds)
+                inside = band[win]
+                self.cum[win][inside] = cum[inside]
+                self.searches.append((b0, b1, b2, b3, mcp))
             from scipy.ndimage import minimum_filter
             # Same reach as connect()'s search, so the estimate never calls
             # a point unreachable that connect() could join.
@@ -409,8 +424,12 @@ class _Level:
             return None
         if self.starts[best[1]]:
             return best[0], np.asarray([best[1]], np.float64)
-        path = np.asarray(self.mcp.traceback(best[1]), np.float64)
-        return best[0], path
+        br, bc = best[1]
+        for b0, b1, b2, b3, mcp in self.searches:
+            if b0 <= br < b1 and b2 <= bc < b3:
+                path = np.asarray(mcp.traceback((br - b0, bc - b2)), np.float64)
+                return best[0], path + (b0, b2)
+        return None
 
     def seam_order(self, pts):
         """Indices of a closed ring's points, cheapest estimated escape

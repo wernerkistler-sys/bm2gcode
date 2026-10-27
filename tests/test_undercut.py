@@ -20,7 +20,7 @@ from stl_mesh import (load_stl, generate_dexels, generate_heightmap, mesh_z_boun
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
 from undercut import (build_undercut_kernels, compute_undercut_toolpath,
-                      NECK, _GapPicker, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
+                      NECK, _GapPicker, _Level, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
 
 FAILURES = []
 
@@ -246,6 +246,44 @@ check("nearest resample keeps each column's gaps",
 pg = pad_gaps(g, 1, 2)
 check("pad_gaps shifts gaps by the margin", pg.shape == (3, 7)
       and list(pg.counts[1]) == [0, 0, 0, 2, 1, 0, 0])
+
+
+# --------------------------------------------------------------------------
+# Escape routes: free space with sky on the left, a solid ring enclosing a
+# free pocket, and a solid wall the route must go around
+# --------------------------------------------------------------------------
+print("escape routes")
+from scipy.ndimage import binary_erosion, minimum_filter
+from skimage.graph import MCP_Geometric
+yy, xx = np.mgrid[:60, :60]
+g_e = np.ones((60, 60))
+g_e[(np.hypot(yy - 30, xx - 40) >= 8) & (np.hypot(yy - 30, xx - 40) <= 10)] = -1.0
+g_e[5:40, 20:23] = -1.0
+g_sky_e = np.where(xx < 12, 1.0, -1.0)
+lev = _Level(0.5, 0, 0, g_e, g_sky_e, 1e-6)
+# The full search through all free space, seeded at the whole sky frontier.
+sq = np.ones((3, 3), bool)
+dom = binary_erosion(g_e >= -1e-6, structure=sq)
+st = binary_erosion(g_sky_e >= -1e-6, structure=sq) & dom
+fr = st & ~binary_erosion(st, structure=sq)
+cum_full, _ = MCP_Geometric(np.where(dom, 1.0, np.inf), fully_connected=True).find_costs(
+    list(zip(*np.nonzero(fr))))
+check("escape costs equal the search through all free space",
+      np.array_equal(lev.cum, np.where(st, 0.0, cum_full)))
+check("a pocket enclosed by solid has no escape", np.isinf(lev.cum[30, 40])
+      and lev.connect((30.0, 40.0)) is None)
+route = lev.connect((20.0, 30.0))
+path = None if route is None else route[1].astype(int)
+check("a route around the wall starts in the sky and ends at the point",
+      path is not None and st[tuple(path[0])] and np.hypot(*(path[-1] - (20, 30))) <= 2.9
+      and all(g_e[r, c] >= 0 for r, c in path)
+      and (path[:, 0].min() < 5 or path[:, 0].max() >= 40))
+# The ring alone in open sky: the pocket is a search window of its own,
+# with no sky next to it.
+g_r = np.where((np.hypot(yy - 30, xx - 30) >= 8) & (np.hypot(yy - 30, xx - 30) <= 10), -1.0, 1.0)
+lev_r = _Level(0.5, 0, 0, g_r, np.where(np.hypot(yy - 30, xx - 30) <= 10, -1.0, 1.0), 1e-6)
+check("a pocket alone in its own window has no escape",
+      lev_r.reachable and np.isinf(lev_r.cum[30, 30]) and lev_r.connect((30.0, 30.0)) is None)
 
 
 # --------------------------------------------------------------------------
