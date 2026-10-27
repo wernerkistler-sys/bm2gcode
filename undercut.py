@@ -425,7 +425,8 @@ def compute_undercut_toolpath(
     ends with an escape path to clear sky at the level's depth.
     """
     from scipy.ndimage import binary_dilation, distance_transform_edt, label
-    from grey_morphology import grey_dilation, grey_erosion
+    from grey_morphology import (banded_grey_dilation, banded_grey_erosion,
+                                 grey_dilation, grey_erosion)
     from skimage.measure import find_contours
     from algorithms import _build_kernel, _retract_breakeven_mm
 
@@ -541,12 +542,11 @@ def compute_undercut_toolpath(
         for r0, r1, c0, c1 in _windows(active, k_rad + 1, (H, W)):
             R0, R1 = max(0, r0 - k_rad), min(H, r1 + k_rad)
             C0, C1 = max(0, c0 - k_rad), min(W, c1 + k_rad)
-            center_k = ceil_k = None
-            for F, C, _, band in picks:
-                e = grey_erosion(F[R0:R1, C0:C1], footprint=band, structure=-lo)
-                c = grey_dilation(C[R0:R1, C0:C1], footprint=band, structure=hi)
-                center_k = e if center_k is None else np.minimum(center_k, e)
-                ceil_k = c if ceil_k is None else np.maximum(ceil_k, c)
+            bands_k = [band for *_, band in picks]
+            center_k = banded_grey_erosion([F[R0:R1, C0:C1] for F, *_ in picks],
+                                           bands_k, -lo)
+            ceil_k = banded_grey_dilation([C[R0:R1, C0:C1] for _, C, *_ in picks],
+                                          bands_k, hi)
             g_gap = np.minimum(center_k - d, d - ceil_k)
             if shank is not None:
                 g_gap = np.minimum(g_gap, shank[R0:R1, C0:C1] - d)

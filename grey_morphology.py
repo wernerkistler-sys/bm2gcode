@@ -18,8 +18,15 @@ once and applied at both offsets.
 The output is split into tiles of rows computed in parallel on a shared
 thread pool: each tile needs only its own input rows plus the footprint's
 half-height above and below, and scipy releases the GIL while it filters.
+
+When numba is installed, a float input with a non-flat structure goes to a
+compiled kernel instead: one parallel pass over the output rows that takes
+the minimum over every footprint offset, with the same values and the same
+reflect border as scipy. banded_grey_erosion/banded_grey_dilation combine
+several inputs, each with its own footprint, in that one pass.
 """
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -30,6 +37,88 @@ _POOL = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 # with its neighbours stay a small part of its work.
 _MIN_TILE_KERNELS = 2
 _MIN_TILE_ROWS = 64
+
+USE_NUMBA = True        # the compiled kernel when numba is installed
+_numba_kernel = None    # compiled on first use; False once numba is found missing
+# numba's default threading layer aborts on kernel launches from two
+# threads at once; every launch already uses all cores.
+_numba_lock = threading.Lock()
+
+
+def _get_numba_kernel():
+    global _numba_kernel
+    if _numba_kernel is None:
+        try:
+            import numba
+        except ImportError:
+            _numba_kernel = False
+            return None
+
+        @numba.njit(parallel=True, cache=True)
+        def stack_erosion(padded, oi, oj, ob, os_, out):
+            """out[r, c] = min over offsets o of
+            padded[ob[o], r + oi[o], c + oj[o]] - os_[o]."""
+            H, W = out.shape
+            for r in numba.prange(H):
+                acc = np.full(W, np.inf)
+                for o in range(oi.size):
+                    # A slice, so the inner loop has no index arithmetic
+                    # and compiles to SIMD.
+                    seg = padded[ob[o], r + oi[o], oj[o]:oj[o] + W]
+                    s = os_[o]
+                    for c in range(W):
+                        v = seg[c] - s
+                        a = acc[c]
+                        acc[c] = v if v < a else a
+                out[r] = acc
+
+        _numba_kernel = stack_erosion
+    return _numba_kernel or None
+
+
+def _numba_applies(inputs, footprints, structure):
+    """True if the compiled kernel is available and the cheaper choice:
+    float inputs and a structure that isn't flat over the footprints (flat
+    rows cost scipy's row path the same whatever their width)."""
+    if not USE_NUMBA or _numba_kernel is False:
+        return False
+    if any(a.dtype not in (np.float32, np.float64) for a in inputs):
+        return False
+    if structure is None or not any(structure[fp].any() for fp in footprints):
+        return False
+    return _get_numba_kernel() is not None
+
+
+def _numba_erosion(inputs, footprints, structure):
+    """min over k of grey_erosion(inputs[k], footprints[k], structure) by
+    the compiled kernel, in the dtype scipy gives inputs[0]."""
+    kh, kw = footprints[0].shape
+    ry, rx = kh // 2, kw // 2
+    padded = np.stack([np.pad(np.asarray(a, np.float64), ((ry, ry), (rx, rx)),
+                              mode="symmetric") for a in inputs])
+    oi, oj, ob, os_ = [], [], [], []
+    for k, fp in enumerate(footprints):
+        i, j = np.nonzero(fp)
+        oi.append(i)
+        oj.append(j)
+        ob.append(np.full(i.size, k))
+        os_.append(structure[i, j])
+    oi, oj, ob = (np.concatenate(x).astype(np.int64) for x in (oi, oj, ob))
+    os_ = np.concatenate(os_).astype(np.float64)
+    out = np.empty(inputs[0].shape, np.float64)
+    with _numba_lock:
+        _get_numba_kernel()(padded, oi, oj, ob, os_, out)
+    # Rounding is monotone, so the min of the rounded values is the
+    # rounded min: the float32 result scipy gives.
+    return out.astype(inputs[0].dtype, copy=False)
+
+
+def _check_args(input, footprint):
+    kh, kw = footprint.shape
+    if input.ndim != 2 or kh % 2 == 0 or kw % 2 == 0:
+        raise ValueError("grey_erosion needs a 2-D input and an odd-sized footprint.")
+    if not footprint.any():
+        raise ValueError("grey_erosion needs a footprint with at least one True element.")
 
 
 def _row_erosion(padded, row, srow, kw):
@@ -75,15 +164,14 @@ def grey_erosion(input, footprint, structure=None):
     structure None means flat (all zeros)."""
     input = np.asarray(input)
     footprint = np.asarray(footprint, dtype=bool)
-    kh, kw = footprint.shape
-    if input.ndim != 2 or kh % 2 == 0 or kw % 2 == 0:
-        raise ValueError("grey_erosion needs a 2-D input and an odd-sized footprint.")
-    if not footprint.any():
-        raise ValueError("grey_erosion needs a footprint with at least one True element.")
+    _check_args(input, footprint)
+    if structure is not None:
+        structure = np.asarray(structure)
+    if _numba_applies([input], [footprint], structure):
+        return _numba_erosion([input], [footprint], structure)
     if structure is None:
         structure = np.zeros(footprint.shape, dtype=np.float64)
-    else:
-        structure = np.asarray(structure)
+    kh = footprint.shape[0]
     ry = kh // 2
     H = input.shape[0]
     # numpy's "symmetric" padding is scipy's "reflect" border mode.
@@ -117,3 +205,35 @@ def grey_opening(input, footprint, structure=None):
     structure=structure): erosion followed by dilation."""
     return grey_dilation(grey_erosion(input, footprint, structure),
                          footprint, structure)
+
+
+def banded_grey_erosion(inputs, footprints, structure=None):
+    """min over k of grey_erosion(inputs[k], footprints[k], structure): the
+    erosion by a footprint split into parts, each part reading its own
+    input. Inputs share one shape and footprints one shape."""
+    inputs = [np.asarray(a) for a in inputs]
+    footprints = [np.asarray(fp, dtype=bool) for fp in footprints]
+    if len(inputs) != len(footprints) or not inputs:
+        raise ValueError("banded_grey_erosion needs one footprint per input.")
+    for a, fp in zip(inputs, footprints):
+        _check_args(a, fp)
+        if a.shape != inputs[0].shape or fp.shape != footprints[0].shape:
+            raise ValueError("banded_grey_erosion needs equal-shaped inputs and footprints.")
+    if structure is not None:
+        structure = np.asarray(structure)
+    if _numba_applies(inputs, footprints, structure):
+        return _numba_erosion(inputs, footprints, structure)
+    out = None
+    for a, fp in zip(inputs, footprints):
+        e = grey_erosion(a, fp, structure)
+        out = e if out is None else np.minimum(out, e, out=out)
+    return out
+
+
+def banded_grey_dilation(inputs, footprints, structure=None):
+    """max over k of grey_dilation(inputs[k], footprints[k], structure)."""
+    if structure is not None:
+        structure = np.asarray(structure)[::-1, ::-1]
+    return -banded_grey_erosion([-np.asarray(a) for a in inputs],
+                                [np.asarray(fp, dtype=bool)[::-1, ::-1] for fp in footprints],
+                                structure)

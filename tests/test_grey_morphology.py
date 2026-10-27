@@ -101,7 +101,8 @@ for rad in (1, 5, 20):
 
 print("Matches scipy when split into row tiles")
 # Tall enough for several tiles whatever the core count; the last tile is
-# shorter than the others.
+# shorter than the others. Tiles are the scipy path's, so numba is off.
+gm.USE_NUMBA = False
 _, fp_ball = _build_kernel(Tool("Ball", 2.0), px_per_mm, max_depth)
 ball = -_build_kernel(Tool("Ball", 2.0), px_per_mm, max_depth)[0].astype(np.float64)
 for H in (gm._MIN_TILE_ROWS * 3 + 17, 1000):
@@ -123,6 +124,7 @@ check("tiled float32 in, float32 out, matches scipy",
       gm.grey_erosion(tall32, fp_ball, ball).dtype == np.float32
       and np.array_equal(gm.grey_erosion(tall32, fp_ball, ball),
                          ndi.grey_erosion(tall32, footprint=fp_ball, structure=ball)))
+gm.USE_NUMBA = True
 
 print("Keeps the input dtype")
 img32 = rng.random((40, 40)).astype(np.float32)
@@ -130,6 +132,45 @@ fp = disk(4).astype(bool)
 check("float32 in, float32 out", gm.grey_erosion(img32, fp).dtype == np.float32)
 check("float32 matches scipy",
       np.array_equal(gm.grey_erosion(img32, fp), ndi.grey_erosion(img32, footprint=fp)))
+
+print("Compiled kernel and scipy fallback")
+gm._get_numba_kernel()
+have_numba = gm._numba_kernel is not False
+print(f"  (numba {'installed' if have_numba else 'not installed: fallback only'})")
+_, fp_l = _build_kernel(Tool("Ball", 3.0), px_per_mm, max_depth)
+s_l = -_build_kernel(Tool("Ball", 3.0), px_per_mm, max_depth)[0].astype(np.float64)
+sentinel = rng.random((150, 120))
+sentinel[10:30, 40:80] = np.inf
+sentinel[60:65] = -2.0e6
+sentinel[:, 100:] = 1.0e6
+band_fps = [fp_l & (np.hypot(*np.mgrid[-15:16, -15:16]) < 8), fp_l & (np.hypot(*np.mgrid[-15:16, -15:16]) >= 8)]
+band_ins = [rng.random((150, 120)), sentinel]
+for use in ([True, False] if have_numba else [False]):
+    gm.USE_NUMBA = use
+    tag = "numba" if use else "fallback"
+    check(f"{tag}: ball erosion with inf and sentinels matches scipy",
+          np.array_equal(gm.grey_erosion(sentinel, fp_l, s_l),
+                         ndi.grey_erosion(sentinel, footprint=fp_l, structure=s_l)))
+    check(f"{tag}: ball dilation with inf and sentinels matches scipy",
+          np.array_equal(gm.grey_dilation(sentinel, fp_l, s_l),
+                         ndi.grey_dilation(sentinel, footprint=fp_l, structure=s_l)))
+    check(f"{tag}: asymmetric structure matches scipy",
+          np.array_equal(gm.grey_erosion(images["77x51"], fp_asym, s_asym),
+                         ndi.grey_erosion(images["77x51"], footprint=fp_asym, structure=s_asym)))
+    e32 = gm.grey_erosion(img32, fp_l[8:23, 8:23], s_l[8:23, 8:23])
+    check(f"{tag}: float32 stays float32 and matches scipy",
+          e32.dtype == np.float32 and np.array_equal(
+              e32, ndi.grey_erosion(img32, footprint=fp_l[8:23, 8:23],
+                                    structure=s_l[8:23, 8:23])))
+    check(f"{tag}: banded erosion is the min of the parts' erosions",
+          np.array_equal(gm.banded_grey_erosion(band_ins, band_fps, s_l),
+                         np.minimum(*[ndi.grey_erosion(a, footprint=fp, structure=s_l)
+                                      for a, fp in zip(band_ins, band_fps)])))
+    check(f"{tag}: banded dilation is the max of the parts' dilations",
+          np.array_equal(gm.banded_grey_dilation(band_ins, band_fps, s_l),
+                         np.maximum(*[ndi.grey_dilation(a, footprint=fp, structure=s_l)
+                                      for a, fp in zip(band_ins, band_fps)])))
+gm.USE_NUMBA = True
 
 print()
 if FAILURES:
