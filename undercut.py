@@ -826,9 +826,6 @@ def compute_undercut_toolpath(
     if has_targets and not chains:
         warn("No undercut is reachable with this tool (check the neck "
              "diameter, neck length and shank diameter).", 90)
-    if previous_result is None:
-        warn("No previous step: Undercut assumes the stock above the overhangs "
-             "was already removed by earlier 2.5D steps.", 90)
 
     # ── Order: undercut regions nearest-first, levels top-down within each ─
     progress(90, "Ordering…")

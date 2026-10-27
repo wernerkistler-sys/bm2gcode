@@ -4188,22 +4188,20 @@ class GCodeGeneratorApp:
         algorithm = params['algorithm']
 
         if algorithm == "Contour":
-            if idx > 0 and prev_tp is None:
+            # Contour reads the prior step's result only to drop air cuts.
+            if params['avoid_air'] and idx > 0 and prev_tp is None:
                 if not messagebox.askyesno(
                         "Previous step not computed",
                         f"Step {idx} has not been computed yet.\n\n"
-                        "Without its result this step will treat the entire "
-                        "depth map as unfinished.\n\nContinue anyway?"):
+                        "Without its result Avoid air treats the stock as "
+                        "uncut and keeps the cuts through material that step "
+                        "would clear.\n\nContinue anyway?"):
                     return
         elif ALGORITHM_FAMILY[algorithm] == "Undercut":
-            if idx > 0 and prev_tp is None:
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        "Undercut cuts sideways under overhangs and assumes the "
-                        "stock above them was already removed by earlier "
-                        "steps.\n\nContinue anyway?"):
-                    return
+            pass  # Undercut cuts the gaps of its own sources regardless of
+                  # any prior step -- a missing prev_tp only affects this
+                  # step's own result bookkeeping, not which pixels get cut,
+                  # so there is nothing to warn about here.
         elif algorithm == "Cutout":
             pass  # Cutout cuts based on its own depth_map threshold regardless
                   # of any prior step -- a missing prev_tp only affects this
