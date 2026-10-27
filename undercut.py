@@ -135,17 +135,47 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
     gap's ceiling). Columns with no such gap have the top surface as floor
     and open sky above. Returns (F, C, active) with active marking the
     columns that use a gap."""
-    F = top.astype(np.float64).copy()
-    C = np.full(top.shape, SKY)
-    active = np.zeros(top.shape, bool)
-    idx = np.flatnonzero(gaps.ceil < d)
-    if idx.size:
-        pix = gap_pix[idx]
-        last = idx[np.r_[pix[1:] != pix[:-1], True]]
-        F.flat[gap_pix[last]] = gaps.floor[last]
-        C.flat[gap_pix[last]] = gaps.ceil[last]
-        active.flat[gap_pix[last]] = True
-    return F, C, active
+    F, C, active = _GapPicker(gaps, gap_pix, top).advance(d)
+    return F.copy(), C.copy(), active.copy()
+
+
+class _GapPicker:
+    """_floor_ceil_at for a depth that rises from call to call: advance(d)
+    writes only the gaps whose ceiling d has passed since the last call,
+    into F, C and active arrays it keeps and returns."""
+
+    def __init__(self, gaps, gap_pix, top, order=None):
+        self.gaps, self.gap_pix = gaps, gap_pix
+        self.top = top.astype(np.float64)
+        # Gaps by ceiling; equal ceilings in column order.
+        self.order = np.argsort(gaps.ceil, kind="stable") if order is None else order
+        self.ceil_sorted = gaps.ceil[self.order]
+        self._reset()
+
+    def _reset(self):
+        self.F = self.top.copy()
+        self.C = np.full(self.top.shape, SKY)
+        self.active = np.zeros(self.top.shape, bool)
+        self.n = 0          # gaps written: order[:n], those with ceil < d
+        self.d = -np.inf
+
+    def advance(self, d):
+        if d < self.d:
+            self._reset()
+        self.d = d
+        n = int(np.searchsorted(self.ceil_sorted, d, side="left"))
+        if n > self.n:
+            # A column's gaps are shallowest first and any gap passed
+            # earlier has a lower ceiling, so the column's last new gap is
+            # the deepest one above d.
+            idx = np.sort(self.order[self.n:n])
+            pix = self.gap_pix[idx]
+            last = idx[np.r_[pix[1:] != pix[:-1], True]]
+            self.F.flat[self.gap_pix[last]] = self.gaps.floor[last]
+            self.C.flat[self.gap_pix[last]] = self.gaps.ceil[last]
+            self.active.flat[self.gap_pix[last]] = True
+            self.n = n
+        return self.F, self.C, self.active
 
 
 def _open_to_sky(depth_map, gaps):
@@ -510,6 +540,13 @@ def compute_undercut_toolpath(
     gap_pix = gaps.pixel_index()
     if gap_pix.size == 0:
         warn("The step's sources have no undercuts.", 100)
+    # One picker per band, each following its band's underside depth down
+    # through the levels. Where all bands pick alike, the picks of the band
+    # nearest the tip (smallest lo, depth b_max) serve the whole footprint.
+    gap_order = np.argsort(gaps.ceil, kind="stable")
+    ceil_sorted = gaps.ceil[gap_order]
+    pickers = [_GapPicker(gaps, gap_pix, depth_map, gap_order) for _ in bands]
+    i_lo_min = int(np.argmin(band_lo))
 
     # ── Levels ────────────────────────────────────────────────────────────
     n_levels = max(1, math.ceil(max_depth / z_increment_mm))
@@ -527,15 +564,16 @@ def compute_undercut_toolpath(
         progress(5 + 85 * li / len(levels),
                  f"Level {li + 1}/{len(levels)} ({d * max_depth:.2f} mm)…")
         b_min, b_max = d - band_lo.max(), d - band_lo.min()
-        if gap_pix.size == 0 or not np.any(gaps.ceil < b_max):
+        n_min, n_max = np.searchsorted(ceil_sorted, [b_min, b_max], side="left")
+        if n_max == 0:
             continue
         # Bands pick the same gaps wherever no ceiling lies between their
         # underside depths; then one pass over the whole footprint does.
-        if np.any((gaps.ceil >= b_min) & (gaps.ceil < b_max)):
-            picks = [_floor_ceil_at(gaps, gap_pix, depth_map, d - lo_mid) + (band,)
-                     for lo_mid, band in bands]
+        if n_max > n_min:
+            picks = [picker.advance(d - lo_mid) + (band,)
+                     for picker, (lo_mid, band) in zip(pickers, bands)]
         else:
-            picks = [_floor_ceil_at(gaps, gap_pix, depth_map, b_max) + (fp,)]
+            picks = [pickers[i_lo_min].advance(b_max) + (fp,)]
         active = np.logical_or.reduce([p[2] for p in picks])
         g_sky = sky_limit - d
         g = g_sky.copy()

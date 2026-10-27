@@ -20,7 +20,7 @@ from stl_mesh import (load_stl, generate_dexels, generate_heightmap, mesh_z_boun
                       normalize_and_orient)
 from tool import Tool, undercut_geometry_error
 from undercut import (build_undercut_kernels, compute_undercut_toolpath,
-                      NECK, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
+                      NECK, _GapPicker, _floor_ceil_at, _open_to_sky, _head_profile, _resample_gaps)
 
 FAILURES = []
 
@@ -194,6 +194,39 @@ F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.7)
 check("depth inside gap 1 uses gap 1", F[0, 1] == 0.8 and C[0, 1] == 0.6)
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.25)
 check("depth above every gap ceiling: no gap", F[0, 2] == 0.1 and not act[0, 2])
+
+
+def floor_ceil_reference(gaps, top, d):
+    """Every column's deepest gap with ceil < d, picked from scratch."""
+    F = top.astype(np.float64).copy()
+    C = np.full(top.shape, -2.0e6)
+    act = np.zeros(top.shape, bool)
+    off = gaps.offsets
+    for p in range(top.size):
+        for k in range(off[p], off[p + 1]):
+            if gaps.ceil[k] < d:
+                F.flat[p], C.flat[p], act.flat[p] = gaps.floor[k], gaps.ceil[k], True
+    return F, C, act
+
+
+# Random stacks of up to 4 gaps per column, with ceilings on a coarse grid so
+# that equal ceilings occur within and across columns; depths rising (the
+# picker's own case), repeated, and falling back (it starts over).
+rng_p = np.random.default_rng(7)
+pix_p, ceil_p, floor_p = [], [], []
+for p in range(300):
+    edges = np.sort(rng_p.integers(0, 20, 2 * rng_p.integers(0, 5)) / 20.0)
+    for c_, f_ in zip(edges[0::2], edges[1::2]):
+        pix_p.append(p); ceil_p.append(c_); floor_p.append(f_)
+gp = Gaps.from_lists((15, 20), pix_p, ceil_p, floor_p)
+top_p = rng_p.random((15, 20)) * 0.05
+picker = _GapPicker(gp, gp.pixel_index(), top_p)
+ok = True
+for d in [0.0, 0.05, 0.05, 0.1, 0.3, 0.30001, 0.55, 0.2, 0.6, 0.95, 1.0, 2.0]:
+    got = picker.advance(d)
+    ref = floor_ceil_reference(gp, top_p, d)
+    ok &= all(np.array_equal(a, b) for a, b in zip(got, ref))
+check("incremental picks equal from-scratch picks at every depth", ok)
 
 # Column 0: a gap at the top, then one starting at that gap's floor; column
 # 1: a gap starting above its top (not merged); column 2: a gap at the top,
