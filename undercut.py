@@ -24,6 +24,7 @@ SKY  = -2.0e6   # ceiling of a column with nothing overhead
 NECK = 1.0e6    # tool top over the neck: the neck runs up without end
 MAX_BANDS = 8   # underside-height bands a footprint is split into at most
 TOP_EPS = 1e-6  # a gap ceiling this close to the top surface opens to the sky
+OPEN_BOTTOM_TOL = 1e-4  # a gap floor this close to full depth is open below
 
 
 def equivalent_2p5d_tool(tool):
@@ -209,6 +210,37 @@ def _open_to_sky(depth_map, gaps):
     keep = ~merged
     return (top.reshape(depth_map.shape).astype(depth_map.dtype),
             Gaps.from_lists(gaps.shape, pix[keep], gaps.ceil[keep], gaps.floor[keep]))
+
+
+def _closed_gaps(gaps):
+    """*gaps* without those whose floor lies at full depth (within
+    OPEN_BOTTOM_TOL), i.e. the enclosed gaps of layers.overhang_masks."""
+    from layers import Gaps
+    keep = gaps.floor < 1.0 - OPEN_BOTTOM_TOL
+    if keep.all():
+        return gaps
+    pix = gaps.pixel_index()
+    return Gaps.from_lists(gaps.shape, pix[keep], gaps.ceil[keep], gaps.floor[keep])
+
+
+def _enclosed_reach(picks, shape, k_rad):
+    """Tool positions whose footprint takes in a column where the band
+    covering that column picked an enclosed gap (floor above full depth).
+    *picks* are (F, C, active, band) per band, band a footprint mask."""
+    from grey_morphology import banded_grey_dilation
+    H, W = shape
+    enclosed = [p[2] & (p[0] < 1.0 - OPEN_BOTTOM_TOL) for p in picks]
+    bands = [band for *_, band in picks]
+    target = np.zeros(shape, bool)
+    for r0, r1, c0, c1 in _windows(np.logical_or.reduce(enclosed), k_rad + 1, shape):
+        R0, R1 = max(0, r0 - k_rad), min(H, r1 + k_rad)
+        C0, C1 = max(0, c0 - k_rad), min(W, c1 + k_rad)
+        # A flat dilation of 0/1 masks: footprints are point-symmetric, so
+        # it gives the positions whose footprint holds an enclosed column.
+        win = banded_grey_dilation(
+            [e[R0:R1, C0:C1].astype(np.float32) for e in enclosed], bands) > 0.5
+        target[r0:r1, c0:c1] |= win[r0 - R0:r1 - R0, c0 - C0:c1 - C0]
+    return target
 
 
 def _gather_gaps(gaps, src_pix, new_shape):
@@ -445,8 +477,9 @@ def compute_undercut_toolpath(
         depth_map, gaps, tool, z_increment_mm, stepover_pct, max_depth,
         width_mm, height_mm, origin="Bottom-Left", feed_rate=800.0,
         previous_result=None, z_safe=5.0, feed_rapid=3000.0,
-        cut_direction="Climb", extra_offset_mm=0.0, n_grey_levels=65536,
-        progress=None, erosion_cache=None, erosion_cache_key=None):
+        cut_direction="Climb", extra_offset_mm=0.0, open_undercuts="cut",
+        n_grey_levels=65536, progress=None, erosion_cache=None,
+        erosion_cache_key=None):
     """Plan undercut roughing and finishing at uniform depth levels.
 
     Parameters
@@ -460,6 +493,15 @@ def compute_undercut_toolpath(
     cut_direction  : "Either" | "Climb" | "Conventional"; Climb keeps the
                      uncut material on the right of travel, as in Contour
     extra_offset_mm: stock to leave on every surface (Minkowski allowance)
+    open_undercuts : what to do with gaps whose floor reaches full depth
+                     (open below, machinable from the back once the stock
+                     is turned over):
+                     "cut"   -- cut them like enclosed ones;
+                     "solid" -- take them as solid (the back is still
+                                uncut), so only enclosed gaps are cut;
+                     "air"   -- keep them as air the tool may move through
+                                (the back is already cut), but cut only
+                                where the tool reaches an enclosed gap
     previous_result: the prior step's ToolPath.result; passed through as
                      this step's result (see README.md)
 
@@ -497,7 +539,14 @@ def compute_undercut_toolpath(
         warnings.append(msg)
         progress(pct, "Warning: " + msg)
 
+    if open_undercuts not in ("cut", "solid", "air"):
+        raise ValueError(f"Unknown open_undercuts mode {open_undercuts!r}.")
     depth_map, gaps = _open_to_sky(depth_map, gaps)
+    has_gaps = gaps.floor.size > 0
+    has_targets = (has_gaps if open_undercuts == "cut"
+                   else bool((gaps.floor < 1.0 - OPEN_BOTTOM_TOL).any()))
+    if open_undercuts == "solid":
+        gaps = _closed_gaps(gaps)
 
     # ── Square pixels ─────────────────────────────────────────────────────
     H, W = depth_map.shape
@@ -557,8 +606,10 @@ def compute_undercut_toolpath(
     band_lo = np.array([b[0] for b in bands])
 
     gap_pix = gaps.pixel_index()
-    if gap_pix.size == 0:
+    if not has_gaps:
         warn("The step's sources have no undercuts.", 100)
+    elif not has_targets:
+        warn("The step's sources have no enclosed undercuts.", 100)
     # One picker per band, each following its band's underside depth down
     # through the levels. Where all bands pick alike, the picks of the band
     # nearest the tip (smallest lo, depth b_max) serve the whole footprint.
@@ -612,20 +663,30 @@ def compute_undercut_toolpath(
             g[r0:r1, c0:c1] = np.maximum(inner, g_sky[r0:r1, c0:c1])
 
         undercut = (g >= -eps) & (g_sky < -eps)
-        if not undercut.any():
+        if open_undercuts == "air":
+            # Where the tool fits, it lies inside the gap each column of its
+            # footprint picked, so it is in enclosed air exactly where a
+            # column of a band picked an enclosed gap.
+            target = _enclosed_reach(picks, (H, W), k_rad)
+            undercut_cut = undercut & target
+        else:
+            target, undercut_cut = None, undercut
+        if not undercut_cut.any():
             continue
-        u_union |= undercut
+        u_union |= undercut_cut
         # A straight link between rings at this depth replaces escape +
         # retract + plunge + re-entry; take it up to the length whose feed
         # time equals the retract it saves, and never less than a tool width.
         link_max_px = max(tool.diameter_mm, _retract_breakeven_mm(
             feed_rate, feed_rapid, z_safe, d * max_depth)) * px_per_mm
         pad = 2 * k_rad + int(np.ceil(max_rings * step_px)) + 8
-        for r0, r1, c0, c1 in _windows(undercut, pad, (H, W)):
+        for r0, r1, c0, c1 in _windows(undercut_cut, pad, (H, W)):
             lev = _Level(d, r0, c0, g[r0:r1, c0:c1], g_sky[r0:r1, c0:c1], eps)
-            u_crop = undercut[r0:r1, c0:c1]
+            u_crop = undercut_cut[r0:r1, c0:c1]
             if not u_crop.any():
                 continue
+            target_crop = (None if target is None
+                           else target[r0:r1, c0:c1].astype(np.float64))
 
             # Rings, outermost (nearest open sky) first, waterline last.
             edt = distance_transform_edt(lev.free)
@@ -646,6 +707,8 @@ def compute_undercut_toolpath(
                     # of g_sky alone flips from point to point.
                     gs = _sample(lev.g_sky, c)
                     in_u = (gs < -eps) & (_sample(lev.g, c) - gs > eps)
+                    if target_crop is not None:
+                        in_u &= _sample(target_crop, c) > 0.0
                     if not in_u.any():
                         continue
                     runs_j.extend(_split_runs(c, in_u, closed, link_max_px))
@@ -747,7 +810,7 @@ def compute_undercut_toolpath(
         warn(f"{n_unreachable} undercut stretch{'es' if n_unreachable != 1 else ''} "
              f"cannot be reached sideways from open sky at its level and "
              f"{'were' if n_unreachable != 1 else 'was'} skipped.", 90)
-    if gap_pix.size and not chains:
+    if has_targets and not chains:
         warn("No undercut is reachable with this tool (check the neck "
              "diameter, neck length and shank diameter).", 90)
     if previous_result is None:
@@ -823,6 +886,7 @@ def compute_undercut_toolpath(
             'z_increment_mm':  z_increment_mm,
             'stepover_pct':    stepover_pct,
             'extra_offset_mm': extra_offset_mm,
+            'open_undercuts':  open_undercuts,
             'n_passes':        n_cut_levels,
             'n_unreachable':   n_unreachable,
             'warnings':        warnings,

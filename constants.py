@@ -8,6 +8,11 @@ POCKET_ZIGZAG     = ["Zig-Zag (0°)", "Zig-Zag (45°)", "Zig-Zag (90°)", "Zig-Z
 POCKET_PATTERNS   = POCKET_ZIGZAG + WOUND_DIRECTIONS + ["Onion Skin (Outside-In)",
                                                         "Onion Skin (Inside-Out)"]
 CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
+# Undercut: what to do with undercuts open below (label -> undercut.py's
+# open_undercuts mode).
+UNDERCUT_OPEN_MODES = {"Cut": "cut",
+                       "Skip, back uncut": "solid",
+                       "Skip, back already cut": "air"}
 ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
@@ -147,6 +152,7 @@ DEFAULTS = {
     "step_head_height":       "2.0",   # T-Slot disc / Dovetail head thickness (mm)
     "step_dovetail_angle":    "60",    # angle between the flank and the bottom face (deg)
     "step_undercut_z_increment": "1.0",  # Undercut depth spacing between levels (mm)
+    "step_undercut_open": "Cut",         # key of UNDERCUT_OPEN_MODES
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     "step_avoid_air":             "0",   # 1 = drop toolpath runs that would cut only air

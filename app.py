@@ -38,7 +38,7 @@ _OVERHANG_REACHED_COLOR = "#2ea8ff"
 
 from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, WOUND_DIRECTIONS,
-    CUT_DIRECTIONS, ALGORITHMS,
+    CUT_DIRECTIONS, UNDERCUT_OPEN_MODES, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
@@ -1106,6 +1106,7 @@ class GCodeGeneratorApp:
         dst['reghole_pattern_var'].set(src['reghole_pattern_var'].get())
         dst['reghole_diag_dir_var'].set(src['reghole_diag_dir_var'].get())
         dst['contour_adaptive_var'].set(src['contour_adaptive_var'].get())
+        dst['undercut_open_var'].set(src['undercut_open_var'].get())
         dst['tsp_2opt_var'].set(src['tsp_2opt_var'].get())
         dst['avoid_air_var'].set(src['avoid_air_var'].get())
         dst['gating_mode_var'].set(src['gating_mode_var'].get())
@@ -1256,6 +1257,16 @@ class GCodeGeneratorApp:
                                             DEFAULTS["step_undercut_z_increment"],
                                             minval=0.01, maxval=50.0, increment=0.1)
         step['undercut_z_increment'] = undercut_z_increment
+        # (not packed initially — shown on demand by _refresh_layout)
+
+        undercut_open_row = ttk.Frame(operation_lf)
+        step['undercut_open_row'] = undercut_open_row
+        ttk.Label(undercut_open_row, text="Open undercuts:").pack(side=tk.LEFT)
+        undercut_open_var = tk.StringVar(value=DEFAULTS["step_undercut_open"])
+        step['undercut_open_var'] = undercut_open_var
+        ttk.Combobox(undercut_open_row, textvariable=undercut_open_var,
+                     values=list(UNDERCUT_OPEN_MODES), state="readonly", width=22
+                     ).pack(side=tk.RIGHT)
         # (not packed initially — shown on demand by _refresh_layout)
 
         # ── Registration-Holes-only controls (hidden unless that algorithm)
@@ -1573,6 +1584,7 @@ class GCodeGeneratorApp:
             if family != "Undercut":
                 step['undercut_frame'].pack_forget()
                 step['undercut_z_increment'].pack_forget()
+                step['undercut_open_row'].pack_forget()
                 if not step['raster_offset'].winfo_manager():
                     step['raster_offset'].pack(fill=tk.X, pady=2, after=step['stepover'])
                 if not step['raster_dir_row'].winfo_manager():
@@ -1703,7 +1715,9 @@ class GCodeGeneratorApp:
                 else:
                     step['dovetail_angle'].pack_forget()
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['undercut_frame'])
-                step['undercut_z_increment'].pack(fill=tk.X, pady=2, after=step['alg_row'])
+                step['undercut_open_row'].pack(fill=tk.X, pady=2, after=step['alg_row'])
+                step['undercut_z_increment'].pack(fill=tk.X, pady=2,
+                                                  after=step['undercut_open_row'])
                 step['raster_frame'].pack(fill=tk.X, after=step['undercut_z_increment'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
             elif family == "Pocket":   # Pocket, V-Carving Clean-up
@@ -1913,6 +1927,7 @@ class GCodeGeneratorApp:
         step['contour_adaptive_var'].set(bool(int(DEFAULTS["step_contour_adaptive"])))
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
         step['undercut_z_increment'].set(DEFAULTS["step_undercut_z_increment"])
+        step['undercut_open_var'].set(DEFAULTS["step_undercut_open"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
         step['avoid_air_var'].set(bool(int(DEFAULTS["step_avoid_air"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
@@ -2935,6 +2950,7 @@ class GCodeGeneratorApp:
             'contour_adaptive':     step['contour_adaptive_var'].get(),
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
             'undercut_z_increment': step['undercut_z_increment'].get(),
+            'undercut_open':        step['undercut_open_var'].get(),
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'avoid_air':            step['avoid_air_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
@@ -3010,6 +3026,9 @@ class GCodeGeneratorApp:
             'undercut_z_increment',
             d.get('stepdown', DEFAULTS['step_undercut_z_increment'])
             if d.get('algorithm') == "Undercut" else DEFAULTS['step_undercut_z_increment']))
+        undercut_open = d.get('undercut_open', DEFAULTS['step_undercut_open'])
+        step['undercut_open_var'].set(undercut_open if undercut_open in UNDERCUT_OPEN_MODES
+                                      else DEFAULTS['step_undercut_open'])
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['avoid_air_var'].set(bool(d.get('avoid_air', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
@@ -3741,6 +3760,7 @@ class GCodeGeneratorApp:
                 'z_increment_mm':    float(step['undercut_z_increment'].get()),
                 'stepover_pct':      float(step['stepover'].get()),
                 'cut_direction':     step['cut_dir_var'].get(),
+                'open_undercuts':    UNDERCUT_OPEN_MODES[step['undercut_open_var'].get()],
                 # Read by _undercut_gaps off the main thread; Layer objects
                 # are plain data, so a snapshot of the list is enough.
                 'layers':            list(self.layers),
@@ -3851,6 +3871,7 @@ class GCodeGeneratorApp:
                 feed_rapid       = self._settings['feed_rapid'],
                 cut_direction    = params['cut_direction'],
                 extra_offset_mm  = params['extra_offset_mm'],
+                open_undercuts   = params['open_undercuts'],
                 n_grey_levels    = n_grey_levels,
                 progress         = progress_fn,
                 erosion_cache    = self._erosion_cache,

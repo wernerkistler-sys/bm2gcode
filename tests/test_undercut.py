@@ -863,6 +863,95 @@ tp_e = compute_undercut_toolpath(depth, Gaps.empty(depth.shape), tool, 0.5, 30.0
 check("no gaps: no chains, with a warning", tp_e.segments == []
       and any("no undercuts" in w for w in tp_e.metadata['warnings']))
 
+print("undercut toolpath: open undercuts")
+# The cone's gaps reach the plate at full depth (open below); the pulley's
+# grooves are enclosed by the pulley itself.
+for mode in ("solid", "air"):
+    tp_co = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                      previous_result=prev, open_undercuts=mode)
+    check(f"{mode}: an open-bottom undercut is not cut, with one warning",
+          tp_co.segments == []
+          and [w for w in tp_co.metadata['warnings'] if "undercut" in w]
+          == ["The step's sources have no enclosed undercuts."])
+    tp_pc = compute_undercut_toolpath(depth_p, gaps_p, tool_p, 0.5, 40.0, HP, SIZE_MM,
+                                      SIZE_MM, previous_result=depth_p.copy(),
+                                      open_undercuts=mode)
+    check(f"{mode}: enclosed undercuts are cut as with \"cut\"",
+          tp_pc.segments == tp_p.segments)
+
+# Both kinds in one map: the pulley's grooves plus a floating ring with
+# open air below it, far enough out that the head plunges between them.
+_rr = np.hypot(_x - AXIS[0], _y - AXIS[1]).ravel()
+_pc = np.flatnonzero((_rr > RP + 8.0) & (_rr < RP + 12.0))
+depth_m = depth_p.copy()
+depth_m.ravel()[_pc] = 0.0
+_gp = gaps_p.pixel_index()
+gaps_m = Gaps.from_lists(gaps_p.shape, np.r_[_gp, _pc], np.r_[gaps_p.ceil, np.full(_pc.size, 0.5)],
+                         np.r_[gaps_p.floor, np.ones(_pc.size)])
+_ring_m = np.flatnonzero((_rr > RP + 9.0) & (_rr < RP + 11.0))
+_groove_m = np.flatnonzero((_rr > RP - 1.0) & (_rr < RP))
+tp_ma = compute_undercut_toolpath(depth_m, gaps_m, tool_p, 0.5, 40.0, HP, SIZE_MM, SIZE_MM,
+                                  previous_result=depth_m.copy())
+check("mixed map, cut: the open ring is reached",
+      tp_ma.undercut_reach.ravel()[_ring_m].any())
+for mode in ("solid", "air"):
+    tp_m = compute_undercut_toolpath(depth_m, gaps_m, tool_p, 0.5, 40.0, HP, SIZE_MM,
+                                     SIZE_MM, previous_result=depth_m.copy(),
+                                     open_undercuts=mode)
+    _reach_m = tp_m.undercut_reach.ravel()
+    check(f"mixed map, {mode}: the enclosed grooves are reached, the open ring not",
+          len(tp_m.segments) > 0 and _reach_m[_groove_m].any()
+          and not _reach_m[_ring_m].any())
+
+# A mushroom cap of radius 10 mm over a ledge at 0.7 of full depth that
+# stops 0.5 mm short of the cap's rim: the outer 0.5 mm of the air under
+# the cap is open below, the rest enclosed. Taken as solid, that band walls
+# the enclosed air off; taken as air, the head reaches past it.
+RM = 10.0
+_cap = np.flatnonzero(_rr < RM)
+depth_mu = np.where(_rr < RM, 0.0, 1.0).reshape(depth.shape).astype(np.float32)
+gaps_mu = Gaps.from_lists(depth.shape, _cap, np.full(_cap.size, 0.3),
+                          np.where(_rr[_cap] < RM - 0.5, 0.7, 1.0))
+_ledge_rim = np.flatnonzero((_rr > RM - 1.25) & (_rr < RM - 0.75))
+tool_mu = Tool("Lollipop", 5.0, neck_diameter_mm=2.0)
+tp_mus = compute_undercut_toolpath(depth_mu, gaps_mu, tool_mu, 0.5, 40.0, HP, SIZE_MM,
+                                   SIZE_MM, previous_result=depth_mu.copy(),
+                                   open_undercuts="solid")
+check("mushroom, solid: the walled-off enclosed air is not cut, with a warning",
+      tp_mus.segments == []
+      and any("No undercut is reachable" in w for w in tp_mus.metadata['warnings']))
+tp_mua = compute_undercut_toolpath(depth_mu, gaps_mu, tool_mu, 0.5, 40.0, HP, SIZE_MM,
+                                   SIZE_MM, previous_result=depth_mu.copy(),
+                                   open_undercuts="air")
+check("mushroom, air: the head reaches the enclosed air past the open band",
+      len(tp_mua.segments) > 0 and tp_mua.undercut_reach.ravel()[_ledge_rim].all())
+_lv = {round(-s[0][2] / HP, 6) for s in tp_mua.segments}
+
+
+def mushroom_solid(xs, ys, zs):
+    rr_ = np.hypot(xs - AXIS[0], ys - AXIS[1])
+    d_ = -zs / HP
+    return (((rr_ <= RM) & (d_ >= 0) & (d_ <= 0.3))
+            | ((rr_ <= RM - 0.5) & (d_ >= 0.7)) | (d_ > 1.0))
+
+
+check("mushroom, air: no tool/part collision",
+      collisions(tp_mua, tool_mu, 0.3, solid=mushroom_solid) == 0)
+# The head's rim rises R above the tip, so its tip may sit below the ledge.
+check("mushroom, air: only levels where the head can be in enclosed air",
+      _lv and all(0.3 < v <= 0.7 + 2.5 / HP + 1e-9 for v in _lv))
+# Positions within a head radius of the enclosed air, reaching a head
+# radius further.
+_far = np.flatnonzero(_rr > RM - 0.5 + 2 * 2.5 + 0.5)
+check("mushroom, air: nothing reached far outside the cap",
+      not tp_mua.undercut_reach.ravel()[_far].any())
+try:
+    compute_undercut_toolpath(depth_mu, gaps_mu, tool_mu, 0.5, 40.0, HP, SIZE_MM, SIZE_MM,
+                              open_undercuts="skip")
+    check("an unknown open_undercuts mode is refused", False)
+except ValueError:
+    check("an unknown open_undercuts mode is refused", True)
+
 print("undercut toolpath: non-square pixels")
 depth_ns = depth[:, :-1]                          # 240 x 239 px over 59.75 x 60 mm
 pix = gaps.pixel_index()
