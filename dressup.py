@@ -29,6 +29,7 @@ class RampSettings:
     start_z_mm: float = 0.0       # Z where the zig-zag begins (stock top); plain plunge above
     max_depth_mm: float = 0.0     # deepest descent one zig-zag covers; 0 = no limit
     max_legs: int = 20            # internal safety cap, not exposed in UI
+    plunge_angle_deg: float = 75.0  # legs at least this steep count as a plunge; internal
 
 
 @dataclass
@@ -163,6 +164,47 @@ def generate_ramp(points: List[Point], z_start: float,
         return [points[0]]
     result[-1] = points[0]
     return result
+
+
+def leading_plunge_end(points: List[Point], settings: RampSettings) -> int:
+    """Index of the last point of the (near) vertical descent `points` starts
+    with: the run of leading legs that go down at settings.plunge_angle_deg
+    or steeper. 0 when the path doesn't start with one.
+    """
+    tan_min = math.tan(math.radians(settings.plunge_angle_deg))
+    end = 0
+    for p, q in zip(points, points[1:]):
+        drop = p[2] - q[2]
+        if drop <= 1e-9 or _xy_dist(p, q) * tan_min > drop:
+            break
+        end += 1
+    return end
+
+
+def generate_plunge_ramp(points: List[Point], plunge_end: int, z_start: float,
+                          settings: Optional[RampSettings]) -> List[Point]:
+    """Zig-zag descent from z_start to the bottom of the plunge that `points`
+    starts with (points[plunge_end], see leading_plunge_end), then back up
+    the plunge to points[0], so the path's own plunge runs through material
+    the zig-zag already removed.
+
+    The zig-zag is generate_ramp() on the path from the plunge's bottom on,
+    entered by a level move from above points[0] to above the plunge's
+    bottom. z_start must not lie below points[0], which keeps that move
+    above the plunge's own legs.
+
+    Returns a list of waypoints ending exactly at points[0]. Like
+    generate_ramp, it omits the caller-known starting position
+    (points[0]'s XY at z_start), and returns [points[0]] (length 1) when
+    the path past the plunge can't carry a ramp.
+    """
+    tail = points[plunge_end:]
+    ramp = generate_ramp(tail, z_start, settings)
+    if len(ramp) < 2:
+        return [points[0]]
+    entry = (tail[0][0], tail[0][1], z_start)
+    lead = [entry] if _xy_dist(points[0], entry) > 1e-9 else []
+    return lead + ramp + points[plunge_end - 1::-1]
 
 
 def compute_backoff_path(prev_points: List[Point],

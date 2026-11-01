@@ -10,7 +10,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dressup import (RampSettings, BackoffSettings, ArcSettings,
-                      generate_ramp, compute_backoff_path, generate_corner_arc)
+                      generate_ramp, generate_plunge_ramp, leading_plunge_end,
+                      compute_backoff_path, generate_corner_arc)
 from toolpath import ToolPath
 
 FAILURES = []
@@ -26,6 +27,10 @@ def check(name, cond):
 
 def dist(a, b):
     return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+
+
+def _xy_dist_of(a, b):
+    return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
 # --------------------------------------------------------------------------
@@ -405,6 +410,115 @@ moves_disabled_limit = moves_for_second_segment(
     tp_deep, z_safe=5.0, ramp=RampSettings(enabled=False, max_depth_mm=3.0))
 check("max ramp depth: disabled ramp stays a single plain plunge",
       [k for k, _ in moves_disabled_limit if k in ('plunge', 'ramp')] == ['plunge'])
+
+
+# ---------------------------------------------------------------------------
+# A path that starts with a (near) vertical plunge of its own is ramped to
+# the plunge's bottom, then moves back up; the path itself stays unchanged.
+# ---------------------------------------------------------------------------
+print("ramp to the bottom of a leading plunge")
+
+rs = RampSettings(enabled=True, angle_deg=30.0, max_length_mm=15.0)
+
+check("leading_plunge_end: exactly vertical leg",
+      leading_plunge_end([(0, 0, -4), (0, 0, -6), (9, 0, -6)], rs) == 1)
+check("leading_plunge_end: near-vertical leg",
+      leading_plunge_end([(0, 0, -4), (0.1, 0, -6), (9, 0, -6)], rs) == 1)
+check("leading_plunge_end: several legs in a row",
+      leading_plunge_end([(0, 0, -4), (0.1, 0, -5), (0.1, 0, -6), (9, 0, -6)], rs) == 2)
+check("leading_plunge_end: a leg flatter than the limit is no plunge",
+      leading_plunge_end([(0, 0, -4), (2, 0, -6), (9, 0, -6)], rs) == 0)
+check("leading_plunge_end: a flat start is no plunge",
+      leading_plunge_end([(0, 0, -4), (9, 0, -4)], rs) == 0)
+check("leading_plunge_end: a rising start is no plunge",
+      leading_plunge_end([(0, 0, -6), (0, 0, -4), (9, 0, -4)], rs) == 0)
+
+check("generate_plunge_ramp: too little path past the plunge",
+      generate_plunge_ramp([(0, 0, -4), (0.1, 0, -6), (0.2, 0, -6)], 1, 0.0, rs)
+      == [(0, 0, -4)])
+
+plunge_seg = [(0.0, 0.0, -4.0), (0.1, 0.0, -6.0), (20.0, 0.0, -6.0)]
+tp_plunge = ToolPath(segments=[[(50.0, 0.0, -1.0), (70.0, 0.0, -1.0)], plunge_seg])
+
+def entry_moves(tp2, **kw):
+    """The plunge/ramp moves of the transition into the second segment."""
+    return [(k, pts) for k, pts in moves_for_second_segment(tp2, **kw)
+            if k in ('plunge', 'ramp')]
+
+
+moves_plunge = entry_moves(tp_plunge, z_safe=5.0, ramp=rs)
+check("leading plunge: air plunge, then ramp",
+      [k for k, _ in moves_plunge] == ['plunge', 'ramp'])
+check("leading plunge: the cut itself is unchanged",
+      [pts for k, pts in tp_plunge.iter_moves(z_safe=5.0, ramp=rs) if k == 'cut'][1]
+      == plunge_seg)
+air_plunge = moves_plunge[0][1]
+check("leading plunge: air plunge stops at ramp start Z",
+      abs(air_plunge[-1][2]) < 1e-9 and air_plunge[-1][:2] == (0.0, 0.0))
+ramp_pts = moves_plunge[1][1]
+check("leading plunge: ramp starts where the air plunge ended",
+      ramp_pts[0] == air_plunge[-1])
+check("leading plunge: ramp reaches the plunge's bottom, then the start",
+      ramp_pts[-2:] == [plunge_seg[1], plunge_seg[0]])
+check("leading plunge: nothing below the plunge's bottom",
+      min(p[2] for p in ramp_pts) >= -6.0 - 1e-9)
+check("leading plunge: Z never rises during the zig-zag",
+      all(b[2] <= a[2] + 1e-9 for a, b in zip(ramp_pts[:-2], ramp_pts[1:-1])))
+
+check("leading plunge: disabled ramp keeps the plain plunge to the start",
+      [(k, p[-1][2]) for k, p in entry_moves(
+          tp_plunge, z_safe=5.0, ramp=RampSettings(enabled=False))]
+      == [('plunge', -4.0)])
+
+# Max ramp depth from the plunge's bottom: set to the step-down, the zig-zag
+# begins at the plunge's start.
+moves_stepped = entry_moves(tp_plunge, z_safe=5.0, ramp=RampSettings(
+    enabled=True, angle_deg=30.0, max_length_mm=15.0, max_depth_mm=2.0))
+check("leading plunge: max ramp depth counts from the plunge's bottom",
+      [k for k, _ in moves_stepped] == ['plunge', 'ramp']
+      and abs(moves_stepped[0][1][-1][2] - (-4.0)) < 1e-9)
+check("leading plunge: level move onto the plunge's bottom XY first",
+      moves_stepped[1][1][:2] == [(0.0, 0.0, -4.0), (0.1, 0.0, -4.0)])
+
+# A limit smaller than the plunge must not plunge below the segment's start.
+moves_small = entry_moves(tp_plunge, z_safe=5.0, ramp=RampSettings(
+    enabled=True, angle_deg=30.0, max_length_mm=15.0, max_depth_mm=0.5))
+check("leading plunge: zig-zag never begins below the segment's start",
+      abs(moves_small[0][1][-1][2] - (-4.0)) < 1e-9)
+
+# Too little path past the plunge: the entry is what it was without one.
+tp_short = ToolPath(segments=[[(50.0, 0.0, -1.0), (70.0, 0.0, -1.0)],
+                              [(0.0, 0.0, -4.0), (0.1, 0.0, -6.0)]])
+check("leading plunge: nothing to ramp along keeps the plain entry",
+      [(k, p[-1][2]) for k, p in entry_moves(tp_short, z_safe=5.0, ramp=rs)]
+      == [('plunge', -4.0)])
+
+# Exactly vertical: no level move, since the XY doesn't change.
+tp_vert = ToolPath(segments=[[(50.0, 0.0, -1.0), (70.0, 0.0, -1.0)],
+                             [(0.0, 0.0, -4.0), (0.0, 0.0, -6.0), (20.0, 0.0, -6.0)]])
+ramp_vert = entry_moves(tp_vert, z_safe=5.0, ramp=rs)[-1][1]
+check("leading plunge: exactly vertical plunge has no level move",
+      _xy_dist_of(ramp_vert[0], ramp_vert[1]) > 1e-9)
+
+# Tool already at the segment's start (e.g. after a link): still ramped.
+tp_linked = ToolPath(segments=[[(20.0, 5.0, -4.0), (0.0, 0.0, -4.0)], plunge_seg])
+moves_linked = entry_moves(tp_linked, z_safe=5.0, ramp=rs)
+check("leading plunge: bridged entry ramps from the segment's start",
+      [k for k, _ in moves_linked] == ['ramp']
+      and moves_linked[0][1][0] == plunge_seg[0]
+      and moves_linked[0][1][-1] == plunge_seg[0])
+
+# Pecks have no XY travel to ramp along and stay as they are.
+tp_peck = ToolPath(segments=[[(0.0, 0.0, 0.0), (0.0, 0.0, -2.0), (0.0, 0.0, 1.0)],
+                             [(0.0, 0.0, -2.0), (0.0, 0.0, -4.0)]])
+check("leading plunge: pecks produce no ramp",
+      'ramp' not in [k for k, _ in tp_peck.iter_moves(z_safe=5.0, ramp=rs)])
+
+check("leading plunge: G-code's cut moves are unchanged by the ramp",
+      [l for l in tp_plunge.to_gcode(z_safe=5.0, ramp=rs).splitlines()
+       if l.startswith('G1') and '; ' not in l]
+      == [l for l in tp_plunge.to_gcode(z_safe=5.0).splitlines()
+          if l.startswith('G1') and '; ' not in l])
 
 
 def implied_radius(arc_pts, z_safe):

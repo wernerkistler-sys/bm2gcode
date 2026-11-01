@@ -3,7 +3,19 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from dressup import generate_ramp, compute_backoff_path, generate_corner_arc
+from dressup import (generate_ramp, generate_plunge_ramp, leading_plunge_end,
+                     compute_backoff_path, generate_corner_arc)
+
+
+def _ramp_split_z(z_target, z_from, ramp):
+    """The Z where a descent from z_from to z_target hands off from a plain
+    vertical plunge to the zig-zag: min(z_from, start_z, z_target + max_depth).
+    """
+    start_z = ramp.start_z_mm if ramp is not None else 0.0
+    split_z = min(z_from, start_z)
+    if ramp is not None and ramp.max_depth_mm > 0.0:
+        split_z = min(split_z, z_target + ramp.max_depth_mm)
+    return split_z
 
 
 def _ramp_plan(points, z_from, ramp):
@@ -15,18 +27,28 @@ def _ramp_plan(points, z_from, ramp):
     that is a plain vertical plunge, through the air and any depth earlier
     passes already cleared. Returns (split_z, ramp_pts):
 
-    - split_z = min(z_from, start_z, z0 + max_depth), the Z at which the
+    - split_z = _ramp_split_z(z0, z_from, ramp), the Z at which the
       vertical leg (if any) hands off to the zig-zag (if any).
     - ramp_pts = generate_ramp(points, split_z, ramp) when there's actually
       material below split_z to ramp into (points[0][2] < split_z), else
       [points[0]] (nothing to ramp -- the caller should do a single plain
       plunge for the whole z_from -> points[0][2] descent).
+
+    A path that starts with a (near) vertical plunge of its own is ramped to
+    that plunge's bottom instead, followed by a move back up to points[0]
+    (see dressup.generate_plunge_ramp); the path then runs unchanged. Here
+    split_z is measured from the plunge's bottom and never lies below
+    points[0], since only the zig-zag clears the material under it.
     """
     z0 = points[0][2]
-    start_z = ramp.start_z_mm if ramp is not None else 0.0
-    split_z = min(z_from, start_z)
-    if ramp is not None and ramp.max_depth_mm > 0.0:
-        split_z = min(split_z, z0 + ramp.max_depth_mm)
+    if ramp is not None and ramp.enabled and z_from >= z0 - 1e-4:
+        plunge_end = leading_plunge_end(points, ramp)
+        if plunge_end:
+            split_z = max(_ramp_split_z(points[plunge_end][2], z_from, ramp), z0)
+            ramp_pts = generate_plunge_ramp(points, plunge_end, split_z, ramp)
+            if len(ramp_pts) > 1:
+                return split_z, ramp_pts
+    split_z = _ramp_split_z(z0, z_from, ramp)
     if z0 < split_z:
         return split_z, generate_ramp(points, split_z, ramp)
     return split_z, [points[0]]
@@ -152,7 +174,9 @@ class ToolPath:
         start Z (``RampSettings.start_z_mm``, normally the stock top) and
         within ``RampSettings.max_depth_mm`` of the target with a zig-zag;
         anything above that is always a plain vertical plunge first (see
-        ``_ramp_plan``/``_emit_plunge_ramp``).
+        ``_ramp_plan``/``_emit_plunge_ramp``). A segment that starts with a
+        (near) vertical plunge of its own is ramped to that plunge's bottom,
+        even when the tool is already at the segment's start.
         """
         segs = segments if segments is not None else self.segments
         prev_points = None
@@ -229,10 +253,11 @@ class ToolPath:
                     split_z, ramp_pts = _ramp_plan(points, z_safe, ramp)
                     yield from _emit_plunge_ramp(x0, y0, z0, z_safe, split_z, ramp_pts)
 
-            elif abs(prev_points[-1][2] - z0) > 1e-4:
+            else:
                 z_from = prev_points[-1][2]
                 split_z, ramp_pts = _ramp_plan(points, z_from, ramp)
-                yield from _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts)
+                if len(ramp_pts) > 1 or abs(z_from - z0) > 1e-4:
+                    yield from _emit_plunge_ramp(x0, y0, z0, z_from, split_z, ramp_pts)
 
             if len(points) >= 2:
                 yield ('cut', points)
