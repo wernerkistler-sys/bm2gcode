@@ -1,7 +1,8 @@
-"""Memory-bounded 2-D grey morphology with scipy.ndimage's semantics.
+"""Memory-bounded 2-D grey and binary morphology with scipy.ndimage's
+semantics.
 
-scipy.ndimage.grey_erosion/grey_dilation precompute a table of memory
-offsets for every border configuration of the footprint, sized roughly
+scipy.ndimage.grey_erosion/grey_dilation/binary_erosion/binary_dilation
+precompute a table of memory offsets for every border configuration of the footprint, sized roughly
 (footprint pixels) x (footprint height x width) x 8 bytes -- O(r^4) in the
 kernel radius. A 25 mm tool at 10 px/mm (r = 125 px) needs ~25 GB for that
 table alone.
@@ -24,6 +25,9 @@ compiled kernel instead: one parallel pass over the output rows that takes
 the minimum over every footprint offset, with the same values and the same
 reflect border as scipy. banded_grey_erosion/banded_grey_dilation combine
 several inputs, each with its own footprint, in that one pass.
+
+binary_erosion/binary_dilation are the flat grey operations on a 0/1 image,
+with scipy's binary border: everything outside the image is False.
 """
 import os
 import threading
@@ -205,6 +209,34 @@ def grey_opening(input, footprint, structure=None):
     structure=structure): erosion followed by dilation."""
     return grey_dilation(grey_erosion(input, footprint, structure),
                          footprint, structure)
+
+
+def _binary_morphology(grey_op, input, structure):
+    """grey_op, flat, of the boolean *input*, where everything outside
+    *input* is False. A False margin one footprint half-size wide holds
+    every value the output pixels read, so grey_op's reflect border is
+    never reached."""
+    input = np.asarray(input, dtype=bool)
+    structure = np.asarray(structure, dtype=bool)
+    _check_args(input, structure)
+    H, W = input.shape
+    ry, rx = structure.shape[0] // 2, structure.shape[1] // 2
+    padded = np.pad(input, ((ry, ry), (rx, rx)), mode="constant").astype(np.float32)
+    return grey_op(padded, structure)[ry:ry + H, rx:rx + W] > 0.5
+
+
+def binary_erosion(input, structure):
+    """Same result as scipy.ndimage.binary_erosion(input, structure=structure)
+    for a 2-D input and an odd-sized structure: True where every x + d, d in
+    structure, is True in *input*; pixels outside the image count as False."""
+    return _binary_morphology(grey_erosion, input, structure)
+
+
+def binary_dilation(input, structure):
+    """Same result as scipy.ndimage.binary_dilation(input, structure=structure)
+    for a 2-D input and an odd-sized structure: True where some x - d, d in
+    structure, is True in *input*."""
+    return _binary_morphology(grey_dilation, input, structure)
 
 
 def banded_grey_erosion(inputs, footprints, structure=None):

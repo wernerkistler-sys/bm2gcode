@@ -1,6 +1,6 @@
 """Plain assert-based tests for grey_morphology.py: results must match
-scipy.ndimage's grey_erosion/grey_dilation/grey_opening exactly, while
-memory stays bounded for large kernels.
+scipy.ndimage's grey_erosion/grey_dilation/grey_opening/binary_erosion/
+binary_dilation exactly, while memory stays bounded for large kernels.
 
 Run with: python tests/test_grey_morphology.py
 """
@@ -47,6 +47,8 @@ before = peak_rss_mb()
 gm.grey_erosion(img_big, fp_big, ball_big)
 gm.grey_dilation(img_big, fp_big, ball_big)
 gm.grey_erosion(img_big, fp_big)
+gm.binary_erosion(img_big > 0.5, fp_big)
+gm.binary_dilation(img_big > 0.5, fp_big)
 check(f"r={r} px: peak RSS grows < 500 MB (grew {peak_rss_mb() - before:.0f} MB)",
       peak_rss_mb() - before < 500.0)
 
@@ -171,6 +173,41 @@ for use in ([True, False] if have_numba else [False]):
                          np.maximum(*[ndi.grey_dilation(a, footprint=fp, structure=s_l)
                                       for a, fp in zip(band_ins, band_fps)])))
 gm.USE_NUMBA = True
+
+print("Binary operations match scipy")
+masks = {name: img > 0.5 for name, img in images.items()}
+masks["touches every edge"] = ndi.gaussian_filter(rng.random((120, 90)), 4) > 0.48
+masks["all True"] = np.ones((50, 60), bool)
+masks["all False"] = np.zeros((50, 60), bool)
+masks["one pixel"] = np.zeros((50, 60), bool)
+masks["one pixel"][25, 30] = True
+masks["full-width band"] = np.zeros((90, 60), bool)
+masks["full-width band"][:30] = True
+fp_empty_center = rng.random((11, 15)) > 0.4
+fp_empty_center[5, 7] = False
+footprints = {"disk r=1": disk(1), "disk r=5": disk(5), "disk r=20": disk(20),
+              "disk r=40 (wider than the small images)": disk(40),
+              "End Mill": _build_kernel(Tool("End Mill", 4.0), px_per_mm, max_depth)[1],
+              "V-Bit": _build_kernel(Tool("V-Bit", 4.0, 60.0), px_per_mm, max_depth)[1],
+              "asymmetric": fp_asym, "asymmetric, center False": fp_empty_center,
+              "rows only": np.ones((1, 9), bool), "columns only": np.ones((9, 1), bool)}
+for fp_name, fp in footprints.items():
+    for mask_name, mask in masks.items():
+        e = gm.binary_erosion(mask, fp)
+        d = gm.binary_dilation(mask, fp)
+        check(f"binary erosion  {fp_name} {mask_name}",
+              e.dtype == bool and np.array_equal(e, ndi.binary_erosion(mask, structure=fp)))
+        check(f"binary dilation {fp_name} {mask_name}",
+              d.dtype == bool and np.array_equal(d, ndi.binary_dilation(mask, structure=fp)))
+
+print("Binary operations match scipy when split into row tiles")
+tall_mask = ndi.gaussian_filter(rng.random((1000, 90)), 4) > 0.5
+check("binary erosion  disk r=12 1000 rows",
+      np.array_equal(gm.binary_erosion(tall_mask, disk(12)),
+                     ndi.binary_erosion(tall_mask, structure=disk(12))))
+check("binary dilation disk r=12 1000 rows",
+      np.array_equal(gm.binary_dilation(tall_mask, disk(12)),
+                     ndi.binary_dilation(tall_mask, structure=disk(12))))
 
 print()
 if FAILURES:

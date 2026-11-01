@@ -1984,7 +1984,8 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     (unpadded) coordinate frame. An undivided island is one chain unless
     _stitch_onion_rings had to split it where no inside link exists.
     """
-    from scipy.ndimage import binary_erosion, label
+    from scipy.ndimage import label
+    from grey_morphology import binary_erosion
     from skimage.morphology import disk
     from skimage.measure import find_contours
 
@@ -2165,7 +2166,7 @@ def compute_raster_gate_mask(residual, work_surface_tol, prior_reference,
     """
     if work_surface_tol <= 0.0:
         return None
-    from scipy.ndimage import binary_dilation
+    from grey_morphology import binary_dilation
     if subtract_unaccessible and prior_reference is not None:
         gate = np.clip(accessible - prior_reference, 0.0, 1.0)
     else:
@@ -2702,8 +2703,7 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     Returns (pocket_mask, center_depth_contour_pocket, accessible_pocket,
     target_z_norm, kernel_pocket, footprint_pocket).
     """
-    from scipy.ndimage import binary_erosion
-    from grey_morphology import grey_erosion, grey_dilation
+    from grey_morphology import binary_erosion, grey_erosion, grey_dilation
     from skimage.morphology import disk
 
     if progress is None:
@@ -5160,7 +5160,8 @@ def compute_cutout_silhouette_mask(depth_map, threshold_mm, max_depth, r_px):
     Returns (mask, mask_direction, threshold_norm); mask is None (with
     mask_direction None) if neither direction yields a usable silhouette.
     """
-    from scipy.ndimage import binary_fill_holes, binary_dilation
+    from scipy.ndimage import binary_fill_holes
+    from grey_morphology import binary_dilation
     from skimage.morphology import disk
 
     if threshold_mm > 0.0:
