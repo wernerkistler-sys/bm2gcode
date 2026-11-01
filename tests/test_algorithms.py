@@ -23,7 +23,9 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         registration_flip_axis, registration_hole_centers,
                         registration_auto_spacing, bore_hole_segments,
                         compute_registration_holes_toolpath, _spiral_px,
-                        _extract_z_contours, _order_contours_graph)
+                        _extract_z_contours, _order_contours_graph,
+                        _fill_level_gaps, _prune_contours,
+                        compute_contour_toolpath)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1436,6 +1438,70 @@ segs = _order_graph(bosses, LEVELS)
 td, in_turn, n_f = _features_in_turn(segs, CENTERS)
 check("vertical-walled bosses: top-down within each boss", td and n_f == 2)
 check("vertical-walled bosses: one boss after the other", in_turn)
+
+
+print("Contour Max step-down")
+check("gap fill: evenly spaced levels between the first level and the surface",
+      np.allclose(_fill_level_gaps([0.3], 0.1), [0.1, 0.2, 0.3]))
+check("gap fill: a gap of exactly the limit stays unfilled",
+      np.allclose(_fill_level_gaps([0.1, 0.2, 0.3], 0.1), [0.1, 0.2, 0.3]))
+filled = _fill_level_gaps([0.05, 0.1, 0.45, 0.5], 0.1)
+check("gap fill: existing levels stay, no gap exceeds the limit",
+      all(z in filled for z in (0.05, 0.1, 0.45, 0.5))
+      and np.max(np.diff([0.0] + filled)) <= 0.1 + 1e-9
+      and filled == sorted(filled))
+check("gap fill: the gap below the deepest point of the surface stays unfilled",
+      np.allclose(_fill_level_gaps([0.1, 0.6, 1.0], 0.25, deepest=0.6),
+                  [0.1, 0.35, 0.6, 1.0]))
+
+# A vertical-walled pit: every level's ring lies on the wall, so each one is
+# laterally redundant to the rings below it.
+pit = (_dist_px((60, 60)) < 30).astype(np.float32)
+levels = [i / 10 for i in range(1, 11)]
+
+
+def _pruned_depths(step_down_mm):
+    pruned = _prune_contours(_extract_z_contours(pit, levels, 256), levels, 2.0,
+                             N_C, N_C, max_depth=10.0, max_step_down_mm=step_down_mm)
+    return [z * 10.0 for z in levels if pruned[z]]
+
+
+def _max_step(depths):
+    return float(np.max(np.diff([0.0] + depths)))
+
+
+check("pruning keeps every level whose removal would exceed Max step-down",
+      np.allclose(_pruned_depths(1.0), range(1, 11)))
+check("pruning stays within a larger Max step-down",
+      _max_step(_pruned_depths(3.0)) <= 3.0 + 1e-6)
+check("pruning still collapses levels within Max step-down",
+      len(_pruned_depths(3.0)) < len(levels))
+
+
+def _contour_depths(**kwargs):
+    # Most pixels are at 0.9 of full depth, a small pit reaches full depth,
+    # so the quantile levels all land near the bottom of a tall wall.
+    surface = np.where(_dist_px((60, 60)) < 50, 0.9, 0.0).astype(np.float32)
+    surface[_dist_px((60, 60)) < 5] = 1.0
+    tp = compute_contour_toolpath(surface, 256, Tool(profile="Flat", diameter_mm=1.0),
+                                  z_increment_mm=2.5, max_depth=10.0,
+                                  width_mm=N_C, height_mm=N_C,
+                                  progress=lambda *a: None, **kwargs)
+    return sorted({round(-p[2], 3) for seg in tp.segments for p in seg[:1]})
+
+
+unbounded = _contour_depths(adaptive_levels=True)
+bounded = _contour_depths(adaptive_levels=True, max_step_down_mm=1.0)
+check("adaptive Contour steps down further than Max step-down without the limit",
+      _max_step(unbounded) > 1.0)
+check("adaptive Contour stays within Max step-down", _max_step(bounded) <= 1.0 + 1e-3)
+check("adaptive Contour keeps the quantile levels",
+      all(z in bounded for z in unbounded))
+check("adaptive Contour stays within Max step-down with lateral pruning",
+      _max_step(_contour_depths(adaptive_levels=True, max_step_down_mm=1.0,
+                                lateral_tol_mm=2.0)) <= 1.0 + 1e-3)
+check("uniform Contour levels ignore Max step-down",
+      _contour_depths(max_step_down_mm=1.0) == _contour_depths())
 
 
 print()

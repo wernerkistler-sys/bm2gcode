@@ -4185,13 +4185,11 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
     If max_step_down_mm is given, a point is pruned only if it is *both*
     laterally within lateral_tol_px of its nearest committed pixel *and* that
     same nearest pixel's recorded depth is within max_step_down_mm of the
-    current level's depth. Otherwise it is kept even though laterally
-    redundant, since relying on that deeper cut would require the tool to
-    plunge more than one stepdown in a single move. A depth gap exactly equal
-    to max_step_down_mm is treated as a legal single-pass stepdown and remains
-    prunable. Note this only prevents pruning from *creating* an oversized
-    gap — in adaptive-levels mode the programmed levels themselves can already
-    be spaced further apart than max_step_down_mm in sparse regions.
+    level above (the stock surface, for the shallowest level). Otherwise it
+    is kept even though laterally redundant: without it, the cut at the level
+    above would be followed by that deeper cut, more than one stepdown lower.
+    A depth gap exactly equal to max_step_down_mm is treated as a legal
+    single-pass stepdown and remains prunable.
 
     A pruned run is restored if its arc length is below the retract+plunge
     breakeven: feed_rate × 2 × (z_safe + z_level_mm) / feed_rapid.  The z_safe
@@ -4223,9 +4221,10 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
     effective_next_img = None
     effective_next_depth = None
 
-    for z_norm in reversed(z_levels):
+    for i, z_norm in reversed(list(enumerate(z_levels))):
         contours = all_z_contours.get(z_norm, [])
         z_level_mm = z_norm * max_depth
+        z_above_mm = z_levels[i - 1] * max_depth if i > 0 else 0.0
         if effective_next_img is None:
             # Deepest level — always kept
             pruned[z_norm] = contours
@@ -4252,7 +4251,7 @@ def _prune_contours(all_z_contours, z_levels, lateral_tol_px, H, W,
             if max_step_down_mm is not None:
                 near_depth_mm = effective_next_depth[nearest_idx[0][rows, cols],
                                                       nearest_idx[1][rows, cols]]
-                depth_gap_mm = near_depth_mm - z_level_mm
+                depth_gap_mm = near_depth_mm - z_above_mm
                 keep_mask = keep_mask | (depth_gap_mm > max_step_down_mm + 1e-6)
             kept.extend(_split_runs(c, keep_mask,
                                     min_prune_arc_px=min_prune_arc_px))
@@ -4366,6 +4365,28 @@ def _contour_threshold(z_norm, n_grey_levels):
     neighbouring deeper region.
     """
     return max(z_norm - 0.5 / max(n_grey_levels - 1, 1), 0.0)
+
+
+def _fill_level_gaps(z_levels, max_gap, deepest=1.0):
+    """Insert evenly spaced levels wherever two consecutive levels, or the
+    stock surface and the first level, are more than max_gap apart.
+
+    z_levels : ascending normalised depths, all kept as they are
+    max_gap  : largest allowed spacing, normalised (a gap exactly this large
+               stays unfilled)
+    deepest  : deepest point of the surface; a gap starting at or below it
+               holds no contours, so it stays unfilled
+
+    Returns the combined ascending list.
+    """
+    filled, prev = [], 0.0
+    for z in z_levels:
+        if prev < deepest:
+            n = int(np.ceil((z - prev) / max_gap - 1e-9))
+            filled.extend(prev + (z - prev) * k / n for k in range(1, n))
+        filled.append(z)
+        prev = z
+    return filled
 
 
 def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb"):
@@ -4660,7 +4681,8 @@ def compute_contour_toolpath(
         When True, place the n_passes contour levels at equal-area (CDF-based)
         depth intervals rather than uniform Z spacing.  This concentrates passes
         where the depth map has the most pixels, avoiding redundant cuts between
-        discrete grey-level transitions.
+        discrete grey-level transitions.  Gaps wider than max_step_down_mm are
+        then filled with evenly spaced extra levels (see _fill_level_gaps).
     max_depth : float
         Total maximum cut depth in mm.
     width_mm, height_mm : float
@@ -4684,10 +4706,11 @@ def compute_contour_toolpath(
         every point lies within this distance of the next deeper (effective)
         contour are considered redundant and omitted.  0.0 disables pruning.
     max_step_down_mm : float or None
-        Maximum Z increment, in mm, that redundancy pruning is allowed to
-        create between one retained cut and the next (see _prune_contours).
-        None or <= 0 means unconstrained — pruning may collapse any number
-        of redundant levels.
+        Maximum Z increment, in mm, between one cut and the next: the bound
+        on adaptive level spacing, and on what redundancy pruning may create
+        between one retained cut and the next (see _prune_contours).
+        None or <= 0 means unconstrained — adaptive gaps stay unfilled and
+        pruning may collapse any number of redundant levels.
     extra_offset_mm : float
         Stock-to-leave allowance (mm) applied laterally and vertically, so a
         subsequent step (typically with extra_offset_mm=0) can refine the
@@ -4727,7 +4750,7 @@ def compute_contour_toolpath(
     from grey_morphology import grey_erosion, grey_dilation
     from skimage.measure import find_contours
 
-    # None/<=0 both mean "unconstrained" for the pruning depth bound.
+    # None/<=0 both mean "unconstrained" for the depth bound.
     _msd = max_step_down_mm if (max_step_down_mm is not None
                                  and max_step_down_mm > 0) else None
 
@@ -4817,6 +4840,9 @@ def compute_contour_toolpath(
         else:
             z_levels = [min(i * z_increment_mm / max_depth, 1.0)
                         for i in range(1, n_passes + 1)]
+        if _msd is not None:
+            z_levels = _fill_level_gaps(z_levels, _msd / max_depth,
+                                        float(center_depth_contour.max()))
         progress(40, f"{len(z_levels)} contour level{'s' if len(z_levels) != 1 else ''}  "
                      f"(adaptive, target Z increment {z_increment_mm:.2f} mm).")
     else:

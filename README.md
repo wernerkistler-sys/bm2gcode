@@ -148,7 +148,7 @@ Traces the depth map as a stack of iso-depth contours, like topographic lines on
 | Parameter | Description |
 |---|---|
 | Z increment | Vertical distance between contour levels (mm). |
-| Adaptive levels (CDF) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. |
+| Adaptive levels (CDF) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. Where two levels end up further apart than Max step-down, evenly spaced levels are added between them. |
 | Lateral tolerance | Discards contour segments that lie within this distance (mm) of an adjacent deeper-level contour, removing redundant passes over areas already covered. |
 | Cut direction | Climb or Conventional forces every contour to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained, so path ordering is free to reverse segments for shorter travel. |
 
@@ -335,9 +335,11 @@ V-Carving step, and vice versa.
 
 Contour also shows a **Max step-down** field here, but with a different
 meaning: it bounds how many redundant levels lateral pruning may collapse —
-see [Contour lateral pruning](#contour-lateral-pruning). Contour's actual
-Z-level spacing is the separate **Z increment** field under
-[Step / Operation / Contour](#step--operation--contour).
+see [Contour lateral pruning](#contour-lateral-pruning) — and, with Adaptive
+levels (CDF), the spacing of the levels. Contour's actual Z-level spacing is
+otherwise the separate **Z increment** field under
+[Step / Operation / Contour](#step--operation--contour), which Max step-down
+doesn't limit.
 
 Cutout shows its own independent Max/Final step-down pair too, alongside
 its own Cut depth and Boundary offset fields — see
@@ -596,7 +598,7 @@ The erosion and dilation (`grey_morphology.py`) give the same results as `scipy.
 1. **Kernel + accessibility map** — Identical to Raster (steps 1–2).
 2. **Level planning** — Two modes:
    - *Uniform*: Z-levels at equal Z-increment intervals.
-   - *Adaptive (CDF)*: Z-levels placed at quantile boundaries of the depth-map pixel distribution. This concentrates levels where many pixels share the same depth value ("plateaus"), so contour lines align with flat areas rather than spanning empty gray ranges.
+   - *Adaptive (CDF)*: Z-levels placed at quantile boundaries of the depth-map pixel distribution. This concentrates levels where many pixels share the same depth value ("plateaus"), so contour lines align with flat areas rather than spanning empty gray ranges. A separate step then bounds the spacing: where two consecutive levels, or the stock surface and the first level, are more than Max step-down apart, evenly spaced levels are added between them, leaving the quantile levels where they are.
 3. **Contour extraction** — `skimage.find_contours` traces iso-depth curves at each Z-level on the accessibility map. If Cut direction is Climb or Conventional, every contour is reversed (or not) by a single global rule applied at this stage (see [Climb / conventional cut direction](#climb--conventional-cut-direction)).
 4. **Lateral pruning (optional)** — For each level, the distance transform to all committed deeper-level cuts is computed. Contour segments closer than the Lateral tolerance are discarded. Short pruned runs are restored if the retract/plunge overhead would cost more machine time than the cut saves. If Avoid cutting air is on, each level's contours are then also pruned where the tool would cut only air (see [Air-cut pruning](#air-cut-pruning)), with the same short-run restore.
 5. **Ordering** — Every hill and every crater is cut strictly top-down, while separate features are cut one after the other. The order follows the contour graph (see [Contour graph ordering](#contour-graph-ordering)): a contour may be cut once the contours above it in its own feature are done. Among the contours that may be cut, greedy nearest-neighbour picks the next one, so the tool follows one feature down until it meets a join (two hills merging below a saddle), then moves to the nearest other branch. A closed contour can start at any point along itself. Because a contour's climb/conventional correctness comes entirely from its own orientation (set in step 3), not from visiting order, a locked Cut direction only disables reversal (flip) — see [Climb / conventional cut direction](#climb--conventional-cut-direction). There is no 2-opt pass.
@@ -811,7 +813,7 @@ Classic integer-arithmetic line drawing, used as the geodesic-link fallback and 
 
 #### Contour lateral pruning
 
-For each contour level, a distance transform to committed deeper-level cuts identifies redundant segments. A breakeven calculation (retract/plunge overhead vs. time saved by skipping) determines whether short pruned runs should be restored before the contour is split into segments.
+For each contour level, a distance transform to committed deeper-level cuts identifies redundant segments. A segment stays when pruning it would leave more than Max step-down between the level above and the committed cut below. A breakeven calculation (retract/plunge overhead vs. time saved by skipping) determines whether short pruned runs should be restored before the contour is split into segments.
 
 #### Contour graph ordering
 
@@ -821,7 +823,7 @@ Pieces of a contour — after lateral or air pruning, clipping to the V-carving 
 
 #### CDF adaptive level spacing
 
-Extracts the empirical depth distribution of the accessibility map and places contour levels at quantile boundaries. This concentrates passes in depth ranges with many pixels and avoids passes in sparse gray ranges.
+Extracts the empirical depth distribution of the accessibility map and places contour levels at quantile boundaries. This concentrates passes in depth ranges with many pixels and avoids passes in sparse gray ranges, except for the levels added to keep the spacing within Max step-down. Gaps below the deepest point of the surface stay unfilled, as they hold no contours.
 
 #### Medial axis / Voronoi skeleton
 
