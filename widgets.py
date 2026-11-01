@@ -690,6 +690,11 @@ class DressUpDialog(tk.Toplevel):
                                          minval=0.5, maxval=200.0, increment=1.0)
         self._ramp_length.pack(fill=tk.X, pady=2)
 
+        self._ramp_max_depth = LabeledEntry(du_sf, "Max ramp depth (0 = no limit)", "mm",
+                                            str(settings.get('ramp_max_depth_mm', 0.0)),
+                                            minval=0.0, maxval=100.0, increment=0.5)
+        self._ramp_max_depth.pack(fill=tk.X, pady=2)
+
         self._ramp_start_z = LabeledEntry(du_sf, "Ramp start Z", "mm",
                                           str(settings.get('ramp_start_z_mm', 0.0)),
                                           minval=-100.0, maxval=100.0, increment=0.5)
@@ -798,6 +803,7 @@ class DressUpDialog(tk.Toplevel):
         self._ramp_angle.set_state(state)
         self._ramp_length.set_state(state)
         self._ramp_start_z.set_state(state)
+        self._ramp_max_depth.set_state(state)
 
     def _on_backoff_toggle(self):
         on = self._backoff_enabled_var.get() and not self._sideways_only()
@@ -822,6 +828,7 @@ class DressUpDialog(tk.Toplevel):
             ramp_angle    = float(self._ramp_angle.get())
             ramp_length   = float(self._ramp_length.get())
             ramp_start_z  = float(self._ramp_start_z.get())
+            ramp_max_depth = float(self._ramp_max_depth.get())
             backoff_dist  = float(self._backoff_dist.get())
             arc_radius    = float(self._arc_radius.get())
             arc_feed      = float(self._arc_feed.get())
@@ -849,6 +856,11 @@ class DressUpDialog(tk.Toplevel):
         if ramp_start_z >= self._z_safe:
             messagebox.showerror("Invalid input",
                                  "Ramp start Z must be below the safe height (z_safe).",
+                                 parent=self)
+            return
+        if ramp_max_depth < 0.0:
+            messagebox.showerror("Invalid input",
+                                 "Max ramp depth cannot be negative.",
                                  parent=self)
             return
         if backoff_dist < 0.0:
@@ -904,6 +916,7 @@ class DressUpDialog(tk.Toplevel):
         self._settings['ramp_angle_deg']      = ramp_angle
         self._settings['ramp_max_length_mm']  = ramp_length
         self._settings['ramp_start_z_mm']     = ramp_start_z
+        self._settings['ramp_max_depth_mm']   = ramp_max_depth
         self._settings['backoff_enabled']     = self._backoff_enabled_var.get()
         self._settings['backoff_distance_mm'] = backoff_dist
         self._settings['arc_rapids_enabled']  = self._arc_enabled_var.get()

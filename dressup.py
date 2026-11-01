@@ -27,6 +27,7 @@ class RampSettings:
     angle_deg: float = 30.0
     max_length_mm: float = 15.0
     start_z_mm: float = 0.0       # Z where the zig-zag begins (stock top); plain plunge above
+    max_depth_mm: float = 0.0     # deepest descent one zig-zag covers; 0 = no limit
     max_legs: int = 20            # internal safety cap, not exposed in UI
 
 

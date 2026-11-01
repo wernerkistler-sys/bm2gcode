@@ -1111,7 +1111,8 @@ class GCodeGeneratorApp:
         dst['avoid_air_var'].set(src['avoid_air_var'].get())
         dst['gating_mode_var'].set(src['gating_mode_var'].get())
         for key in ('ramp_in_enabled', 'ramp_angle_deg', 'ramp_max_length_mm',
-                    'ramp_start_z_mm', 'backoff_enabled', 'backoff_distance_mm',
+                    'ramp_start_z_mm', 'ramp_max_depth_mm',
+                    'backoff_enabled', 'backoff_distance_mm',
                     'arc_rapids_enabled', 'arc_radius_mm'):
             dst[f'{key}_var'].set(src[f'{key}_var'].get())
 
@@ -1153,6 +1154,8 @@ class GCodeGeneratorApp:
             value=float(DEFAULTS['step_ramp_max_length_mm']))
         step['ramp_start_z_mm_var']     = tk.DoubleVar(
             value=float(DEFAULTS['step_ramp_start_z_mm']))
+        step['ramp_max_depth_mm_var']   = tk.DoubleVar(
+            value=float(DEFAULTS['step_ramp_max_depth_mm']))
         step['backoff_enabled_var']     = tk.BooleanVar(
             value=bool(int(DEFAULTS['step_backoff_enabled'])))
         step['backoff_distance_mm_var'] = tk.DoubleVar(
@@ -2529,6 +2532,7 @@ class GCodeGeneratorApp:
             'ramp_angle_deg':      step['ramp_angle_deg_var'].get(),
             'ramp_max_length_mm':  step['ramp_max_length_mm_var'].get(),
             'ramp_start_z_mm':     step['ramp_start_z_mm_var'].get(),
+            'ramp_max_depth_mm':   step['ramp_max_depth_mm_var'].get(),
             'backoff_enabled':     step['backoff_enabled_var'].get(),
             'backoff_distance_mm': step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':  step['arc_rapids_enabled_var'].get(),
@@ -2552,6 +2556,7 @@ class GCodeGeneratorApp:
             step['ramp_angle_deg_var'].set(settings['ramp_angle_deg'])
             step['ramp_max_length_mm_var'].set(settings['ramp_max_length_mm'])
             step['ramp_start_z_mm_var'].set(settings['ramp_start_z_mm'])
+            step['ramp_max_depth_mm_var'].set(settings['ramp_max_depth_mm'])
             step['backoff_enabled_var'].set(settings['backoff_enabled'])
             step['backoff_distance_mm_var'].set(settings['backoff_distance_mm'])
             step['arc_rapids_enabled_var'].set(settings['arc_rapids_enabled'])
@@ -2636,7 +2641,8 @@ class GCodeGeneratorApp:
                                      and not self._sideways_only(step)),
                              angle_deg=step['ramp_angle_deg_var'].get(),
                              max_length_mm=step['ramp_max_length_mm_var'].get(),
-                             start_z_mm=step['ramp_start_z_mm_var'].get())
+                             start_z_mm=step['ramp_start_z_mm_var'].get(),
+                             max_depth_mm=step['ramp_max_depth_mm_var'].get())
 
     def _backoff_settings(self, step):
         return BackoffSettings(enabled=(step['backoff_enabled_var'].get()
@@ -2978,6 +2984,7 @@ class GCodeGeneratorApp:
             'ramp_angle_deg':       step['ramp_angle_deg_var'].get(),
             'ramp_max_length_mm':   step['ramp_max_length_mm_var'].get(),
             'ramp_start_z_mm':      step['ramp_start_z_mm_var'].get(),
+            'ramp_max_depth_mm':    step['ramp_max_depth_mm_var'].get(),
             'backoff_enabled':      step['backoff_enabled_var'].get(),
             'backoff_distance_mm':  step['backoff_distance_mm_var'].get(),
             'arc_rapids_enabled':   step['arc_rapids_enabled_var'].get(),
@@ -3062,6 +3069,8 @@ class GCodeGeneratorApp:
             'ramp_max_length_mm', DEFAULTS['step_ramp_max_length_mm']))
         step['ramp_start_z_mm_var'].set(d.get(
             'ramp_start_z_mm', DEFAULTS['step_ramp_start_z_mm']))
+        step['ramp_max_depth_mm_var'].set(d.get(
+            'ramp_max_depth_mm', DEFAULTS['step_ramp_max_depth_mm']))
         step['backoff_enabled_var'].set(bool(d.get(
             'backoff_enabled', bool(int(DEFAULTS['step_backoff_enabled'])))))
         step['backoff_distance_mm_var'].set(d.get(

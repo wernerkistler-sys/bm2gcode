@@ -357,6 +357,55 @@ moves_surface_raised = moves_for_second_segment(tp_surface, z_safe=5.0, ramp=rai
 check("raised start Z: surface-level (z=0) target is ramped into",
       'ramp' in [k for k, _ in moves_surface_raised])
 
+# Max ramp depth limits the zig-zag to that distance above the target; the
+# vertical plunge covers the rest of the descent.
+limited_ramp = RampSettings(enabled=True, angle_deg=30.0, max_length_mm=15.0,
+                            max_depth_mm=3.0)
+moves_limited = moves_for_second_segment(tp_deep, z_safe=5.0, ramp=limited_ramp)
+plunge_limited = next(pts for k, pts in moves_limited if k == 'plunge')
+ramp_limited = next(pts for k, pts in moves_limited if k == 'ramp')
+check("max ramp depth: plunge runs from z_safe to target + max depth",
+      abs(plunge_limited[0][2] - 5.0) < 1e-9 and abs(plunge_limited[-1][2] - (-5.0)) < 1e-9)
+check("max ramp depth: ramp runs from target + max depth to the target",
+      abs(ramp_limited[0][2] - (-5.0)) < 1e-9 and abs(ramp_limited[-1][2] - (-8.0)) < 1e-9)
+check("max ramp depth: no ramp waypoint rises above target + max depth",
+      all(p[2] <= -5.0 + 1e-9 for p in ramp_limited))
+
+# The limit only ever lowers the zig-zag's start: a shallow target keeps
+# ramp start Z as the start.
+tp_shallow = ToolPath(segments=[
+    [(0.0, 0.0, -1.0), (20.0, 0.0, -1.0)],
+    [(50.0, 0.0, -2.0), (70.0, 0.0, -2.0)],
+])
+moves_shallow = moves_for_second_segment(tp_shallow, z_safe=5.0, ramp=limited_ramp)
+ramp_shallow = next(pts for k, pts in moves_shallow if k == 'ramp')
+check("max ramp depth: start Z wins when it is lower than target + max depth",
+      abs(ramp_shallow[0][2] - 0.0) < 1e-9)
+
+# A same-XY step-down deeper than the limit plunges to the limit first.
+tp_long_step = ToolPath(segments=[
+    [(0.0, 0.0, -3.0), (20.0, 0.0, -3.0)],
+    [(20.0, 0.0, -9.0), (0.0, 0.0, -9.0)],
+])
+moves_long_step = moves_for_second_segment(tp_long_step, z_safe=5.0, ramp=limited_ramp)
+check("max ramp depth: long step-down plunges from the last cut to the limit",
+      [k for k, _ in moves_long_step] == ['plunge', 'ramp']
+      and abs(moves_long_step[0][1][0][2] - (-3.0)) < 1e-9
+      and abs(moves_long_step[0][1][-1][2] - (-6.0)) < 1e-9
+      and abs(moves_long_step[1][1][-1][2] - (-9.0)) < 1e-9)
+
+# 0 means no limit: same moves as with the field left at its default.
+check("max ramp depth 0 reproduces the unlimited ramp",
+      moves_for_second_segment(tp_deep, z_safe=5.0, ramp=RampSettings(
+          enabled=True, angle_deg=30.0, max_length_mm=15.0, max_depth_mm=0.0))
+      == moves_deep)
+
+# With ramp-in disabled the limit changes nothing.
+moves_disabled_limit = moves_for_second_segment(
+    tp_deep, z_safe=5.0, ramp=RampSettings(enabled=False, max_depth_mm=3.0))
+check("max ramp depth: disabled ramp stays a single plain plunge",
+      [k for k, _ in moves_disabled_limit if k in ('plunge', 'ramp')] == ['plunge'])
+
 
 def implied_radius(arc_pts, z_safe):
     """Both corner arcs' Z ranges span [z_safe - r, z_safe], so the implied
