@@ -22,6 +22,7 @@ python tests/test_tool_library.py
 python tests/test_machine_defaults.py
 python tests/test_grey_morphology.py
 python tests/test_undercut.py
+python tests/test_widgets.py
 ```
 There is no test runner config, build step, or lint config in this repo.
 

@@ -780,10 +780,6 @@ class DressUpDialog(tk.Toplevel):
         btn_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
-        ttk.Button(btn_row, text="Save as Default",
-                   command=self._save_as_default).pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="Use Defaults",
-                   command=self._use_defaults).pack(side=tk.LEFT, padx=(6, 0))
 
         # Centre on parent
         self.update_idletasks()
@@ -2534,10 +2530,6 @@ class ExportToolpathDialog(tk.Toplevel):
         btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="OK",     command=self._confirm).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
-        ttk.Button(btn_row, text="Save as Default",
-                   command=self._save_as_default).pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="Use Defaults",
-                   command=self._use_defaults).pack(side=tk.LEFT, padx=(6, 0))
 
         # Centre on parent
         self.update_idletasks()
