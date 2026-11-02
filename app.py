@@ -378,8 +378,23 @@ class GCodeGeneratorApp:
 
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        # Re-laying out every sidebar widget to a new width is slow on
+        # Windows, so dragging the pane sash only reflows the content once
+        # the width has settled.
+        reflow_after_id = None
+
+        def _on_canvas_configure(event):
+            nonlocal reflow_after_id
+            if reflow_after_id is not None:
+                canvas.after_cancel(reflow_after_id)
+
+            def _apply():
+                nonlocal reflow_after_id
+                reflow_after_id = None
+                canvas.itemconfig(win_id, width=event.width)
+            reflow_after_id = canvas.after(120, _apply)
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         def _mw(event):
             mpl = getattr(self, 'mpl_canvas', None)
@@ -1979,6 +1994,23 @@ class GCodeGeneratorApp:
         self.mpl_canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.mpl_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.mpl_canvas.draw()
+
+        # Matplotlib redraws the whole figure on every <Configure>, which
+        # makes dragging the pane sash or the window border lag. Resize the
+        # figure only once the widget's size has settled.
+        tk_widget = self.mpl_canvas.get_tk_widget()
+        tk_widget.unbind("<Configure>")
+        self._mpl_resize_after_id = None
+
+        def _on_mpl_configure(event):
+            if self._mpl_resize_after_id is not None:
+                tk_widget.after_cancel(self._mpl_resize_after_id)
+
+            def _apply():
+                self._mpl_resize_after_id = None
+                self.mpl_canvas.resize(event)
+            self._mpl_resize_after_id = tk_widget.after(120, _apply)
+        tk_widget.bind("<Configure>", _on_mpl_configure)
 
         # ── Zoom (scroll wheel) and pan (middle-button drag) ──────────
         self.mpl_canvas.mpl_connect("scroll_event",         self._on_scroll)
