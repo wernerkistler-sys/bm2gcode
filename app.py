@@ -40,6 +40,7 @@ from constants import (
     TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, WOUND_DIRECTIONS,
     CUT_DIRECTIONS, UNDERCUT_OPEN_MODES, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
+    STEP_PEAK_BYTES_PER_PX, STEP_PEAK_BYTES_PER_PX_DEFAULT,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_ACCESSIBLE, DISPLAY_STEP_UNACCESSIBLE,
@@ -61,6 +62,7 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_registration_holes_toolpath, registration_hole_centers,
                         registration_flip_axis, registration_auto_spacing)
 from tool import Tool, UNDERCUT_PROFILES
+from erosion_cache import ErosionCache
 from undercut import compute_undercut_toolpath
 from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state,
                           update_cutting_from_step, tool_from_step, format_value,
@@ -144,7 +146,9 @@ class GCodeGeneratorApp:
         self._last_effective_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _auto_px_per_mm
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
-        self._erosion_cache = {}   # tool_signature -> (center_depth_contour, accessible)
+        # tool_signature -> (center_depth_contour, accessible), bounded by
+        # the machine's memory (see erosion_cache.py)
+        self._erosion_cache = ErosionCache()
         self._overhang_cache = {}  # see _overhang_masks
 
         # Zoom / pan state (2D)
@@ -3850,6 +3854,10 @@ class GCodeGeneratorApp:
         algorithm exception on failure.
         """
         algorithm    = params['algorithm']
+        # Room for this step's own peak, freed from the erosion cache if
+        # memory is short.
+        self._erosion_cache.make_room(depth_map.size * STEP_PEAK_BYTES_PER_PX.get(
+            ALGORITHM_FAMILY[algorithm], STEP_PEAK_BYTES_PER_PX_DEFAULT))
 
         tool = params['tool']
         erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,

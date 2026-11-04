@@ -22,11 +22,12 @@ python tests/test_tool_library.py
 python tests/test_machine_defaults.py
 python tests/test_grey_morphology.py
 python tests/test_undercut.py
+python tests/test_erosion_cache.py
 python tests/test_widgets.py
 ```
 There is no test runner config, build step, or lint config in this repo.
 
-Dependencies (no requirements.txt/pyproject.toml — install manually): `numpy`, `scipy`, `scikit-image`, `matplotlib`, `tkinter`. Optional: `numba` (compiled grey morphology in `grey_morphology.py`; scipy fallback when missing).
+Dependencies (no requirements.txt/pyproject.toml — install manually): `numpy`, `scipy`, `scikit-image`, `matplotlib`, `tkinter`. Optional: `numba` (compiled grey morphology in `grey_morphology.py`; scipy fallback when missing), `psutil` (memory readings for `erosion_cache.py`; `/proc/meminfo` or the Windows API otherwise).
 
 ## Architecture
 
@@ -40,6 +41,7 @@ Module responsibilities:
 - **`stl_mesh.py`** — STL loading (binary and ASCII, no external mesh library), rasterizing a mesh into a heightmap for use as a `Layer`, and into `Dexels` (every surface crossing of each pixel's vertical line through the mesh) for the Undercut step.
 - **`tool.py`** — the `Tool` dataclass (profile, diameter, V-bit angle, a Custom profile's radial curve, and the neck/shank/head geometry of the undercut profiles Lollipop, T-Slot and Dovetail — `UNDERCUT_FIELDS` says which apply to which), plus `undercut_geometry_error`.
 - **`tool_library.py`** — the user-wide tool library (no Tk code): `ToolLibrary`/`ToolDef`/`Material`/`CuttingData`, JSON load/save at a per-user path (atomic save; a damaged file is moved to `.bak` and reseeded), import merging, and the pure step-field mapping used by the step tab — `step_values_from`, `sync_state` (compares only the step-down field the algorithm family reads), `update_cutting_from_step` (never changes geometry). Steps copy library values and store only a link (`library_tool_id`/`_name`/`_material_id`), so projects stay self-contained.
+- **`erosion_cache.py`** — `ErosionCache`, the app's achievable-depth surface cache (no Tk code): a dict-like LRU keyed by tool signature that the algorithms read and fill through their `erosion_cache` parameter. It never holds more than half of RAM, evicts while storing would leave less than a quarter available, and `make_room(nbytes)` (called by `_compute_step_work` with `STEP_PEAK_BYTES_PER_PX` × canvas pixels) frees room before a step computes. Readers recompute on a miss, so eviction only costs time.
 - **`machine_defaults.py`** — the user-wide default machine settings (the Settings dialog's values; no Tk code): JSON load/save next to the tool library (atomic save; a damaged file is moved to `.bak` and the built-in values are used). They seed the startup project, every New Project, and any setting missing from an opened project; a project's own saved settings always win.
 - **`algorithms.py`** — the six toolpath algorithms (`compute_raster_toolpath`, `compute_contour_toolpath`, `compute_vcarve_toolpath`, `compute_cutout_toolpath`, `compute_pocket_toolpath`, `compute_registration_holes_toolpath`) plus shared machinery: tool-accessibility morphological opening, multi-pass depth-slicing, path ordering (greedy + 2-opt; Contour rings top-down per feature along the contour graph), geodesic terrain linking, RDP simplification. This is the core of the project — see `README.md`'s "Technical Details" section for the pipeline stages before modifying.
 - **`grey_morphology.py`** — `grey_erosion`/`grey_dilation`/`grey_opening`/`binary_erosion`/`binary_dilation` with `scipy.ndimage`'s results but memory bounded for large kernels (row-by-row decomposition; scipy's own offset table grows with r⁴). Output rows run in parallel tiles on a thread pool; with numba installed, non-flat structures go to a compiled parallel kernel (bit-identical to scipy; `USE_NUMBA` switches it off), and `banded_grey_erosion`/`banded_grey_dilation` combine several inputs with their own footprints in one pass. The binary operations are the flat grey ones on a mask padded with False, which keeps scipy's "outside is False" border. `algorithms.py` imports these instead of scipy's — use them for any new grey morphology and for binary morphology with a tool-sized or larger structure.

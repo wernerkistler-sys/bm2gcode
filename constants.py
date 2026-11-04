@@ -41,6 +41,12 @@ ALGORITHM_FAMILY  = {
     "Undercut":                  "Undercut",
 }
 
+# Rough peak memory of one step's computation per canvas pixel, on top of
+# what the app already holds (measured in docs/PERFORMANCE.md). Before a step
+# is computed, the erosion cache frees this much if memory is short.
+STEP_PEAK_BYTES_PER_PX = {"Undercut": 300}
+STEP_PEAK_BYTES_PER_PX_DEFAULT = 100
+
 # Registration Holes flip axes (see algorithms.py's registration_flip_axis).
 # The Diagonal line always passes through the G-code origin; DIAG_DIRECTIONS
 # picks its direction only for a Center origin, since a corner origin implies it.

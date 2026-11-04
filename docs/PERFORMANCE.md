@@ -2,12 +2,13 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
-Recommendations 1–5 were followed up on 2026-11-04; see
+Recommendations 1–5 and 7 were followed up on 2026-11-04; see
 [Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample),
 [Follow-up: terrain links](#follow-up-terrain-links),
 [Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin),
-[Follow-up: morphology in float32](#follow-up-morphology-in-float32) and
-[Follow-up: Undercut memory](#follow-up-undercut-memory).
+[Follow-up: morphology in float32](#follow-up-morphology-in-float32),
+[Follow-up: Undercut memory](#follow-up-undercut-memory) and
+[Follow-up: erosion cache](#follow-up-erosion-cache).
 
 ## Summary
 
@@ -83,8 +84,9 @@ Memory the app keeps between computations:
 - Every computed step holds `result` and `accessible` at full size
   (8 B/px, i.e. 384 MB per step at 48 Mpx); Cutout adds `alpha`.
 - `GCodeGeneratorApp._erosion_cache` holds two float32 maps per tool
-  signature (another 384 MB each at 48 Mpx). It has no size limit and is only
-  emptied when invalidated.
+  signature (another 384 MB each at 48 Mpx). It had no size limit and was
+  only emptied when invalidated. It is bounded by the machine's memory since
+  (see the follow-up).
 
 ## Results: time
 
@@ -429,6 +431,47 @@ the Gaps arrays (~40 B/px on this model), and the banded morphology's
 per-level stack. Sharing F/C between band pickers would address the first,
 for Lollipop tools only (T-Slot and Dovetail have one band).
 
+## Follow-up: erosion cache
+
+The app's `_erosion_cache` maps each tool signature (tool, max depth, stock
+size, extra offset, the step's source visibility) to that tool's
+achievable-depth surfaces: two float32 canvas maps for Raster, Pocket,
+Contour, V-carve and Undercut. A step's toolpath keeps the same `accessible`
+array, so an entry for a tool a step still uses costs 4 B/px extra. One left
+behind by a tool no step uses any more costs 8 B/px, 384 MB at 48 Mpx. Every
+reader recomputes on a miss, so a limit can only cost time, never change a
+result.
+
+A fixed limit would be too strict on a large machine and too generous on a
+small one. The new `erosion_cache.ErosionCache` (a dict-like LRU) adapts to
+the machine instead. It frees memory at the two moments the app controls:
+
+- **Storing** an entry evicts least recently used ones while the system's
+  available memory is below a quarter of RAM, or while the cache holds more
+  than half of it. The entry just stored stays.
+- **Before each step**, `_compute_step_work` calls `make_room` with the step's
+  expected peak: `STEP_PEAK_BYTES_PER_PX` × canvas pixels, 300 B/px for
+  Undercut and 100 B/px for the others, from the measurements above. The
+  cache evicts until that much is available above the quarter-of-RAM floor.
+
+Available memory comes from `psutil` if installed, else from
+`/proc/meminfo` (Linux) or `GlobalMemoryStatusEx` (Windows), else the cache
+holds at most 1 GiB. Evicting frees RAM right away for entries nothing else
+holds, because numpy allocates large arrays straight from the operating
+system. An array shared by two entries (V-carve's idealized-tool entry
+stores one twice) counts once.
+
+A simulated session on this machine (15.8 GB RAM, 9.8 GB available) stored
+one 48 Mpx entry (384 MB) for each of 20 tools. The plain dict would have
+grown to 7.7 GB. The cache grew to 15 entries (5.8 GB), then held steady
+with 4.1 GB still available. A following `make_room` for a 48 Mpx Undercut
+step (14.4 GB) emptied it, leaving 9.9 GB available. The new
+`tests/test_erosion_cache.py` covers the eviction order, use versus
+iteration, the floor and cap, `make_room`, shared arrays, entries held
+elsewhere, unreadable memory, threads, the `/proc/meminfo` fallback, and the
+algorithms' use of the cache (a cache hit in Raster, the V-bit scan). All
+tests passed.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -454,5 +497,5 @@ Ordered by expected payoff.
    `grey_morphology.py` is the intended fix. Whether numba wheels exist for
    Windows ARM64 with Python 3.13 was not checked. Without it, Ball and V-Bit
    tools at high resolution are inherently px/mm⁴.
-7. **App memory:** put a size limit on `_erosion_cache` (LRU), so it doesn't
-   grow with every tool tried.
+7. **App memory.** Done: `_erosion_cache` is an LRU bounded by the
+   machine's available memory (see the follow-up).

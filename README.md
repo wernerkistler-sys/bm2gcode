@@ -18,7 +18,7 @@ A set of visualization modes supports strategy planning. In addition to the 3D t
 
 **Requirements:** Python 3.8+, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `tkinter` (bundled with most Python distributions).
 
-Optional: `numba`, which computes tool accessibility and the Undercut step several times faster (`pip install numba`). Without it the same results are computed with scipy alone.
+Optional: `numba`, which computes tool accessibility and the Undercut step several times faster (`pip install numba`). Without it the same results are computed with scipy alone. Optional: `psutil`, which reports the free memory that the cache of tool accessibility surfaces adapts to; without it, the app reads it from the operating system directly on Linux and Windows, and elsewhere limits the cache to 1 GB.
 
 ```bash
 git clone https://github.com/wernerkistler-sys/bm2gcode.git
