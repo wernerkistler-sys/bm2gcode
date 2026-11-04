@@ -2,11 +2,12 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
-Recommendations 1–4 were followed up on 2026-11-04; see
+Recommendations 1–5 were followed up on 2026-11-04; see
 [Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample),
 [Follow-up: terrain links](#follow-up-terrain-links),
-[Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin) and
-[Follow-up: morphology in float32](#follow-up-morphology-in-float32).
+[Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin),
+[Follow-up: morphology in float32](#follow-up-morphology-in-float32) and
+[Follow-up: Undercut memory](#follow-up-undercut-memory).
 
 ## Summary
 
@@ -18,8 +19,8 @@ Recommendations 1–4 were followed up on 2026-11-04; see
   stock area × (px/mm)⁴ × tool diameter².
 - **Memory** during a computation runs at roughly 70–115 bytes per canvas
   pixel. The worst spikes came from the removal simulation
-  (`ToolPath.resample`, vectorised since; see the follow-up) and, by
-  estimate, from the Undercut step.
+  (`ToolPath.resample`, vectorised since; see the follow-up) and from the
+  Undercut step, which the follow-up measured at ~600 B/px.
 
 ## Scale
 
@@ -43,7 +44,9 @@ multiplied by about 4 for a 400×300 mm stock.
 - Memory: `tracemalloc` (which tracks numpy allocations), peak per
   progress-callback stage. Measured in a separate run, because tracemalloc
   slows Python-heavy code several times over.
-- Undercut was **not benchmarked**; its figures are estimated from the code.
+- Undercut was **not benchmarked** in this first run; its figures are
+  estimated from the code. The follow-up measured it with
+  `bench/bench_undercut.py`, and the estimate turned out about 3× too low.
 
 Reproduce from the repo root:
 
@@ -52,6 +55,8 @@ python bench/bench_raster.py 200 150 20 3 Ball 2.0        # timing per stage
 python bench/bench_raster.py 200 150 20 3 Ball 2.0 mem    # memory per stage
 python bench/bench_algos.py 200 150 20 pocket             # contour | vcarve | pocket | cutout
 python bench/bench_algos.py 200 150 20 pocket mem
+python bench/bench_undercut.py 20                         # umbilic torus, Lollipop 6 mm
+python bench/bench_undercut.py 20 mem
 ```
 
 `bench_raster.py` arguments: width mm, height mm, px/mm, tool diameter,
@@ -71,7 +76,7 @@ Peak traced memory per computation at 12 Mpx (200×150 mm, 20 px/mm):
 | V-carve | 1117 MB | Morphology plus the result map. |
 | Pocket | 1220 MB | Morphology plus the result map. |
 | Contour | 862 MB | Morphology plus the result map. |
-| Undercut (**estimated**) | ~190 B/px, so ~9 GB at 48 Mpx | Up to `MAX_BANDS = 8` `_GapPicker` objects, each holding `F` and `C` as float64 plus `active` (17 B/px each), on top of `depth64`, `center25`, `sky_limit`, `shank`, `g` and `g_sky`. Dexels and Gaps add an int64 `offsets` array (8 B/px each). The non-placed path of `layers.composite_gaps` adds ~80 B/px of temporaries (`mgrid`, float64 coordinates, int64 source indices). |
+| Undercut (**estimated**) | ~190 B/px, so ~9 GB at 48 Mpx | Up to `MAX_BANDS = 8` `_GapPicker` objects, each holding `F` and `C` as float64 plus `active` (17 B/px each), on top of `depth64`, `center25`, `sky_limit`, `shank`, `g` and `g_sky`. Dexels and Gaps add an int64 `offsets` array (8 B/px each). The non-placed path of `layers.composite_gaps` adds ~80 B/px of temporaries (`mgrid`, float64 coordinates, int64 source indices). | **Measured since:** ~600 B/px on the umbilic torus, mostly duplicated per-picker copies; fixed to ~270 B/px (see the follow-up).
 
 Memory the app keeps between computations:
 
@@ -359,8 +364,70 @@ memory bandwidth or conversion in scipy's inner loop rather than to the
 buffer. The first run after the change also compiles the kernel's float32
 version once (about 1 s); numba caches it.
 
-The Undercut step (`undercut.py`) still works in float64; that is
-recommendation 5.
+The Undercut step (`undercut.py`) is covered by the next follow-up.
+
+## Follow-up: Undercut memory
+
+Same machine as the previous follow-ups, with the new
+`bench/bench_undercut.py`. It runs the Undercut step on
+`umbilic-torus-3-1.stl` (118 × 124 × 50 mm) with a 6 mm Lollipop (3 mm neck),
+2 mm levels and 20 % step-over. That gives 8 bands, and 71 % of the pixels
+have gaps.
+
+**The estimate was too low.** Measured at 10 px/mm, the step peaked at
+606 B/px, not ~190 B/px, and already held 340 B/px before its first level. A
+tracemalloc snapshot showed that most of it was the 8 band pickers
+(`_GapPicker`), each with its own copies:
+
+| Per picker (× 8) | B/px, all 8 |
+|---|---|
+| `self.top`, a float64 copy of the depth map, read only by `_reset` | 64 |
+| `F`, float64 | 64 |
+| `C`, float64 | 64 |
+| `ceil_sorted`, a copy of every gap ceiling in sorted order | 47 |
+| `active` | 8 |
+
+During each level, `banded_grey_erosion`/`banded_grey_dilation` stack and
+pad all bands' F (or C) windows on top of this.
+
+Of the two alternatives in recommendation 5, sharing F/C between the band
+pickers would save the most but is complex. The pickers sit at different
+depths, so it needs a shared base plus per-band overrides, and the banded
+morphology still needs a dense array per band and window. Keeping F/C only
+within the active windows doesn't help a model like this, whose windows
+cover nearly the whole canvas. Two simpler steps were done instead:
+
+1. **Shared read-only data.** All pickers share `top` and `ceil_sorted`,
+   which the caller already computes. The output is bit-identical.
+2. **float32.** F and C, and the depth map, `center25`, the shank limit,
+   `sky_limit`, `g` and `g_sky` are float32. The banded morphology then pads
+   in float32 too (see the previous follow-up). STL sources count as 65,536
+   grey levels, so the free-space tests compare against
+   eps = 7.6 · 10⁻⁶. Float32's rounding near full depth is below 10⁻⁷.
+
+| | Before (`30b2426`) | Step 1 | Steps 1 + 2 |
+|---|---|---|---|
+| 10 px/mm (1.46 Mpx): highest stage peak | 884 MB (606 B/px) | 723 MB (496 B/px) | **416 MB (285 B/px)** |
+| 10 px/mm: held before the first level | 496 MB | – | **218 MB** |
+| 10 px/mm: time | 6.5 s | – | **5.2 s** |
+| 20 px/mm (5.83 Mpx): highest stage peak | 3429 MB (588 B/px) | – | **1556 MB (267 B/px)** |
+| 20 px/mm: held before the first level | 1883 MB | – | **770 MB** |
+| 20 px/mm: time | 71.3 s | – | **55.4 s** |
+
+At 48 Mpx that is about 13 GB instead of about 28 GB.
+
+Step 2 isn't bit-identical. At both resolutions, every chain has the same
+number of points as before, and the points move by at most 0.001 µm. The
+result map, the reach overlay (`undercut_reach`) and the warnings are
+identical. The accessible map differs by one float32 rounding step, because
+the 2.5-D erosion's result is rounded to float32 before the dilation. All
+tests passed. `test_undercut.py`'s picker checks now compare against the
+float32 rounding of the gaps' float64 values.
+
+The remaining ~270 B/px are mostly the 8 pickers' float32 F/C (64 B/px),
+the Gaps arrays (~40 B/px on this model), and the banded morphology's
+per-level stack. Sharing F/C between band pickers would address the first,
+for Lollipop tools only (T-Slot and Dovetail have one band).
 
 ## Recommendations
 
@@ -380,8 +447,9 @@ Ordered by expected payoff.
 4. **Morphology memory.** Done: the algorithms pass float32 maps, and the
    scipy row path reuses one `output=` buffer per tile (see the follow-up).
    Results are the float32 rounding of the float64 ones, as before.
-5. **Undercut memory:** share the `F`/`C` arrays between band pickers, or keep
-   them in float32 and only within the active windows.
+5. **Undercut memory.** Done: shared read-only picker data and float32
+   (see the follow-up). Remaining option: share F/C between the band
+   pickers of a Lollipop.
 6. **Non-flat morphology speed:** numba's compiled kernel in
    `grey_morphology.py` is the intended fix. Whether numba wheels exist for
    Windows ARM64 with Python 3.13 was not checked. Without it, Ball and V-Bit

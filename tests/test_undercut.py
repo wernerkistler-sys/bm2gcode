@@ -189,17 +189,20 @@ g = Gaps.from_lists((1, 3), [1, 1, 2], [0.2, 0.6, 0.3], [0.4, 0.8, 1.0])
 top = np.array([[0.0, 0.1, 0.1]])
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.5)
 check("no gap: top surface floor, open sky", F[0, 0] == 0.0 and C[0, 0] < -1e5 and not act[0, 0])
-check("depth in solid below gap 0 uses gap 0", F[0, 1] == 0.4 and C[0, 1] == 0.2)
+check("floor and ceiling are float32", F.dtype == C.dtype == np.float32)
+f32 = np.float32
+check("depth in solid below gap 0 uses gap 0", F[0, 1] == f32(0.4) and C[0, 1] == f32(0.2))
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.7)
-check("depth inside gap 1 uses gap 1", F[0, 1] == 0.8 and C[0, 1] == 0.6)
+check("depth inside gap 1 uses gap 1", F[0, 1] == f32(0.8) and C[0, 1] == f32(0.6))
 F, C, act = _floor_ceil_at(g, g.pixel_index(), top, 0.25)
-check("depth above every gap ceiling: no gap", F[0, 2] == 0.1 and not act[0, 2])
+check("depth above every gap ceiling: no gap", F[0, 2] == f32(0.1) and not act[0, 2])
 
 
 def floor_ceil_reference(gaps, top, d):
-    """Every column's deepest gap with ceil < d, picked from scratch."""
-    F = top.astype(np.float64).copy()
-    C = np.full(top.shape, -2.0e6)
+    """Every column's deepest gap with ceil < d, picked from scratch, in
+    the picker's float32."""
+    F = top.astype(np.float32)
+    C = np.full(top.shape, -2.0e6, np.float32)
     act = np.zeros(top.shape, bool)
     off = gaps.offsets
     for p in range(top.size):

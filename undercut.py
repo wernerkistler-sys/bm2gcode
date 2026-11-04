@@ -108,7 +108,7 @@ def _shank_limit(depth_map, tool, px_per_mm, max_depth, allowance_mm):
     k = max(1, int(np.ceil(r_s * px_per_mm)))
     ky, kx = np.mgrid[-k:k + 1, -k:k + 1]
     fp = np.sqrt(kx ** 2 + ky ** 2) <= r_s * px_per_mm + 0.5
-    top = grey_erosion(depth_map.astype(np.float64), footprint=fp)
+    top = grey_erosion(depth_map.astype(np.float32, copy=False), footprint=fp)
     return top + (tool.neck_length_mm - allowance_mm) / max_depth
 
 
@@ -143,19 +143,23 @@ def _floor_ceil_at(gaps, gap_pix, top, d):
 class _GapPicker:
     """_floor_ceil_at for a depth that rises from call to call: advance(d)
     writes only the gaps whose ceiling d has passed since the last call,
-    into F, C and active arrays it keeps and returns."""
+    into F, C and active arrays it keeps and returns. F and C are float32:
+    one picker per band holds a pair, and float32's rounding (below 1e-7
+    near full depth) stays far inside the half grey level the free space
+    is tested against."""
 
-    def __init__(self, gaps, gap_pix, top, order=None):
-        self.gaps, self.gap_pix = gaps, gap_pix
-        self.top = top.astype(np.float64)
-        # Gaps by ceiling; equal ceilings in column order.
+    def __init__(self, gaps, gap_pix, top, order=None, ceil_sorted=None):
+        """*order* (gaps by ceiling; equal ceilings in column order) and
+        *ceil_sorted* (gaps.ceil[order]) are computed when not given; the
+        pickers of one step share them, and *top*, which is only read."""
+        self.gaps, self.gap_pix, self.top = gaps, gap_pix, top
         self.order = np.argsort(gaps.ceil, kind="stable") if order is None else order
-        self.ceil_sorted = gaps.ceil[self.order]
+        self.ceil_sorted = gaps.ceil[self.order] if ceil_sorted is None else ceil_sorted
         self._reset()
 
     def _reset(self):
-        self.F = self.top.copy()
-        self.C = np.full(self.top.shape, SKY)
+        self.F = self.top.astype(np.float32)
+        self.C = np.full(self.top.shape, SKY, np.float32)
         self.active = np.zeros(self.top.shape, bool)
         self.n = 0          # gaps written: order[:n], those with ceil < d
         self.d = -np.inf
@@ -585,7 +589,7 @@ def compute_undercut_toolpath(
           "Top-Right": H_mm, "Center": H_mm / 2}.get(origin, 0)
 
     eps = 0.5 / max(n_grey_levels - 1, 1)
-    depth64 = depth_map.astype(np.float64)
+    depth32 = depth_map.astype(np.float32, copy=False)
 
     # ── Kernels and the plunge-from-above surface ─────────────────────────
     progress(0, "Building tool geometry…")
@@ -599,8 +603,8 @@ def compute_undercut_toolpath(
         center25, accessible = cached
     else:
         progress(2, "Computing plunge-accessible depth…")
-        center25 = grey_erosion(depth64, footprint=fp, structure=-lo)
-        center_real = grey_erosion(depth64, footprint=real_fp,
+        center25 = grey_erosion(depth32, footprint=fp, structure=-lo)
+        center_real = grey_erosion(depth32, footprint=real_fp,
                                    structure=-real_kernel.astype(np.float64))
         accessible = np.clip(grey_dilation(
             np.clip(center_real, 0.0, 1.0), footprint=real_fp,
@@ -628,7 +632,8 @@ def compute_undercut_toolpath(
     # nearest the tip (smallest lo, depth b_max) serve the whole footprint.
     gap_order = np.argsort(gaps.ceil, kind="stable")
     ceil_sorted = gaps.ceil[gap_order]
-    pickers = [_GapPicker(gaps, gap_pix, depth_map, gap_order) for _ in bands]
+    pickers = [_GapPicker(gaps, gap_pix, depth_map, gap_order, ceil_sorted)
+               for _ in bands]
     i_lo_min = int(np.argmin(band_lo))
 
     # ── Levels ────────────────────────────────────────────────────────────
