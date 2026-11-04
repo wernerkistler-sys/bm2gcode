@@ -9,6 +9,9 @@ Recommendations 1–5 and 7 were followed up on 2026-11-04; see
 [Follow-up: morphology in float32](#follow-up-morphology-in-float32),
 [Follow-up: Undercut memory](#follow-up-undercut-memory) and
 [Follow-up: erosion cache](#follow-up-erosion-cache).
+[Undercut speed: analysis and ideas](#undercut-speed-analysis-and-ideas)
+records where the Undercut step's time goes and what could speed it up
+(recommendation 8; not implemented yet).
 
 ## Summary
 
@@ -472,6 +475,116 @@ elsewhere, unreadable memory, threads, the `/proc/meminfo` fallback, and the
 algorithms' use of the cache (a cache hit in Raster, the V-bit scan). All
 tests passed.
 
+## Undercut speed: analysis and ideas
+
+Analysis only; nothing below is implemented yet. Done on 2026-11-04 against
+commit `b2c864c`, same machine as the follow-ups (numba installed), with
+`bench/bench_undercut.py`: the umbilic torus, 6 mm Lollipop (3 mm neck),
+2 mm levels, 20 % step-over.
+
+### Where the time goes
+
+cProfile of `bench_undercut.py 20` (5.83 Mpx, 25 levels): 52 s in
+`compute_undercut_toolpath`, of which **44.5 s** is the banded morphology,
+65 calls of `_numba_erosion` at ~0.68 s each. Every level runs one
+`banded_grey_erosion` of the floors F and one `banded_grey_dilation` of the
+ceilings C (`undercut.py`, the level loop's `_windows(active, ...)`), over
+windows that cover most of the canvas on this model. Everything else is
+about 8 s: `_GapPicker.advance` 2.2 s, `np.stack`/padding of the band inputs
+~2 s, `label`, `find_contours`, `distance_transform_edt` and the escape
+routes under 1 s each. Loading the STL (`generate_dexels` 4 s,
+`generate_heightmap` 1.5 s) happens when the source is placed, not in the
+step.
+
+**Why Lollipops are the slow case.** The Lollipop's ball head has a
+non-flat underside (`lo`) and top (`hi`), so the compiled kernel visits every
+footprint pixel for every output pixel. At 20 px/mm the 6 mm head has a
+60 px radius, about 11,300 offsets per output pixel, so the cost grows with
+(px/mm)⁴. T-Slot and Dovetail have flat undersides and go to scipy's flat row
+path (`minimum_filter1d`), whose cost grows only linearly with the radius.
+The number of bands (up to `MAX_BANDS = 8`) doesn't matter: each footprint
+pixel belongs to exactly one band, so the bands together visit every offset
+once.
+
+### Ideas, measured
+
+The potential of each idea was measured on the 10 px/mm job (1.46 Mpx,
+31 banded calls, mean window 0.93 Mpx) by wrapping
+`grey_morphology.banded_grey_erosion`/`banded_grey_dilation`. `undercut.py`
+imports them inside the function, so patching the module attributes is
+enough; skip the flat calls from `_enclosed_reach` (`structure=None`). The
+`g_sky` fraction needed an instrumented copy of the level loop.
+
+1. **Stopping each minimum early: recommended, exact (bit-identical).**
+   In erosion form, the kernel takes min over offsets o of
+   `input(x + o) − s(o)`. Sort the offsets by `−s(o)` ascending. For each
+   output block of B pixels along a row, let `m` be a lower bound of the
+   input over the block's whole footprint window. That's one sliding
+   minimum per band input, `minimum_filter(size=(kh, kw + B − 1))`, which is
+   cheap. Once `−s(o) + m` reaches the largest value the block has so far,
+   no remaining offset can lower any of its pixels (`input ≥ m` and `−s` only
+   grows), so the block is done. Equal values don't change a minimum, so the
+   result stays identical to scipy's. The dilation is the same erosion on
+   the negated input, as `banded_grey_dilation` already does.
+
+   Measured fraction of offsets still needed (pixel-weighted mean over all
+   calls):
+
+   | Block width B | Floors F (erosion) | Ceilings C (dilation) |
+   |---|---|---|
+   | 16 px | **43 %** (worst call 76 %) | **25 %** (worst 32 %) |
+   | 64 px | 55 % (worst 86 %) | 36 % (worst 47 %) |
+   | 256 px | 80 % (worst 100 %) | 64 % (worst 83 %) |
+
+   With 16 px blocks that is about 3× less morphology work: this job from
+   ~52 s to an estimated ~23 s. The same kernel serves every non-flat
+   erosion, so the gain carries over elsewhere. The achievable-depth
+   erosion of the Raster benchmark relief (12 Mpx, 20 px/mm, B = 64) needs
+   only **13 %** of the offsets with a V-Bit 6 mm 60° (10,557 offsets), and
+   V-carve's morphology was its largest cost (see "Other algorithms at
+   12 Mpx"). With a Ball 3 mm (2,821 offsets) it needs 86 %, so Raster with
+   a Ball tool gains little.
+
+   Open questions for a prototype:
+   - **Memory access.** Visiting offsets in sorted order instead of
+     footprint order makes memory access less regular. Whether the real
+     kernel achieves the estimate needs measuring.
+   - **Block width.** 16 px is two or four SIMD vectors in float32 or
+     float64, so the per-block loop overhead may matter.
+   - **The bound.** Each band input needs its own windowed minimum (or one
+     over all bands' inputs, as measured above).
+
+   The change belongs in `grey_morphology._get_numba_kernel`/`_numba_erosion`.
+   The scipy fallback stays as it is. `tests/test_grey_morphology.py`
+   already checks the compiled kernel against scipy bit for bit, including
+   inf and sentinel values, banded inputs and float32.
+
+2. **Computing Undercut on a coarser grid: large gain, but results change.**
+   For example, a step option to compute at most 10 px/mm whatever the
+   canvas resolution, resampling the depth map and gaps the way
+   `compute_undercut_toolpath` already does for non-square pixels
+   (`_resample_gaps`). Halving px/mm cuts the morphology about 16×
+   (4× pixels × 4× footprint). Ring positions then lie on a 0.1 mm grid
+   instead of 0.05 mm, before RDP simplification. Whether that's acceptable
+   is a product decision.
+
+3. **Larger Z increment.** The step's time is linear in its number of
+   levels: 4 mm instead of 2 mm halves it. A user setting, not a code
+   change.
+
+**Measured and not worth it:**
+
+- **Recomputing only what changed since the previous level.** F and C
+  change between levels only where a gap ceiling was passed, so only
+  outputs within a head radius of such a column need recomputing. On this
+  model that is still **69 %** of each level's output on average, and the
+  windows (`_windows(active, ...)`) change shape in 18 of 30 level
+  transitions. That's at most ~1.4×, for a lot of bookkeeping.
+- **Computing the band result only where plunging can't reach.** `g` only
+  differs from `g_sky` where `g_sky < −eps`, give or take the pixel or two
+  that `find_contours` and the bilinear `_sample` read. That region, dilated
+  by 2 px, is **88 %** of the window area, so ~1.1×.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -499,3 +612,9 @@ Ordered by expected payoff.
    tools at high resolution are inherently px/mm⁴.
 7. **App memory.** Done: `_erosion_cache` is an LRU bounded by the
    machine's available memory (see the follow-up).
+8. **Undercut speed.** Early termination in the compiled kernel (see
+   [Undercut speed: analysis and ideas](#undercut-speed-analysis-and-ideas)):
+   exact, an estimated ~2.3× for Lollipop Undercut steps, and large gains
+   for V-Bit erosions. Prototype it and benchmark it against the current
+   kernel first. Optionally, a coarser grid for Undercut, if a 0.1 mm grid
+   is acceptable.
