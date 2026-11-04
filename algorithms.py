@@ -93,49 +93,49 @@ def _geodesic_link(r0, c0, r1, c1, ceil_norm,
 
     Uses the roughing surface (terrain − final_norm_val, capped at ceil_norm)
     for arc-length cost, so the path avoids edges in the surface being cut.
+    The search runs on the 8-connected pixel grid of a window around both
+    ends (a margin of a quarter of their distance, at least 2 px), each
+    move costing its 3-D length; scipy.sparse.csgraph.dijkstra solves it.
+    Returns the (row, col) pixels from (r0,c0) to (r1,c1), or the
+    Bresenham line between them when no path is found.
     """
-    import heapq
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
     margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
     rlo = max(0, min(r0, r1) - margin)
     rhi = min(H - 1, max(r0, r1) + margin)
     clo = max(0, min(c0, c1) - margin)
     chi = min(W - 1, max(c0, c1) + margin)
 
-    DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
-            (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    dist = {}
-    prev = {}
-    dist[(r0, c0)] = 0.0
-    heap = [(0.0, r0, c0)]
+    z = np.clip(center_depth_map[rlo:rhi + 1, clo:chi + 1].astype(np.float64)
+                - final_norm_val, 0.0, ceil_norm)
+    h, w = z.shape
+    idx = np.arange(h * w).reshape(h, w)
+    # Each undirected edge once: right, down, down-right, down-left.
+    src, dst, cost = [], [], []
+    for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        cols_a = slice(max(0, -dc), w - max(0, dc))
+        cols_b = slice(max(0, dc), w - max(0, -dc))
+        dz = (z[dr:, cols_b] - z[:h - dr, cols_a]).ravel() * max_depth
+        dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
+        src.append(idx[:h - dr, cols_a].ravel())
+        dst.append(idx[dr:, cols_b].ravel())
+        cost.append(np.sqrt(dxy2 + dz * dz))
+    graph = csr_matrix((np.concatenate(cost),
+                        (np.concatenate(src), np.concatenate(dst))),
+                       shape=(h * w, h * w))
+    start = (r0 - rlo) * w + (c0 - clo)
+    target = (r1 - rlo) * w + (c1 - clo)
+    _, pred = dijkstra(graph, directed=False, indices=start,
+                       return_predecessors=True)
 
-    while heap:
-        d, r, c = heapq.heappop(heap)
-        if (r, c) == (r1, c1):
-            break
-        if d > dist.get((r, c), float('inf')):
-            continue
-        z_cur = min(max(float(center_depth_map[r, c]) - final_norm_val, 0.0), ceil_norm)
-        for dr, dc in DIRS:
-            nr, nc = r + dr, c + dc
-            if not (rlo <= nr <= rhi and clo <= nc <= chi):
-                continue
-            z_nb = min(max(float(center_depth_map[nr, nc]) - final_norm_val, 0.0),
-                       ceil_norm)
-            dxy2 = (dr / px_per_mm_y) ** 2 + (dc / px_per_mm_x) ** 2
-            dz   = (z_nb - z_cur) * max_depth
-            nd   = d + (dxy2 + dz * dz) ** 0.5
-            if nd < dist.get((nr, nc), float('inf')):
-                dist[(nr, nc)] = nd
-                prev[(nr, nc)] = (r, c)
-                heapq.heappush(heap, (nd, nr, nc))
-
-    if (r1, c1) not in prev and (r0, c0) != (r1, c1):
+    if target != start and pred[target] < 0:
         return list(_bresenham_pixels(r0, c0, r1, c1))
 
-    path, cur = [], (r1, c1)
-    while cur != (r0, c0):
-        path.append(cur)
-        cur = prev[cur]
+    path, cur = [], target
+    while cur != start:
+        path.append((rlo + cur // w, clo + cur % w))
+        cur = int(pred[cur])
     path.append((r0, c0))
     path.reverse()
     return path

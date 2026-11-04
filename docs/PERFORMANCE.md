@@ -2,8 +2,9 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
-Recommendation 1 was examined further on 2026-11-04; see
-[Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample).
+Recommendations 1 and 2 were followed up on 2026-11-04; see
+[Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample)
+and [Follow-up: terrain links](#follow-up-terrain-links).
 
 ## Summary
 
@@ -212,6 +213,46 @@ path was then simplified twice. Doing this properly means skipping the final
 RDP for cut segments and updating the README's Raster pipeline. Pocket's
 raster fill uses the same helpers and would benefit too.
 
+## Follow-up: terrain links
+
+Same machine and Raster job as the previous follow-up.
+
+`_geodesic_link` costs each 8-connected move by its 3-D length,
+√(Δxy² + Δz²), so links go around walls and follow level ground. The
+suggested `skimage.graph.MCP_Geometric` can't express that.
+It costs a move as its length × the mean of the two pixels' values, so it
+never sees the depth *difference* between them. A slope-based value per
+pixel would charge a link running level along a slope as if it climbed, and
+would smear a vertical step over two pixels. The links would come out
+different, not just faster.
+
+Measured on 300 random links of up to 24 px on the benchmark relief:
+
+| Search | Cost | Time per link | Same pixels as the heapq version |
+|---|---|---|---|
+| Python `heapq` Dijkstra (before) | exact 3-D length | 2.9 ms | — |
+| `scipy.sparse.csgraph.dijkstra` | exact 3-D length | **0.18 ms** | 300/300 |
+| `skimage.graph.MCP_Flexible`, `travel_cost` overridden | exact 3-D length | 0.68 ms | 259/300 (equal length, other ties) |
+
+`_geodesic_link` now builds the window's 8-connected graph with numpy, with
+edge costs computed the same way as before, and solves it with
+`csgraph.dijkstra`. The window, surface, return value and Bresenham fallback
+are unchanged, and so are its callers in Raster, Pocket and Contour.
+`csgraph` computes the whole window instead of stopping at the target,
+which costs little because the windows are small (around 40×40 px).
+
+| | Before (`5181cf3`) | After |
+|---|---|---|
+| Raster total | 12.9 s | **8.2 s** |
+| Depth slicing + ordering + terrain links (3,661) | 7.5 s | **3.0 s** |
+
+The job's toolpath is identical before and after (all 7,586 segments
+compared). A new test compares against the heapq version on relief and on
+flat floors with steps, with ceilings, finishing allowance and canvas edges:
+120/120 links are identical. Exactly tied shortest paths may still be broken
+differently in rare cases, with the same length. The Pocket and Contour
+benchmarks hardly link (0 and 7 links), so their times don't change.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -221,9 +262,9 @@ Ordered by expected payoff.
    full-depth segments before `make_multipass`, as V-Carving does, instead of
    converting every path to `(N, 3)` arrays. Keep `ToolPath.segments` as
    lists of tuples.
-2. **Replace `_geodesic_link`** with `skimage.graph.MCP_Geometric` on the link
-   window (already used in `undercut.py`), or a compiled routine. That moves
-   the biggest single cost in Raster into C.
+2. **Terrain links.** Done with `scipy.sparse.csgraph.dijkstra`, not
+   `MCP_Geometric`, whose per-pixel cost can't express 3-D arc length (see
+   the follow-up).
 3. **Pocket onion skin:** compute one `distance_transform_edt` per region and
    threshold it at k·step, instead of repeated `binary_erosion` calls. The
    cost no longer depends on radius or ring count. The rings come out

@@ -25,7 +25,7 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         compute_registration_holes_toolpath, _spiral_px,
                         _extract_z_contours, _order_contours_graph,
                         _fill_level_gaps, _prune_contours,
-                        compute_contour_toolpath)
+                        compute_contour_toolpath, _geodesic_link)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1555,6 +1555,88 @@ check("a sample on a plunge's vertex takes the plunge's bottom",
                                (1.5, 0, -2)]))
 check("an empty path resamples to an empty (0, 3) array",
       ToolPath(segments=[]).resample(0.1).shape == (0, 3))
+
+
+# ---------------------------------------------------------------------------
+print("_geodesic_link")
+
+
+def _geodesic_link_heapq(r0, c0, r1, c1, ceil_norm, depth, H, W, ppx, ppy,
+                         max_depth, final_norm_val=0.0):
+    """Point-by-point reference: heapq Dijkstra over the same window, moves
+    and 3-D arc-length cost."""
+    import heapq
+    margin = max(2, max(abs(r1 - r0), abs(c1 - c0)) // 4 + 1)
+    rlo, rhi = max(0, min(r0, r1) - margin), min(H - 1, max(r0, r1) + margin)
+    clo, chi = max(0, min(c0, c1) - margin), min(W - 1, max(c0, c1) + margin)
+    dist, prev, heap = {(r0, c0): 0.0}, {}, [(0.0, r0, c0)]
+    while heap:
+        d, r, c = heapq.heappop(heap)
+        if (r, c) == (r1, c1):
+            break
+        if d > dist.get((r, c), float('inf')):
+            continue
+        z_cur = min(max(float(depth[r, c]) - final_norm_val, 0.0), ceil_norm)
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            nr, nc = r + dr, c + dc
+            if not (rlo <= nr <= rhi and clo <= nc <= chi):
+                continue
+            z_nb = min(max(float(depth[nr, nc]) - final_norm_val, 0.0), ceil_norm)
+            dz = (z_nb - z_cur) * max_depth
+            nd = d + ((dr / ppy) ** 2 + (dc / ppx) ** 2 + dz * dz) ** 0.5
+            if nd < dist.get((nr, nc), float('inf')):
+                dist[(nr, nc)], prev[(nr, nc)] = nd, (r, c)
+                heapq.heappush(heap, (nd, nr, nc))
+    path, cur = [], (r1, c1)
+    while cur != (r0, c0):
+        path.append(cur)
+        cur = prev[cur]
+    return [(r0, c0)] + path[::-1]
+
+
+def _link_len(path, depth, ceil_norm, ppm, max_depth, fn=0.0):
+    p = np.array(path)
+    z = np.clip(depth[p[:, 0], p[:, 1]].astype(np.float64) - fn, 0.0, ceil_norm) * max_depth
+    d = np.diff(p, axis=0) / ppm
+    return float(np.sum(np.sqrt((d ** 2).sum(axis=1) + np.diff(z) ** 2)))
+
+
+_gl_ppm, _gl_md = 20.0, 5.0
+_gl_yy, _gl_xx = np.mgrid[0:300, 0:300].astype(np.float32)
+_gl_relief = np.clip(0.5 + 0.3 * np.sin(_gl_xx / 31.0) * np.cos(_gl_yy / 17.0)
+                     + 0.15 * np.sin((_gl_xx + _gl_yy) / 9.0), 0, 1).astype(np.float32)
+_gl_step = np.full((300, 300), 0.6, np.float32)
+_gl_step[:, 150:] = 0.2
+_gl_step[100:120, 60:240] = 0.9                       # a deeper groove across the step
+_gl_rng = np.random.default_rng(3)
+_gl_cases = []
+for _gl_depth in (_gl_relief, _gl_step):
+    for _ in range(60):
+        r0, c0 = (int(v) for v in _gl_rng.integers(0, 300, 2))
+        r1 = int(np.clip(r0 + _gl_rng.integers(-24, 25), 0, 299))
+        c1 = int(np.clip(c0 + _gl_rng.integers(-24, 25), 0, 299))
+        _gl_cases.append((_gl_depth, r0, c0, r1, c1, float(_gl_rng.choice([0.4, 0.7, 1.0])),
+                          float(_gl_rng.choice([0.0, 0.1]))))
+_gl_same = _gl_len_ok = 0
+for depth, r0, c0, r1, c1, cn, fn in _gl_cases:
+    new = _geodesic_link(r0, c0, r1, c1, cn, depth, 300, 300, _gl_ppm, _gl_ppm, _gl_md, fn)
+    ref = _geodesic_link_heapq(r0, c0, r1, c1, cn, depth, 300, 300, _gl_ppm, _gl_ppm, _gl_md, fn)
+    _gl_same += new == ref
+    _gl_len_ok += abs(_link_len(new, depth, cn, _gl_ppm, _gl_md, fn)
+                      - _link_len(ref, depth, cn, _gl_ppm, _gl_md, fn)) < 1e-9
+check("every link is as short as the heapq Dijkstra's (relief, flat floor with steps, "
+      "ceilings, final allowance, canvas edges)", _gl_len_ok == len(_gl_cases))
+check(f"links follow the heapq Dijkstra's pixels ({_gl_same}/{len(_gl_cases)} identical)",
+      _gl_same >= 0.9 * len(_gl_cases))
+_gl_path = _geodesic_link(10, 10, 14, 30, 1.0, _gl_relief, 300, 300, _gl_ppm, _gl_ppm, _gl_md)
+check("a link runs from its start to its end in 8-connected steps",
+      _gl_path[0] == (10, 10) and _gl_path[-1] == (14, 30)
+      and all(max(abs(a[0] - b[0]), abs(a[1] - b[1])) == 1
+              for a, b in zip(_gl_path, _gl_path[1:])))
+check("a link from a pixel to itself is that pixel",
+      _geodesic_link(5, 5, 5, 5, 1.0, _gl_relief, 300, 300, _gl_ppm, _gl_ppm, _gl_md)
+      == [(5, 5)])
 
 
 print()
