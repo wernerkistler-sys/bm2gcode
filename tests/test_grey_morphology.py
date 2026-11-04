@@ -164,6 +164,11 @@ for use in ([True, False] if have_numba else [False]):
           e32.dtype == np.float32 and np.array_equal(
               e32, ndi.grey_erosion(img32, footprint=fp_l[8:23, 8:23],
                                     structure=s_l[8:23, 8:23])))
+    tall32 = rng.random((700, 90)).astype(np.float32)        # several row tiles
+    for op in (gm.grey_erosion, gm.grey_dilation):
+        r32, r64 = op(tall32, fp_l, s_l), op(tall32.astype(np.float64), fp_l, s_l)
+        check(f"{tag}: float32 {op.__name__} is the float64 result rounded to float32",
+              r32.dtype == np.float32 and np.array_equal(r32, r64.astype(np.float32)))
     check(f"{tag}: banded erosion is the min of the parts' erosions",
           np.array_equal(gm.banded_grey_erosion(band_ins, band_fps, s_l),
                          np.minimum(*[ndi.grey_erosion(a, footprint=fp, structure=s_l)

@@ -390,7 +390,7 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
     from grey_morphology import grey_dilation as _grey_dilation
     H, W = shape
     px_per_mm = (px_per_mm_x * px_per_mm_y) ** 0.5
-    achieved = np.zeros((H, W), dtype=np.float64)
+    achieved = np.zeros((H, W), dtype=np.float32)
     for pts in toolpath.iter_resampled(resample_spacing_px / px_per_mm):
         xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
         cs     = (xs + ox) * px_per_mm_x
@@ -402,7 +402,7 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
         np.maximum.at(achieved, (ris[valid], cis[valid]), depths[valid])
     return np.maximum(
         _grey_dilation(achieved, footprint=footprint,
-                       structure=-kernel.astype(np.float64)).astype(np.float32),
+                       structure=-kernel.astype(np.float64)).astype(np.float32, copy=False),
         0.0)
 
 
@@ -575,12 +575,12 @@ def compute_air_free_depth(previous_result, kernel, footprint, shape,
     if previous_result is None and previous_alpha is None:
         return np.zeros(shape, dtype=np.float32)
     from grey_morphology import grey_erosion
-    removed = (previous_result.astype(np.float64) if previous_result is not None
-               else np.zeros(shape, dtype=np.float64))
+    removed = (previous_result.astype(np.float32, copy=False) if previous_result is not None
+               else np.zeros(shape, dtype=np.float32))
     if previous_alpha is not None:
         removed = np.where(previous_alpha < 0.5, 1e6, removed)
     return grey_erosion(removed, footprint=footprint,
-                        structure=-kernel.astype(np.float64)).astype(np.float32)
+                        structure=-kernel.astype(np.float64)).astype(np.float32, copy=False)
 
 
 def _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm):
@@ -2351,7 +2351,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
 
         # Max depth the tool can reach when centred at each pixel (erosion).
         # Used internally as per-pixel depth targets during toolpath planning.
-        center_depth_contour_raster = grey_erosion(depth_map.astype(np.float64),
+        center_depth_contour_raster = grey_erosion(depth_map.astype(np.float32, copy=False),
                                   footprint=footprint_plan,
                                   structure=structure).astype(np.float32)
         center_depth_contour_raster = np.clip(center_depth_contour_raster, 0.0, 1.0)
@@ -2359,7 +2359,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         # Dilation of the erosion gives the true achievable depth at each material
         # point: the tool can carve (x,y) while centred at an offset position.
         # Erosion followed by dilation = morphological opening.
-        accessible_raster = grey_dilation(center_depth_contour_raster.astype(np.float64),
+        accessible_raster = grey_dilation(center_depth_contour_raster,
                                    footprint=footprint_plan,
                                    structure=structure).astype(np.float32)
         accessible_raster = np.clip(accessible_raster, 0.0, 1.0)
@@ -2737,11 +2737,11 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
         structure = -kernel_pocket.astype(np.float64)
-        center_depth_contour_pocket = grey_erosion(source_surface.astype(np.float64),
+        center_depth_contour_pocket = grey_erosion(source_surface.astype(np.float32, copy=False),
                                   footprint=footprint_pocket,
                                   structure=structure).astype(np.float32)
         center_depth_contour_pocket = np.clip(center_depth_contour_pocket, 0.0, 1.0)
-        accessible_pocket = grey_dilation(center_depth_contour_pocket.astype(np.float64),
+        accessible_pocket = grey_dilation(center_depth_contour_pocket,
                                    footprint=footprint_pocket,
                                    structure=structure).astype(np.float32)
         accessible_pocket = np.clip(accessible_pocket, 0.0, 1.0)
@@ -3341,8 +3341,8 @@ def compute_vcarve_mask(ref, threshold_norm, min_feature_width_mm, px_per_mm,
         from grey_morphology import grey_opening as _grey_opening
         radius = max(1, int(np.ceil((min_feature_width_mm / 2.0) * px_per_mm)))
         filtered = _grey_opening(
-            ref.astype(np.float64), footprint=_disk(radius)
-        ).astype(np.float32)
+            ref.astype(np.float32, copy=False), footprint=_disk(radius)
+        ).astype(np.float32, copy=False)
     mask = filtered >= threshold_norm
     if max_feature_width_mm > 0.0:
         from scipy.ndimage import distance_transform_edt as _edt
@@ -3425,7 +3425,7 @@ def compute_vcarve_synth_achievable_depth(depth_map, tool, max_depth,
             synth_tool, px_per_mm, max_depth, extra_offset_mm,
             kernel_synth, footprint_synth)
         center_depth_contour_synth = grey_erosion(
-            depth_map.astype(np.float64),
+            depth_map.astype(np.float32, copy=False),
             footprint=footprint_synth_plan,
             structure=-kernel_synth_plan.astype(np.float64),
         ).astype(np.float32)
@@ -3613,14 +3613,14 @@ def compute_vcarve_toolpath(depth_map, n_grey_levels,
     else:
         progress(10, "Computing achievable depth surface (morphological opening)…")
         center_depth_contour_vcarve = grey_erosion(
-            depth_map.astype(np.float64),
+            depth_map.astype(np.float32, copy=False),
             footprint=footprint_plan,
             structure=-kernel_plan.astype(np.float64),
         ).astype(np.float32)
         center_depth_contour_vcarve = np.clip(center_depth_contour_vcarve, 0.0, 1.0)
 
         accessible_vcarve = grey_dilation(
-            center_depth_contour_vcarve.astype(np.float64),
+            center_depth_contour_vcarve,
             footprint=footprint_plan,
             structure=-kernel_plan.astype(np.float64),
         ).astype(np.float32)
@@ -4812,7 +4812,7 @@ def compute_contour_toolpath(
 
         # Max depth the tool can reach when centred at each pixel (erosion).
         # Used for contour extraction and adaptive level planning.
-        center_depth_contour = grey_erosion(depth_map.astype(np.float64),
+        center_depth_contour = grey_erosion(depth_map.astype(np.float32, copy=False),
                                   footprint=footprint_plan,
                                   structure=structure).astype(np.float32)
         center_depth_contour = np.clip(center_depth_contour, 0.0, 1.0)
@@ -4820,7 +4820,7 @@ def compute_contour_toolpath(
         # Dilation of the erosion gives the true achievable depth at each material
         # point: the tool can carve (x,y) while centred at an offset position.
         # Erosion followed by dilation = morphological opening.
-        accessible_contour = grey_dilation(center_depth_contour.astype(np.float64),
+        accessible_contour = grey_dilation(center_depth_contour,
                                            footprint=footprint_plan,
                                            structure=structure).astype(np.float32)
         accessible_contour = np.clip(accessible_contour, 0.0, 1.0)

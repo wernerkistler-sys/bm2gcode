@@ -28,6 +28,12 @@ several inputs, each with its own footprint, in that one pass.
 
 binary_erosion/binary_dilation are the flat grey operations on a 0/1 image,
 with scipy's binary border: everything outside the image is False.
+
+Every intermediate array has the input's dtype, so a float32 input needs
+half the memory of a float64 one. Both scipy and the compiled kernel
+subtract the structure in double precision and round once, when storing
+the result; rounding is monotone, so a float32 input gives exactly the
+float32 rounding of the float64 result.
 """
 import os
 import threading
@@ -98,7 +104,8 @@ def _numba_erosion(inputs, footprints, structure):
     the compiled kernel, in the dtype scipy gives inputs[0]."""
     kh, kw = footprints[0].shape
     ry, rx = kh // 2, kw // 2
-    padded = np.stack([np.pad(np.asarray(a, np.float64), ((ry, ry), (rx, rx)),
+    dtype = np.result_type(*inputs)
+    padded = np.stack([np.pad(np.asarray(a, dtype), ((ry, ry), (rx, rx)),
                               mode="symmetric") for a in inputs])
     oi, oj, ob, os_ = [], [], [], []
     for k, fp in enumerate(footprints):
@@ -109,12 +116,12 @@ def _numba_erosion(inputs, footprints, structure):
         os_.append(structure[i, j])
     oi, oj, ob = (np.concatenate(x).astype(np.int64) for x in (oi, oj, ob))
     os_ = np.concatenate(os_).astype(np.float64)
-    out = np.empty(inputs[0].shape, np.float64)
+    # The kernel takes the min in double precision and rounds it once, into
+    # out; rounding is monotone, so that is the float32 result scipy gives.
+    out = np.empty(inputs[0].shape, inputs[0].dtype)
     with _numba_lock:
         _get_numba_kernel()(padded, oi, oj, ob, os_, out)
-    # Rounding is monotone, so the min of the rounded values is the
-    # rounded min: the float32 result scipy gives.
-    return out.astype(inputs[0].dtype, copy=False)
+    return out
 
 
 def _check_args(input, footprint):
@@ -125,15 +132,19 @@ def _check_args(input, footprint):
         raise ValueError("grey_erosion needs a footprint with at least one True element.")
 
 
-def _row_erosion(padded, row, srow, kw):
+def _row_erosion(padded, row, srow, kw, output):
+    """1-row erosion of *padded* by footprint row *row*, written into
+    *output* (padded's shape and dtype), which is returned."""
     idx = np.flatnonzero(row)
     lo, hi = idx[0], idx[-1]
     if (not srow[row].any() and len(idx) == hi - lo + 1
             and lo + hi == kw - 1):
         # Flat, contiguous run centred on the kernel column.
-        return ndi.minimum_filter1d(padded, hi - lo + 1, axis=1)
-    return ndi.grey_erosion(padded, footprint=row[None, :],
-                            structure=srow[None, :])
+        ndi.minimum_filter1d(padded, hi - lo + 1, axis=1, output=output)
+    else:
+        ndi.grey_erosion(padded, footprint=row[None, :],
+                         structure=srow[None, :], output=output)
+    return output
 
 
 def _rows_erosion(padded, footprint, structure, H):
@@ -142,11 +153,13 @@ def _rows_erosion(padded, footprint, structure, H):
     kh, kw = footprint.shape
     out = None
     done = set()
+    # Every row's erosion goes into this one buffer.
+    buf = np.empty_like(padded)
     for i in range(kh):
         row = footprint[i]
         if i in done or not row.any():
             continue
-        e = _row_erosion(padded, row, structure[i], kw)
+        e = _row_erosion(padded, row, structure[i], kw, buf)
         rows = [i]
         j = kh - 1 - i
         if (j != i and np.array_equal(footprint[j], row)

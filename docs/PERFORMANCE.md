@@ -2,10 +2,11 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
-Recommendations 1–3 were followed up on 2026-11-04; see
+Recommendations 1–4 were followed up on 2026-11-04; see
 [Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample),
-[Follow-up: terrain links](#follow-up-terrain-links) and
-[Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin).
+[Follow-up: terrain links](#follow-up-terrain-links),
+[Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin) and
+[Follow-up: morphology in float32](#follow-up-morphology-in-float32).
 
 ## Summary
 
@@ -64,7 +65,7 @@ Peak traced memory per computation at 12 Mpx (200×150 mm, 20 px/mm):
 
 | Step / stage | Peak | Main cause |
 |---|---|---|
-| Raster: morphology (erosion + dilation) | 782 MB (~65 B/px) | `grey_morphology.py` works in float64: input copy, padded copy and output are each 8 B/px, and the 12 parallel tiles each allocate a full float64 temporary per footprint row (`_row_erosion`). |
+| Raster: morphology (erosion + dilation) | 782 MB (~65 B/px) | `grey_morphology.py` works in float64: input copy, padded copy and output are each 8 B/px, and the 12 parallel tiles each allocate a full float64 temporary per footprint row (`_row_erosion`). **Fixed since** (see the follow-up on float32). |
 | Raster: removal simulation | **1383 MB** | `ToolPath.resample` builds a Python list with one small numpy array per sample, every 0.5 px. At 20 px/mm that is 40 samples per mm of path, about 6M arrays for this job. The `achieved` map and the dilation are float64. **Fixed since** (see the follow-up): the samples are computed with numpy and painted in chunks. |
 | Raster: path storage | ~140 B per point | `_line_points` creates one `(x, y, z)` tuple per pixel on each line, and `make_multipass` copies everything as 4-tuples (`_insert_ceiling_crossings`). Grows with path length × px/mm. Phase 1 added ~145 MB here, depth slicing another ~165 MB. |
 | V-carve | 1117 MB | Morphology plus the result map. |
@@ -299,6 +300,68 @@ radii R − k · step: 96.7 % of the chain's points are within 1.5 px, against
 `find_contours` and `label` on the whole region crop; cropping each level to
 its shrinking bounding box would reduce them further.
 
+## Follow-up: morphology in float32
+
+Same machine as the previous follow-ups. Raster:
+`bench_raster.py 200 150 20 3 Ball 2.0`, once with numba's compiled kernel
+and once with `grey_morphology.USE_NUMBA = False` (the scipy row path, which
+the original Windows runs used). Pocket: `bench_algos.py 200 150 20 pocket`
+(End Mill 6 mm, a flat footprint).
+
+`grey_morphology.py` already keeps the input's dtype. The float64 came from
+the callers, which converted their float32 maps to float64 before every
+erosion and dilation and converted the result back. The changes:
+
+- **The callers in `algorithms.py` pass float32 maps:** the achievable-depth
+  erosion and dilation of Raster, Pocket, Contour and V-carve, V-carve's
+  feature-width opening, `compute_air_free_depth`, and the `achieved` map of
+  the removal simulation. The structures stay float64.
+- **The scipy row path reuses one buffer per tile.** `_row_erosion` writes
+  into it with `output=`, where scipy used to allocate and zero a new array
+  for every footprint row.
+- **The compiled kernel pads in the inputs' dtype** and rounds into an output
+  of that dtype, instead of padding in float64.
+
+**Results.** Both scipy and the compiled kernel subtract the structure in
+double precision and round only when storing, and rounding is monotone. A
+float32 input therefore gives exactly the float32 rounding of the float64
+result, which is what the callers kept anyway. A new test checks this for
+both paths. On 100×75 mm versions of the benchmark jobs (Raster on both
+paths, a Raster refining step with Avoid air cutting, Pocket, Contour and
+V-carve), every toolpath and every accessible map is identical. So are
+Pocket's and V-carve's result maps. The Raster and Contour result maps differ
+by at most 0.0003 µm, one float32 rounding step, because the simulation now
+rounds each painted sample depth to float32 before the dilation. All tests
+passed.
+
+Stage time / stage peak (tracemalloc, including what is already held):
+
+| Job | Stage | Before (`ecf2178`) | After |
+|---|---|---|---|
+| Raster, numba | achievable depth | 1.6 s / 488 MB | **1.3 s / 244 MB** |
+| | removal simulation | 1.2 s / 863 MB | 1.2 s / **667 MB** |
+| | total | 8.2 s | 7.9 s |
+| Raster, scipy path | achievable depth | 3.9 s / 768 MB | 4.2 s / **301 MB** |
+| | removal simulation | 2.4 s / 1145 MB | 2.7 s / **725 MB** |
+| | total | 11.7 s | 12.5 s |
+| Pocket (flat) | achievable depth | 3.3 s / 839 MB | **1.3 s / 336 MB** |
+| | removal simulation | 1.7 s / 1150 MB | **0.8 s / 695 MB** |
+| | total | 9.5 s | **6.7 s** |
+
+The highest stage peak of each job drops by 23–40 %. The memory each stage
+adds on top of what is already held drops by more than half (Raster
+simulation with numba: 295 MB → 99 MB). Flat footprints get faster because
+the zeroed temporaries per row are gone. The one cost is that scipy's
+non-flat erosion (Ball, V-Bit and Custom without numba) runs about 8 %
+slower on float32 input when using all 12 threads: one 12 Mpx Ball erosion
+took 2.10 s against 1.94 s. Single-threaded it isn't slower, which points to
+memory bandwidth or conversion in scipy's inner loop rather than to the
+buffer. The first run after the change also compiles the kernel's float32
+version once (about 1 s); numba caches it.
+
+The Undercut step (`undercut.py`) still works in float64; that is
+recommendation 5.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -314,11 +377,9 @@ Ordered by expected payoff.
 3. **Pocket onion skin.** Done: one `distance_transform_edt` per region,
    thresholded at k · step (see the follow-up). Remaining option: crop each
    level to its shrinking bounding box before `find_contours` and `label`.
-4. **Morphology memory:** work in float32 instead of float64 and pass a
-   preallocated `output=` to the per-row scipy calls in `grey_morphology.py`.
-   That roughly halves the morphology peak and removes the allocation churn.
-   First check that float32 is precise enough for the module's
-   "identical to scipy" contract and for the algorithms' tolerances.
+4. **Morphology memory.** Done: the algorithms pass float32 maps, and the
+   scipy row path reuses one `output=` buffer per tile (see the follow-up).
+   Results are the float32 rounding of the float64 ones, as before.
 5. **Undercut memory:** share the `F`/`C` arrays between band pickers, or keep
    them in float32 and only within the active windows.
 6. **Non-flat morphology speed:** numba's compiled kernel in
