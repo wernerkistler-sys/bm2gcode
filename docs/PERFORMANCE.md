@@ -2,6 +2,8 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
+Recommendation 1 was examined further on 2026-11-04; see
+[Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample).
 
 ## Summary
 
@@ -12,8 +14,9 @@ canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
   over at higher resolutions or with larger tools. Its cost grows with
   stock area × (px/mm)⁴ × tool diameter².
 - **Memory** during a computation runs at roughly 70–115 bytes per canvas
-  pixel. The worst spikes come from the removal simulation
-  (`ToolPath.resample`) and, by estimate, from the Undercut step.
+  pixel. The worst spikes came from the removal simulation
+  (`ToolPath.resample`, vectorised since; see the follow-up) and, by
+  estimate, from the Undercut step.
 
 ## Scale
 
@@ -60,7 +63,7 @@ Peak traced memory per computation at 12 Mpx (200×150 mm, 20 px/mm):
 | Step / stage | Peak | Main cause |
 |---|---|---|
 | Raster: morphology (erosion + dilation) | 782 MB (~65 B/px) | `grey_morphology.py` works in float64: input copy, padded copy and output are each 8 B/px, and the 12 parallel tiles each allocate a full float64 temporary per footprint row (`_row_erosion`). |
-| Raster: removal simulation | **1383 MB** | `ToolPath.resample` builds a Python list with one small numpy array per sample, every 0.5 px. At 20 px/mm that is 40 samples per mm of path, about 6M arrays for this job. The `achieved` map and the dilation are float64. |
+| Raster: removal simulation | **1383 MB** | `ToolPath.resample` builds a Python list with one small numpy array per sample, every 0.5 px. At 20 px/mm that is 40 samples per mm of path, about 6M arrays for this job. The `achieved` map and the dilation are float64. **Fixed since** (see the follow-up): the samples are computed with numpy and painted in chunks. |
 | Raster: path storage | ~140 B per point | `_line_points` creates one `(x, y, z)` tuple per pixel on each line, and `make_multipass` copies everything as 4-tuples (`_insert_ceiling_crossings`). Grows with path length × px/mm. Phase 1 added ~145 MB here, depth slicing another ~165 MB. |
 | V-carve | 1117 MB | Morphology plus the result map. |
 | Pocket | 1220 MB | Morphology plus the result map. |
@@ -133,15 +136,91 @@ dilation).
 | Pocket (End Mill 6 mm, onion skin) | 51 s | `_onion_skin_chains` calls `binary_erosion(disk(step_px))` once per ring: 97 full morphology calls, 23 s of 1-D filtering, plus ~15 s in `numpy.zeros` because scipy allocates a new output array for every footprint row. |
 | Cutout (End Mill 6 mm) | 8 s | About half is morphology. |
 
+## Follow-up: path storage and `ToolPath.resample`
+
+Done on 2026-11-04 on Linux (AMD Ryzen 5 7600, 12 threads, Python 3.13,
+numba installed), with the same Raster job:
+`bench_raster.py 200 150 20 3 Ball 2.0`.
+
+The original recommendation 1 combined two changes. Measured separately,
+they differ a lot in both cost and payoff.
+
+**The final path is small.** After RDP, the job's `ToolPath.segments` holds
+7,586 segments with 68,359 points, about 10 MB as tuples. Storing them as
+arrays saves almost nothing. `ToolPath.resample` has one caller,
+`simulate_toolpath_result`, and runs on this simplified path. It could be
+fixed without changing how paths are stored.
+
+**The dense data is the intermediate.** Phase 1 builds one point per pixel:
+251 lines × 4,000 points, about 1M points per pass, kept as tuples through
+depth slicing, air pruning, ordering and terrain linking until RDP. Without
+the profiler, its per-point Python costs about 1.5 s (`_line_points` ~0.4 s,
+`make_multipass` ~1 s), not ~10 s. The cProfile figures above inflate it,
+and most of their ~10 s was `resample`. Its memory is the ~310 MB already
+listed under "Raster: path storage": a 536 MB peak during slicing, with
+~460 MB held until RDP.
+
+### Vectorised `resample` (implemented)
+
+`ToolPath.iter_resampled` computes each segment's cumulative XY arc length
+and places its samples with `np.arange` and `np.searchsorted`, in chunks of
+at most 2¹⁸ samples. A single long Spiral or Coil segment therefore stays
+bounded too. `simulate_toolpath_result` paints each chunk as it comes, and
+`resample` concatenates them. Before is commit `7f0554b`, after is the
+vectorised version:
+
+| | Before | After |
+|---|---|---|
+| Raster total | 16.0 s | **12.7 s** |
+| Simulation stage | 4.5 s | **1.2 s** |
+| Simulation stage peak (tracemalloc) | 1176 MB | **860 MB** |
+| Of which above the 566 MB held before the stage | 610 MB | **294 MB** |
+
+The remaining 294 MB is the float64 `achieved` map (96 MB) and the float64
+temporaries of the dilation, which is recommendation 4. The test suite
+passed before and after.
+
+The samples are the same as before, except where the old loop's running sum
+(`pos += spacing`) drifted across an exact edge boundary. About 30 % of the
+samples sit exactly on a 0.5 px rounding tie, so noise of 10⁻¹³ mm decides
+their pixel either way. On this job the removal map differs at 19.5 % of
+pixels: 4.6 µm on average and 15 µm at most, below one grey level (19.6 µm).
+It comes out deeper about as often as shallower (12.1 % against 7.4 % of
+pixels), so there is no bias. A sample that lands exactly on a plunge's
+vertex now takes the plunge's bottom.
+
+### Paths as arrays throughout (not recommended)
+
+Converting `ToolPath.segments` to `(N, 3)` arrays touches every algorithm's
+point builders, `_insert_ceiling_crossings`/`make_multipass`,
+`prune_air_segments`, the ordering functions (`list(reversed(seg))`), the
+terrain-link anchors, `dressup.apply_tabs`, `iter_moves`/`to_gcode` (slower
+over numpy scalars unless converted back with `.tolist()`), `app.py`
+(`if not pts:` fails on arrays) and the tests that compare `tp.segments` with
+lists. All of this only affects the ~1.5 s and ~310 MB of the dense
+intermediate, which have a cheaper fix:
+
+**Simplify before depth slicing.** V-Carving already RDP-simplifies its
+full-depth segments before `make_multipass` (`algorithms.py`, "full_depth_segs
+= [simplify_line(...)"), and `make_multipass` inserts exact ceiling crossings
+for this case. Ordering and terrain linking only read segment endpoints,
+which RDP keeps. A one-line trial of this for Raster cut the memory held
+during ordering and linking from ~460 MB to ~165 MB and the slicing peak from
+536 MB to 291 MB. Time stayed about the same (15.9 s against 16.2 s). The
+output moved by up to 83 µm, about four grey levels, probably because the
+path was then simplified twice. Doing this properly means skipping the final
+RDP for cut segments and updating the README's Raster pipeline. Pocket's
+raster fill uses the same helpers and would benefit too.
+
 ## Recommendations
 
 Ordered by expected payoff.
 
-1. **Store paths as `(N, 3)` numpy arrays and vectorise `ToolPath.resample`**
-   (cumulative arc length plus `np.interp`). Removes the 1.4 GB simulation
-   spike and ~10 s of per-point Python in `_line_points`, `make_multipass` and
-   `resample`. This is the largest change: segments are lists of tuples
-   throughout `algorithms.py`, `toolpath.py` and `dressup.py`.
+1. **Simulation and path storage.** Vectorising `ToolPath.resample` is done
+   (see the follow-up). For the dense Raster intermediate, simplify the
+   full-depth segments before `make_multipass`, as V-Carving does, instead of
+   converting every path to `(N, 3)` arrays. Keep `ToolPath.segments` as
+   lists of tuples.
 2. **Replace `_geodesic_link`** with `skimage.graph.MCP_Geometric` on the link
    window (already used in `undercut.py`), or a compiled routine. That moves
    the biggest single cost in Raster into C.

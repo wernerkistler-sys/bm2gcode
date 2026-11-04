@@ -1504,6 +1504,59 @@ check("uniform Contour levels ignore Max step-down",
       _contour_depths(max_step_down_mm=1.0) == _contour_depths())
 
 
+# ---------------------------------------------------------------------------
+print("ToolPath.resample / iter_resampled")
+
+
+def _resample_loop(segments, spacing):
+    """Point-by-point reference: per segment its first point, then a sample
+    every *spacing* of XY arc length, the spacing carried across edges."""
+    out = []
+    for seg in segments:
+        if not seg:
+            continue
+        pts = np.asarray(seg, dtype=np.float64)
+        out.append(pts[0])
+        carry = 0.0
+        for i in range(1, len(pts)):
+            diff = pts[i] - pts[i - 1]
+            seg_len = float(np.hypot(diff[0], diff[1]))
+            if seg_len < 1e-10:
+                continue
+            pos = carry
+            while pos < seg_len:
+                out.append(pts[i - 1] + pos / seg_len * diff)
+                pos += spacing
+            carry = pos - seg_len
+    return np.array(out).reshape(-1, 3)
+
+
+_rs_segs = [
+    [(0.0, 0.0, 0.0), (1.0, 0.0, -1.0), (1.0, 0.0, -2.0), (1.0, 0.7, -2.0),
+     (1.0, 0.7, -2.0), (0.3, 0.7, -0.5)],              # plunge + duplicate vertex
+    [(5.0, 5.0, -1.0)],                                  # single point
+    [],
+    [(2.0, 2.0, 0.0), (2.0, 2.0, -3.0)],                 # pure plunge
+    [(0.0, 3.0, -0.25), (0.13, 3.0, -0.25), (0.13, 3.29, -0.5), (0.9, 3.4, -0.1)],
+]
+# 0.0731 mm divides none of the edge lengths, so no sample falls on a vertex.
+_rs_ref = _resample_loop(_rs_segs, 0.0731)
+_rs_vec = ToolPath(segments=_rs_segs).resample(0.0731)
+check("matches the point-by-point sampling (plunges, carried spacing, single points)",
+      _rs_vec.shape == _rs_ref.shape and np.allclose(_rs_vec, _rs_ref, atol=1e-12))
+_rs_chunks = list(ToolPath(segments=_rs_segs).iter_resampled(0.0731, max_samples=3))
+check("chunks hold at most max_samples rows and concatenate to resample()",
+      max(len(c) for c in _rs_chunks) <= 3
+      and np.array_equal(np.concatenate(_rs_chunks), _rs_vec))
+_rs_plunge = ToolPath(segments=[[(0.0, 0.0, 0.0), (1.0, 0.0, -1.0), (1.0, 0.0, -2.0),
+                                 (2.0, 0.0, -2.0)]]).resample(0.5)
+check("a sample on a plunge's vertex takes the plunge's bottom",
+      np.allclose(_rs_plunge, [(0, 0, 0), (0, 0, 0), (0.5, 0, -0.5), (1, 0, -2),
+                               (1.5, 0, -2)]))
+check("an empty path resamples to an empty (0, 3) array",
+      ToolPath(segments=[]).resample(0.1).shape == (0, 3))
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

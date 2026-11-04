@@ -384,14 +384,14 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
     Densely resamples *toolpath* segments at sub-pixel XY spacing, paints each
     sample's depth into a pixel-space array, then grey-dilates with the tool
     geometry kernel to produce the cumulative material-removal map (float32,
-    values in [0, 1] normalised depth units).
+    values in [0, 1] normalised depth units). Samples are painted chunk by
+    chunk as ToolPath.iter_resampled produces them.
     """
     from grey_morphology import grey_dilation as _grey_dilation
     H, W = shape
     px_per_mm = (px_per_mm_x * px_per_mm_y) ** 0.5
-    pts = toolpath.resample(resample_spacing_px / px_per_mm)
     achieved = np.zeros((H, W), dtype=np.float64)
-    if len(pts):
+    for pts in toolpath.iter_resampled(resample_spacing_px / px_per_mm):
         xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
         cs     = (xs + ox) * px_per_mm_x
         rs     = (H - 1) - (ys + oy) * px_per_mm_y

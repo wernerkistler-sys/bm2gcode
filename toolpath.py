@@ -121,33 +121,50 @@ class ToolPath:
 
     metadata: dict = field(default_factory=dict)
 
-    def resample(self, spacing_mm: float) -> 'np.ndarray':
+    def iter_resampled(self, spacing_mm: float, max_samples: int = 1 << 18):
         """Densely sample all segments at *spacing_mm* XY arc-length intervals.
 
-        Returns a (N, 3) float64 array of (x, y, z) mm positions. Air moves
-        between non-adjacent segments are not interpolated.
+        Each segment yields its first point, then one sample every
+        *spacing_mm* of XY arc length from its start (0, spacing_mm,
+        2 * spacing_mm, ...) while short of its end, interpolated in X, Y
+        and Z on the edge containing it; a sample on a vertex belongs to
+        the edge starting there, after any vertical plunge, which holds no
+        samples itself (nor does any other edge without XY length). Air
+        moves between non-adjacent segments are not interpolated.
+
+        Yields (k, 3) float64 arrays of (x, y, z) mm positions in path
+        order, each with at most *max_samples* rows, so memory stays
+        bounded however long the path is.
         """
-        pts_out = []
         for seg in self.segments:
-            if not seg:
+            if len(seg) == 0:
                 continue
             pts = np.asarray(seg, dtype=np.float64)
-            pts_out.append(pts[0])
-            carry = 0.0
-            for i in range(1, len(pts)):
-                diff = pts[i] - pts[i - 1]
-                seg_len = float(np.hypot(diff[0], diff[1]))
-                if seg_len < 1e-10:
-                    continue
-                pos = carry
-                while pos < seg_len:
-                    t = pos / seg_len
-                    pts_out.append(pts[i - 1] + t * diff)
-                    pos += spacing_mm
-                carry = pos - seg_len
-        if not pts_out:
+            yield pts[:1]
+            if len(pts) < 2:
+                continue
+            d = np.diff(pts, axis=0)
+            edge_len = np.hypot(d[:, 0], d[:, 1])
+            edge_len[edge_len < 1e-10] = 0.0
+            cum = np.concatenate(([0.0], np.cumsum(edge_len)))
+            n = int(np.ceil(cum[-1] / spacing_mm)) if cum[-1] > 0.0 else 0
+            for k0 in range(0, n, max_samples):
+                s = np.arange(k0, min(k0 + max_samples, n)) * spacing_mm
+                s = s[s < cum[-1]]
+                # The edge holding each sample: the last edge starting at or
+                # before it, which skips edges with no XY length.
+                e = np.minimum(np.searchsorted(cum, s, side='right') - 1,
+                               len(d) - 1)
+                t = (s - cum[e]) / edge_len[e]
+                yield pts[e] + t[:, None] * d[e]
+
+    def resample(self, spacing_mm: float) -> 'np.ndarray':
+        """All samples of :meth:`iter_resampled` as one (N, 3) float64
+        array of (x, y, z) mm positions."""
+        chunks = list(self.iter_resampled(spacing_mm))
+        if not chunks:
             return np.empty((0, 3), dtype=np.float64)
-        return np.array(pts_out, dtype=np.float64)
+        return np.concatenate(chunks)
 
     def iter_moves(self, segments=None, z_safe=5.0, ramp=None, backoff=None, arc=None):
         """Single source of truth for rapid/retract/plunge/ramp/back-off/arc
