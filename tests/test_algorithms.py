@@ -1558,6 +1558,22 @@ check("an empty path resamples to an empty (0, 3) array",
 
 
 # ---------------------------------------------------------------------------
+print("onion skin rings on a large disk stay concentric")
+_os_R, _os_step = 300, 10
+_os_yy, _os_xx = np.mgrid[0:2 * _os_R + 21, 0:2 * _os_R + 21]
+_os_c = _os_R + 10
+_os_chains = _onion_skin_chains(np.hypot(_os_yy - _os_c, _os_xx - _os_c) <= _os_R,
+                                _os_step, min_area_px=20)
+_os_pts = np.vstack(_os_chains)
+_os_rad = np.hypot(_os_pts[:, 0] - _os_c, _os_pts[:, 1] - _os_c)
+_os_off = np.abs(_os_rad - (_os_R - _os_step * np.round((_os_R - _os_rad) / _os_step)))
+# Ring points sit within a pixel and a half of R - k * step; only the links
+# between rings (a few percent of the points) lie farther from them.
+check(f"rings lie on R - k * step-over ({100 * np.mean(_os_off <= 1.5):.1f}% of points "
+      "within 1.5 px)", len(_os_chains) == 1 and np.mean(_os_off <= 1.5) >= 0.93)
+
+
+# ---------------------------------------------------------------------------
 print("_geodesic_link")
 
 

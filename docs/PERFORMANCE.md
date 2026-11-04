@@ -2,9 +2,10 @@
 
 Analysis of where bm2gcode spends memory and time at a high but realistic
 canvas resolution of **20 px/mm**, done on 2026-11-02 against commit `076a2b0`.
-Recommendations 1 and 2 were followed up on 2026-11-04; see
-[Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample)
-and [Follow-up: terrain links](#follow-up-terrain-links).
+Recommendations 1–3 were followed up on 2026-11-04; see
+[Follow-up: path storage and `ToolPath.resample`](#follow-up-path-storage-and-toolpathresample),
+[Follow-up: terrain links](#follow-up-terrain-links) and
+[Follow-up: Pocket onion skin](#follow-up-pocket-onion-skin).
 
 ## Summary
 
@@ -253,6 +254,51 @@ flat floors with steps, with ceilings, finishing allowance and canvas edges:
 differently in rare cases, with the same length. The Pocket and Contour
 benchmarks hardly link (0 and 7 links), so their times don't change.
 
+## Follow-up: Pocket onion skin
+
+Same machine as the previous follow-ups, with
+`bench_algos.py 200 150 20 pocket` (End Mill 6 mm, Step-over 2.4 mm = 48 px,
+Onion Skin (Outside-In), one region of 8.1 Mpx).
+
+A profile of the onion skin phase before the change: 19.8 s, of which 16.5 s
+was 23 `binary_erosion(disk(step_px))` calls on the whole region.
+`find_contours`, `label`, ring ordering and stitching took the other ~3 s.
+
+`_onion_skin_chains` now computes one `distance_transform_edt` of the region
+and takes level k as the pixels whose squared distance to the outside
+exceeds (k · step_px)². Within a branch after a fork, it intersects that
+with the branch's mask. Labelling, the stray-fragment filter, forks,
+`find_contours` and stitching are unchanged.
+
+- **Level 1 is identical** to one erosion by `disk(step_px)`, which keeps
+  exactly the pixels with squared distance > step_px².
+- **Deeper levels differ**, and come out more accurate. Eroding by a
+  *digital* disk again and again adds up its polygonal error. On a disk of
+  radius 420 px, the eroded rings drift up to 12 px (a whole step-over of
+  12 px) from the ideal radii 420 − 12k over 35 levels. The distance-transform
+  rings stay within 1 px. With a 48 px step-over the drift is 1.7 px against
+  1 px. Rectangles come out identical.
+- **Links stay inside the region.** A pixel of level k+1 lies more than
+  (k+1) · step_px from the outside, so its whole `disk(step_px)` lies inside
+  level k (triangle inequality). The guarantee that every ring has a short
+  link back to the previous one, inside the region, holds as before.
+
+| | Before (`e9ba8f5`) | After |
+|---|---|---|
+| Pocket total | 24.6 s | **10.0 s** |
+| Onion skin phase | 18.4 s | **3.7 s** |
+| Onion skin phase peak (tracemalloc) | 851 MB | **747 MB** |
+| Cut length | 27,776 mm | 27,741 mm |
+| Pocket floor pixels at target depth | 100 % | 100 % |
+
+All tests passed after the change, including the existing onion-skin
+regressions (dumbbell forks, stray fragments, links inside the region,
+S-links). A new test checks that the rings on a 300 px disk lie on the ideal
+radii R − k · step: 96.7 % of the chain's points are within 1.5 px, against
+83.0 % with repeated erosions. The remaining ~3 s are per-level
+`find_contours` and `label` on the whole region crop; cropping each level to
+its shrinking bounding box would reduce them further.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -265,11 +311,9 @@ Ordered by expected payoff.
 2. **Terrain links.** Done with `scipy.sparse.csgraph.dijkstra`, not
    `MCP_Geometric`, whose per-pixel cost can't express 3-D arc length (see
    the follow-up).
-3. **Pocket onion skin:** compute one `distance_transform_edt` per region and
-   threshold it at k·step, instead of repeated `binary_erosion` calls. The
-   cost no longer depends on radius or ring count. The rings come out
-   slightly different from discrete repeated erosions, so tests need
-   checking.
+3. **Pocket onion skin.** Done: one `distance_transform_edt` per region,
+   thresholded at k · step (see the follow-up). Remaining option: crop each
+   level to its shrinking bounding box before `find_contours` and `label`.
 4. **Morphology memory:** work in float32 instead of float64 and pass a
    preallocated `output=` to the per-row scipy calls in `grey_morphology.py`.
    That roughly halves the morphology peak and removes the allocation churn.

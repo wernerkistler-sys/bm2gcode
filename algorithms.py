@@ -1926,16 +1926,23 @@ def _order_level_rings(rings, prev_ring):
 
 def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     """Concentric-ring toolpath chain(s) clearing one connected pocket
-    region: repeatedly binary_erosion's region_mask by disk(step_px),
-    extracting each ring's boundary via find_contours, and stitching
+    region: erosion level k is the set of region pixels farther than
+    k * step_px from the region's outside (one Euclidean distance transform
+    of region_mask, thresholded at each level), and each level's
+    boundary is extracted via find_contours as its rings, stitching
     consecutive rings into one continuous chain with _stitch_onion_rings,
     which picks every ring's seam jointly for the cheapest total
     ring-to-ring links, joins rings with a tangent-continuous S-shaped
     biarc wherever one fits (a straight link otherwise), and only ever
-    uses a link that stays inside region_mask. A ring on erosion level k+1 is the boundary
-    of level k's mask eroded by disk(step_px), so from every one of its
-    points a link of about step_px back to level k's ring exists and
-    lies within that disk, i.e. inside the region. Same-level rings (an
+    uses a link that stays inside region_mask. Every pixel on erosion
+    level k+1 has its disk(step_px) inside level k (its distance to the
+    outside exceeds (k+1) * step_px, so every pixel of that disk lies
+    farther than k * step_px from the outside), so from every point of a level k+1
+    ring a link of about step_px back to level k's ring exists and lies
+    within that disk, i.e. inside the region. Level 1 is exactly
+    region_mask eroded by disk(step_px), and every level is the region's
+    Euclidean inward offset by k * step_px to within a pixel. Same-level
+    rings (an
     outer boundary plus hole/island rings) are visited in
     _order_level_rings' nearest-ring order. Every ring is emitted the
     moment its mask is non-empty (before the area/erosion check below),
@@ -1984,17 +1991,17 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     (unpadded) coordinate frame. An undivided island is one chain unless
     _stitch_onion_rings had to split it where no inside link exists.
     """
-    from scipy.ndimage import label
-    from grey_morphology import binary_erosion
-    from skimage.morphology import disk
+    from scipy.ndimage import label, distance_transform_edt
     from skimage.measure import find_contours
 
-    structure = disk(step_px)
     chains = []
 
     padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
     safe_mask_f = padded.astype(np.float32)
-    branches = [{'mask': padded, 'rings': []}]
+    # Squared distance of every pixel to the nearest outside pixel, rounded
+    # to the exact integer it is; level k is where it exceeds (k*step_px)^2.
+    dist2 = np.rint(np.square(distance_transform_edt(padded)))
+    branches = [{'mask': padded, 'rings': [], 'level': 0}]
 
     def close_branch(rings):
         chains.extend(_stitch_onion_rings(rings, safe_mask_f, step_px))
@@ -2002,7 +2009,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     while branches:
         next_round = []
         for br in branches:
-            cur, rings = br['mask'], br['rings']
+            cur, rings, k = br['mask'], br['rings'], br['level'] + 1
 
             level = [r for r in find_contours(cur.astype(np.float32), 0.5) if len(r) >= 3]
             if not level:
@@ -2015,13 +2022,16 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
             if np.sum(cur) < min_area_px:
                 close_branch(rings)
                 continue
-            nxt = binary_erosion(cur, structure=structure)
+            # Level k within this branch: a pixel's disk(step_px) is
+            # 4-connected and lies inside level k-1, so it lies inside the
+            # pixel's own component there, the branch's mask.
+            nxt = cur & (dist2 > float(k * step_px) ** 2)
             if not np.any(nxt):
                 close_branch(rings)
                 continue
             labeled, n_comp = label(nxt)
             if n_comp <= 1:
-                next_round.append({'mask': nxt, 'rings': rings})
+                next_round.append({'mask': nxt, 'rings': rings, 'level': k})
             else:
                 # A split can throw off a stray fragment of just a few
                 # pixels -- erosion detaching a sliver at a concave cusp of
@@ -2035,13 +2045,15 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
                             if np.sum(labeled == cid) >= min_area_px]
                 if len(surviving) <= 1:
                     if surviving:
-                        next_round.append({'mask': surviving[0], 'rings': rings})
+                        next_round.append({'mask': surviving[0], 'rings': rings,
+                                           'level': k})
                     else:
                         close_branch(rings)
                 else:
                     close_branch(rings)
                     for comp_mask in surviving:
-                        next_round.append({'mask': comp_mask, 'rings': []})
+                        next_round.append({'mask': comp_mask, 'rings': [],
+                                           'level': k})
         branches = next_round
 
     return [c - 1.0 for c in chains]
