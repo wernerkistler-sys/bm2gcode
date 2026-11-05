@@ -179,6 +179,74 @@ for use in ([True, False] if have_numba else [False]):
                                       for a, fp in zip(band_ins, band_fps)])))
 gm.USE_NUMBA = True
 
+if have_numba:
+    print("Compiled kernel's early-finished blocks match scipy")
+    k_v, fp_v = _build_kernel(Tool("V-Bit", 3.0, 60.0), px_per_mm, max_depth)
+    s_v = -k_v.astype(np.float64)
+    B, T = gm._BLOCK, gm._TILE
+
+    def terrain(h, w):
+        """Smooth relief with flat plateaus beside noise: blocks finish
+        after a few chunks in some places and need every offset in others."""
+        t = ndi.gaussian_filter(rng.random((h, w)), 6)
+        t = (t - t.min()) / (np.ptp(t) or 1.0)
+        t[:, : w // 3] = np.round(t[:, : w // 3] * 4) / 4
+        t[h // 2:, w // 2:] += 0.3 * rng.random((h - h // 2, w - w // 2))
+        return t
+
+    for w in (B - 1, B, B + 1, 3 * B + 5, T - 1, T, T + 1, 2 * T + 7):
+        img = terrain(40, w)
+        for name, fp, s in (("V-bit", fp_v, s_v), ("ball", fp_l, s_l)):
+            check(f"{name} erosion, width {w}",
+                  np.array_equal(gm.grey_erosion(img, fp, s),
+                                 ndi.grey_erosion(img, footprint=fp, structure=s)))
+            check(f"{name} dilation, width {w}",
+                  np.array_equal(gm.grey_dilation(img, fp, s),
+                                 ndi.grey_dilation(img, footprint=fp, structure=s)))
+    const = np.full((50, 70), 0.4)
+    check("constant image: every block finishes after the first chunk",
+          np.array_equal(gm.grey_erosion(const, fp_v, s_v),
+                         ndi.grey_erosion(const, footprint=fp_v, structure=s_v)))
+    tiny = terrain(9, 12)
+    check("footprint larger than the image",
+          np.array_equal(gm.grey_erosion(tiny, fp_v, s_v),
+                         ndi.grey_erosion(tiny, footprint=fp_v, structure=s_v)))
+    fp5 = np.ones((5, 5), bool)
+    s5 = -rng.random((5, 5))
+    img = terrain(60, 80)
+    check("fewer offsets than one chunk",
+          np.array_equal(gm.grey_erosion(img, fp5, s5),
+                         ndi.grey_erosion(img, footprint=fp5, structure=s5)))
+    # Bands of an Undercut erosion read inputs at very different heights;
+    # each band's own rows decide where a block is finished.
+    rings = np.hypot(*np.mgrid[-15:16, -15:16])
+    fps3 = [fp_l & (rings < 5), fp_l & (rings >= 5) & (rings < 10), fp_l & (rings >= 10)]
+    ins3 = [terrain(120, 2 * T + 3), terrain(120, 2 * T + 3) + 5.0,
+            np.where(rng.random((120, 2 * T + 3)) < 0.1, -2.0e6, terrain(120, 2 * T + 3))]
+    for dtype in (np.float64, np.float32):
+        ins = [a.astype(dtype) for a in ins3]
+        tag = np.dtype(dtype).name
+        check(f"{tag} banded erosion, inputs at different heights",
+              np.array_equal(gm.banded_grey_erosion(ins, fps3, s_l),
+                             np.minimum.reduce([ndi.grey_erosion(a, footprint=fp, structure=s_l)
+                                                for a, fp in zip(ins, fps3)])))
+        check(f"{tag} banded dilation, inputs at different heights",
+              np.array_equal(gm.banded_grey_dilation(ins, fps3, s_l),
+                             np.maximum.reduce([ndi.grey_dilation(a, footprint=fp, structure=s_l)
+                                                for a, fp in zip(ins, fps3)])))
+    for seed in range(4):
+        r_ = np.random.default_rng(100 + seed)
+        h, w = r_.integers(1, 80), r_.integers(1, 2 * T + 40)
+        img = terrain(h, w) if min(h, w) > 1 else r_.random((h, w))
+        ky = int(r_.integers(0, 12)) * 2 + 1
+        kx = int(r_.integers(0, 12)) * 2 + 1
+        fp = r_.random((ky, kx)) < 0.7
+        fp[ky // 2, kx // 2] = True
+        s = -np.round(r_.random((ky, kx)) * 4) / 4      # ties between offsets
+        check(f"random {h}x{w}, footprint {ky}x{kx}",
+              np.array_equal(gm.grey_erosion(img, fp, s),
+                             ndi.grey_erosion(img, footprint=fp, structure=s)))
+
 print("Binary operations match scipy")
 masks = {name: img > 0.5 for name, img in images.items()}
 masks["touches every edge"] = ndi.gaussian_filter(rng.random((120, 90)), 4) > 0.48

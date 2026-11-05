@@ -22,9 +22,14 @@ half-height above and below, and scipy releases the GIL while it filters.
 
 When numba is installed, a float input with a non-flat structure goes to a
 compiled kernel instead: one parallel pass over the output rows that takes
-the minimum over every footprint offset, with the same values and the same
-reflect border as scipy. banded_grey_erosion/banded_grey_dilation combine
-several inputs, each with its own footprint, in that one pass.
+the minimum over the footprint offsets, with the same values and the same
+reflect border as scipy. It visits the offsets by falling structure value
+and stops for each block of 16 output pixels once no remaining offset can
+lower it: input >= m over the block's whole window, so every remaining
+value is at least m - (the largest remaining structure value). Equal
+values don't change a minimum, so the result is still scipy's, bit for
+bit. banded_grey_erosion/banded_grey_dilation combine several inputs, each
+with its own footprint, in that one pass.
 
 binary_erosion/binary_dilation are the flat grey operations on a 0/1 image,
 with scipy's binary border: everything outside the image is False.
@@ -53,6 +58,11 @@ _numba_kernel = None    # compiled on first use; False once numba is found missi
 # numba's default threading layer aborts on kernel launches from two
 # threads at once; every launch already uses all cores.
 _numba_lock = threading.Lock()
+# The compiled kernel's output blocks, offset chunks and column tiles (see
+# stack_erosion); the tile is a whole number of blocks.
+_BLOCK = 16
+_CHUNK = 64
+_TILE = 1024
 
 
 def _get_numba_kernel():
@@ -65,24 +75,119 @@ def _get_numba_kernel():
             return None
 
         @numba.njit(parallel=True, cache=True)
-        def stack_erosion(padded, oi, oj, ob, os_, out):
-            """out[r, c] = min over offsets o of
-            padded[ob[o], r + oi[o], c + oj[o]] - os_[o]."""
-            H, W = out.shape
-            for r in numba.prange(H):
-                acc = np.full(W, np.inf)
-                for o in range(oi.size):
-                    # A slice, so the inner loop has no index arithmetic
-                    # and compiles to SIMD.
-                    seg = padded[ob[o], r + oi[o], oj[o]:oj[o] + W]
-                    s = os_[o]
-                    for c in range(W):
-                        v = seg[c] - s
-                        a = acc[c]
-                        acc[c] = v if v < a else a
-                out[r] = acc
+        def band_min(padded, out):
+            """out = min over k of padded[k]."""
+            nb, Hp, Wp = padded.shape
+            for r in numba.prange(Hp):
+                row = out[r]
+                for c in range(Wp):
+                    row[c] = padded[0, r, c]
+                for k in range(1, nb):
+                    src = padded[k, r]
+                    for c in range(Wp):
+                        v = src[c]
+                        row[c] = v if v < row[c] else row[c]
 
-        _numba_kernel = stack_erosion
+        @numba.njit(parallel=True, cache=True)
+        def block_min(V, B, span, bound):
+            """bound[r, b] = min of V[r, b*B : (b + span)*B]."""
+            H, Wp = V.shape
+            nb = bound.shape[1]
+            nch = (Wp + B - 1) // B
+            for r in numba.prange(H):
+                ch = np.empty(nch)
+                for k in range(nch):
+                    m = np.inf
+                    for c in range(k * B, min(k * B + B, Wp)):
+                        v = V[r, c]
+                        m = v if v < m else m
+                    ch[k] = m
+                for b in range(nb):
+                    m = np.inf
+                    for k in range(b, min(b + span, nch)):
+                        m = ch[k] if ch[k] < m else m
+                    bound[r, b] = m
+
+        @numba.njit(parallel=True, cache=True)
+        def stack_erosion(padded, bound, oi, oj, ob, os_, thr, out, perm,
+                          B, K, TW):
+            """out[r, c] = min over offsets o of
+            padded[ob[o], r + oi[o], c + oj[o]] - os_[o].
+
+            Each output row is computed in tiles of TW columns, each tile in
+            blocks of B columns. The offsets come in chunks of K; thr[i] is
+            the largest os_ after chunk i, and bound[r, b] is at most every
+            value that block b of row r reads. After each chunk a block
+            whose largest result is at most bound - thr is finished: no later
+            offset gives it a smaller value. The remaining offsets run over
+            the runs of unfinished blocks. perm is the order of the rows,
+            interleaved so that every thread gets rows from all over the
+            image."""
+            H, W = out.shape
+            n = oi.size
+            nbt = TW // B
+            for i in numba.prange(H):
+                r = perm[i]
+                acc = np.empty(TW)
+                live = np.empty(nbt, np.bool_)
+                rs = np.empty(nbt, np.int64)
+                re = np.empty(nbt, np.int64)
+                for t0 in range(0, W, TW):
+                    tw = min(TW, W - t0)
+                    nb = (tw + B - 1) // B
+                    for c in range(tw):
+                        acc[c] = np.inf
+                    for b in range(nb):
+                        live[b] = True
+                    nruns = 1
+                    rs[0] = 0
+                    re[0] = tw
+                    o = 0
+                    ci = 0
+                    while o < n and nruns > 0:
+                        o1 = min(o + K, n)
+                        for q in range(o, o1):
+                            s = os_[q]
+                            j = t0 + oj[q]
+                            for k in range(nruns):
+                                a0 = rs[k]
+                                a1 = re[k]
+                                # Slices, so the inner loop has no index
+                                # arithmetic and compiles to SIMD.
+                                seg = padded[ob[q], r + oi[q], j + a0:j + a1]
+                                sub = acc[a0:a1]
+                                for c in range(a1 - a0):
+                                    v = seg[c] - s
+                                    a = sub[c]
+                                    sub[c] = v if v < a else a
+                        o = o1
+                        if o < n:
+                            th = thr[ci]
+                            nruns = 0
+                            prev = False
+                            b0 = t0 // B
+                            for b in range(nb):
+                                c0 = b * B
+                                c1 = min(c0 + B, tw)
+                                if live[b]:
+                                    mx = acc[c0]
+                                    for c in range(c0 + 1, c1):
+                                        mx = acc[c] if acc[c] > mx else mx
+                                    if bound[r, b0 + b] - th >= mx:
+                                        live[b] = False
+                                if live[b]:
+                                    if prev:
+                                        re[nruns - 1] = c1
+                                    else:
+                                        rs[nruns] = c0
+                                        re[nruns] = c1
+                                        nruns += 1
+                                prev = live[b]
+                        ci += 1
+                    for c in range(tw):
+                        out[r, t0 + c] = acc[c]
+
+        _numba_kernel = (stack_erosion, band_min, block_min)
     return _numba_kernel or None
 
 
@@ -99,11 +204,28 @@ def _numba_applies(inputs, footprints, structure):
     return _get_numba_kernel() is not None
 
 
+def _block_bound(padded, H, W, ry, rx):
+    """bound[r, b]: the minimum of padded, over all inputs, in the window
+    that output block b of row r reads (rows r .. r + 2ry, columns
+    b*_BLOCK .. b*_BLOCK + _BLOCK - 1 + 2rx, widened to whole blocks)."""
+    _, band_min, block_min = _get_numba_kernel()
+    if padded.shape[0] > 1:
+        P = np.empty(padded.shape[1:], padded.dtype)
+        band_min(padded, P)
+    else:
+        P = padded[0]
+    V = ndi.minimum_filter1d(P, 2 * ry + 1, axis=0)[ry:ry + H]
+    bound = np.empty((H, -(-W // _BLOCK)))
+    block_min(V, _BLOCK, 1 + -(-2 * rx // _BLOCK), bound)
+    return bound
+
+
 def _numba_erosion(inputs, footprints, structure):
     """min over k of grey_erosion(inputs[k], footprints[k], structure) by
     the compiled kernel, in the dtype scipy gives inputs[0]."""
     kh, kw = footprints[0].shape
     ry, rx = kh // 2, kw // 2
+    H, W = inputs[0].shape
     dtype = np.result_type(*inputs)
     padded = np.stack([np.pad(np.asarray(a, dtype), ((ry, ry), (rx, rx)),
                               mode="symmetric") for a in inputs])
@@ -116,11 +238,29 @@ def _numba_erosion(inputs, footprints, structure):
         os_.append(structure[i, j])
     oi, oj, ob = (np.concatenate(x).astype(np.int64) for x in (oi, oj, ob))
     os_ = np.concatenate(os_).astype(np.float64)
+    # Offsets by falling structure value, so the ones that can lower a
+    # result most come first and a block's minimum is often settled early.
+    # Within a chunk of _CHUNK offsets, by input and row, so consecutive
+    # offsets read nearby memory; thr holds each chunk's successors' largest
+    # structure value.
+    order = np.argsort(-os_, kind="stable")
+    n = order.size
+    starts = np.arange(_CHUNK, n, _CHUNK)
+    thr = os_[order][starts]
+    chunk = np.arange(n) // _CHUNK
+    order = order[np.lexsort((oj[order], oi[order], ob[order], chunk))]
+    oi, oj, ob, os_ = oi[order], oj[order], ob[order], os_[order]
+    stack_erosion = _get_numba_kernel()[0]
     # The kernel takes the min in double precision and rounds it once, into
     # out; rounding is monotone, so that is the float32 result scipy gives.
     out = np.empty(inputs[0].shape, inputs[0].dtype)
     with _numba_lock:
-        _get_numba_kernel()(padded, oi, oj, ob, os_, out)
+        bound = _block_bound(padded, H, W, ry, rx)
+        import numba
+        T = numba.get_num_threads()
+        perm = np.concatenate([np.arange(t, H, T) for t in range(T)])
+        stack_erosion(padded, bound, oi, oj, ob, os_, thr, out, perm,
+                      _BLOCK, _CHUNK, _TILE)
     return out
 
 

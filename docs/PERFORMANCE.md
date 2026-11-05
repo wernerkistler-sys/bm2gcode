@@ -11,7 +11,8 @@ Recommendations 1–5 and 7 were followed up on 2026-11-04; see
 [Follow-up: erosion cache](#follow-up-erosion-cache).
 [Undercut speed: analysis and ideas](#undercut-speed-analysis-and-ideas)
 records where the Undercut step's time goes and what could speed it up
-(recommendation 8; not implemented yet).
+(recommendation 8); its first idea was followed up on 2026-11-05, see
+[Follow-up: early termination in the compiled kernel](#follow-up-early-termination-in-the-compiled-kernel).
 
 ## Summary
 
@@ -477,7 +478,7 @@ tests passed.
 
 ## Undercut speed: analysis and ideas
 
-Analysis only; nothing below is implemented yet. Done on 2026-11-04 against
+Done on 2026-11-04 against
 commit `b2c864c`, same machine as the follow-ups (numba installed), with
 `bench/bench_undercut.py`: the umbilic torus, 6 mm Lollipop (3 mm neck),
 2 mm levels, 20 % step-over.
@@ -585,6 +586,70 @@ enough; skip the flat calls from `_enclosed_reach` (`structure=None`). The
   that `find_contours` and the bilinear `_sample` read. That region, dilated
   by 2 px, is **88 %** of the window area, so ~1.1×.
 
+## Follow-up: early termination in the compiled kernel
+
+Idea 1 above, implemented in `grey_morphology._numba_erosion` and its
+compiled `stack_erosion` on 2026-11-05 (same machine). Results stay
+bit-identical to scipy's.
+
+**How it works.** The offsets are sorted by falling structure value and
+split into chunks of 64 (`_CHUNK`); `thr` holds, per chunk, the largest
+structure value of the offsets after it. Within a chunk the offsets are
+ordered by input and row, so consecutive offsets read nearby memory. The
+bound is one value per output block of 16 pixels (`_BLOCK`): the minimum of
+all band inputs over the block's window (rows r … r + 2ry, columns widened
+to whole blocks), from a numba band minimum, a vertical
+`minimum_filter1d` and a numba block minimum. After each chunk, a block whose
+largest result is at most `bound − thr` is finished. Each output row runs in
+tiles of 1024 columns (`_TILE`), and within a tile the next chunk's offsets
+run over the contiguous runs of blocks still live, so the inner loop stays a
+long SIMD loop over a slice. Rows are handed to the threads interleaved,
+because a row's cost now depends on how early its blocks finish (up to 2.5×
+the mean on the torus).
+
+**What didn't work.** A loop over 16-pixel blocks, with all offsets per
+block, was 3× *slower* than the old kernel even with no early stop: numba
+doesn't vectorise a 16-wide inner loop well, and per-offset overhead
+dominates. Flat indexing with a compile-time block width was no better.
+Running offsets in sorted order over the whole row (the runs of live blocks)
+costs only ~20 % over footprint order. The 1024-column tiles (to keep the
+rows a chunk reads in L2) and the per-chunk reordering each gained ~5–15 %.
+Block widths 8, 32 and 64 and chunk sizes 16–128 were within ±10 %;
+16 / 64 / 1024 was best overall.
+
+**Work needed.** Fraction of the offset × pixel work actually done: V-Bit
+6 mm 60° on the Raster relief **24 %** (the analysis' 13 % was measured with
+a different bound), Ball 3 mm **71 %**, the Undercut band erosions 16–32 %
+per call.
+
+**Measured** (end to end, each run once; kernel compiled and cached
+beforehand):
+
+| Job | Before | After | |
+|---|---|---|---|
+| Undercut, torus, Lollipop 6 mm, 20 px/mm (5.83 Mpx) | 52.3 s | 27.2 s | 1.9× |
+| — of which banded morphology | 45.1 s | 20.5 s | 2.2× |
+| Undercut, same, 10 px/mm | 4.9 s | 4.1 s | 1.2× |
+| Raster 12 Mpx, V-Bit 6 mm 60°: achievable depth | 4.3 s | 1.6 s | 2.7× |
+| Raster 12 Mpx, V-Bit 6 mm 60°: total | 11.2 s | 7.2 s | 1.6× |
+| Raster 12 Mpx, Ball 3 mm: achievable depth | 1.2 s | 1.1 s | 1.1× |
+| V-carve 12 Mpx, V-Bit 6 mm 60°: total | 9.1 s | 3.8 s | 2.4× |
+
+At 10 px/mm the Undercut morphology calls are small (~0.07 s each), so the
+fixed per-call costs — stacking and padding the band inputs, the bound —
+take a larger share; their share falls with px/mm², the kernel's work with
+px/mm⁴. The Undercut toolpaths at 10 and 20 px/mm, and the Raster and
+V-carve results, are identical before and after.
+
+**Tests.** `tests/test_grey_morphology.py` gains checks of the compiled
+kernel against scipy for block and tile edges (widths 15, 16, 17, 53, 1023,
+1024, 1025, 2055), V-bit and ball erosion and dilation, a constant image
+(every block finishes after the first chunk), a footprint larger than the
+image, fewer offsets than one chunk, banded float32/float64 inputs at very
+different heights with `SKY` sentinels, and random footprints with tied
+structure values. Raising the bound by 0.05 makes 67 checks fail. All test
+scripts pass.
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -612,9 +677,8 @@ Ordered by expected payoff.
    tools at high resolution are inherently px/mm⁴.
 7. **App memory.** Done: `_erosion_cache` is an LRU bounded by the
    machine's available memory (see the follow-up).
-8. **Undercut speed.** Early termination in the compiled kernel (see
-   [Undercut speed: analysis and ideas](#undercut-speed-analysis-and-ideas)):
-   exact, an estimated ~2.3× for Lollipop Undercut steps, and large gains
-   for V-Bit erosions. Prototype it and benchmark it against the current
-   kernel first. Optionally, a coarser grid for Undercut, if a 0.1 mm grid
-   is acceptable.
+8. **Undercut speed.** Done: early termination in the compiled kernel,
+   exact, 1.9× for the Lollipop Undercut step at 20 px/mm and 2.4–2.7× for
+   V-Bit erosions (see the follow-up). Remaining option: a coarser grid
+   for Undercut, if a 0.1 mm grid is acceptable (~16× less morphology per
+   halving of px/mm).
