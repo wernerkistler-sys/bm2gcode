@@ -104,7 +104,7 @@ Each step has its own Visible/hidden choice for every source on the canvas: when
 
 ### Steps
 
-Each cutting step appears as a numbered tab. Use the **Add Step After** and **Remove this step** buttons at the bottom of each tab to manage the sequence; **Add Step After** copies all settings — including dress-up — from the step it was added after. The **Dress-up…** button opens that step's tool path dress-up settings (see [Step / Dress-up](#step--dress-up) below). Each tab also contains an **Operation** group and a **Tool** group.
+Each cutting step appears as a numbered tab. Use the **Add step** and **Remove this step** buttons at the bottom of each tab to manage the sequence; **Add step** copies all settings — including dress-up — from the step it was added after. The **Dress-up…** button opens that step's tool path dress-up settings (see [Step / Dress-up](#step--dress-up) below). Each tab also contains an **Operation** group and a **Tool** group.
 
 ---
 
@@ -148,7 +148,7 @@ Traces the depth map as a stack of iso-depth contours, like topographic lines on
 | Parameter | Description |
 |---|---|
 | Z increment | Vertical distance between contour levels (mm). |
-| Adaptive levels (CDF) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. Where two levels end up further apart than Max step-down, evenly spaced levels are added between them. |
+| Adaptive (checkbox beside Z increment) | Distributes levels non-uniformly. Instead of equal Z spacing, levels are placed where many pixels share the same gray value ("plateaus"), so contour lines align with the flat areas of the depth map rather than spanning empty gray ranges. Where two levels end up further apart than Max step-down, evenly spaced levels are added between them. |
 | Lateral tolerance | Discards contour segments that lie within this distance (mm) of an adjacent deeper-level contour, removing redundant passes over areas already covered. |
 | Cut direction | Climb or Conventional forces every contour to travel in one consistent direction relative to the spindle rotation, at the cost of some travel-time optimisation — see [Climb / conventional cut direction](#climb--conventional-cut-direction). Either leaves direction unconstrained, so path ordering is free to reverse segments for shorter travel. |
 
@@ -357,7 +357,7 @@ Undercut shows no step-down field here. Its level spacing is the
 
 #### Step / Dress-up
 
-The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add Step After** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
+The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add step** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
 
 Undercut steps don't use ramp-in or back-off: their checkboxes are greyed out and, if set, ignored. Both move the tool sideways along the cut while it rises, and under an overhang that could hit the part. Arc-rounding still applies, since it only rounds corners at safe height.
 

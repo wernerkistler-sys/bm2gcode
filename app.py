@@ -491,7 +491,7 @@ class GCodeGeneratorApp:
 
         eff_row = ttk.Frame(tab)
         eff_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(eff_row, text="Effective resolution:").pack(side=tk.LEFT)
+        ttk.Label(eff_row, text="Effective resolution").pack(side=tk.LEFT)
         self.effective_resolution_var = tk.StringVar(value="—")
         ttk.Label(eff_row, textvariable=self.effective_resolution_var,
                   foreground="#666666").pack(side=tk.RIGHT)
@@ -533,7 +533,7 @@ class GCodeGeneratorApp:
 
         polarity_row = ttk.Frame(tab)
         polarity_row.pack(fill=tk.X, pady=(6, 2))
-        ttk.Label(polarity_row, text="z=0 colour:").pack(side=tk.LEFT)
+        ttk.Label(polarity_row, text="z=0 colour").pack(side=tk.LEFT)
         self.surface = tk.StringVar(value=DEFAULTS["surface"])
         ttk.Combobox(polarity_row, textvariable=self.surface,
                      values=["white", "black"],
@@ -542,7 +542,7 @@ class GCodeGeneratorApp:
 
         origin_row = ttk.Frame(tab)
         origin_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(origin_row, text="G-code origin:").pack(side=tk.LEFT)
+        ttk.Label(origin_row, text="G-code origin").pack(side=tk.LEFT)
         self.origin_var = tk.StringVar(value=DEFAULTS["origin"])
         ttk.Combobox(origin_row, textvariable=self.origin_var,
                      values=["Bottom-Left", "Bottom-Right",
@@ -846,7 +846,7 @@ class GCodeGeneratorApp:
         # up the back side of a two-sided job (see layers._mirror_axis_mm).
         mirror_row = ttk.Frame(tab)
         mirror_row.pack(fill=tk.X, pady=2)
-        ttk.Label(mirror_row, text="Mirror:").pack(side=tk.LEFT)
+        ttk.Label(mirror_row, text="Mirror").pack(side=tk.LEFT)
         mirror_var = tk.StringVar(value=layer.mirror)
         ttk.Combobox(mirror_row, textvariable=mirror_var,
                      values=LAYER_MIRRORS, state="readonly", width=14
@@ -854,7 +854,7 @@ class GCodeGeneratorApp:
 
         blend_row = ttk.Frame(tab)
         blend_row.pack(fill=tk.X, pady=2)
-        ttk.Label(blend_row, text="Blend mode:").pack(side=tk.LEFT)
+        ttk.Label(blend_row, text="Blend mode").pack(side=tk.LEFT)
         blend_var = tk.StringVar(value=layer.blend_mode)
         if is_base:
             # Forced to Replace at composite time regardless of what's
@@ -1075,7 +1075,7 @@ class GCodeGeneratorApp:
         ttk.Button(bf, text="Dress-up…",
                    command=lambda s=step: self._open_dressup(s)
                    ).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
-        ttk.Button(bf, text="Add Step After",
+        ttk.Button(bf, text="Add step",
                    command=self._add_step
                    ).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=(2, 0))
         step['remove_btn'] = ttk.Button(
@@ -1206,7 +1206,7 @@ class GCodeGeneratorApp:
 
         alg_row = ttk.Frame(operation_lf)
         alg_row.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(alg_row, text="Algorithm:").pack(side=tk.LEFT)
+        ttk.Label(alg_row, text="Algorithm").pack(side=tk.LEFT)
         algorithm_var = tk.StringVar(value=DEFAULTS["step_algorithm"])
         step['algorithm_var'] = algorithm_var
         ttk.Combobox(alg_row, textvariable=algorithm_var,
@@ -1232,7 +1232,7 @@ class GCodeGeneratorApp:
         dir_row = ttk.Frame(raster_frame)
         dir_row.pack(fill=tk.X, pady=2)
         step['raster_dir_row'] = dir_row
-        ttk.Label(dir_row, text="Scan direction:").pack(side=tk.LEFT)
+        ttk.Label(dir_row, text="Scan direction").pack(side=tk.LEFT)
         dir_var = tk.StringVar(value=DEFAULTS["step_raster_dir"])
         step['raster_dir_var'] = dir_var
         raster_dir_cb = ttk.Combobox(dir_row, textvariable=dir_var,
@@ -1243,7 +1243,7 @@ class GCodeGeneratorApp:
         cut_dir_row = ttk.Frame(operation_lf)
         cut_dir_row.pack(fill=tk.X, pady=2, after=raster_frame)   # initially shown (default = Raster Scan)
         step['cut_dir_row'] = cut_dir_row
-        ttk.Label(cut_dir_row, text="Cut direction:").pack(side=tk.LEFT)
+        ttk.Label(cut_dir_row, text="Cut direction").pack(side=tk.LEFT)
         cut_dir_var = tk.StringVar(value=DEFAULTS["step_cut_direction"])
         step['cut_dir_var'] = cut_dir_var
         ttk.Combobox(cut_dir_row, textvariable=cut_dir_var,
@@ -1263,8 +1263,9 @@ class GCodeGeneratorApp:
 
         contour_adaptive_var = tk.BooleanVar(
             value=bool(int(DEFAULTS["step_contour_adaptive"])))
-        ttk.Checkbutton(contour_frame, text="Adaptive levels (CDF)",
-                        variable=contour_adaptive_var).pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(contour_z_increment, text="Adaptive",
+                        variable=contour_adaptive_var
+                        ).pack(side=tk.RIGHT, padx=(0, 4))
         step['contour_adaptive_var'] = contour_adaptive_var
 
         contour_lateral_tol = LabeledEntry(contour_frame, "Lateral tolerance", "mm",
@@ -1283,7 +1284,7 @@ class GCodeGeneratorApp:
 
         undercut_open_row = ttk.Frame(operation_lf)
         step['undercut_open_row'] = undercut_open_row
-        ttk.Label(undercut_open_row, text="Open undercuts:").pack(side=tk.LEFT)
+        ttk.Label(undercut_open_row, text="Open undercuts").pack(side=tk.LEFT)
         undercut_open_var = tk.StringVar(value=DEFAULTS["step_undercut_open"])
         step['undercut_open_var'] = undercut_open_var
         ttk.Combobox(undercut_open_row, textvariable=undercut_open_var,
@@ -1299,7 +1300,7 @@ class GCodeGeneratorApp:
         reghole_pattern_row = ttk.Frame(reghole_frame)
         reghole_pattern_row.pack(fill=tk.X, pady=2)
         step['reghole_pattern_row'] = reghole_pattern_row
-        ttk.Label(reghole_pattern_row, text="Flip axis:").pack(side=tk.LEFT)
+        ttk.Label(reghole_pattern_row, text="Flip axis").pack(side=tk.LEFT)
         reghole_pattern_var = tk.StringVar(value=DEFAULTS["step_reghole_pattern"])
         step['reghole_pattern_var'] = reghole_pattern_var
         ttk.Combobox(reghole_pattern_row, textvariable=reghole_pattern_var,
@@ -1310,7 +1311,7 @@ class GCodeGeneratorApp:
         # a corner origin implies it (see registration_flip_axis).
         reghole_diag_dir_row = ttk.Frame(reghole_frame)
         step['reghole_diag_dir_row'] = reghole_diag_dir_row
-        ttk.Label(reghole_diag_dir_row, text="Diagonal direction:").pack(side=tk.LEFT)
+        ttk.Label(reghole_diag_dir_row, text="Diagonal direction").pack(side=tk.LEFT)
         reghole_diag_dir_var = tk.StringVar(value=DEFAULTS["step_reghole_diag_dir"])
         step['reghole_diag_dir_var'] = reghole_diag_dir_var
         ttk.Combobox(reghole_diag_dir_row, textvariable=reghole_diag_dir_var,
@@ -1377,7 +1378,7 @@ class GCodeGeneratorApp:
         region_row = ttk.Frame(gating_frame)
         region_row.pack(fill=tk.X, pady=(0, 4))
         step['gating_region_row'] = region_row
-        ttk.Label(region_row, text="Process region:").pack(side=tk.LEFT)
+        ttk.Label(region_row, text="Process region").pack(side=tk.LEFT)
         gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
         step['gating_mode_var'] = gating_var
         gating_cb = ttk.Combobox(region_row, textvariable=gating_var,
@@ -1417,7 +1418,7 @@ class GCodeGeneratorApp:
         step['library_cb_ids'] = [""]   # tool id per combobox entry ("" = none)
         library_row = ttk.Frame(tool_lf)
         library_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(library_row, text="Library:").pack(side=tk.LEFT)
+        ttk.Label(library_row, text="Library").pack(side=tk.LEFT)
         library_menu_btn = ttk.Menubutton(library_row, text="⋯", width=2)
         library_menu_btn.pack(side=tk.RIGHT, padx=(4, 0))
         library_menu = tk.Menu(library_menu_btn, tearoff=0)
@@ -1448,7 +1449,7 @@ class GCodeGeneratorApp:
 
         profile_row = ttk.Frame(tool_lf)
         profile_row.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(profile_row, text="Profile:").pack(side=tk.LEFT)
+        ttk.Label(profile_row, text="Profile").pack(side=tk.LEFT)
         profile_var = tk.StringVar(value=DEFAULTS["step_profile"])
         step['profile_var'] = profile_var
         profile_cb = ttk.Combobox(profile_row, textvariable=profile_var,
@@ -1977,7 +1978,7 @@ class GCodeGeneratorApp:
         """Horizontal scale to preview how far the tool has progressed along the toolpath."""
         self.toolpath_scale_var = tk.DoubleVar(value=100.0)
 
-        ttk.Label(parent, text="Toolpath progress:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(parent, text="Toolpath progress").pack(side=tk.LEFT, padx=(0, 6))
         self.toolpath_scale_label = ttk.Label(parent, text="100%", width=5, anchor=tk.E)
         self.toolpath_scale_label.pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Scale(parent, from_=0, to=100, orient=tk.HORIZONTAL,
@@ -2328,7 +2329,7 @@ class GCodeGeneratorApp:
 
     def _add_source_after(self, entry):
         """Per-tab 'Add Source' button: inserts a new source right after
-        the tab it's on, mirroring Steps' 'Add Step After'."""
+        the tab it's on, mirroring Steps' 'Add step'."""
         path = filedialog.askopenfilename(title="Add Source",
                                           filetypes=self._SOURCE_FILETYPES)
         if not path:
