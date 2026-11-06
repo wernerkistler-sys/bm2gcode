@@ -2018,6 +2018,7 @@ class GCodeGeneratorApp:
     def _build_toolpath_scale(self, parent):
         """Horizontal scale to preview how far the tool has progressed along the toolpath."""
         self.toolpath_scale_var = tk.DoubleVar(value=100.0)
+        self._toolpath_scale_render_id = None
 
         ttk.Label(parent, text="Toolpath progress").pack(side=tk.LEFT, padx=(0, 6))
         self.toolpath_scale_label = ttk.Label(parent, text="100%", width=5, anchor=tk.E)
@@ -2050,6 +2051,16 @@ class GCodeGeneratorApp:
 
     def _on_toolpath_scale_changed(self, _value=None):
         self.toolpath_scale_label.config(text=f"{round(self.toolpath_scale_var.get())}%")
+        # A full redraw can take longer than the interval between drag
+        # motion events, so the render runs once Tk is idle: motion events
+        # queued meanwhile only move the slider, and one render then shows
+        # the latest position instead of each intermediate one in turn.
+        if self._toolpath_scale_render_id is None:
+            self._toolpath_scale_render_id = self.toolpath_scale_label.after_idle(
+                self._render_toolpath_scale)
+
+    def _render_toolpath_scale(self):
+        self._toolpath_scale_render_id = None
         self._render()
 
     def _build_image_canvas(self, parent):
