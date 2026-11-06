@@ -853,7 +853,7 @@ class GCodeGeneratorApp:
         ttk.Label(mirror_row, text="Mirror").pack(side=tk.LEFT)
         mirror_var = tk.StringVar(value=layer.mirror)
         ttk.Combobox(mirror_row, textvariable=mirror_var,
-                     values=LAYER_MIRRORS, state="readonly", width=14
+                     values=LAYER_MIRRORS, state="readonly", width=22
                      ).pack(side=tk.RIGHT)
 
         blend_row = ttk.Frame(tab)
@@ -867,18 +867,17 @@ class GCodeGeneratorApp:
                       foreground="#666666").pack(side=tk.RIGHT)
         else:
             ttk.Combobox(blend_row, textvariable=blend_var,
-                        values=BLEND_MODES, state="readonly", width=14
+                        values=BLEND_MODES, state="readonly", width=22
                         ).pack(side=tk.RIGHT)
 
         opacity = LabeledEntry(tab, "Opacity", "%", str(layer.opacity_pct),
                                minval=0.0, maxval=100.0, increment=5.0)
         opacity.pack(fill=tk.X, pady=2)
-        min_depth = LabeledEntry(tab, "Min depth", "%", str(layer.min_depth_pct),
-                                 minval=0.0, maxval=100.0, increment=5.0)
-        min_depth.pack(fill=tk.X, pady=2)
-        max_depth = LabeledEntry(tab, "Max depth", "%", str(layer.max_depth_pct),
-                                 minval=0.0, maxval=100.0, increment=5.0)
-        max_depth.pack(fill=tk.X, pady=2)
+        # Max below min is allowed: it flips the source's polarity.
+        depth_range = LabeledRangeEntry(tab, "Depth range", "%",
+                                        str(layer.min_depth_pct), str(layer.max_depth_pct),
+                                        minval=0.0, maxval=100.0, increment=5.0)
+        depth_range.pack(fill=tk.X, pady=2)
 
         # Visible is per-STEP (see step['source_visibility']), not a
         # property of the Layer itself -- its checked state reflects
@@ -917,15 +916,16 @@ class GCodeGeneratorApp:
                 layer.rotation_deg  = float(rot.get())
                 layer.scale_pct     = float(scale.get())
                 layer.opacity_pct   = float(opacity.get())
-                layer.min_depth_pct = float(min_depth.get())
-                layer.max_depth_pct = float(max_depth.get())
+                layer.min_depth_pct = float(depth_range.lo_entry.get())
+                layer.max_depth_pct = float(depth_range.hi_entry.get())
             except ValueError:
                 return   # mid-edit invalid text -- skip silently
             layer.blend_mode = blend_var.get()   # no-op when is_base
             layer.mirror     = mirror_var.get()
             self._on_layer_property_changed()
 
-        for entry in (ox, oy, rot, scale, opacity, min_depth, max_depth):
+        for entry in (ox, oy, rot, scale, opacity,
+                      depth_range.lo_entry, depth_range.hi_entry):
             entry.committed_var.trace_add("write", _apply)
         blend_var.trace_add("write", _apply)
         mirror_var.trace_add("write", _apply)

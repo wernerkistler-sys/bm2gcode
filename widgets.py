@@ -344,8 +344,9 @@ class LabeledRangeEntry(ttk.Frame):
     arrows/wheel and commit like any LabeledEntry, and [high] lines up
     with the entries of the rows around it. The dash between them fills
     the rest of a ``span``-character Combobox's width, so [low] starts
-    where such a combobox does. low < high is not enforced here; callers
-    validate the pair when they use it.
+    where such a combobox does; if that combobox is too narrow for both
+    fields, the dash just gets a little padding. low < high is not
+    enforced here; callers validate the pair when they use it.
     """
 
     def __init__(self, parent, label, unit, default_lo, default_hi, width=8,
