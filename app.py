@@ -2022,10 +2022,31 @@ class GCodeGeneratorApp:
         ttk.Label(parent, text="Toolpath progress").pack(side=tk.LEFT, padx=(0, 6))
         self.toolpath_scale_label = ttk.Label(parent, text="100%", width=5, anchor=tk.E)
         self.toolpath_scale_label.pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Scale(parent, from_=0, to=100, orient=tk.HORIZONTAL,
-                  variable=self.toolpath_scale_var,
-                  command=self._on_toolpath_scale_changed
-                  ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scale = ttk.Scale(parent, from_=0, to=100, orient=tk.HORIZONTAL,
+                          variable=self.toolpath_scale_var,
+                          command=self._on_toolpath_scale_changed)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # The wheel steps the scale anywhere over the bar, one percent per
+        # notch (wheel up advances); "break" keeps the sidebar's bind_all
+        # wheel handler from also scrolling.
+        for w in (parent, scale, *parent.winfo_children()):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                w.bind(seq, self._on_toolpath_scale_wheel)
+
+    def _on_toolpath_scale_wheel(self, event):
+        if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            step = -1.0
+        elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            step = 1.0
+        else:
+            return "break"
+        old = self.toolpath_scale_var.get()
+        new = min(100.0, max(0.0, round(old) + step))
+        if new != old:
+            self.toolpath_scale_var.set(new)
+            self._on_toolpath_scale_changed()
+        return "break"
 
     def _on_toolpath_scale_changed(self, _value=None):
         self.toolpath_scale_label.config(text=f"{round(self.toolpath_scale_var.get())}%")
