@@ -61,6 +61,27 @@ for cls in classes:
     check(f"{cls.name}: every command exists{missing or ''}", not missing)
 
 
+print("range entry")
+try:
+    import tkinter as tk
+    _root = tk.Tk()
+except Exception as exc:          # no display: nothing to build the widget on
+    print(f"  skipped ({exc})")
+else:
+    sys.path.insert(0, ROOT)
+    from widgets import LabeledRangeEntry
+    _rng = LabeledRangeEntry(_root, "Z range", "%", "0", "100",
+                             minval=0.0, maxval=100.0, increment=5.0)
+    check("defaults", _rng.get() == ("0", "100"))
+    _rng.set(25, 75.5)
+    check("set/get", _rng.get() == ("25", "75.5"))
+    _rng.set(-10, 250)
+    check("values clamp to the bounds", _rng.get() == ("0", "100"))
+    _rng.lo_entry.var.set("40")
+    _rng.lo_entry._commit()
+    check("a typed bound commits", _rng.get() == ("40", "100"))
+    _root.destroy()
+
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
     for f in FAILURES:

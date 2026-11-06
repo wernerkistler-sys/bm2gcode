@@ -25,7 +25,8 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         compute_registration_holes_toolpath, _spiral_px,
                         _extract_z_contours, _order_contours_graph,
                         _fill_level_gaps, _prune_contours,
-                        compute_contour_toolpath, _geodesic_link)
+                        compute_contour_toolpath, _geodesic_link,
+                        _plan_passes, make_multipass, band_levels, check_z_range)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1654,6 +1655,88 @@ check("a link from a pixel to itself is that pixel",
       _geodesic_link(5, 5, 5, 5, 1.0, _gl_relief, 300, 300, _gl_ppm, _gl_ppm, _gl_md)
       == [(5, 5)])
 
+
+# --------------------------------------------------------------------------
+# Z range: the depth band of Raster Scan and Contour steps
+# --------------------------------------------------------------------------
+print("Z range")
+
+check("passes step down from top_mm",
+      _plan_passes(10.0, 2.0, 0.0, 4.0) == [6.0, 8.0, 10.0])
+check("passes from top_mm keep the dedicated final pass",
+      _plan_passes(10.0, 2.0, 1.0, 4.0) == [6.0, 8.0, 9.0, 10.0])
+check("top_mm = 0 plans the same passes as before",
+      _plan_passes(5.0, 1.5, 0.5) == _plan_passes(5.0, 1.5, 0.5, 0.0))
+_mp = make_multipass([[(0.0, 0.0, -9.0), (1.0, 0.0, -9.0)]], 10.0, 2.0, top_mm=4.0)
+check("make_multipass from top_mm: first ceiling is top + step-down",
+      [c for c, _, _ in _mp] == [6.0, 8.0, 10.0]
+      and _mp[0][2][0][0][2] == -6.0 and _mp[-1][2][0][0][2] == -9.0)
+_mpf = make_multipass([[(0.0, 0.0, -4.5), (1.0, 0.0, -9.0)]], 10.0, 2.0, 1.0, top_mm=4.0)
+check("make_multipass from top_mm with a final reserve roughs nothing above top_mm",
+      all(p[2] <= -4.0 + 1e-9 for _, fin, segs in _mpf if not fin for sg in segs for p in sg))
+_bl = band_levels((0.3, 0.7), 1.0, 10.0)
+check("band levels lie in (lo, hi] and end at hi",
+      len(_bl) == 4 and all(0.3 < z <= 0.7 for z in _bl) and _bl[-1] == 0.7)
+check("full band levels match the uniform levels",
+      band_levels((0.0, 1.0), 0.3, 1.0) == [min(i * 0.3 / 1.0, 1.0) for i in range(1, 5)])
+for _bad in ((0.5, 0.5), (0.6, 0.4), (-0.1, 1.0), (0.0, 1.1)):
+    try:
+        check_z_range(_bad)
+        check(f"Z range {_bad} is rejected", False)
+    except ValueError:
+        check(f"Z range {_bad} is rejected", True)
+
+_zr_kw = dict(n_grey_levels=256, tool=Tool(profile="Ball", diameter_mm=0.6),
+              step_mm=0.3, stepdown_mm=1.0, max_depth=5.0, width_mm=12.0,
+              height_mm=12.0, raster_dir="Horizontal", cut_direction="Climb",
+              progress=_noop_progress)
+_zr_full = compute_raster_toolpath(dome, **_zr_kw)
+_zr_full2 = compute_raster_toolpath(dome, z_range=(0.0, 1.0), **_zr_kw)
+check("Raster: full Z range gives the default path",
+      _zr_full.segments == _zr_full2.segments
+      and np.array_equal(_zr_full.result, _zr_full2.result))
+_zr_band = compute_raster_toolpath(dome, z_range=(0.3, 0.7), **_zr_kw)
+_zr_z = np.array([-p[2] for s in _zr_band.segments for p in s])
+check("Raster: no point is cut below the band's floor",
+      _zr_z.size > 0 and _zr_z.max() <= 0.7 * 5.0 + 1e-6)
+check("Raster: the result stays above the band's floor",
+      float(_zr_band.result.max()) <= 0.7 + 1e-6)
+check("Raster: accessible is capped at the band's floor",
+      float(_zr_band.accessible.max()) <= 0.7 + 1e-6)
+_zr_cuts = [s for s in _zr_band.segments if len(s) > 1]
+_zr_deep = np.array([-p[2] for s in _zr_cuts for p in s])
+check("Raster: the passes cut only below the band's top (links aside)",
+      np.mean(_zr_deep >= 0.3 * 5.0 - 0.05) > 0.95)
+check("Raster: the band takes fewer passes",
+      _zr_band.metadata['n_passes'] < _zr_full.metadata['n_passes']
+      and _zr_band.metadata['z_range'] == (0.3, 0.7))
+
+
+def _contour_levels(**kwargs):
+    tp = compute_contour_toolpath(dome, 256, Tool(profile="Ball", diameter_mm=0.6),
+                                  z_increment_mm=0.5, max_depth=5.0,
+                                  width_mm=12.0, height_mm=12.0,
+                                  progress=_noop_progress, **kwargs)
+    return tp, sorted({round(-p[2] / 5.0, 4) for seg in tp.segments for p in seg})
+
+
+_zc_full, _ = _contour_levels()
+_zc_full2, _ = _contour_levels(z_range=(0.0, 1.0))
+check("Contour: full Z range gives the default path",
+      _zc_full.segments == _zc_full2.segments)
+_zc_band, _zc_lv = _contour_levels(z_range=(0.3, 0.7))
+check("Contour: every cut lies in the band",
+      bool(_zc_lv) and min(_zc_lv) >= 0.3 - 0.01 and max(_zc_lv) <= 0.7 + 1e-4)
+check("Contour: the band's floor is its deepest level",
+      abs(max(_zc_lv) - 0.7) < 1e-3)
+check("Contour: accessible is capped at the band's floor",
+      float(_zc_band.accessible.max()) <= 0.7 + 1e-6)
+_zca_band, _zca_lv = _contour_levels(z_range=(0.3, 0.7), adaptive_levels=True,
+                                     max_step_down_mm=0.4)
+check("Contour (adaptive, Max step-down): every cut lies in the band",
+      bool(_zca_lv) and min(_zca_lv) >= 0.3 - 0.01 and max(_zca_lv) <= 0.7 + 1e-4)
+check("_fill_level_gaps starts from start",
+      _fill_level_gaps([0.9], 0.2, 1.0, start=0.5) == [0.7, 0.9])
 
 print()
 if FAILURES:

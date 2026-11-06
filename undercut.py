@@ -496,7 +496,7 @@ def compute_undercut_toolpath(
         previous_result=None, z_safe=5.0, feed_rapid=3000.0,
         cut_direction="Climb", extra_offset_mm=0.0, open_undercuts="cut",
         n_grey_levels=65536, progress=None, erosion_cache=None,
-        erosion_cache_key=None):
+        erosion_cache_key=None, z_range=(0.0, 1.0)):
     """Plan undercut roughing and finishing at uniform depth levels.
 
     Parameters
@@ -521,6 +521,8 @@ def compute_undercut_toolpath(
                                 where the tool reaches an enclosed gap
     previous_result: the prior step's ToolPath.result; passed through as
                      this step's result (see README.md)
+    z_range        : (lo, hi), normalised, 0 <= lo < hi <= 1 -- the levels
+                     lie in (lo, hi], hi being the deepest one
 
     At each level d the tool fits at a pixel if its underside clears the
     floor below and its top (and neck) clears the ceiling above, in each
@@ -536,7 +538,7 @@ def compute_undercut_toolpath(
     from grey_morphology import (banded_grey_dilation, banded_grey_erosion,
                                  grey_dilation, grey_erosion)
     from skimage.measure import find_contours
-    from algorithms import _build_kernel, _retract_breakeven_mm
+    from algorithms import _build_kernel, _retract_breakeven_mm, band_levels, check_z_range
 
     if progress is None:
         progress = lambda pct, msg: None
@@ -550,6 +552,7 @@ def compute_undercut_toolpath(
         raise ValueError("Step-down must be greater than 0.")
     if stepover_pct <= 0.0:
         raise ValueError("Step-over must be greater than 0.")
+    z_lo, z_hi = check_z_range(z_range)
     warnings = []
 
     def warn(msg, pct):
@@ -637,8 +640,7 @@ def compute_undercut_toolpath(
     i_lo_min = int(np.argmin(band_lo))
 
     # ── Levels ────────────────────────────────────────────────────────────
-    n_levels = max(1, math.ceil(max_depth / z_increment_mm))
-    levels = [min(i * z_increment_mm / max_depth, 1.0) for i in range(1, n_levels + 1)]
+    levels = band_levels((z_lo, z_hi), z_increment_mm, max_depth)
     step_px = max(stepover_pct / 100.0 * tool.diameter_mm * px_per_mm, 1.0)
     max_rings = int(np.ceil(tool.diameter_mm * px_per_mm / step_px)) + 2
     reverse = (cut_direction == "Climb")
@@ -907,6 +909,7 @@ def compute_undercut_toolpath(
             'radius_mm':       tool.diameter_mm / 2,
             'neck_diameter_mm': tool.neck_diameter_mm,
             'z_increment_mm':  z_increment_mm,
+            'z_range':         (z_lo, z_hi),
             'stepover_pct':    stepover_pct,
             'extra_offset_mm': extra_offset_mm,
             'open_undercuts':  open_undercuts,

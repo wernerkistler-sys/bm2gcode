@@ -48,7 +48,7 @@ from constants import (
     DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
-from widgets import (ProgressDialog, LabeledEntry,
+from widgets import (ProgressDialog, LabeledEntry, LabeledRangeEntry,
                      SettingsDialog, DressUpDialog, ExportToolpathDialog,
                      ImportSTLDialog, ToolLibraryDialog, ApplyMaterialDialog,
                      _fmt_time)
@@ -88,7 +88,11 @@ _UNDERCUT_KEYS = ('neck_diameter', 'neck_length', 'shank_diameter',
                   'head_height', 'dovetail_angle')
 
 
-class _MissingProfileCurve(ValueError):
+class _StepInputError(ValueError):
+    """Bad step input whose message is shown to the user as it is."""
+
+
+class _MissingProfileCurve(_StepInputError):
     """A step uses the Custom profile but carries no curve."""
 
 
@@ -1118,6 +1122,7 @@ class GCodeGeneratorApp:
             if dst[key].auto_var is not None and src[key].auto_var is not None:
                 dst[key].auto_var.set(src[key].auto_var.get())
             dst[key].set(src[key].get())
+        dst['z_range'].set(*src['z_range'].get())
         dst['raster_dir_var'].set(src['raster_dir_var'].get())
         for key in ('library_material_id_var', 'library_tool_name_var',
                     'library_tool_id_var'):
@@ -1273,6 +1278,16 @@ class GCodeGeneratorApp:
                                            minval=0.0, maxval=50.0, increment=0.05)
         contour_lateral_tol.pack(fill=tk.X, pady=2)
         step['contour_lateral_tol'] = contour_lateral_tol
+
+        # ── Depth band (Raster Scan, Contour, Undercut) ────────────────
+        # One widget, packed by _refresh_layout into whichever frame holds
+        # the algorithm's depth controls (pack in_= works because every
+        # such frame is a descendant of operation_lf).
+        z_range = LabeledRangeEntry(operation_lf, "Z range", "%",
+                                    DEFAULTS["step_z_min_pct"],
+                                    DEFAULTS["step_z_max_pct"],
+                                    minval=0.0, maxval=100.0, increment=5.0)
+        step['z_range'] = z_range
 
         # ── Undercut-only op control (hidden unless Undercut algorithm) ──
         # Not part of the library's cutting data, unlike Max step-down.
@@ -1579,6 +1594,26 @@ class GCodeGeneratorApp:
         step['spindle_rpm'] = rpm
 
         # ── Wire up algorithm / profile toggle ────────────────────────
+        def _place_z_range():
+            """Pack the Z range row with the algorithm's own depth controls,
+            or hide it for algorithms without one."""
+            alg = algorithm_var.get()
+            family = ALGORITHM_FAMILY[alg]
+            if alg == "Contour":
+                step['z_range'].pack(in_=step['contour_frame'], fill=tk.X, pady=2,
+                                     after=step['contour_z_increment'])
+            elif family == "Undercut":
+                step['z_range'].pack(in_=step['operation_lf'], fill=tk.X, pady=2,
+                                     after=step['undercut_z_increment'])
+            elif family == "Raster Scan":
+                step['z_range'].pack(in_=step['gating_frame'], fill=tk.X, pady=2,
+                                     after=step['threshold'])
+            else:
+                step['z_range'].pack_forget()
+            # Siblings stack in creation order, so a frame created after
+            # z_range (gating_frame) would hide it when it's packed inside.
+            step['z_range'].lift()
+
         def _refresh_layout(*_):
             alg     = algorithm_var.get()
             profile = step['profile_var'].get()
@@ -1808,6 +1843,8 @@ class GCodeGeneratorApp:
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['vbit_angle'].set_state("normal")
 
+            _place_z_range()
+
             step['diameter'].set_state(
                 "disabled" if step['profile_var'].get() == "Custom" else "normal")
 
@@ -1833,6 +1870,9 @@ class GCodeGeneratorApp:
                 self._on_display_mode_changed()
 
         step['refresh_layout'] = _refresh_layout
+        # The widgets packed above already form the default algorithm's
+        # layout, except for the Z range row, which goes in only here.
+        _place_z_range()
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
         reghole_pattern_var.trace_add("write", _refresh_layout)
@@ -1958,6 +1998,7 @@ class GCodeGeneratorApp:
         step['contour_lateral_tol'].set(DEFAULTS["step_contour_lateral_tol"])
         step['undercut_z_increment'].set(DEFAULTS["step_undercut_z_increment"])
         step['undercut_open_var'].set(DEFAULTS["step_undercut_open"])
+        step['z_range'].set(DEFAULTS["step_z_min_pct"], DEFAULTS["step_z_max_pct"])
         step['tsp_2opt_var'].set(bool(int(DEFAULTS["step_tsp_2opt"])))
         step['avoid_air_var'].set(bool(int(DEFAULTS["step_avoid_air"])))
         step['gating_mode_var'].set(DEFAULTS["step_gating_mode"])
@@ -3001,6 +3042,8 @@ class GCodeGeneratorApp:
             'contour_lateral_tol':    step['contour_lateral_tol'].get(),
             'undercut_z_increment': step['undercut_z_increment'].get(),
             'undercut_open':        step['undercut_open_var'].get(),
+            'z_min_pct':            step['z_range'].get()[0],
+            'z_max_pct':            step['z_range'].get()[1],
             'tsp_2opt':             step['tsp_2opt_var'].get(),
             'avoid_air':            step['avoid_air_var'].get(),
             'feed_rate':            step['feed_rate'].get(),
@@ -3080,6 +3123,8 @@ class GCodeGeneratorApp:
         undercut_open = d.get('undercut_open', DEFAULTS['step_undercut_open'])
         step['undercut_open_var'].set(undercut_open if undercut_open in UNDERCUT_OPEN_MODES
                                       else DEFAULTS['step_undercut_open'])
+        step['z_range'].set(d.get('z_min_pct', DEFAULTS['step_z_min_pct']),
+                            d.get('z_max_pct', DEFAULTS['step_z_max_pct']))
         step['tsp_2opt_var'].set(bool(d.get('tsp_2opt', False)))
         step['avoid_air_var'].set(bool(d.get('avoid_air', False)))
         step['feed_rate'].set(d.get('feed_rate', DEFAULTS['step_feed_rate']))
@@ -3670,6 +3715,15 @@ class GCodeGeneratorApp:
         raise ValueError(
             "V-Carving Clean-up requires a preceding V-Carving (Hybrid) step.")
 
+    def _step_z_range(self, step):
+        """The step's Z range as a normalised (lo, hi) pair; raises
+        _StepInputError unless 0 % <= min < max <= 100 %."""
+        lo_pct, hi_pct = (float(v) for v in step['z_range'].get())
+        if not 0.0 <= lo_pct < hi_pct <= 100.0:
+            raise _StepInputError(f"Z range min ({lo_pct:g} %) must be below "
+                                  f"its max ({hi_pct:g} %).")
+        return lo_pct / 100.0, hi_pct / 100.0
+
     def _gather_step_params(self, step):
         """Read and validate all parameters for one step.
 
@@ -3745,6 +3799,7 @@ class GCodeGeneratorApp:
                 'use_2opt':            step['tsp_2opt_var'].get(),
                 'contour_max_step_down': float(step['stepdown'].get()),
                 'cut_direction':       step['cut_dir_var'].get(),
+                'z_range':             self._step_z_range(step),
             })
         elif algorithm == "Cutout":
             tool = Tool("End Mill", float(step['diameter'].get()), 90.0)
@@ -3811,6 +3866,7 @@ class GCodeGeneratorApp:
             params.update({
                 'tool':              tool,
                 'z_increment_mm':    float(step['undercut_z_increment'].get()),
+                'z_range':           self._step_z_range(step),
                 'stepover_pct':      float(step['stepover'].get()),
                 'cut_direction':     step['cut_dir_var'].get(),
                 'open_undercuts':    UNDERCUT_OPEN_MODES[step['undercut_open_var'].get()],
@@ -3838,6 +3894,7 @@ class GCodeGeneratorApp:
                 'cut_direction':            step['cut_dir_var'].get(),
                 'gating_mode':              step['gating_mode_var'].get(),
                 'work_surface_tol':         threshold_mm / max_depth if max_depth else 0.0,
+                'z_range':                  self._step_z_range(step),
             })
 
         return params
@@ -3929,6 +3986,7 @@ class GCodeGeneratorApp:
                 cut_direction    = params['cut_direction'],
                 extra_offset_mm  = params['extra_offset_mm'],
                 open_undercuts   = params['open_undercuts'],
+                z_range          = params['z_range'],
                 n_grey_levels    = n_grey_levels,
                 progress         = progress_fn,
                 erosion_cache    = self._erosion_cache,
@@ -3960,6 +4018,7 @@ class GCodeGeneratorApp:
                 avoid_air          = params['avoid_air'],
                 erosion_cache      = self._erosion_cache,
                 erosion_cache_key  = erosion_cache_key,
+                z_range            = params['z_range'],
             )
         elif algorithm == "Cutout":
             # Split into Phase A (silhouette mask + contour extraction) and
@@ -4146,6 +4205,7 @@ class GCodeGeneratorApp:
                 progress          = progress_fn,
                 erosion_cache     = self._erosion_cache,
                 erosion_cache_key = erosion_cache_key,
+                z_range           = params['z_range'],
             )
 
     def _stale_stl_sources(self):
@@ -4230,7 +4290,7 @@ class GCodeGeneratorApp:
         idx = self.steps.index(step)
         try:
             params = self._gather_step_params(step)
-        except _MissingProfileCurve as exc:
+        except _StepInputError as exc:
             messagebox.showerror("Invalid input", f"Step {idx + 1}: {exc}")
             return
         except ValueError:
@@ -4334,7 +4394,7 @@ class GCodeGeneratorApp:
         for step in self.steps:
             try:
                 all_params.append(self._gather_step_params(step))
-            except _MissingProfileCurve as exc:
+            except _StepInputError as exc:
                 messagebox.showerror("Invalid input",
                                      f"Step {self.steps.index(step) + 1}: {exc}")
                 return

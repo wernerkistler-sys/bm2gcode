@@ -991,6 +991,20 @@ check("non-square pixels: undercut_reach on the input grid",
       tp_ns.undercut_reach.shape == depth_ns.shape and tp_ns.undercut_reach.any())
 
 
+print("undercut toolpath: Z range")
+tp_zf = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                  previous_result=prev, z_range=(0.0, 1.0))
+check("full Z range gives the default chains", tp_zf.segments == tp.segments)
+_zall = sorted({round(-p[2] / HC, 6) for s in tp.segments for p in s})
+_zlo, _zhi = _zall[0] + 0.5 * (_zall[-1] - _zall[0]) / 2, _zall[-1] - 0.25 * (_zall[-1] - _zall[0])
+tp_zb = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                  previous_result=prev, z_range=(_zlo, _zhi))
+_zb = sorted({round(-p[2] / HC, 6) for s in tp_zb.segments for p in s})
+check("a Z band keeps only the levels inside it",
+      len(tp_zb.segments) > 0 and _zlo < _zb[0] and _zb[-1] <= _zhi + 1e-6
+      and len(_zb) < len(_zall))
+check("the band's floor is a level", abs(_zb[-1] - _zhi) < 1e-6)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: {FAILURES}")

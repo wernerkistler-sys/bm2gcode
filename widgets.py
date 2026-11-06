@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import font as tkfont
 import copy
 import math
 import queue
@@ -200,12 +201,14 @@ class LabeledEntry(ttk.Frame):
         self._minval = minval
         self._maxval = maxval
         self._label_widget = ttk.Label(self, text=label)
-        self._label_widget.pack(side=tk.LEFT)
+        if label:   # an empty label would still take up a few pixels
+            self._label_widget.pack(side=tk.LEFT)
         self.var = tk.StringVar(value=default)
         self.entry = ttk.Spinbox(self, textvariable=self.var, width=width,
                                  from_=minval, to=maxval, increment=increment)
         self.entry.pack(side=tk.RIGHT)
-        ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
+        if unit:
+            ttk.Label(self, text=unit, foreground="#666666").pack(side=tk.RIGHT, padx=(0, 3))
         self.auto_var = None
         self._auto_checkbutton = None
         if auto_label is not None:
@@ -329,6 +332,65 @@ class LabeledEntry(ttk.Frame):
             self._auto_checkbutton.pack(side=tk.RIGHT, padx=(0, 4))
         else:
             self._auto_checkbutton.pack_forget()
+
+
+class LabeledRangeEntry(ttk.Frame):
+    """Single-row widget for a (low, high) pair sharing one unit:
+    [label ← spacer → unit [low] – [high]], the unit placed before the
+    values as in LabeledEntry.
+
+    Each bound is a label-less LabeledEntry (``lo_entry``/``hi_entry``) of
+    the usual entry width, so both clamp to [minval, maxval], nudge with
+    arrows/wheel and commit like any LabeledEntry, and [high] lines up
+    with the entries of the rows around it. The dash between them fills
+    the rest of a ``span``-character Combobox's width, so [low] starts
+    where such a combobox does. low < high is not enforced here; callers
+    validate the pair when they use it.
+    """
+
+    def __init__(self, parent, label, unit, default_lo, default_hi, width=8,
+                 minval=0.0, maxval=100.0, increment=1.0, span=22, **kw):
+        super().__init__(parent, **kw)
+        self._label_widget = ttk.Label(self, text=label)
+        self._label_widget.pack(side=tk.LEFT)
+        self.hi_entry = LabeledEntry(self, "", "", default_hi, width=width,
+                                     minval=minval, maxval=maxval, increment=increment)
+        self.hi_entry.pack(side=tk.RIGHT)
+        dash = ttk.Label(self, text="–", anchor=tk.CENTER)
+        # Measured, not assumed: character widths depend on font and DPI.
+        probe = ttk.Combobox(self, width=span)
+        gap = probe.winfo_reqwidth() - 2 * self.hi_entry.entry.winfo_reqwidth()
+        probe.destroy()
+        # The glyph, not the label's requested width: the label's own 1 px
+        # border may be clipped by the fixed-width box without harm.
+        glyph = tkfont.Font(font=dash.cget("font") or "TkDefaultFont").measure("–")
+        if gap >= glyph:
+            dash_box = ttk.Frame(self, width=gap, height=dash.winfo_reqheight())
+            dash_box.pack_propagate(False)
+            dash_box.pack(side=tk.RIGHT, fill=tk.Y)
+            dash.destroy()
+            dash = ttk.Label(dash_box, text="–", anchor=tk.CENTER)
+            dash.pack(fill=tk.BOTH, expand=True)
+        else:   # too narrow to line up: keep the dash readable instead
+            dash.pack(side=tk.RIGHT, padx=3)
+        self.lo_entry = LabeledEntry(self, "", unit, default_lo, width=width,
+                                     minval=minval, maxval=maxval, increment=increment)
+        self.lo_entry.pack(side=tk.RIGHT)
+
+    def get(self):
+        """Committed (low, high) strings."""
+        return self.lo_entry.get(), self.hi_entry.get()
+
+    def set(self, lo, hi):
+        self.lo_entry.set(lo)
+        self.hi_entry.set(hi)
+
+    def set_state(self, state):
+        self.lo_entry.set_state(state)
+        self.hi_entry.set_state(state)
+
+    def set_label(self, text):
+        self._label_widget.config(text=text)
 
 
 class SectionFrame(ttk.LabelFrame):

@@ -406,26 +406,29 @@ def simulate_toolpath_result(toolpath, shape, px_per_mm_x, px_per_mm_y, ox, oy,
         0.0)
 
 
-def _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
+def _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm=0.0, top_mm=0.0):
     """Return ordered list of cumulative cut-depth ceilings (mm).
 
+    The passes step down from top_mm (0 = the stock surface; deeper when the
+    material above it is already removed) to max_depth_mm.
     If final_stepdown_mm > 0, roughing stops at max_depth − final_stepdown_mm
     and a dedicated finishing pass reaches max_depth.
     stepdown_mm = 0 means one roughing step at full roughing depth (equivalent
-    to stepdown_mm = max_depth_mm).
+    to stepdown_mm = max_depth_mm − top_mm).
     """
+    band_mm = max_depth_mm - top_mm
     if stepdown_mm <= 0.0:
         if final_stepdown_mm <= 0.0:
             return [max_depth_mm]
-        stepdown_mm = max_depth_mm   # one roughing step + one final pass
-    if final_stepdown_mm > 0.0 and final_stepdown_mm < max_depth_mm:
-        roughable = max_depth_mm - final_stepdown_mm
+        stepdown_mm = band_mm   # one roughing step + one final pass
+    if final_stepdown_mm > 0.0 and final_stepdown_mm < band_mm:
+        roughable = band_mm - final_stepdown_mm
         n = max(1, int(np.ceil(roughable / stepdown_mm)))
-        passes = [min((i + 1) * stepdown_mm, roughable) for i in range(n)]
+        passes = [top_mm + min((i + 1) * stepdown_mm, roughable) for i in range(n)]
         passes.append(max_depth_mm)
     else:
-        n = max(1, int(np.ceil(max_depth_mm / stepdown_mm)))
-        passes = [min((i + 1) * stepdown_mm, max_depth_mm) for i in range(n)]
+        n = max(1, int(np.ceil(band_mm / stepdown_mm)))
+        passes = [top_mm + min((i + 1) * stepdown_mm, band_mm) for i in range(n)]
     return passes
 
 
@@ -458,7 +461,8 @@ def _insert_ceiling_crossings(seg, thresholds):
     return out
 
 
-def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
+def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0,
+                   top_mm=0.0):
     """Depth-slice full-depth segments into per-pass segments.
 
     Parameters
@@ -467,6 +471,8 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     max_depth_mm   : total cut depth in mm
     stepdown_mm    : max depth increment per roughing pass (0 = single pass)
     final_stepdown_mm : depth reserved for a dedicated finishing pass (0 = none)
+    top_mm         : depth the first pass steps down from (0 = the stock
+                     surface); material above it counts as already removed
 
     Returns
     -------
@@ -502,7 +508,8 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     if stepdown_mm <= 0.0 and final_stepdown_mm <= 0.0:
         return [(max_depth_mm, True, list(segments))]
 
-    pass_ceilings = _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm)
+    pass_ceilings = _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm,
+                                 top_mm)
     EPS = 1e-6
     n_passes = len(pass_ceilings)
     has_dedicated_final = final_stepdown_mm > 0.0
@@ -515,7 +522,7 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
     for k in range(n_rough):
         if k == 0 and not has_dedicated_final:
             continue   # first roughing pass with no reserve keeps every point already
-        prev_ceil = pass_ceilings[k - 1] if k > 0 else 0.0
+        prev_ceil = pass_ceilings[k - 1] if k > 0 else top_mm
         thresholds.append((-prev_ceil - final_stepdown_mm, k))
 
     aug_segments = [_insert_ceiling_crossings(seg, thresholds) for seg in segments]
@@ -536,7 +543,8 @@ def make_multipass(segments, max_depth_mm, stepdown_mm, final_stepdown_mm=0.0):
                     if boundary_pi == pi:
                         keep = True   # exact entry crossing — force it in despite the EPS margin below
                     elif pi == 0:
-                        keep = True if not has_dedicated_final else (z_target < -EPS)
+                        keep = (True if not has_dedicated_final
+                                else z_target < -top_mm - EPS)
                     else:
                         prev_target = rough_target(z_full, pass_ceilings[pi - 1])
                         keep = z_target < prev_target - EPS
@@ -2205,7 +2213,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                             feed_rapid=3000.0,
                             progress=None,
                             erosion_cache=None,
-                            erosion_cache_key=None):
+                            erosion_cache_key=None,
+                            z_range=(0.0, 1.0)):
     """Compute a raster toolpath by scanning the depth map with the given tool.
 
     Parameters
@@ -2289,6 +2298,13 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
                         recomputing it.  None disables caching.
     erosion_cache_key : hashable key identifying the (tool, px_per_mm, max_depth)
                         combination for erosion_cache lookups.
+    z_range           : (lo, hi), normalised, 0 <= lo < hi <= 1 -- depth
+                        band of the cut. The tool never goes below hi (it
+                        clears flat at hi where the relief is deeper), lines
+                        are cut only where the tool-centre depth is deeper
+                        than lo, and the passes step down from lo, so material
+                        above lo counts as already removed. The stored
+                        accessible surface is capped at hi.
 
     Returns
     -------
@@ -2296,7 +2312,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     """
     from grey_morphology import grey_erosion, grey_dilation
 
-
+    z_lo, z_hi = check_z_range(z_range)
     if work_surface_tol is None:
         work_surface_tol = 0.0
 
@@ -2371,10 +2387,17 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         off_norm = extra_offset_mm / max_depth
         center_depth_contour_raster = np.clip(center_depth_contour_raster - off_norm, 0.0, 1.0)
         accessible_raster = np.clip(accessible_raster - off_norm, 0.0, 1.0)
+    if z_hi < 1.0:
+        # New arrays: the cached surfaces stay uncapped for other steps.
+        center_depth_contour_raster = np.minimum(center_depth_contour_raster, z_hi)
+        accessible_raster = np.minimum(accessible_raster, z_hi)
+    band_top_mm    = z_lo * max_depth
+    band_bottom_mm = z_hi * max_depth
 
     # ── Stage 3 · Plan passes (35–40 %) ───────────────────────────
     progress(35, "Planning depth passes…")
-    pass_plan       = _plan_passes(max_depth, stepdown_mm, final_stepdown_mm)
+    pass_plan       = _plan_passes(band_bottom_mm, stepdown_mm, final_stepdown_mm,
+                                   band_top_mm)
     n_passes        = len(pass_plan)
     final_norm      = final_stepdown_mm / max_depth
     step_px = max(1, int(round(step_mm * px_per_mm)))   # for progress display only
@@ -2419,6 +2442,12 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     if prior_mask is not None:
         progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
                      f"{int(np.sum(prior_mask))}/{H*W} pixels in mask.")
+    if z_lo > 0.0:
+        # Tool-centre criterion, so not widened by the footprint like the
+        # Process Region gate: spans start and end where the tool tip
+        # crosses lo.
+        band = (center_depth_contour_raster > z_lo + 0.5 * resid_tol).astype(np.float32)
+        prior_mask = band if prior_mask is None else prior_mask * band
 
     all_segments     = []
     tool_pos         = np.array([0.0, 0.0])
@@ -2486,8 +2515,8 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     progress(55, f"Phase 1 complete — {len(full_depth_segs)} full-depth span(s).")
 
     # ── Phase 2: depth-slice into per-pass segments ───────────────
-    pass_list = make_multipass(full_depth_segs, max_depth, stepdown_mm,
-                               final_stepdown_mm)
+    pass_list = make_multipass(full_depth_segs, band_bottom_mm, stepdown_mm,
+                               final_stepdown_mm, top_mm=band_top_mm)
 
     # ── Phase 2b: drop air-cutting runs (optional) ────────────────
     air_pruned_mm = 0.0
@@ -2640,6 +2669,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
             'stepdown_mm': stepdown_mm,
             'final_stepdown_mm': final_stepdown_mm,
             'extra_offset_mm': extra_offset_mm,
+            'z_range': (z_lo, z_hi),
             'max_depth': max_depth,
             'width_mm': width_mm,
             'height_mm': height_mm,
@@ -4379,19 +4409,45 @@ def _contour_threshold(z_norm, n_grey_levels):
     return max(z_norm - 0.5 / max(n_grey_levels - 1, 1), 0.0)
 
 
-def _fill_level_gaps(z_levels, max_gap, deepest=1.0):
+def check_z_range(z_range):
+    """Return z_range as a (lo, hi) float pair, or raise ValueError unless
+    0 <= lo < hi <= 1."""
+    lo, hi = float(z_range[0]), float(z_range[1])
+    if not (0.0 <= lo < hi <= 1.0):
+        raise ValueError(f"Z range must satisfy 0 % <= min < max <= 100 % "
+                         f"(got {lo * 100:g} % – {hi * 100:g} %).")
+    return lo, hi
+
+
+def band_levels(z_range, z_increment_mm, max_depth):
+    """Uniform normalised depth levels lo + i·z_increment_mm (i >= 1) inside
+    z_range = (lo, hi), the last one capped at hi, so hi itself is always
+    the deepest level and lo never is one."""
+    import math
+    lo, hi = z_range
+    n = max(1, math.ceil((hi - lo) * max_depth / z_increment_mm))
+    levels = []
+    for i in range(1, n + 1):
+        z = min(lo + i * z_increment_mm / max_depth, hi)
+        if not levels or z > levels[-1]:
+            levels.append(z)
+    return levels
+
+
+def _fill_level_gaps(z_levels, max_gap, deepest=1.0, start=0.0):
     """Insert evenly spaced levels wherever two consecutive levels, or the
-    stock surface and the first level, are more than max_gap apart.
+    start depth and the first level, are more than max_gap apart.
 
     z_levels : ascending normalised depths, all kept as they are
     max_gap  : largest allowed spacing, normalised (a gap exactly this large
                stays unfilled)
     deepest  : deepest point of the surface; a gap starting at or below it
                holds no contours, so it stays unfilled
+    start    : depth the first gap starts at (0 = the stock surface)
 
     Returns the combined ascending list.
     """
-    filled, prev = [], 0.0
+    filled, prev = [], start
     for z in z_levels:
         if prev < deepest:
             n = int(np.ceil((z - prev) / max_gap - 1e-9))
@@ -4666,6 +4722,7 @@ def compute_contour_toolpath(
     avoid_air=False,
     erosion_cache=None,
     erosion_cache_key=None,
+    z_range=(0.0, 1.0),
 ):
     """Compute a waterline (contour) tool path from a normalised depth map.
 
@@ -4753,6 +4810,10 @@ def compute_contour_toolpath(
     erosion_cache_key : hashable, optional
         Key identifying the (tool, px_per_mm, max_depth) combination for
         erosion_cache lookups.
+    z_range : (lo, hi), normalised, 0 <= lo < hi <= 1
+        Depth band of the contour levels: every level lies in (lo, hi] and
+        hi is the deepest one. Material above lo counts as already removed.
+        The stored accessible surface is capped at hi.
 
     Returns
     -------
@@ -4761,6 +4822,8 @@ def compute_contour_toolpath(
     import math
     from grey_morphology import grey_erosion, grey_dilation
     from skimage.measure import find_contours
+
+    z_lo, z_hi = check_z_range(z_range)
 
     # None/<=0 both mean "unconstrained" for the depth bound.
     _msd = max_step_down_mm if (max_step_down_mm is not None
@@ -4835,32 +4898,35 @@ def compute_contour_toolpath(
 
     # ── Stage 3 · Plan Z-levels (35–40 %) ─────────────────────────────────
     progress(35, "Planning contour levels…")
-    n_passes = max(1, math.ceil(max_depth / z_increment_mm))
+    n_passes = max(1, math.ceil((z_hi - z_lo) * max_depth / z_increment_mm))
     if adaptive_levels:
-        flat = center_depth_contour[center_depth_contour > 1e-6].ravel()
+        # Quantiles over the pixels inside the band; deeper ones all count
+        # towards the band's floor hi.
+        flat = np.minimum(
+            center_depth_contour[center_depth_contour > max(z_lo, 1e-6)], z_hi).ravel()
         if flat.size >= 2:
             quantiles = np.linspace(1.0 / n_passes, 1.0, n_passes)
             z_raw = np.quantile(flat, quantiles)
             min_gap = 0.5 / max(n_grey_levels - 1, 1)
-            z_levels, prev = [], -1.0
-            for z in np.clip(z_raw, 0.0, 1.0):
+            # A level at lo itself would repeat the step above's deepest cut.
+            z_levels, prev = [], (z_lo if z_lo > 0.0 else -1.0)
+            for z in np.clip(z_raw, 0.0, z_hi):
                 if float(z) - prev >= min_gap:
                     z_levels.append(float(z))
                     prev = float(z)
-            if not z_levels or z_levels[-1] < 1.0 - min_gap:
-                z_levels.append(1.0)
+            if not z_levels or z_levels[-1] < z_hi - min_gap:
+                z_levels.append(z_hi)
         else:
-            z_levels = [min(i * z_increment_mm / max_depth, 1.0)
-                        for i in range(1, n_passes + 1)]
+            z_levels = band_levels((z_lo, z_hi), z_increment_mm, max_depth)
         if _msd is not None:
             z_levels = _fill_level_gaps(z_levels, _msd / max_depth,
-                                        float(center_depth_contour.max()))
+                                        float(center_depth_contour.max()),
+                                        start=z_lo)
         progress(40, f"{len(z_levels)} contour level{'s' if len(z_levels) != 1 else ''}  "
                      f"(adaptive, target Z increment {z_increment_mm:.2f} mm).")
     else:
-        z_levels = [min(i * z_increment_mm / max_depth, 1.0)
-                    for i in range(1, n_passes + 1)]
-        progress(40, f"{n_passes} contour level{'s' if n_passes != 1 else ''}  "
+        z_levels = band_levels((z_lo, z_hi), z_increment_mm, max_depth)
+        progress(40, f"{len(z_levels)} contour level{'s' if len(z_levels) != 1 else ''}  "
                      f"({z_increment_mm:.2f} mm each).")
 
     # ── Stage 4 · Extract contours and build segments (40–80 %) ───────────
@@ -4971,9 +5037,11 @@ def compute_contour_toolpath(
     tp = ToolPath(
         segments=all_segments,
         result=result,
-        accessible=accessible_contour,
+        accessible=(np.minimum(accessible_contour, z_hi) if z_hi < 1.0
+                    else accessible_contour),
         metadata={
             'algorithm':       'Contour',
+            'z_range':         (z_lo, z_hi),
             'profile':         tool.profile,
             'max_depth':       max_depth,
             'radius_mm':       tool.diameter_mm / 2,

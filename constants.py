@@ -159,6 +159,9 @@ DEFAULTS = {
     "step_dovetail_angle":    "60",    # angle between the flank and the bottom face (deg)
     "step_undercut_z_increment": "1.0",  # Undercut depth spacing between levels (mm)
     "step_undercut_open": "Cut",         # key of UNDERCUT_OPEN_MODES
+    # Depth band of Raster Scan, Contour and Undercut steps (% of max depth)
+    "step_z_min_pct": "0",     # cut only below this; material above counts as removed
+    "step_z_max_pct": "100",   # never cut below this
     # Path-ordering
     "step_tsp_2opt":              "0",   # 0 = greedy only, 1 = apply 2-opt post-pass
     "step_avoid_air":             "0",   # 1 = drop toolpath runs that would cut only air
