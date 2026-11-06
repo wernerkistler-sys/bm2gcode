@@ -16,7 +16,10 @@ import numpy as np
 from scipy.ndimage import affine_transform
 
 
-@dataclass
+# eq=False: a source is identified by the object itself (self.layers.index/
+# remove), never by its field values -- two sources loaded from the same file
+# are distinct, and comparing their numpy arrays field-wise would raise.
+@dataclass(eq=False)
 class Layer:
     name: str
     raw: np.ndarray                 # float32 [0, 1], native resolution — same
