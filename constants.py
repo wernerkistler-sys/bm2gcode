@@ -59,6 +59,17 @@ LAYER_MIRRORS     = ["None", "Vertical axis", "Horizontal axis",
                      "Diagonal (+45°)", "Diagonal (−45°)"]
 BLEND_MODES       = ["Replace", "Merge high", "Merge low", "Add", "Subtract"]
 
+# Process Region modes (Raster Scan, V-Carving). GATING_DEPTH_MAP_CHANGE is
+# offered only where the step's depth map differs from the prior step's (see
+# app.py's _gating_mode_values).
+GATING_DEPTH_MAP_CHANGE = "Depth map change"
+GATING_MODES      = ["Full depth map",
+                     GATING_DEPTH_MAP_CHANGE,
+                     "Residual from prior step",
+                     "Inaccessible by prior tool",
+                     "Reachable residual",
+                     "Reachable inaccessible"]
+
 DEFAULT_PREAMBLE = (
     "G21         ; units = mm\n"
     "G90         ; absolute positioning\n"

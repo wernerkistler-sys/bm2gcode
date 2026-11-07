@@ -286,14 +286,15 @@ The **Process Region** selector is the adaptive gating mechanism. It defines whi
 | Mode | What it processes |
 |---|---|
 | Full depth map | The entire depth map — no reference to prior steps. |
-| Residual from prior step | Only regions where material remains that the depth map says should have been removed — areas where the prior step fell short of the target depth. |
+| Depth map change | Only regions where this step's depth map (its own source visibility) is deeper than the prior step's depth map (the prior step's source visibility) — e.g. a source hidden in the prior step and visible in this one. What the prior step actually cut plays no part, so the prior step needn't be computed; where this step's depth map is shallower, nothing is processed. Offered only where the two depth maps differ (and on a step already set to it); on the first step it processes the full depth map. |
+| Residual from prior step | Only regions where material remains that this step's depth map (built from this step's own source visibility) says should have been removed — areas where the prior step's result falls short of this step's target depth. A source hidden in the prior step but visible in this one counts entirely as residual; where the prior step cut deeper than this step's depth map (e.g. for a source hidden here), the residual is zero. |
 | Inaccessible by prior tool | Only material that the prior tool's geometry could not remove (too narrow, wrong shape), regardless of the depth achieved. |
 | Reachable residual | Intersection of "this tool can reach here" AND "the prior step left residual here." |
 | Reachable inaccessible | Intersection of "this tool can reach here" AND "the prior tool could not reach here." |
 
 Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
 
-**Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth) exceeds this value, skipping areas that deviate from the reference by less than this amount.
+**Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth, or depth map difference) exceeds this value, skipping areas that deviate from the reference by less than this amount.
 
 **Z range** (Raster Scan only) — shown below Z-threshold, since it too limits which part of the depth map the step cuts; see [Raster Scan](#step--operation--raster-scan).
 
@@ -576,7 +577,7 @@ The erosion and dilation (`grey_morphology.py`) give the same results as `scipy.
 
 **Accessibility caching.** The grey-erosion/grey-dilation pair above is the most expensive part of computing a step, and it depends only on the tool geometry (including a Custom profile's curve), Max cut depth, and the work area's physical dimensions — not on step-down, threshold, gating mode, or any other per-step parameter. bm2gcode keeps a cache of these accessibility maps keyed by that combination, so recomputing a step after tweaking an unrelated parameter, or computing a later step with the same tool, reuses the previously computed result instead of rerunning the erosion/dilation. The cache is cleared whenever a source, the canvas, or the project changes.
 
-**Result map.** After each step is computed, a float32 *result map* records how deep the material has been cut at every pixel. This is passed to the next step as the prior reference, enabling the Residual and Reachable gating modes.
+**Result map.** After each step is computed, a float32 *result map* records how deep the material has been cut at every pixel. This is passed to the next step as the prior reference, enabling the Residual and Reachable gating modes: the residual is the next step's own depth map minus this result map, clipped at zero, so the prior step's depth map plays no part.
 
 ---
 

@@ -1738,6 +1738,34 @@ check("Contour (adaptive, Max step-down): every cut lies in the band",
 check("_fill_level_gaps starts from start",
       _fill_level_gaps([0.9], 0.2, 1.0, start=0.5) == [0.7, 0.9])
 
+
+print("Depth map change gating (prior step's depth map as prior_reference)")
+
+# Two plateaus; the prior step's depth map has only the left one, so gating
+# against it cuts only the right one, and gating against an identical depth
+# map cuts nothing.
+_dmc = np.zeros((60, 60), dtype=np.float32)
+_dmc[10:50, 5:20] = 0.5
+_dmc[10:50, 40:55] = 0.5
+_dmc_prior = _dmc.copy()
+_dmc_prior[:, 30:] = 0.0
+
+
+def _dmc_raster(prior_reference):
+    return compute_raster_toolpath(
+        _dmc, n_grey_levels=256, tool=Tool(profile="End Mill", diameter_mm=2.0),
+        step_mm=1.0, stepdown_mm=5.0, max_depth=5.0, width_mm=60.0, height_mm=60.0,
+        raster_dir="Horizontal", work_surface_tol=0.01,
+        prior_reference=prior_reference, progress=_noop_progress)
+
+
+_dmc_tp = _dmc_raster(_dmc_prior)
+_dmc_x = (np.concatenate([np.asarray(s)[:, 0] for s in _dmc_tp.segments])
+          if _dmc_tp.segments else np.zeros(0))
+check("changed plateau is cut", _dmc_x.size > 0)
+check("unchanged plateau is not cut", _dmc_x.size > 0 and float(_dmc_x.min()) >= 38.0)
+check("identical depth maps cut nothing", len(_dmc_raster(_dmc).segments) == 0)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

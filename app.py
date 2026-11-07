@@ -42,6 +42,7 @@ from constants import (
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     STEP_PEAK_BYTES_PER_PX, STEP_PEAK_BYTES_PER_PX_DEFAULT,
     DEFAULT_PREAMBLE, DEFAULT_POSTAMBLE, BLEND_MODES,
+    GATING_MODES, GATING_DEPTH_MAP_CHANGE,
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_ACCESSIBLE, DISPLAY_STEP_UNACCESSIBLE,
     DISPLAY_PROC_MASK,
@@ -1405,12 +1406,10 @@ class GCodeGeneratorApp:
         gating_var = tk.StringVar(value=DEFAULTS["step_gating_mode"])
         step['gating_mode_var'] = gating_var
         gating_cb = ttk.Combobox(region_row, textvariable=gating_var,
-                                 values=["Full depth map",
-                                         "Residual from prior step",
-                                         "Inaccessible by prior tool",
-                                         "Reachable residual",
-                                         "Reachable inaccessible"],
+                                 values=self._gating_mode_values(step),
                                  state="readonly", width=22)
+        gating_cb.configure(postcommand=lambda: gating_cb.configure(
+            values=self._gating_mode_values(step)))
         gating_cb.pack(side=tk.RIGHT)
         step['gating_cb'] = gating_cb
 
@@ -3993,14 +3992,17 @@ class GCodeGeneratorApp:
 
         return params
 
-    def _compute_step_work(self, step, params, progress_fn, prev_tp, depth_map, n_grey_levels):
+    def _compute_step_work(self, step, params, progress_fn, prev_tp, depth_map, n_grey_levels,
+                           prior_depth_map=None):
         """Synchronous algorithm computation — call from a background thread.
 
         depth_map/n_grey_levels are precomputed on the main thread (see
         _get_depth_map_for_step) rather than read here, both because this
         runs off the main thread and because each step must be computed
         against its OWN source_visibility, not whichever step tab happens
-        to be selected.
+        to be selected. prior_depth_map is the prior step's depth map,
+        precomputed the same way, for the "Depth map change" Process Region
+        (None for the first step).
 
         Returns a toolpath result. Raises ProgressDialog.Cancelled or any
         algorithm exception on failure.
@@ -4018,7 +4020,10 @@ class GCodeGeneratorApp:
 
         if ALGORITHM_FAMILY[algorithm] == "V-Carving":
             gating_mode = params['gating_mode']
-            if gating_mode == "Residual from prior step":
+            if gating_mode == GATING_DEPTH_MAP_CHANGE:
+                prior_reference       = prior_depth_map
+                subtract_unaccessible = False
+            elif gating_mode == "Residual from prior step":
                 prior_reference       = prev_tp.result    if prev_tp is not None else None
                 subtract_unaccessible = False
             elif gating_mode == "Inaccessible by prior tool":
@@ -4252,7 +4257,10 @@ class GCodeGeneratorApp:
             )
         else:  # Raster
             gating_mode = params['gating_mode']
-            if gating_mode == "Residual from prior step":
+            if gating_mode == GATING_DEPTH_MAP_CHANGE:
+                prior_reference       = prior_depth_map
+                subtract_unaccessible = False
+            elif gating_mode == "Residual from prior step":
                 prior_reference       = prev_tp.result    if prev_tp is not None else None
                 subtract_unaccessible = False
             elif gating_mode == "Inaccessible by prior tool":
@@ -4428,7 +4436,8 @@ class GCodeGeneratorApp:
                   # so there is nothing to warn about here.
         else:
             gating_mode = params['gating_mode']
-            if gating_mode != "Full depth map" and idx > 0 and prev_tp is None:
+            if (gating_mode not in ("Full depth map", GATING_DEPTH_MAP_CHANGE)
+                    and idx > 0 and prev_tp is None):
                 surf_name = ("accessible surface"
                              if gating_mode in ("Inaccessible by prior tool",
                                                 "Reachable inaccessible")
@@ -4440,13 +4449,20 @@ class GCodeGeneratorApp:
                         f"full depth map.\n\nContinue anyway?"):
                     return
 
+        # The prior step's depth map needs no computed prior step; it is
+        # built here because _get_depth_map_for_step reads Tk variables.
+        prior_depth_map = None
+        if params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE and idx > 0:
+            prior_depth_map, _ = self._get_depth_map_for_step(self.steps[idx - 1])
+
         dlg = ProgressDialog(self.root,
                              title=f"Computing Step {idx + 1} Tool Path")
 
         def _worker():
             try:
                 result = self._compute_step_work(
-                    step, params, dlg.report, prev_tp, depth_map, n_grey_levels)
+                    step, params, dlg.report, prev_tp, depth_map, n_grey_levels,
+                    prior_depth_map)
             except ProgressDialog.Cancelled:
                 self.root.after(0, lambda: dlg.close("Cancelled."))
                 return
@@ -4513,10 +4529,12 @@ class GCodeGeneratorApp:
                     zip(self.steps, all_params, all_depth_maps)):
                 idx     = params['idx']
                 prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
+                prior_depth_map = all_depth_maps[idx - 1][0] if idx > 0 else None
                 try:
                     dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
                     result = self._compute_step_work(
-                        step, params, step_progress(i), prev_tp, depth_map, n_grey_levels)
+                        step, params, step_progress(i), prev_tp, depth_map, n_grey_levels,
+                        prior_depth_map)
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
@@ -5076,6 +5094,34 @@ class GCodeGeneratorApp:
             composite_raw = np.zeros((H, W), dtype=np.float32)
         return self._finish_depth_map(composite_raw, n_grey_levels)
 
+    def _prior_step(self, step):
+        """The step before *step*, or None for the first (or an unlisted) step."""
+        idx = next((i for i, s in enumerate(self.steps) if s is step), None)
+        return self.steps[idx - 1] if idx else None
+
+    def _depth_map_differs_from_prior(self, step):
+        """Whether *step*'s depth map differs from the prior step's. Equal
+        source visibility means equal depth maps, so both are composited
+        only when the visibility differs. Call from the main thread."""
+        prior = self._prior_step(step)
+        if prior is None:
+            return False
+        if list(step.get('source_visibility') or []) == list(prior.get('source_visibility') or []):
+            return False
+        return not np.array_equal(self._get_depth_map_for_step(step)[0],
+                                  self._get_depth_map_for_step(prior)[0])
+
+    def _gating_mode_values(self, step):
+        """Process Region choices for *step*: GATING_MODES, with "Depth map
+        change" only where the step's depth map differs from the prior
+        step's -- or where the step already uses it, so the setting is never
+        changed behind the user's back."""
+        var = step.get('gating_mode_var')
+        if ((var is not None and var.get() == GATING_DEPTH_MAP_CHANGE)
+                or self._depth_map_differs_from_prior(step)):
+            return list(GATING_MODES)
+        return [m for m in GATING_MODES if m != GATING_DEPTH_MAP_CHANGE]
+
     def _sync_auto_target_depth(self, step):
         """If *step* is a Pocket-family step whose Target depth Auto
         checkbox is checked, refresh the displayed value from that step's
@@ -5459,7 +5505,14 @@ class GCodeGeneratorApp:
                     gating_mode = self.steps[step_idx]['gating_mode_var'].get()
 
                 prior_idx = step_idx - 1
-                if gating_mode == "Inaccessible by prior tool":
+                if gating_mode == GATING_DEPTH_MAP_CHANGE:
+                    if 0 <= prior_idx < len(self.steps):
+                        prior_depth_map, _ = self._get_depth_map_for_step(
+                            self.steps[prior_idx])
+                        ref = np.clip(depth_map - prior_depth_map, 0.0, 1.0)
+                    else:
+                        ref = depth_map.copy()
+                elif gating_mode == "Inaccessible by prior tool":
                     ref = unaccessible  # depth_map − accessible, computed above
                 elif gating_mode == "Residual from prior step":
                     prior_result = (
