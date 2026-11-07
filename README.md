@@ -73,6 +73,7 @@ Each source — an opened image or imported STL — gets its own tab in the note
 
 | Parameter | Description |
 |---|---|
+| File | The source's file name (hover for the full path). Clicking it opens a file dialog that loads a different image or STL file into this source, keeping every other setting on its tab, its stack position, its per-step visibility and the canvas size; the tab takes the new file's name and computed toolpaths are reset. Replacing with an STL shows the [Import STL](#import-stl) orientation dialog without the Physical Size section, preset to the source's current rotation, and rasterizes the mesh at the source's current Scale. |
 | Offset X / Offset Y | Position relative to the canvas center, in mm. +X is right, +Y is up. |
 | Rotation | Counter-clockwise rotation, in degrees. |
 | Scale | Size as a percentage of the canvas's own physical size, aspect-preserving: at 100%, the source is inscribed in the canvas rectangle along whichever of its own axes binds ("contain"), independent of the source's native resolution or the canvas's pixel density. An STL source's default Scale reproduces the mesh's true physical size (see [Import STL](#import-stl)). |

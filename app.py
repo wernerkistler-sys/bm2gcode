@@ -844,6 +844,28 @@ class GCodeGeneratorApp:
         layer = entry['layer']
         is_base = self.layers.index(layer) == 0
 
+        # The source's file, shown in a read-only combobox styled like the
+        # Mirror/Blend rows below; clicking it (or Return/space/Down while it
+        # has focus) opens a file dialog instead of a dropdown, to load a
+        # different file into this source while keeping every setting below.
+        file_row = ttk.Frame(tab)
+        file_row.pack(fill=tk.X, pady=2)
+        ttk.Label(file_row, text="File").pack(side=tk.LEFT)
+        file_cb = ttk.Combobox(file_row, values=(), state="readonly", width=22,
+                               cursor="hand2")
+        file_cb.set(os.path.basename(layer.path) if layer.path else "(no file)")
+        file_cb.pack(side=tk.RIGHT)
+
+        def _open_replace(_event=None):
+            self._replace_layer_source(entry)
+            return "break"   # suppress the (empty) dropdown list
+        for seq in ("<Button-1>", "<Return>", "<space>", "<Down>"):
+            file_cb.bind(seq, _open_replace)
+        if layer.path:
+            file_cb.bind("<Enter>", lambda _e: self.status_var.set(
+                f"{layer.path}  —  click to replace this source's file"))
+            file_cb.bind("<Leave>", lambda _e: self.status_var.set(""))
+
         ox = LabeledEntry(tab, "Offset X", "mm", str(layer.offset_x_mm),
                           minval=-100000.0, maxval=100000.0, increment=1.0)
         ox.pack(fill=tk.X, pady=2)
@@ -935,9 +957,9 @@ class GCodeGeneratorApp:
             layer.mirror     = mirror_var.get()
             self._on_layer_property_changed()
 
-        for entry in (ox, oy, rot, scale, opacity,
-                      depth_range.lo_entry, depth_range.hi_entry):
-            entry.committed_var.trace_add("write", _apply)
+        for w in (ox, oy, rot, scale, opacity,
+                  depth_range.lo_entry, depth_range.hi_entry):
+            w.committed_var.trace_add("write", _apply)
         blend_var.trace_add("write", _apply)
         mirror_var.trace_add("write", _apply)
 
@@ -2421,6 +2443,73 @@ class GCodeGeneratorApp:
             self._add_stl_source(path, insert_at)
         else:
             self._add_image_source(path, insert_at)
+
+    def _replace_layer_source(self, entry):
+        """Source tab's 'Replace…' button: loads a different image or STL
+        file into this source, keeping its placement, blend, depth range,
+        stack position, per-step visibility and the canvas size. An STL is
+        oriented via the Import STL dialog (preset to the source's current
+        rotation) and rasterized at the source's current Scale."""
+        layer = entry['layer']
+        initialdir = os.path.dirname(layer.path) if layer.path else None
+        path = filedialog.askopenfilename(title="Replace Source",
+                                          filetypes=self._SOURCE_FILETYPES,
+                                          initialdir=initialdir)
+        if not path:
+            return
+        if path.lower().endswith(".stl"):
+            try:
+                triangles = stl_mesh.load_stl(path)
+            except Exception as exc:
+                messagebox.showerror("Load Error", str(exc))
+                return
+            xy_bounds = stl_mesh.mesh_xy_bounds(triangles)
+            z_bounds  = stl_mesh.mesh_z_bounds(triangles)
+            sp = layer.stl_params if layer.source_kind == "stl" and layer.stl_params else {}
+            rotation = (sp.get('rot_x', 0), sp.get('rot_y', 0), sp.get('rot_z', 0))
+            dlg = ImportSTLDialog(self.root, triangles, xy_bounds, z_bounds,
+                                  is_base=False, rotation=rotation)
+            if not dlg.confirmed:
+                return
+            mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
+                xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+            try:
+                width_mm  = float(self.width_mm.get())
+                height_mm = float(self.height_mm.get())
+            except ValueError:
+                width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+            width_px, height_px = self._stl_raster_px(
+                mesh_w_mm, mesh_h_mm, width_mm, height_mm, layer.scale_pct)
+            try:
+                rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
+                hm      = stl_mesh.generate_heightmap(rotated, width_px, height_px)
+                raw, alpha = stl_mesh.normalize_and_orient(
+                    hm, stl_mesh.mesh_z_bounds(rotated))
+            except Exception as exc:
+                messagebox.showerror("Import Error", str(exc))
+                return
+            layer.source_kind = "stl"
+            layer.stl_params = {'width_px': width_px, 'height_px': height_px,
+                                'mesh_w_mm': mesh_w_mm, 'mesh_h_mm': mesh_h_mm,
+                                'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y,
+                                'rot_z': dlg.rot_z}
+        else:
+            loaded = self._load_image_layer(path)
+            if loaded is None:
+                return
+            raw, alpha = loaded.raw, loaded.alpha
+            layer.source_kind = "image"
+            layer.stl_params = None
+        layer.raw, layer.alpha = raw, alpha
+        layer.path = path
+        layer.name = os.path.basename(path)
+        # Derived from the previous file's mesh; rebuilt on demand.
+        layer.placed = None
+        layer.dexels = None
+        layer.dexels_key = None
+        self._on_layers_structure_changed()
+        self._select_layer_tab(layer)
+        self.status_var.set(f"Replaced source: {os.path.basename(path)}")
 
     def _add_image_source(self, path, insert_at):
         if not self.layers:

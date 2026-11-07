@@ -2682,7 +2682,8 @@ class ImportSTLDialog(tk.Toplevel):
 
     _ROT_VALUES = ["0", "90", "180", "270"]
 
-    def __init__(self, parent, triangles, xy_bounds, z_bounds, is_base=True):
+    def __init__(self, parent, triangles, xy_bounds, z_bounds, is_base=True,
+                 rotation=(0, 0, 0)):
         super().__init__(parent)
         self.title("Import STL")
         self.resizable(False, False)
@@ -2702,9 +2703,10 @@ class ImportSTLDialog(tk.Toplevel):
         rot_sf = SectionFrame(outer, "Orientation")
         rot_sf.pack(fill=tk.X, pady=(0, 8))
 
-        self.rot_x_var = tk.StringVar(value="0")
-        self.rot_y_var = tk.StringVar(value="0")
-        self.rot_z_var = tk.StringVar(value="0")
+        # *rotation* presets the dropdowns (X, Y, Z quarter turns in degrees).
+        self.rot_x_var = tk.StringVar(value=str(int(rotation[0]) % 360))
+        self.rot_y_var = tk.StringVar(value=str(int(rotation[1]) % 360))
+        self.rot_z_var = tk.StringVar(value=str(int(rotation[2]) % 360))
         for label, var in (("Rotate around X axis", self.rot_x_var),
                            ("Rotate around Y axis", self.rot_y_var),
                            ("Rotate around Z axis", self.rot_z_var)):
