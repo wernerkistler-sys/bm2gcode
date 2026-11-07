@@ -39,7 +39,7 @@ python bm2gcode.py
 6. Use the **View** menu (hotkeys 0–8) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 7. **File → Export Toolpath…** — save a `.nc` G-code file for your CNC machine.
 
-Save your work at any time with **File → Save Project…** (Ctrl+S); reload it later with **File → Open Project…** (Ctrl+Shift+O). Project files store the canvas, every source's placement, all step configuration, and a path back to each source's original image or STL file (re-rasterized with the same settings on reload).
+Save your work at any time with **File → Save Project** (Ctrl+S), which writes to the project's own file (asking for a file name only while the project is still untitled), or under a new name with **File → Save Project As…** (Ctrl+Shift+S); reload it later with **File → Open Project…** (Ctrl+Shift+O). The window title shows the project file's name, prefixed with `*` while there are unsaved changes. Project files store the canvas, every source's placement, all step configuration, and a path back to each source's original image or STL file (re-rasterized with the same settings on reload).
 
 ---
 
@@ -412,7 +412,8 @@ Being a Z-only change, a tab doesn't alter the toolpath's outline, so it's other
 |---|---|---|
 | New Project | Ctrl+N | Discard the current canvas, sources, steps, and parameters and restart from default values. |
 | Open Project… | Ctrl+Shift+O | Reload a previously saved `.prj` file, restoring the canvas, every source's placement, and all step configuration. |
-| Save Project… | Ctrl+S | Save the current canvas, sources, and step configuration to a `.prj` file. |
+| Save Project | Ctrl+S | Save the current canvas, sources, and step configuration to the project's `.prj` file; for an untitled project, asks for a file name as Save Project As… does. |
+| Save Project As… | Ctrl+Shift+S | Save the project to a new `.prj` file, which becomes the project's file for later saves. |
 | Open Source… | Ctrl+O | Load a grayscale image or import an STL mesh as the canvas's base source, replacing the whole project (see below). |
 | Export Toolpath… | — | Export G-code for selected computed steps to a `.nc` file. |
 | Settings… | — | Configure machine parameters (see below). |
@@ -433,7 +434,7 @@ The rasterization resolution itself isn't chosen in this dialog — it follows a
 
 Adding an STL as an additional source (via a source tab's or the Canvas tab's **Add Source** button, rather than as the very first/base source) shows the same dialog without the Physical Size section, since a non-base source must never resize the canvas.
 
-**File → Save Project…** after an STL import stores the STL file's path together with its chosen rotation, instead of a bitmap reference. Reopening the project re-parses the STL and re-rasterizes the depth map with the same settings, so the result is reproduced exactly. If a source's file has since been moved or deleted, the project still loads with every other source and setting intact, and a warning explains that it must be re-added manually via **Open Source…** or a source tab's **Add Source** button.
+**File → Save Project** after an STL import stores the STL file's path together with its chosen rotation, instead of a bitmap reference. Reopening the project re-parses the STL and re-rasterizes the depth map with the same settings, so the result is reproduced exactly. If a source's file has since been moved or deleted, the project still loads with every other source and setting intact, and a warning explains that it must be re-added manually via **Open Source…** or a source tab's **Add Source** button.
 
 **Settings dialog:**
 

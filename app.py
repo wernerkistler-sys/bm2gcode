@@ -121,7 +121,10 @@ class GCodeGeneratorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("CNC Relief Carving — Parameter Setup")
+        # Path of the .prj file the project was opened from or last saved
+        # to; None for an untitled project.
+        self._project_path = None
+        self._title_shown = None
         self.root.geometry("1240x780")
         self.root.minsize(940, 560)
 
@@ -177,6 +180,8 @@ class GCodeGeneratorApp:
         # Baseline snapshot of the default, "empty" project — lets us detect
         # changes even if the user never opens or saves a project file.
         self._saved_snapshot = self._snapshot_key()
+        self._update_title()
+        self._poll_title()
         self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
         if library_warning:
             self.root.after(200, lambda: messagebox.showwarning(
@@ -205,8 +210,10 @@ class GCodeGeneratorApp:
                               command=self._new_project)
         file_menu.add_command(label="Open Project…", accelerator="Ctrl+Shift+O",
                               command=self._load_project)
-        file_menu.add_command(label="Save Project…", accelerator="Ctrl+S",
+        file_menu.add_command(label="Save Project",  accelerator="Ctrl+S",
                               command=self._save_project)
+        file_menu.add_command(label="Save Project As…", accelerator="Ctrl+Shift+S",
+                              command=self._save_project_as)
         file_menu.add_separator()
         # ── Source ──────────────────────────────────────────────────
         file_menu.add_command(label="Open Source…",  accelerator="Ctrl+O",
@@ -304,6 +311,7 @@ class GCodeGeneratorApp:
         self.root.bind("<Control-n>", lambda e: self._new_project())
         self.root.bind("<Control-o>", lambda e: self._open_source_file())
         self.root.bind("<Control-s>", lambda e: self._save_project())
+        self.root.bind("<Control-S>", lambda e: self._save_project_as())
         self.root.bind("<Control-O>", lambda e: self._load_project())
         self.root.bind("<Control-q>", lambda e: self._on_exit())
         self.root.bind("<Control-t>", lambda e: self._open_tool_library())
@@ -3357,6 +3365,28 @@ class GCodeGeneratorApp:
     def _is_dirty(self):
         return self._snapshot_key() != self._saved_snapshot
 
+    _APP_TITLE = "CNC Relief Carving"
+
+    def _update_title(self):
+        """Show the project file's name in the window title, prefixed with
+        '*' while the project has unsaved changes."""
+        name = (os.path.basename(self._project_path) if self._project_path
+                else "Untitled")
+        title = f"{'*' if self._is_dirty() else ''}{name} — {self._APP_TITLE}"
+        if title != self._title_shown:
+            self._title_shown = title
+            self.root.title(title)
+
+    def _poll_title(self):
+        """Keep the title's unsaved-changes marker current; edits reach the
+        project state through many widgets, so it is re-checked once a
+        second rather than traced per field."""
+        try:
+            self._update_title()
+        except tk.TclError:
+            return
+        self.root.after(1000, self._poll_title)
+
     def _confirm_discard(self, verb):
         """If there are unsaved changes, ask the user how to proceed.
 
@@ -3430,16 +3460,38 @@ class GCodeGeneratorApp:
         self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
         self.status_var.set("New project")
+        self._project_path = None
         self._saved_snapshot = self._snapshot_key()
+        self._update_title()
 
     def _save_project(self):
+        """File -> Save Project: write to the project's own file, or ask for
+        one (as Save Project As) when the project is untitled. Returns True
+        if the project was saved."""
+        if self._project_path is None:
+            return self._save_project_as()
+        return self._write_project(self._project_path)
+
+    def _save_project_as(self):
+        """File -> Save Project As: ask for a file, write the project to it,
+        and make it the project's own file. Returns True if saved."""
+        if self._project_path:
+            initialdir  = os.path.dirname(self._project_path)
+            initialfile = os.path.basename(self._project_path)
+        else:
+            initialdir, initialfile = None, "Untitled.prj"
         path = filedialog.asksaveasfilename(
-            title="Save Project",
+            title="Save Project As",
             defaultextension=".prj",
+            initialdir=initialdir,
+            initialfile=initialfile,
             filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
         )
         if not path:
             return False
+        return self._write_project(path)
+
+    def _write_project(self, path):
         snapshot = self._project_snapshot()
         layers_out = []
         for layer, d in zip(self.layers, snapshot['layers']):
@@ -3458,15 +3510,20 @@ class GCodeGeneratorApp:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(project, f, indent=2)
             self.status_var.set(f"Project saved: {path}")
+            self._project_path = path
             self._saved_snapshot = json.dumps(snapshot, sort_keys=True)
+            self._update_title()
             return True
         except Exception as exc:
             messagebox.showerror("Save Error", f"Could not save project:\n{exc}")
             return False
 
     def _load_project(self):
+        initialdir = (os.path.dirname(self._project_path)
+                      if self._project_path else None)
         path = filedialog.askopenfilename(
             title="Open Project",
+            initialdir=initialdir,
             filetypes=[("BM2GCODE project", "*.prj"), ("All files", "*.*")],
         )
         if not path:
@@ -3485,6 +3542,7 @@ class GCodeGeneratorApp:
 
         if not self._confirm_discard("opening another project"):
             return
+        self._project_path = path
 
         # ── Global image-size parameters ──────────────────────────────
         g = project.get('global', {})
@@ -3627,6 +3685,7 @@ class GCodeGeneratorApp:
             else:
                 self.status_var.set(f"Project loaded: {path}")
             self._saved_snapshot = self._snapshot_key()
+            self._update_title()
             return
 
         # ── Legacy single image/STL (version 1) ──────────────────────────
@@ -3654,6 +3713,7 @@ class GCodeGeneratorApp:
                     self.status_var.set(
                         f"Project loaded: {path}  |  Image: {resolved_image_path}")
                     self._saved_snapshot = self._snapshot_key()
+                    self._update_title()
                     return
                 except Exception as exc:
                     messagebox.showwarning(
@@ -3698,6 +3758,7 @@ class GCodeGeneratorApp:
                     self.status_var.set(
                         f"Project loaded: {path}  |  STL: {resolved_stl_path}")
                     self._saved_snapshot = self._snapshot_key()
+                    self._update_title()
                     return
                 except Exception as exc:
                     messagebox.showwarning(
@@ -3712,6 +3773,7 @@ class GCodeGeneratorApp:
 
         self.status_var.set(f"Project loaded: {path}")
         self._saved_snapshot = self._snapshot_key()
+        self._update_title()
 
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
