@@ -379,6 +379,62 @@ check("empty gaps give empty masks",
       not any(m.any() for m in overhang_masks(Gaps.empty((3, 3)))))
 
 
+# --------------------------------------------------------------------------
+# STL placement by the mesh's mm extent
+# --------------------------------------------------------------------------
+print("STL placement by mesh extent")
+
+from layers import place_stl_layer, placement_key, raw_fills_canvas, native_aspect
+
+
+def box_mesh(w, h, d):
+    v = np.array([[0, 0, 0], [w, 0, 0], [w, h, 0], [0, h, 0],
+                  [0, 0, d], [w, 0, d], [w, h, d], [0, h, d]], float)
+    f = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+         (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    return np.array([[v[a], v[b], v[c]] for a, b, c in f], np.float32)
+
+
+def stl_layer(raw_shape, mesh_w, mesh_h, **kw):
+    hl, wl = raw_shape
+    return make_layer(np.zeros(raw_shape, np.float32), source_kind='stl', path='box.stl',
+                      stl_params={'width_px': wl, 'height_px': hl,
+                                  'mesh_w_mm': mesh_w, 'mesh_h_mm': mesh_h}, **kw)
+
+
+# A 100 x 3.3 mm box on a 100 x 50 mm canvas at 10 px/mm: its preview
+# raster's rounded pixel count (33, 7, 6 or 2 rows) must not change where
+# the mesh lands on the canvas grid.
+thin = box_mesh(100.0, 3.3, 2.0)
+footprints = []
+for raw_shape in [(33, 1000), (7, 200), (6, 200), (2, 50)]:
+    pr = place_stl_layer(stl_layer(raw_shape, 100.0, 3.3), thin, (500, 1000), 10.0, 10.0)
+    cov = pr.alpha if pr.alpha is not None else np.ones((500, 1000))
+    footprints.append(cov.astype(bool))
+check("placed STL raster is independent of the preview raster's pixel count",
+      all(np.array_equal(footprints[0], fp) for fp in footprints[1:]))
+check("placed STL raster spans the mesh's width and height",
+      footprints[0].any(0).sum() == 1000 and abs(footprints[0].any(1).sum() - 33) <= 1)
+
+lk = stl_layer((7, 200), 100.0, 3.3)
+key_a = placement_key(lk, (500, 1000), 10.0, 10.0, "Bottom-Left")
+lk.raw = np.zeros((33, 1000), np.float32)
+lk.stl_params = dict(lk.stl_params, width_px=1000, height_px=33)
+check("placement key ignores the preview raster's size",
+      key_a == placement_key(lk, (500, 1000), 10.0, 10.0, "Bottom-Left"))
+check("native aspect of an STL layer is the mesh's", abs(native_aspect(lk) - 100.0 / 3.3) < 1e-12)
+
+check("an image at the canvas's shape fills it 1:1",
+      raw_fills_canvas(make_layer(np.zeros((40, 60), np.float32)), (40, 60)))
+check("an STL raster whose mesh proportions differ from the grid's does not",
+      not raw_fills_canvas(stl_layer((40, 60), 60.0, 40.5), (40, 60)))
+check("an STL raster with the grid's proportions does",
+      raw_fills_canvas(stl_layer((40, 60), 60.0, 40.0), (40, 60)))
+check("a scaled source does not fill the canvas 1:1",
+      not raw_fills_canvas(make_layer(np.zeros((40, 60), np.float32), scale_pct=90.0),
+                           (40, 60)))
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

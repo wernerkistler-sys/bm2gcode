@@ -152,7 +152,7 @@ class GCodeGeneratorApp:
         self._last_width_mm  = float(DEFAULTS["width_mm"])          # see _on_canvas_size_changed
         self._last_height_mm = float(DEFAULTS["height_mm"])
         self._last_min_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _on_min_px_per_mm_changed
-        self._last_effective_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _auto_px_per_mm
+        self._stl_placement_pending = None   # after_idle id, see _schedule_stl_placement
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
         # tool_signature -> (center_depth_contour, accessible), bounded by
@@ -243,10 +243,6 @@ class GCodeGeneratorApp:
             label="Compute All Steps",
             accelerator="F6",
             command=self._compute_all_steps)
-        compute_menu.add_separator()
-        compute_menu.add_command(
-            label="Recompute Canvas Resolution",
-            command=self._recompute_auto_resolution)
         menubar.add_cascade(label="Compute", menu=compute_menu)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
@@ -593,7 +589,7 @@ class GCodeGeneratorApp:
             W_l / H_l, width_mm, height_mm, layer.scale_pct)
         return W_l / max(footprint_w_mm, 1e-9)
 
-    def _auto_px_per_mm(self, width_mm, height_mm):
+    def _auto_px_per_mm(self, width_mm, height_mm, layers=None):
         """Canvas pixel density (px/mm), auto-chosen between the Min.
         px/mm floor and the Max Megapixels ceiling: with no bitmap source
         present the floor is used as-is; otherwise the finest bitmap's own
@@ -603,7 +599,7 @@ class GCodeGeneratorApp:
         only arise from editing Width/Height/Min. px/mm/Max Megapixels,
         each of which gates the change through _confirm_canvas_shape before
         committing, so by the time this runs it's already something the
-        user explicitly chose to allow."""
+        user explicitly chose to allow. *layers* defaults to self.layers."""
         try:
             floor_density = float(self.min_px_per_mm.get())
         except ValueError:
@@ -611,7 +607,8 @@ class GCodeGeneratorApp:
         if floor_density <= 1e-9:
             floor_density = float(DEFAULTS["min_px_per_mm"])
 
-        bitmap_layers = [l for l in self.layers if l.source_kind == "image"]
+        bitmap_layers = [l for l in (self.layers if layers is None else layers)
+                         if l.source_kind == "image"]
         if not bitmap_layers:
             candidate = floor_density
         else:
@@ -630,49 +627,38 @@ class GCodeGeneratorApp:
             return max(candidate, floor_density)
         return min(max(candidate, floor_density), cap_density)
 
-    def _effective_px_per_mm(self):
-        """The canvas density the last recompute settled on -- used by STL
-        rasterization/staleness checks, which need a concrete density to
-        target rather than re-deriving one live."""
-        return self._last_effective_px_per_mm
+    def _canvas_grid(self):
+        """(W, H, density): the canvas pixel shape and its px/mm, derived
+        live from the physical size and the auto-chosen density
+        (_auto_px_per_mm) -- the single source of truth for how big the
+        depth map is."""
+        try:
+            width_mm  = float(self.width_mm.get())
+            height_mm = float(self.height_mm.get())
+        except ValueError:
+            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
+        density = self._auto_px_per_mm(width_mm, height_mm)
+        W = max(2, round(width_mm * density))
+        H = max(2, round(height_mm * density))
+        return W, H, density
 
     def _canvas_shape_px(self):
-        """Canvas pixel shape (W, H), derived from physical size and the
-        auto-chosen density (_auto_px_per_mm) -- the single source of truth
-        for how big the depth map is."""
-        try:
-            width_mm  = float(self.width_mm.get())
-            height_mm = float(self.height_mm.get())
-        except ValueError:
-            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
-        density = self._auto_px_per_mm(width_mm, height_mm)
-        W = max(2, round(width_mm * density))
-        H = max(2, round(height_mm * density))
+        """Canvas pixel shape (W, H), see _canvas_grid."""
+        W, H, _ = self._canvas_grid()
         return W, H
 
-    def _settle_auto_resolution(self):
-        """Re-evaluate _auto_px_per_mm() against current widget/layer
-        state, update the effective-resolution readout and the settled-
-        density cache (_last_effective_px_per_mm, read by
-        _effective_px_per_mm for STL rasterization), and -- only if density
-        actually moved -- offer to re-rasterize any STL source whose detail
-        no longer matches it (rather than waiting for the next Compute).
-        Deliberately does NOT recomposite/re-render on its own: callers that
-        need the canvas to visibly update call _on_canvas_shape_changed
-        instead; callers like _compute_step that are about to recomposite
-        moments later anyway (via _get_depth_map_for_step, which always
-        reads live state) just need the settled density to be fresh first."""
-        try:
-            width_mm  = float(self.width_mm.get())
-            height_mm = float(self.height_mm.get())
-        except ValueError:
-            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
-        density = self._auto_px_per_mm(width_mm, height_mm)
-        W = max(2, round(width_mm * density))
-        H = max(2, round(height_mm * density))
-        self.effective_resolution_var.set(f"{W}x{H} px  ({density:.3g} px/mm)")
-        density_changed = abs(density - self._last_effective_px_per_mm) > 1e-9
-        self._last_effective_px_per_mm = density
+    def _on_canvas_shape_changed(self, *_):
+        """Shared tail once canvas pixel shape and/or every source's
+        placement has already been reconciled with whatever just changed
+        (Width/Height via _on_canvas_size_changed, Min. px/mm/Max
+        Megapixels via their own handlers) -- all of them already gated the
+        change itself on _confirm_canvas_shape, so by the time we get here
+        a huge canvas is something the user explicitly chose to proceed
+        with; the status line still notes it. Then treat this as a
+        structural change like add/remove -- invalidate caches and
+        recomposite every source onto the new grid so the change is
+        visible immediately."""
+        W, H, _ = self._canvas_grid()
         try:
             max_mp = float(self.max_megapixels.get())
         except ValueError:
@@ -681,21 +667,6 @@ class GCodeGeneratorApp:
             self.status_var.set(
                 f"Canvas is {W}x{H} px (~{W * H / 1e6:.0f} MP) -- "
                 "this may be slow.")
-        if density_changed:
-            self._confirm_stale_stl_sources()
-
-    def _on_canvas_shape_changed(self, *_):
-        """Shared tail once canvas pixel shape and/or every source's
-        placement has already been reconciled with whatever just changed
-        (Width/Height via _on_canvas_size_changed, Min. px/mm/Max
-        Megapixels via their own handlers, a new source via import) -- all
-        of them already gated the change itself on _confirm_canvas_shape,
-        so by the time we get here a huge canvas is something the user
-        explicitly chose to proceed with. Settle the auto-resolution, then
-        treat this as a structural change like add/remove -- invalidate
-        caches and recomposite every source onto the new grid so the
-        change is visible immediately."""
-        self._settle_auto_resolution()
         self._on_layers_structure_changed()
 
     def _confirm_canvas_shape(self, width_mm, height_mm, density, max_mp=None):
@@ -801,14 +772,6 @@ class GCodeGeneratorApp:
                                                float(self.height_mm.get()),
                                                floor_density, max_mp=new_max_mp):
                 return
-        self._on_canvas_shape_changed()
-
-    def _recompute_auto_resolution(self):
-        """Compute-menu action: re-evaluate the auto-chosen canvas density
-        now, without waiting for the next explicit trigger. Needed because
-        dragging a source's own Scale-%/Offset deliberately does *not*
-        recompute (avoids recompositing on every slider nudge), so this is
-        the direct way back to an optimal density after such an edit."""
         self._on_canvas_shape_changed()
 
     # ------------------------------------------------------------------ #
@@ -1040,6 +1003,8 @@ class GCodeGeneratorApp:
     def _duplicate_layer_tab(self, entry):
         import copy
         dup = copy.copy(entry['layer'])
+        if dup.stl_params is not None:
+            dup.stl_params = dict(dup.stl_params)
         dup.layer_id = self._new_layer_id()
         dup.name = f"{entry['layer'].name} copy"
         idx = self.layers.index(entry['layer'])
@@ -2164,19 +2129,20 @@ class GCodeGeneratorApp:
                                 source_kind="image", path=path,
                                 layer_id=self._new_layer_id())
 
-    def _stl_raster_px(self, mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct=100.0):
-        """Target (width_px, height_px) for rasterizing an STL source of the
-        given (rotated) mesh bounding-box size, at the canvas's settled
-        density (_effective_px_per_mm) and the source's own canvas-relative
-        Scale-% (see layers._affine_params / _contain_footprint_mm) -- i.e.
-        rasterize at exactly the pixel resolution the mesh will actually be
-        displayed at, so enlarging it doesn't blur detail that could have
-        been baked in to begin with. Bounds-independent so it can be reused
-        both at import time (fresh bounds) and to re-evaluate an already-
-        rasterized source's staleness (stored mesh_w_mm/mesh_h_mm)."""
+    def _stl_raster_px(self, mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct=100.0,
+                       density_layers=None):
+        """Target (width_px, height_px) for an STL source's raster raw, at
+        the canvas density (_auto_px_per_mm over *density_layers*, by
+        default self.layers) and the source's own canvas-relative Scale-%
+        (see layers._affine_params / _contain_footprint_mm). raw is only
+        the source's live preview while its placement is edited: every
+        step is computed against the mesh rasterized on the canvas grid
+        itself (_place_stl_sources), and the mesh is placed by its mm size
+        (layers.native_extent), so raw's pixel count never changes the
+        result."""
         footprint_w_mm, footprint_h_mm = self._contain_footprint_mm(
             mesh_w_mm / mesh_h_mm, width_mm, height_mm, scale_pct)
-        density = self._effective_px_per_mm()
+        density = self._auto_px_per_mm(width_mm, height_mm, density_layers)
         width_px  = max(2, round(footprint_w_mm * density))
         height_px = max(2, round(footprint_h_mm * density))
         return width_px, height_px
@@ -2191,7 +2157,23 @@ class GCodeGeneratorApp:
         mesh_h_mm = max(y_max - y_min, 1e-6)
         return mesh_w_mm, mesh_h_mm
 
-    def _build_stl_layer(self, path, triangles, dlg, xy_bounds, z_bounds):
+    @staticmethod
+    def _rasterize_stl(rotated, width_px, height_px):
+        """(image, alpha): the rotated mesh as a raster of the given size
+        tiling its own XY bounds."""
+        hm = stl_mesh.generate_heightmap(rotated, width_px, height_px)
+        return stl_mesh.normalize_and_orient(hm, stl_mesh.mesh_z_bounds(rotated))
+
+    @staticmethod
+    def _attach_mesh(layer, rotated):
+        """Hold the STL layer's rotated mesh on it (see _rotated_mesh)."""
+        sp = layer.stl_params or {}
+        layer.mesh = rotated
+        layer.mesh_key = (layer.path, sp.get('rot_x', 0), sp.get('rot_y', 0),
+                          sp.get('rot_z', 0))
+
+    def _build_stl_layer(self, path, triangles, dlg, xy_bounds, z_bounds,
+                         density_layers=None):
         """Rasterize *triangles* (already validated/loaded) per *dlg*'s
         orientation and wrap the result as a new (unattached) Layer, or
         show an error dialog and return None on failure. The new layer's
@@ -2199,7 +2181,9 @@ class GCodeGeneratorApp:
         size by default (matching the "populate from mesh bounding box"
         intent) -- computed directly from the mesh's own mm bounding box
         and the canvas's current physical Width/Height, independent of
-        canvas pixel density, so it's correct even before rasterizing."""
+        canvas pixel density, so it's correct even before rasterizing.
+        *density_layers* are the sources the raster's density is chosen
+        for (_stl_raster_px)."""
         mesh_w_mm, mesh_h_mm = self._stl_raster_dims(
             xy_bounds, z_bounds, dlg.rot_x, dlg.rot_y, dlg.rot_z)
         try:
@@ -2212,22 +2196,22 @@ class GCodeGeneratorApp:
         else:
             scale_pct = 100.0 * mesh_h_mm / max(height_mm, 1e-9)
         width_px, height_px = self._stl_raster_px(
-            mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct)
+            mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct, density_layers)
         try:
             rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
-            raw     = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-            image, alpha = stl_mesh.normalize_and_orient(
-                raw, stl_mesh.mesh_z_bounds(rotated))
+            image, alpha = self._rasterize_stl(rotated, width_px, height_px)
         except Exception as exc:
             messagebox.showerror("Import Error", str(exc))
             return None
         stl_params = {'width_px': width_px, 'height_px': height_px,
                       'mesh_w_mm': mesh_w_mm, 'mesh_h_mm': mesh_h_mm,
                       'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y, 'rot_z': dlg.rot_z}
-        return layers_mod.Layer(name=os.path.basename(path), raw=image, alpha=alpha,
-                                source_kind="stl", path=path, stl_params=stl_params,
-                                scale_pct=scale_pct,
-                                layer_id=self._new_layer_id())
+        layer = layers_mod.Layer(name=os.path.basename(path), raw=image, alpha=alpha,
+                                 source_kind="stl", path=path, stl_params=stl_params,
+                                 scale_pct=scale_pct,
+                                 layer_id=self._new_layer_id())
+        self._attach_mesh(layer, rotated)
+        return layer
 
     def _establish_base_image_layer(self, path):
         """Load *path* as a fresh base/canvas-defining source at its native
@@ -2314,14 +2298,18 @@ class GCodeGeneratorApp:
         would actually carve. self.current_image keeps its old role -- the
         single flattened depth map everything downstream of
         _get_depth_map() reads -- it's just a cached compositor output now
-        instead of a direct load."""
+        instead of a direct load. Also refreshes the Effective resolution
+        readout, which therefore always shows the grid the composite was
+        just built on."""
         if not self.layers:
             self.current_image = None
             self.n_grey_levels = 256
+            self.effective_resolution_var.set("—")
             return
 
         base = self.layers[0]
-        W, H = self._canvas_shape_px()
+        W, H, density = self._canvas_grid()
+        self.effective_resolution_var.set(f"{W}x{H} px  ({density:.3g} px/mm)")
         step = self._current_step()
         visibility = step['source_visibility'] if step is not None else None
         base_visible = visibility[0] if visibility else base.visible
@@ -2335,8 +2323,7 @@ class GCodeGeneratorApp:
         if (len(self.layers) == 1 and base_visible and base.opacity_pct >= 100.0
                 and base.blend_mode == "Replace"
                 and base.min_depth_pct == 0.0 and base.max_depth_pct == 100.0
-                and base.is_identity_placement() and base.alpha is None
-                and base.raw.shape == (H, W)):
+                and base.alpha is None and layers_mod.raw_fills_canvas(base, (H, W))):
             self.current_image = base.raw
             self.n_grey_levels = layers_mod.compute_n_grey_levels(self.layers, self.current_image)
             self._sync_auto_target_depth(step)
@@ -2394,6 +2381,7 @@ class GCodeGeneratorApp:
             self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self._refresh_layer_tabs()
         self._render()
+        self._schedule_stl_placement()
 
     def _open_source_file(self):
         """File -> Open Source...: replaces the whole project with just
@@ -2479,12 +2467,11 @@ class GCodeGeneratorApp:
             except ValueError:
                 width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
             width_px, height_px = self._stl_raster_px(
-                mesh_w_mm, mesh_h_mm, width_mm, height_mm, layer.scale_pct)
+                mesh_w_mm, mesh_h_mm, width_mm, height_mm, layer.scale_pct,
+                [l for l in self.layers if l is not layer])
             try:
                 rotated = stl_mesh.apply_rotation(triangles, dlg.rot_x, dlg.rot_y, dlg.rot_z)
-                hm      = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                raw, alpha = stl_mesh.normalize_and_orient(
-                    hm, stl_mesh.mesh_z_bounds(rotated))
+                raw, alpha = self._rasterize_stl(rotated, width_px, height_px)
             except Exception as exc:
                 messagebox.showerror("Import Error", str(exc))
                 return
@@ -2493,6 +2480,7 @@ class GCodeGeneratorApp:
                                 'mesh_w_mm': mesh_w_mm, 'mesh_h_mm': mesh_h_mm,
                                 'rot_x': dlg.rot_x, 'rot_y': dlg.rot_y,
                                 'rot_z': dlg.rot_z}
+            mesh = rotated
         else:
             loaded = self._load_image_layer(path)
             if loaded is None:
@@ -2500,6 +2488,7 @@ class GCodeGeneratorApp:
             raw, alpha = loaded.raw, loaded.alpha
             layer.source_kind = "image"
             layer.stl_params = None
+            mesh = None
         layer.raw, layer.alpha = raw, alpha
         layer.path = path
         layer.name = os.path.basename(path)
@@ -2507,6 +2496,9 @@ class GCodeGeneratorApp:
         layer.placed = None
         layer.dexels = None
         layer.dexels_key = None
+        layer.mesh = layer.mesh_key = None
+        if mesh is not None:
+            self._attach_mesh(layer, mesh)
         self._on_layers_structure_changed()
         self._select_layer_tab(layer)
         self.status_var.set(f"Replaced source: {os.path.basename(path)}")
@@ -2574,8 +2566,7 @@ class GCodeGeneratorApp:
     def _on_aspect_lock_toggle(self):
         if self._aspect_lock_var.get():
             if self.layers:
-                h, w = self.layers[0].raw.shape
-                self._image_aspect = w / h
+                self._image_aspect = layers_mod.native_aspect(self.layers[0])
             self._recalc_height()
         else:
             self._image_aspect = None
@@ -2710,7 +2701,10 @@ class GCodeGeneratorApp:
             self._image_aspect = mesh_w_mm / mesh_h_mm
             self._recalc_height()
 
-        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds)
+        # The previous project's sources are about to be replaced, so the
+        # raster's density is chosen for this source alone.
+        layer = self._build_stl_layer(path, triangles, dlg, xy_bounds, z_bounds,
+                                      density_layers=[])
         if layer is None:
             return
         h, w = layer.raw.shape
@@ -3355,6 +3349,18 @@ class GCodeGeneratorApp:
             d['stl_params'] = dict(layer.stl_params)
         return d
 
+    @staticmethod
+    def _loaded_stl_params(rotated, width_px, height_px, rot_x, rot_y, rot_z):
+        """stl_params for an STL source re-read from a project: its saved
+        raster size and rotation, and the mesh's mm size taken from the
+        mesh itself -- project files saved without it place the mesh by its
+        exact proportions too (layers.native_extent)."""
+        x_min, x_max, y_min, y_max = stl_mesh.mesh_xy_bounds(rotated)
+        return {'width_px': width_px, 'height_px': height_px,
+                'mesh_w_mm': max(float(x_max - x_min), 1e-6),
+                'mesh_h_mm': max(float(y_max - y_min), 1e-6),
+                'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z}
+
     def _layer_from_dict(self, d, prj_path):
         """Resolve and (re)load one saved layer. Returns a Layer, or None if
         its source file can't be found or fails to load/rasterize -- the
@@ -3373,19 +3379,14 @@ class GCodeGeneratorApp:
                 rot_z = stl_params.get('rot_z', 0)
                 triangles = stl_mesh.load_stl(resolved)
                 rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
-                raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                image, alpha = stl_mesh.normalize_and_orient(
-                    raw, stl_mesh.mesh_z_bounds(rotated))
-                new_stl_params = {'width_px': width_px, 'height_px': height_px,
-                                  'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z}
-                if 'mesh_w_mm' in stl_params and 'mesh_h_mm' in stl_params:
-                    new_stl_params['mesh_w_mm'] = stl_params['mesh_w_mm']
-                    new_stl_params['mesh_h_mm'] = stl_params['mesh_h_mm']
+                image, alpha = self._rasterize_stl(rotated, width_px, height_px)
                 layer = layers_mod.Layer(
                     name=d.get('name') or os.path.basename(resolved), raw=image, alpha=alpha,
                     source_kind='stl', path=resolved,
-                    stl_params=new_stl_params,
+                    stl_params=self._loaded_stl_params(rotated, width_px, height_px,
+                                                       rot_x, rot_y, rot_z),
                     layer_id=self._new_layer_id())
+                self._attach_mesh(layer, rotated)
             else:
                 raw = mpimg.imread(resolved)
                 gray, alpha = layers_mod.to_grayscale(raw)
@@ -3526,7 +3527,6 @@ class GCodeGeneratorApp:
         self._last_width_mm  = float(DEFAULTS['width_mm'])
         self._last_height_mm = float(DEFAULTS['height_mm'])
         self._last_min_px_per_mm = float(DEFAULTS['min_px_per_mm'])
-        self._last_effective_px_per_mm = float(DEFAULTS['min_px_per_mm'])
         self.effective_resolution_var.set("—")
         self.current_image  = None
         self._image_aspect  = None
@@ -3744,25 +3744,9 @@ class GCodeGeneratorApp:
             self.background_depth_pct.set(
                 str(c.get('background_depth_pct', DEFAULTS['canvas_background_depth_pct'])))
             if self._aspect_lock_var.get() and self.layers:
-                h, w = self.layers[0].raw.shape
-                self._image_aspect = w / h
+                self._image_aspect = layers_mod.native_aspect(self.layers[0])
                 self._recalc_height()
             self._on_layers_structure_changed()
-            # Settle the density readout/cache against the now-final layer
-            # set without treating the load itself as an auto-resolution
-            # trigger -- no proactive STL-staleness prompt on every open;
-            # that check still runs lazily at the next Compute Step.
-            try:
-                width_mm_now  = float(self.width_mm.get())
-                height_mm_now = float(self.height_mm.get())
-            except ValueError:
-                width_mm_now  = float(DEFAULTS['width_mm'])
-                height_mm_now = float(DEFAULTS['height_mm'])
-            density = self._auto_px_per_mm(width_mm_now, height_mm_now)
-            self._last_effective_px_per_mm = density
-            W_disp = max(2, round(width_mm_now * density))
-            H_disp = max(2, round(height_mm_now * density))
-            self.effective_resolution_var.set(f"{W_disp}x{H_disp} px  ({density:.3g} px/mm)")
             if failed:
                 messagebox.showwarning(
                     "Source Load Warning",
@@ -3830,19 +3814,17 @@ class GCodeGeneratorApp:
                     height_px = saved_stl_source['height_px']
                     triangles = stl_mesh.load_stl(resolved_stl_path)
                     rotated   = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
-                    raw       = stl_mesh.generate_heightmap(rotated, width_px, height_px)
-                    image, alpha = stl_mesh.normalize_and_orient(
-                        raw, stl_mesh.mesh_z_bounds(rotated))
+                    image, alpha = self._rasterize_stl(rotated, width_px, height_px)
                     layer = layers_mod.Layer(
                         name=os.path.basename(resolved_stl_path), raw=image, alpha=alpha,
                         source_kind='stl', path=resolved_stl_path,
-                        stl_params={'width_px': width_px, 'height_px': height_px,
-                                    'rot_x': rot_x, 'rot_y': rot_y, 'rot_z': rot_z},
+                        stl_params=self._loaded_stl_params(rotated, width_px, height_px,
+                                                           rot_x, rot_y, rot_z),
                         layer_id=self._new_layer_id())
+                    self._attach_mesh(layer, rotated)
                     self.layers = [layer]
                     if self._aspect_lock_var.get():
-                        h, w = layer.raw.shape
-                        self._image_aspect = w / h
+                        self._image_aspect = layers_mod.native_aspect(layer)
                         self._recalc_height()
                     self._on_layers_structure_changed()
                     self.status_var.set(
@@ -4403,83 +4385,11 @@ class GCodeGeneratorApp:
                 z_range           = params['z_range'],
             )
 
-    def _stale_stl_sources(self):
-        """STL sources whose rasterized detail no longer matches what the
-        canvas's current density and the source's own Scale-% call for --
-        e.g. Min. px/mm/Max Megapixels changed, or Scale was increased,
-        since the source was last (re)rasterized from its mesh."""
-        try:
-            width_mm  = float(self.width_mm.get())
-            height_mm = float(self.height_mm.get())
-        except ValueError:
-            width_mm, height_mm = float(DEFAULTS["width_mm"]), float(DEFAULTS["height_mm"])
-        stale = []
-        for layer in self.layers:
-            if layer.source_kind != 'stl' or not layer.stl_params:
-                continue
-            mesh_w_mm = layer.stl_params.get('mesh_w_mm')
-            mesh_h_mm = layer.stl_params.get('mesh_h_mm')
-            if mesh_w_mm is None or mesh_h_mm is None:
-                continue   # legacy project file predates this bookkeeping
-            target_w, target_h = self._stl_raster_px(
-                mesh_w_mm, mesh_h_mm, width_mm, height_mm, scale_pct=layer.scale_pct)
-            cur_w = layer.stl_params.get('width_px', target_w)
-            cur_h = layer.stl_params.get('height_px', target_h)
-            if (abs(target_w - cur_w) > 0.05 * max(target_w, 1)
-                    or abs(target_h - cur_h) > 0.05 * max(target_h, 1)):
-                stale.append((layer, target_w, target_h))
-        return stale
-
-    def _confirm_stale_stl_sources(self):
-        """Offer to re-rasterize stale STL sources (see _stale_stl_sources)
-        from their source mesh before a step is computed. Always returns
-        True (computing proceeds either way) -- declining just means the
-        step is computed against the existing, less-detailed rasters, same
-        as it would be if this check didn't exist."""
-        stale = self._stale_stl_sources()
-        if not stale:
-            return True
-        names = ", ".join(layer.name for layer, _, _ in stale)
-        if not messagebox.askyesno(
-                "Mesh detail out of date",
-                f"{len(stale)} mesh source(s) ({names}) were rasterized at a "
-                "different detail level than the canvas currently calls for.\n\n"
-                "Re-rasterize from source for full detail before computing?"):
-            return True
-        for layer, target_w, target_h in stale:
-            try:
-                triangles = stl_mesh.load_stl(layer.path)
-                rot_x = layer.stl_params.get('rot_x', 0)
-                rot_y = layer.stl_params.get('rot_y', 0)
-                rot_z = layer.stl_params.get('rot_z', 0)
-                rotated = stl_mesh.apply_rotation(triangles, rot_x, rot_y, rot_z)
-                raw     = stl_mesh.generate_heightmap(rotated, target_w, target_h)
-                image, alpha = stl_mesh.normalize_and_orient(
-                    raw, stl_mesh.mesh_z_bounds(rotated))
-            except Exception as exc:
-                messagebox.showerror("Re-rasterize Error",
-                                     f"Could not re-rasterize {layer.name}:\n{exc}")
-                continue
-            layer.raw, layer.alpha = image, alpha
-            layer.stl_params['width_px']  = target_w
-            layer.stl_params['height_px'] = target_h
-        self._recompute_composite()
-        self._erosion_cache.clear()
-        self._render()
-        return True
-
     def _compute_step(self, step):
         if self.current_image is None:
             messagebox.showinfo("No image", "Please open an image first.")
             return
 
-        # Compute Step is an explicit auto-resolution trigger too, so a
-        # step is never computed against a density gone stale purely
-        # because a source's Scale-% was dragged since the last of the
-        # other triggers -- see _settle_auto_resolution.
-        self._settle_auto_resolution()
-        if not self._confirm_stale_stl_sources():
-            return
         self._place_stl_sources()
 
         idx = self.steps.index(step)
@@ -4924,13 +4834,30 @@ class GCodeGeneratorApp:
                 if layer.source_kind == "stl"
                 and (visibility[i] if i < len(visibility) else layer.visible)]
 
-    @staticmethod
-    def _rotated_mesh(layer):
-        """The STL layer's mesh, loaded from its file and rotated as its
-        raster was (stl_params rot_x/rot_y/rot_z)."""
+    @classmethod
+    def _rotated_mesh(cls, layer):
+        """The STL layer's mesh rotated as its raster was (stl_params
+        rot_x/rot_y/rot_z): the one held on the layer (layer.mesh), read
+        from its file only if none is held for this path and rotation."""
         sp = layer.stl_params or {}
-        return stl_mesh.apply_rotation(stl_mesh.load_stl(layer.path), sp.get('rot_x', 0),
-                                       sp.get('rot_y', 0), sp.get('rot_z', 0))
+        key = (layer.path, sp.get('rot_x', 0), sp.get('rot_y', 0), sp.get('rot_z', 0))
+        if layer.mesh is None or layer.mesh_key != key:
+            cls._attach_mesh(layer, stl_mesh.apply_rotation(
+                stl_mesh.load_stl(layer.path), *key[1:]))
+        return layer.mesh
+
+    def _schedule_stl_placement(self):
+        """Run _place_stl_sources once the current event has been handled,
+        so a cascade of changes (a project load, an import setting Width
+        and Height) places the STL sources once, against the final canvas
+        and source stack. The composite then shows the exact canvas-grid
+        rasters, not the resampled preview rasters."""
+        if self._stl_placement_pending is None:
+            self._stl_placement_pending = self.root.after_idle(self._run_stl_placement)
+
+    def _run_stl_placement(self):
+        self._stl_placement_pending = None
+        self._place_stl_sources()
 
     def _place_stl_sources(self):
         """Rasterize every STL source whose placement isn't 1:1 directly on
@@ -4939,7 +4866,8 @@ class GCodeGeneratorApp:
         exact samples of the mesh rather than its raster resampled -- which
         interpolates heights where the surface jumps, and leaves only part
         of each outline pixel covered. Called on the main thread before a
-        step's depth map is built; the live preview keeps resampling while
+        step's depth map is built and after every structural change
+        (_schedule_stl_placement); the live preview keeps resampling while
         a placement is being edited."""
         try:
             width_mm  = float(self.width_mm.get())
@@ -4953,10 +4881,11 @@ class GCodeGeneratorApp:
         origin = self.origin_var.get()
         todo = [layer for layer in self.layers
                 if layer.source_kind == "stl" and layer.path
-                and not (layer.is_identity_placement() and layer.raw.shape == (H, W))
+                and not layers_mod.raw_fills_canvas(layer, (H, W))
                 and layers_mod.placed_raster(layer, (H, W), ppm_x, ppm_y, origin) is None]
         if not todo:
             return
+        status = self.status_var.get()
         self.root.config(cursor="watch")
         try:
             for layer in todo:
@@ -4971,7 +4900,7 @@ class GCodeGeneratorApp:
                                          f"placement:\n{exc}")
         finally:
             self.root.config(cursor="")
-            self.status_var.set("")
+            self.status_var.set(status)
         self._recompute_composite()
         self._erosion_cache.clear()
         self._render()
@@ -5084,7 +5013,8 @@ class GCodeGeneratorApp:
         return ((id(layer.raw), id(layer.alpha))
                 + tuple((f.name, repr(getattr(layer, f.name)))
                         for f in dataclasses.fields(layer)
-                        if f.name not in ('raw', 'alpha', 'dexels', 'dexels_key')))
+                        if f.name not in ('raw', 'alpha', 'dexels', 'dexels_key', 'mesh',
+                                              'mesh_key')))
 
     def _overhang_reach(self, step_idx, shape):
         """Union of the undercut_reach masks of the computed Undercut steps

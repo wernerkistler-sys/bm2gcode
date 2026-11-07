@@ -26,7 +26,8 @@ class Layer:
                                      # contract as the app's old current_image
     source_kind: str                # "image" | "stl"
     path: Optional[str] = None
-    stl_params: Optional[dict] = None   # {'width_px','height_px','rot_x','rot_y','rot_z'}
+    stl_params: Optional[dict] = None   # {'width_px','height_px','mesh_w_mm',
+                                         #  'mesh_h_mm','rot_x','rot_y','rot_z'}
     layer_id: str = ""               # stable id, assigned by the app for Treeview iids
     alpha: Optional[np.ndarray] = None  # float32 [0,1], same shape as raw, or None
                                          # (fully opaque / no alpha channel in source)
@@ -58,11 +59,36 @@ class Layer:
     # stands in for resampling raw, so every canvas pixel is one exact
     # sample of the mesh instead of an interpolation between samples.
     placed: Optional[object] = field(default=None, repr=False, compare=False)
+    # STL layers only: the mesh rotated as stl_params says, held so it is
+    # read from its file once; mesh_key records the (path, rotation) it was
+    # loaded for. Never serialised.
+    mesh: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    mesh_key: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     def is_identity_placement(self) -> bool:
         return (self.offset_x_mm == 0.0 and self.offset_y_mm == 0.0
                 and self.rotation_deg == 0.0 and self.scale_pct == 100.0
                 and self.mirror == "None")
+
+
+def native_extent(layer: Layer) -> Tuple[float, float]:
+    """(height, width) of the layer's own content in its native units --
+    pixels for an image, and for an STL layer its (rotated) mesh's XY
+    bounding box in mm (stl_params mesh_h_mm/mesh_w_mm), so the mesh is
+    placed at its exact proportions whatever pixel count its raster raw
+    was rounded to. An STL layer without those falls back to raw's shape."""
+    sp = layer.stl_params or {}
+    if (layer.source_kind == "stl" and sp.get('mesh_w_mm') is not None
+            and sp.get('mesh_h_mm') is not None):
+        return float(sp['mesh_h_mm']), float(sp['mesh_w_mm'])
+    H_l, W_l = layer.raw.shape
+    return float(H_l), float(W_l)
+
+
+def native_aspect(layer: Layer) -> float:
+    """Width / height of the layer's own content (native_extent)."""
+    h_n, w_n = native_extent(layer)
+    return w_n / max(h_n, 1e-12)
 
 
 @dataclass
@@ -78,11 +104,13 @@ class PlacedRaster:
 def placement_key(layer: Layer, canvas_shape: Tuple[int, int],
                   px_per_mm_x: float, px_per_mm_y: float, origin: str) -> tuple:
     """Everything a PlacedRaster of *layer* depends on: its mesh (path and
-    rotation), the raster raw it is placed relative to, its placement, and
-    the canvas grid."""
-    return (layer.path, tuple(sorted((layer.stl_params or {}).items())), layer.raw.shape,
-            layer.offset_x_mm, layer.offset_y_mm, layer.rotation_deg, layer.scale_pct,
-            layer.mirror, tuple(canvas_shape), px_per_mm_x, px_per_mm_y, origin)
+    rotation), the extent it is placed by (native_extent), its placement,
+    and the canvas grid -- not raw's pixel count, which only the preview
+    resampling reads."""
+    sp = layer.stl_params or {}
+    return (layer.path, sp.get('rot_x', 0), sp.get('rot_y', 0), sp.get('rot_z', 0),
+            native_extent(layer), layer.offset_x_mm, layer.offset_y_mm,
+            layer.rotation_deg, layer.scale_pct, layer.mirror, tuple(canvas_shape), px_per_mm_x, px_per_mm_y, origin)
 
 
 def placed_raster(layer: Layer, canvas_shape: Tuple[int, int],
@@ -105,7 +133,9 @@ def stl_pixel_xy(layer: Layer, xy_bounds, canvas_shape: Tuple[int, int],
 
     raw's pixels are cells tiling the (rotated) mesh's *xy_bounds*
     (stl_mesh.cell_scale), row 0 at max Y; _affine_params maps canvas pixels
-    to raw pixels. The map is the inverse of the latter after the former."""
+    to raw pixels. The map is the inverse of the latter after the former;
+    raw's pixel count cancels out of it, as _affine_params places the
+    layer by its mm extent (native_extent)."""
     from stl_mesh import cell_scale
     x_min, x_max, y_min, y_max = xy_bounds
     H_l, W_l = layer.raw.shape
@@ -293,9 +323,13 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
     (aspect-preserving "contain"), independent of the layer's native pixel
     count or the canvas's pixel density -- so a source's on-stock physical
     size only depends on scale_pct and the canvas's physical Width/Height,
-    never on canvas resolution. fit_ratio (canvas px per layer-native px at
+    never on canvas resolution. fit_ratio (canvas px per native unit at
     scale_pct=100, along whichever axis the layer's aspect ratio binds)
-    converts that into the pixel-space factor the matrix below needs.
+    converts that into the pixel-space factor the matrix below needs. The
+    native units are native_extent's: an image's pixels, an STL layer's
+    mesh mm -- its raw raster's pixel cells, which tile the mesh's bounding
+    box at a rounded pixel count, are scaled onto those per axis, so the
+    mesh keeps its exact proportions.
 
     mirror, if set, reflects the placed layer across a stock flip axis (see
     _mirror_params) -- applied after placement, so an offset layer's offset
@@ -306,7 +340,8 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
 
     H, W = canvas_shape
     H_l, W_l = layer.raw.shape
-    fit_ratio = min(W / W_l, H / H_l)
+    h_n, w_n = native_extent(layer)
+    fit_ratio = min(W / w_n, H / h_n)
     s = fit_ratio * max(layer.scale_pct, 1e-6) / 100.0
     theta = math.radians(layer.rotation_deg)
     cos_t, sin_t = math.cos(theta), math.sin(theta)
@@ -316,20 +351,30 @@ def _affine_params(layer: Layer, canvas_shape: Tuple[int, int],
     ox = layer.offset_x_mm * px_per_mm_x
     oy = layer.offset_y_mm * px_per_mm_y
 
-    matrix = np.array([[ cos_t / s,  sin_t / s],
-                        [-sin_t / s,  cos_t / s]])
+    # Canvas px -> native units (isotropic), then native units -> raw px.
+    matrix = np.diag([H_l / h_n, W_l / w_n]) @ np.array([[ cos_t / s,  sin_t / s],
+                                                          [-sin_t / s,  cos_t / s]])
 
     k1 = cx_c + ox
     k2 = cy_c - oy
-    offset = np.array([
-        cy_l - (sin_t / s) * k1 - (cos_t / s) * k2,
-        cx_l - (cos_t / s) * k1 + (sin_t / s) * k2,
-    ])
+    offset = np.array([cy_l, cx_l]) - matrix @ np.array([k2, k1])
     mirror = _mirror_params(layer.mirror, canvas_shape, px_per_mm_x, px_per_mm_y, origin)
     if mirror is not None:
         R, t = mirror
         matrix, offset = matrix @ R, matrix @ t + offset
     return matrix, offset
+
+
+def raw_fills_canvas(layer: Layer, canvas_shape: Tuple[int, int]) -> bool:
+    """Whether the layer's raw already is its placement on the canvas,
+    pixel for pixel: an identity placement whose _affine_params is the
+    identity map -- raw has the canvas's shape and, for an STL layer, the
+    mesh's proportions match the canvas grid's exactly."""
+    if not layer.is_identity_placement() or layer.raw.shape != tuple(canvas_shape):
+        return False
+    matrix, offset = _affine_params(layer, canvas_shape, 1.0, 1.0)
+    return (np.allclose(matrix, np.eye(2), rtol=0.0, atol=1e-12)
+            and np.allclose(offset, 0.0, rtol=0.0, atol=1e-9))
 
 
 def resample_layer(layer: Layer, canvas_shape: Tuple[int, int],
@@ -347,7 +392,7 @@ def resample_layer(layer: Layer, canvas_shape: Tuple[int, int],
         coverage = (placed.alpha if placed.alpha is not None
                     else np.ones(canvas_shape, dtype=np.float32))
         return placed.raw, coverage
-    if layer.is_identity_placement() and layer.raw.shape == canvas_shape:
+    if raw_fills_canvas(layer, canvas_shape):
         coverage = (layer.alpha if layer.alpha is not None
                     else np.ones(canvas_shape, dtype=np.float32))
         return layer.raw, coverage
@@ -634,7 +679,7 @@ def composite_gaps(layers: List[Layer], canvas_shape: Tuple[int, int],
             continue
 
         H_l, W_l = layer.raw.shape
-        if placed is not None or (layer.is_identity_placement() and (H_l, W_l) == (H, W)):
+        if placed is not None or raw_fills_canvas(layer, canvas_shape):
             src = np.arange(H * W)
             ok = np.ones(H * W, bool)
         else:
