@@ -26,7 +26,8 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         _extract_z_contours, _order_contours_graph,
                         _fill_level_gaps, _prune_contours,
                         compute_contour_toolpath, _geodesic_link,
-                        _plan_passes, make_multipass, band_levels, check_z_range)
+                        _plan_passes, make_multipass, band_levels, check_z_range,
+                        depth_map_change, depth_map_change_reference)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1765,6 +1766,29 @@ _dmc_x = (np.concatenate([np.asarray(s)[:, 0] for s in _dmc_tp.segments])
 check("changed plateau is cut", _dmc_x.size > 0)
 check("unchanged plateau is not cut", _dmc_x.size > 0 and float(_dmc_x.min()) >= 38.0)
 check("identical depth maps cut nothing", len(_dmc_raster(_dmc).segments) == 0)
+
+# Sideways tolerance: a sharp wall shifted by up to DEPTH_MAP_CHANGE_TOL_PX
+# is no change; a wider shift and a thin new feature are.
+_wall = np.zeros((40, 40), dtype=np.float32)
+_wall[:, 20:] = 0.8
+for _shift in (1, 2):
+    _moved = np.roll(_wall, -_shift, axis=1)
+    _moved[:, -_shift:] = 0.8
+    check(f"wall shifted {_shift} px: no depth map change",
+          not np.any(depth_map_change(_moved, _wall)))
+    check(f"wall shifted {_shift} px: gate reference leaves no difference",
+          not np.any(np.clip(_moved - depth_map_change_reference(_wall), 0.0, 1.0)))
+_moved3 = np.roll(_wall, -3, axis=1)
+_moved3[:, -3:] = 0.8
+check("wall shifted 3 px: the outermost column changes",
+      bool(np.all(depth_map_change(_moved3, _wall)[:, 17] > 0.7))
+      and not np.any(depth_map_change(_moved3, _wall)[:, 18:]))
+_line = np.zeros((40, 40), dtype=np.float32)
+_line[:, 10] = 0.5
+check("a 1 px wide new line keeps its full depth",
+      bool(np.allclose(depth_map_change(_line, np.zeros_like(_line))[:, 10], 0.5)))
+check("a removed feature reads negative",
+      bool(np.allclose(depth_map_change(np.zeros_like(_wall), _wall)[:, 25], -0.8)))
 
 print()
 if FAILURES:

@@ -46,7 +46,7 @@ from constants import (
     DISPLAY_ORIGINAL, DISPLAY_STEP_RES, DISPLAY_STEP_RESULT,
     DISPLAY_STEP_3D, DISPLAY_STEP_ACCESSIBLE, DISPLAY_STEP_UNACCESSIBLE,
     DISPLAY_PROC_MASK,
-    DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
+    DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT, DISPLAY_DIFF_DEPTH_MAP,
     DISPLAY_MODES, DISPLAY_3D_MODES, DISPLAY_STEP_MODES,
 )
 from widgets import (ProgressDialog, LabeledEntry, LabeledRangeEntry,
@@ -61,7 +61,8 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_pocket_toolpath, compute_pocket_mask, _build_kernel,
                         compute_vcarve_synth_achievable_depth,
                         compute_registration_holes_toolpath, registration_hole_centers,
-                        registration_flip_axis, registration_auto_spacing)
+                        registration_flip_axis, registration_auto_spacing,
+                        depth_map_change, depth_map_change_reference)
 from tool import Tool, UNDERCUT_PROFILES
 from erosion_cache import ErosionCache
 from undercut import compute_undercut_toolpath
@@ -264,7 +265,8 @@ class GCodeGeneratorApp:
             (DISPLAY_STEP_UNACCESSIBLE, "5"),
             (DISPLAY_DIFF_RES_UNCUT,     "6"),
             (DISPLAY_DIFF_UNCUT_UNCUT,  "7"),
-            (DISPLAY_PROC_MASK,         "8"),
+            (DISPLAY_DIFF_DEPTH_MAP,    "8"),
+            (DISPLAY_PROC_MASK,         "9"),
         ]
         self._display_menu_indices = {}
         for mode, key in _display_hotkeys:
@@ -4021,7 +4023,8 @@ class GCodeGeneratorApp:
         if ALGORITHM_FAMILY[algorithm] == "V-Carving":
             gating_mode = params['gating_mode']
             if gating_mode == GATING_DEPTH_MAP_CHANGE:
-                prior_reference       = prior_depth_map
+                prior_reference       = (depth_map_change_reference(prior_depth_map)
+                                         if prior_depth_map is not None else None)
                 subtract_unaccessible = False
             elif gating_mode == "Residual from prior step":
                 prior_reference       = prev_tp.result    if prev_tp is not None else None
@@ -4258,7 +4261,8 @@ class GCodeGeneratorApp:
         else:  # Raster
             gating_mode = params['gating_mode']
             if gating_mode == GATING_DEPTH_MAP_CHANGE:
-                prior_reference       = prior_depth_map
+                prior_reference       = (depth_map_change_reference(prior_depth_map)
+                                         if prior_depth_map is not None else None)
                 subtract_unaccessible = False
             elif gating_mode == "Residual from prior step":
                 prior_reference       = prev_tp.result    if prev_tp is not None else None
@@ -4712,6 +4716,7 @@ class GCodeGeneratorApp:
                      and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
+            and not (m == DISPLAY_DIFF_DEPTH_MAP and not (has_step and idx > 0))
             and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
                 has_accessible
                 and idx > 0
@@ -5509,7 +5514,7 @@ class GCodeGeneratorApp:
                     if 0 <= prior_idx < len(self.steps):
                         prior_depth_map, _ = self._get_depth_map_for_step(
                             self.steps[prior_idx])
-                        ref = np.clip(depth_map - prior_depth_map, 0.0, 1.0)
+                        ref = np.clip(depth_map_change(depth_map, prior_depth_map), 0.0, 1.0)
                     else:
                         ref = depth_map.copy()
                 elif gating_mode == "Inaccessible by prior tool":
@@ -5668,9 +5673,28 @@ class GCodeGeneratorApp:
             else:
                 mode = DISPLAY_ORIGINAL
 
+        elif mode == DISPLAY_DIFF_DEPTH_MAP:
+            prev_idx = step_idx - 1
+            if 0 <= prev_idx < len(self.steps) and step_idx < len(self.steps):
+                # depth_map vs. prior step's depth map, each from its own
+                # source visibility, with depth_map_change's sideways
+                # tolerance (its positive part is what the "Depth map
+                # change" Process Region gates on):
+                # positive → this step asks for material the prior step's depth map keeps
+                # negative → this step's depth map is shallower than the prior step's
+                depth_map, _ = self._get_depth_map()
+                prior_depth_map, _ = self._get_depth_map_for_step(self.steps[prev_idx])
+                img   = depth_map_change(depth_map, prior_depth_map)
+                cmap  = _DIFF_CMAP
+                vmin, vmax = -1.0, 1.0
+                title = f"Depth Map Change (Step {step_idx + 1})"
+            else:
+                mode = DISPLAY_ORIGINAL
+
         if mode not in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_ACCESSIBLE,
                         DISPLAY_STEP_UNACCESSIBLE, DISPLAY_PROC_MASK,
-                        DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
+                        DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
+                        DISPLAY_DIFF_DEPTH_MAP):
             img   = self._pad_image(self.current_image)
             cmap  = "gray"
             title = "Original"
@@ -6022,7 +6046,8 @@ class GCodeGeneratorApp:
         if mode == DISPLAY_PROC_MASK:
             val = float(img[row, col])
             z_str = f"Z: {'1' if val > 0.5 else '0'}"
-        elif mode in (DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT):
+        elif mode in (DISPLAY_DIFF_RES_UNCUT, DISPLAY_DIFF_UNCUT_UNCUT,
+                      DISPLAY_DIFF_DEPTH_MAP):
             val = float(img[row, col])
             z_str = f"ΔZ: {val * max_depth:+.2f} mm"
         else:

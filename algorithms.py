@@ -2172,6 +2172,38 @@ def _ring_arc_between(ring, i0, i1):
     return ring.pts_px[idx]
 
 
+# Sideways tolerance (px) of the "Depth map change" Process Region: two
+# rasterizations of the same mesh can place a sharp wall up to this far
+# apart, which must not count as a change.
+DEPTH_MAP_CHANGE_TOL_PX = 2
+
+
+def depth_map_change_reference(prior_depth_map, tol_px=DEPTH_MAP_CHANGE_TOL_PX):
+    """The prior step's depth map, grey-dilated by a disk of *tol_px*: the
+    deepest it gets within *tol_px* of each pixel. Used as prior_reference,
+    clip(depth_map − this, 0, 1) is the depth this step asks for beyond
+    anything the prior depth map has within *tol_px*, so a wall shifted by
+    up to *tol_px* yields no difference while thin new features keep theirs."""
+    from grey_morphology import grey_dilation
+    from skimage.morphology import disk
+    return grey_dilation(np.asarray(prior_depth_map, dtype=np.float32),
+                         footprint=disk(tol_px)).astype(np.float32, copy=False)
+
+
+def depth_map_change(depth_map, prior_depth_map, tol_px=DEPTH_MAP_CHANGE_TOL_PX):
+    """Signed depth map change with the sideways tolerance of
+    depth_map_change_reference: positive where *depth_map* is deeper than
+    the prior depth map anywhere within *tol_px* (the part the "Depth map
+    change" Process Region processes), negative where it is shallower than
+    the prior depth map everywhere within *tol_px*, 0 otherwise."""
+    from grey_morphology import grey_erosion
+    from skimage.morphology import disk
+    prior = np.asarray(prior_depth_map, dtype=np.float32)
+    deeper = np.clip(depth_map - depth_map_change_reference(prior, tol_px), 0.0, 1.0)
+    shallower = np.clip(grey_erosion(prior, footprint=disk(tol_px)) - depth_map, 0.0, 1.0)
+    return (deeper - shallower).astype(np.float32)
+
+
 def compute_raster_gate_mask(residual, work_surface_tol, prior_reference,
                               subtract_unaccessible, accessible, footprint):
     """Build the Process Region gate mask for a raster-style pass, or None

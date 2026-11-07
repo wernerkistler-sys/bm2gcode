@@ -36,7 +36,7 @@ python bm2gcode.py
 3. Optionally add more sources with **Add Source** (on the Canvas tab, or on any source's own tab) and arrange them with each source's Offset, Rotation, Scale, and Blend mode (see [Sources](#sources) below).
 4. Configure one or more **steps** — choose algorithm, tool, region targeting, and which sources it should see for each.
 5. **Compute → Compute All Steps** (F6) — generate toolpaths.
-6. Use the **View** menu (hotkeys 0–8) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
+6. Use the **View** menu (hotkeys 0–9) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 7. **File → Export Toolpath…** — save a `.nc` G-code file for your CNC machine.
 
 Save your work at any time with **File → Save Project** (Ctrl+S), which writes to the project's own file (asking for a file name only while the project is still untitled), or under a new name with **File → Save Project As…** (Ctrl+Shift+S); reload it later with **File → Open Project…** (Ctrl+Shift+O). The window title shows the project file's name, prefixed with `*` while there are unsaved changes. Project files store the canvas, every source's placement, all step configuration, and a path back to each source's original image or STL file (re-rasterized with the same settings on reload).
@@ -286,13 +286,13 @@ The **Process Region** selector is the adaptive gating mechanism. It defines whi
 | Mode | What it processes |
 |---|---|
 | Full depth map | The entire depth map — no reference to prior steps. |
-| Depth map change | Only regions where this step's depth map (its own source visibility) is deeper than the prior step's depth map (the prior step's source visibility) — e.g. a source hidden in the prior step and visible in this one. What the prior step actually cut plays no part, so the prior step needn't be computed; where this step's depth map is shallower, nothing is processed. Offered only where the two depth maps differ (and on a step already set to it); on the first step it processes the full depth map. |
+| Depth map change | Only regions where this step's depth map (its own source visibility) is deeper than the prior step's depth map (the prior step's source visibility) — e.g. a source hidden in the prior step and visible in this one. The comparison tolerates 2 px sideways: a pixel counts only where this step's depth map is deeper than the prior step's anywhere within 2 px, so a sharp wall that two rasterizations of the same mesh place 1–2 px apart is no change, while thin new features keep their full depth. What the prior step actually cut plays no part, so the prior step needn't be computed; where this step's depth map is shallower, nothing is processed. Offered only where the two depth maps differ (and on a step already set to it); on the first step it processes the full depth map. |
 | Residual from prior step | Only regions where material remains that this step's depth map (built from this step's own source visibility) says should have been removed — areas where the prior step's result falls short of this step's target depth. A source hidden in the prior step but visible in this one counts entirely as residual; where the prior step cut deeper than this step's depth map (e.g. for a source hidden here), the residual is zero. |
 | Inaccessible by prior tool | Only material that the prior tool's geometry could not remove (too narrow, wrong shape), regardless of the depth achieved. |
 | Reachable residual | Intersection of "this tool can reach here" AND "the prior step left residual here." |
 | Reachable inaccessible | Intersection of "this tool can reach here" AND "the prior tool could not reach here." |
 
-Use the **Processing Mask** view (hotkey 8) and the **Prev Residual − Unaccessible** view (hotkey 6) to verify the gating is configured as intended before computing.
+Use the **Processing Mask** view (hotkey 9), the **Prev Residual − Unaccessible** view (hotkey 6) and, for "Depth map change", the **Depth Map Change** view (hotkey 8) to verify the gating is configured as intended before computing.
 
 **Z-threshold** — a depth threshold in mm. In "Full depth map" mode: only process pixels deeper than this value. In all other modes: only process regions where the residual (or inaccessible depth, or depth map difference) exceeds this value, skipping areas that deviate from the reference by less than this amount.
 
@@ -536,7 +536,8 @@ The first time the overlay is shown for an STL source, its mesh is read for the 
 | Step Unaccessible | 5 | Material that the current tool profile cannot remove. Positive (warm) values indicate regions where the target depth cannot be reached, regardless of strategy; cf. the "Inaccessible by prior tool" option for "Process region". Requires recomputation when tool parameters are changed.|
 | Prev Residual − Unaccessible | 6 | Difference between the prior step's residual and the current tool's inaccessible material. Positive (warm) values indicate residual material from the previous step that can be removed by the present tool; cf. the "Reachable residual" option for "Process region". Requires recomputation when tool parameters are changed.|
 | Prev Unaccessible − Unaccessible | 7 | Difference between the prior step's inaccessible material and the current tool's inaccessible material. Positive (warm) values indicate regions the current tool can reach that the prior tool could not; negative (cool) values indicate the current tool is more restricted than its predecessor; cf. the "Reachable inaccessible" option for "Process region". Requires recomputation when tool parameters are changed.|
-| Processing Mask | 8 | Binary mask of which regions will be cut in this step, based on the Process Region setting. Live update when Z-threshold is changed.|
+| Depth Map Change | 8 | Difference between this step's depth map and the prior step's, each composited from its own step's source visibility. Uses the same 2 px sideways tolerance as that option: positive where this step's depth map is deeper than the prior step's anywhere within 2 px, negative where it is shallower than the prior step's everywhere within 2 px. Positive (warm) values indicate regions where this step's depth map is deeper — what the "Depth map change" option for "Process region" processes; negative (cool) values indicate regions where it is shallower, which that option leaves alone. Available from the second step on; needs no computed step.|
+| Processing Mask | 9 | Binary mask of which regions will be cut in this step, based on the Process Region setting. Live update when Z-threshold is changed.|
 
 **Canvas navigation:**
 - All modes: scroll to zoom, middle-click drag to pan, double-click to reset.
