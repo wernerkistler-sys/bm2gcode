@@ -1,7 +1,7 @@
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from dressup import (generate_ramp, generate_plunge_ramp, leading_plunge_end,
                      compute_backoff_path, generate_corner_arc)
@@ -120,6 +120,14 @@ class ToolPath:
     undercut_reach: np.ndarray = None
 
     metadata: dict = field(default_factory=dict)
+
+    # Set by the app once the step is computed (see staleness.py): the
+    # fingerprint of the step's own inputs at the time, a serial unique to
+    # this computation, and the serial of the previous step's toolpath it
+    # read (None if there was none).
+    input_fingerprint: Optional[str] = None
+    compute_serial: Optional[int] = None
+    prior_serial: Optional[int] = None
 
     def iter_resampled(self, spacing_mm: float, max_samples: int = 1 << 18):
         """Densely sample all segments at *spacing_mm* XY arc-length intervals.

@@ -4,6 +4,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import copy
 import dataclasses
 import hashlib
+import itertools
 import json
 import os
 import matplotlib.colors as mcolors
@@ -12,6 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import threading
+import weakref
 
 # Diverging colormap that is dark at zero (like "hot") and bright at both extremes.
 # Negative half: black → blue → cyan → white  (cold mirror of hot)
@@ -66,6 +68,7 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         depth_map_change, depth_map_change_reference)
 from tool import Tool, UNDERCUT_PROFILES
 from erosion_cache import ErosionCache
+import staleness
 from undercut import compute_undercut_toolpath
 from tool_library import (ToolLibrary, cutting_for, step_values_from, sync_state,
                           update_cutting_from_step, tool_from_step, format_value,
@@ -156,6 +159,12 @@ class GCodeGeneratorApp:
         self._stl_placement_pending = None   # after_idle id, see _schedule_stl_placement
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
+        # ToolPath.compute_serial source (see staleness.py); next() is
+        # atomic, so the compute worker thread may draw from it.
+        self._compute_serials = itertools.count(1)
+        # id(array) -> (weakref to it, token), see _content_token
+        self._content_tokens = {}
+        self._content_token_next = itertools.count(1)
         # tool_signature -> (center_depth_contour, accessible), bounded by
         # the machine's memory (see erosion_cache.py)
         self._erosion_cache = ErosionCache()
@@ -1073,10 +1082,7 @@ class GCodeGeneratorApp:
 
         # Renumber tabs that shifted due to the insertion.
         for i in range(insert_at + 1, len(self.steps)):
-            s = self.steps[i]
-            self._steps_nb.tab(s['tab'], text=f"Step {i + 1}")
-            txt = s['info_var'].get()
-            s['info_var'].set(f"Step {i + 1}:" + txt.split(":", 1)[1])
+            self._steps_nb.tab(self.steps[i]['tab'], text=f"Step {i + 1}")
 
         # 2×2 button grid — all four buttons share equal width and height
         ttk.Button(bf, text="Compute",
@@ -1103,6 +1109,7 @@ class GCodeGeneratorApp:
             s['info_label'].pack_forget()
         for s in self.steps:
             s['info_label'].pack(anchor=tk.W, pady=(0, 4))
+        self._refresh_step_infos()
 
         self._update_remove_buttons()
         self.display_mode_var.set(DISPLAY_ORIGINAL)
@@ -1153,15 +1160,10 @@ class GCodeGeneratorApp:
         step['info_label'].destroy()
         self.steps.pop(idx)
         self.toolpaths.pop(idx)
-        # Renumber remaining tabs and info labels
+        # Renumber remaining tabs and info lines
         for i, s in enumerate(self.steps):
             self._steps_nb.tab(s['tab'], text=f"Step {i + 1}")
-            if self.toolpaths[i] is None:
-                s['info_var'].set(f"Step {i + 1}: not computed")
-            else:
-                # Preserve existing computed text, just update the step number
-                txt = s['info_var'].get()
-                s['info_var'].set(f"Step {i + 1}:" + txt.split(":", 1)[1])
+        self._refresh_step_infos()
 
         self._highlight_selected_step_info()
         self._update_remove_buttons()
@@ -2384,9 +2386,9 @@ class GCodeGeneratorApp:
         self._recompute_composite()
         self._erosion_cache.clear()
         self.toolpaths = [None] * len(self.steps)
-        for i, s in enumerate(self.steps):
-            s['info_var'].set(f"Step {i + 1}: not computed")
+        for s in self.steps:
             s['_cutout_rings_cache'] = None
+        self._refresh_step_infos()
         self.display_mode_var.set(DISPLAY_ORIGINAL)
         self._reset_zoom()
         if self.layers:
@@ -2839,12 +2841,33 @@ class GCodeGeneratorApp:
             spindle_rpm     = tp.metadata.get('spindle_rpm', 0.0),
             spindle_dwell_s = self._settings['spindle_dwell_s'],
         )
-        text = (f"Step {idx + 1}: {stats['motion_count']} motion lines\n"
+        text = (f"{stats['motion_count']} motion lines\n"
                 f"Est. time: {_fmt_time(stats['est_minutes'])}"
                 f" @ {feed_rate:.0f} mm/min")
         for warning in tp.metadata.get('warnings', ()):
             text += f"\n⚠ {warning}"
-        step['info_var'].set(text)
+        step['_info_stats'] = text
+        self._refresh_step_infos()
+
+    def _refresh_step_infos(self):
+        """Set every step's info line: its number, then 'not computed' or
+        the stats _show_step_stats last recorded, marked where the toolpath
+        is outdated or only its result map is (see staleness.py)."""
+        currency = self._step_currency()
+        for i, (step, tp, cur) in enumerate(zip(self.steps, self.toolpaths, currency)):
+            var = step.get('info_var')
+            if var is None:
+                continue
+            if tp is None:
+                text = f"Step {i + 1}: not computed"
+            else:
+                text = f"Step {i + 1}: {step.get('_info_stats', 'computed')}"
+                if not cur.cuts_current:
+                    text += "\n⚠ Outdated: inputs changed since computed"
+                elif not cur.result_current:
+                    text += "\nⓘ Preview outdated: an earlier step changed"
+            if var.get() != text:
+                var.set(text)
 
     @staticmethod
     def _sideways_only(step):
@@ -3483,11 +3506,13 @@ class GCodeGeneratorApp:
             self.root.title(title)
 
     def _poll_title(self):
-        """Keep the title's unsaved-changes marker current; edits reach the
-        project state through many widgets, so it is re-checked once a
-        second rather than traced per field."""
+        """Keep the title's unsaved-changes marker and the step info lines'
+        outdated markers current; edits reach the project state through
+        many widgets, so both are re-checked once a second rather than
+        traced per field."""
         try:
             self._update_title()
+            self._refresh_step_infos()
         except tk.TclError:
             return
         self.root.after(1000, self._poll_title)
@@ -3547,7 +3572,7 @@ class GCodeGeneratorApp:
         self.n_grey_levels  = 256
         self.toolpaths      = [None]
         self._erosion_cache.clear()
-        self.steps[0]['info_var'].set("Step 1: not computed")
+        self._refresh_step_infos()
         self._refresh_layer_tabs()
 
         self.display_mode_var.set(DISPLAY_ORIGINAL)
@@ -3864,7 +3889,8 @@ class GCodeGeneratorApp:
     # ------------------------------------------------------------------ #
     #  Compute / save tool paths
     # ------------------------------------------------------------------ #
-    def _resolve_cleanup_reference(self, idx, max_depth, eff_width_mm, eff_height_mm):
+    def _resolve_cleanup_reference(self, idx, max_depth, eff_width_mm, eff_height_mm,
+                                   light=False):
         """Gather everything V-Carving Clean-up needs, off the nearest
         preceding V-Carving (Hybrid) step, to later erode that step's own
         idealized-V-bit achievable-depth surface by this step's clearing
@@ -3873,25 +3899,30 @@ class GCodeGeneratorApp:
         gouge the V-bit's actual sloped wall, for any clearing tool
         profile. Must be called on the main thread (like
         _gather_step_params) -- _get_depth_map_for_step reads Tkinter
-        variables. Raises ValueError if no such step exists.
+        variables. Raises ValueError if no such step exists. With *light*
+        (see _gather_step_params), 'depth_inputs' (the source step's
+        _depth_inputs_key) takes the place of its depth map.
         """
         for i in range(idx - 1, -1, -1):
             prior = self.steps[i]
             if prior['algorithm_var'].get() == "V-Carving (Hybrid)":
                 tool = self._step_tool(prior)
                 extra_offset_mm = float(prior['extra_offset'].get())
-                depth_map, n_grey_levels = self._get_depth_map_for_step(prior)
                 erosion_cache_key = (
                     tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
                     tool_profile.curve_key(tool.profile_curve), max_depth, eff_width_mm, eff_height_mm,
                     extra_offset_mm, tuple(prior.get('source_visibility', ())))
-                return {
+                reference = {
                     'tool':              tool,
                     'extra_offset_mm':   extra_offset_mm,
-                    'depth_map':         depth_map,
-                    'n_grey_levels':     n_grey_levels,
                     'erosion_cache_key': erosion_cache_key,
                 }
+                if light:
+                    reference['depth_inputs'] = self._depth_inputs_key(prior)
+                else:
+                    reference['depth_map'], reference['n_grey_levels'] = (
+                        self._get_depth_map_for_step(prior))
+                return reference
         raise ValueError(
             "V-Carving Clean-up requires a preceding V-Carving (Hybrid) step.")
 
@@ -3904,11 +3935,17 @@ class GCodeGeneratorApp:
                                   f"its max ({hi_pct:g} %).")
         return lo_pct / 100.0, hi_pct / 100.0
 
-    def _gather_step_params(self, step):
+    def _gather_step_params(self, step, light=False):
         """Read and validate all parameters for one step.
 
         Returns a dict of ready-to-use values. Raises ValueError on bad input.
         Must be called on the main thread so that tkinter variable reads are safe.
+
+        With *light*, nothing is derived from a depth map (an auto Target
+        depth stays 'auto', V-Carving Clean-up's reference carries its
+        source step's depth-map inputs instead of its depth map) and an
+        Undercut step's layers are left out: the result only identifies
+        the step's inputs, for _step_fingerprint, and is never computed with.
         """
         idx       = self.steps.index(step)
         algorithm = step['algorithm_var'].get()
@@ -3929,8 +3966,11 @@ class GCodeGeneratorApp:
             # Resolved fresh from this step's own current depth map rather
             # than trusting the displayed value, which _sync_auto_target_depth
             # only keeps live while this step's tab is the selected one.
-            auto_depth_map, _ = self._get_depth_map_for_step(step)
-            threshold_mm = float(np.max(auto_depth_map)) * max_depth
+            if light:
+                threshold_mm = 'auto'
+            else:
+                auto_depth_map, _ = self._get_depth_map_for_step(step)
+                threshold_mm = float(np.max(auto_depth_map)) * max_depth
 
         params = {
             'idx':           idx,
@@ -4014,7 +4054,7 @@ class GCodeGeneratorApp:
                 # the source step's own tool a second time by *this* step's
                 # clearing tool -- see _resolve_cleanup_reference.
                 params['cleanup_reference'] = self._resolve_cleanup_reference(
-                    idx, max_depth, eff_width_mm, eff_height_mm)
+                    idx, max_depth, eff_width_mm, eff_height_mm, light=light)
         elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
             geo = self._reghole_geometry(step)
             params.update({
@@ -4052,7 +4092,7 @@ class GCodeGeneratorApp:
                 'open_undercuts':    UNDERCUT_OPEN_MODES[step['undercut_open_var'].get()],
                 # Read by _undercut_gaps off the main thread; Layer objects
                 # are plain data, so a snapshot of the list is enough.
-                'layers':            list(self.layers),
+                'layers':            [] if light else list(self.layers),
                 'canvas_shape':      (H, W),
                 'px_per_mm_x':       W / width_mm,
                 'px_per_mm_y':       H / height_mm,
@@ -4078,6 +4118,109 @@ class GCodeGeneratorApp:
             })
 
         return params
+
+    # ------------------------------------------------------------------ #
+    #  Step currency (see staleness.py)
+    # ------------------------------------------------------------------ #
+    def _content_token(self, arr):
+        """A token for the array object *arr* (None for None), the same for
+        as long as that object lives and never given to another one --
+        unlike id(), which a later array may reuse."""
+        if arr is None:
+            return None
+        entry = self._content_tokens.get(id(arr))
+        if entry is not None and entry[0]() is arr:
+            return entry[1]
+        self._content_tokens = {k: v for k, v in self._content_tokens.items()
+                                if v[0]() is not None}
+        token = next(self._content_token_next)
+        self._content_tokens[id(arr)] = (weakref.ref(arr), token)
+        return token
+
+    def _depth_inputs_key(self, step):
+        """What *step*'s depth map (and an Undercut step's gaps) is built
+        from, as plain data: the canvas and global settings and, for each
+        source the step sees, its placement/blend fields and a token of its
+        loaded content. Reads no pixels, so it is cheap to rebuild."""
+        def num(entry):
+            value = entry.get()
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return str(value)
+        sources = []
+        for i, (layer, seen) in enumerate(zip(self.layers,
+                                              self._effective_visibility(step))):
+            if not seen:
+                continue
+            d = self._layer_to_dict(layer)
+            del d['name'], d['visible']
+            d['index']   = i
+            d['content'] = [self._content_token(layer.raw),
+                            self._content_token(layer.alpha)]
+            sources.append(d)
+        return {
+            'canvas_px':        list(self._canvas_shape_px()),
+            'width_mm':         num(self.width_mm),
+            'height_mm':        num(self.height_mm),
+            'min_px_per_mm':    num(self.min_px_per_mm),
+            'max_megapixels':   num(self.max_megapixels),
+            'max_depth':        num(self.max_depth),
+            'margin_mm':        num(self.margin_mm),
+            'margin_depth_pct': num(self.margin_depth_pct),
+            'background_depth': self._background_depth(),
+            'surface':          self.surface.get(),
+            'origin':           self.origin_var.get(),
+            'sources':          sources,
+        }
+
+    @staticmethod
+    def _step_reads_prior(params):
+        """Whether the cuts of the step with *params* read the previous
+        step's toolpath: a Process Region other than the full or changed
+        depth map, or Contour's Avoid air. Every other step reads it only
+        into its own result map."""
+        algorithm = params['algorithm']
+        family = ALGORITHM_FAMILY[algorithm]
+        if algorithm == "Contour":
+            return bool(params['avoid_air'])
+        if algorithm == "Cutout" or family in ("Undercut", "Registration Holes", "Pocket"):
+            return False
+        return params['gating_mode'] not in ("Full depth map", GATING_DEPTH_MAP_CHANGE)
+
+    def _step_fingerprint(self, step):
+        """(fingerprint, reads_prior) of *step*'s own current inputs (see
+        staleness.py) -- its parameters (feeds and library tool included,
+        since its toolpath stores them for stats and export), its depth
+        map's inputs, the reference depth map's for "Depth map change",
+        and the machine settings the algorithms read. The fingerprint is
+        None while the step's fields don't parse."""
+        idx = self.steps.index(step)
+        try:
+            params = self._gather_step_params(step, light=True)
+        except (ValueError, ArithmeticError, KeyError, tk.TclError):
+            return None, False
+        inputs = {k: v for k, v in params.items() if k not in ('idx', 'layers')}
+        inputs['depth_inputs'] = self._depth_inputs_key(step)
+        inputs['machine'] = {'z_safe':     self._settings['z_safe'],
+                             'feed_rapid': self._settings['feed_rapid']}
+        ref_idx = self._change_reference_index(idx)
+        if params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE and ref_idx is not None:
+            inputs['change_reference'] = self._depth_inputs_key(self.steps[ref_idx])
+        return staleness.fingerprint(inputs), self._step_reads_prior(params)
+
+    def _step_currency(self):
+        """staleness.StepCurrency of every step, in step order."""
+        states = []
+        for step, tp in zip(self.steps, self.toolpaths):
+            fp, reads_prior = self._step_fingerprint(step)
+            if tp is None:
+                states.append(staleness.StepState(fp, reads_prior))
+            else:
+                states.append(staleness.StepState(
+                    fp, reads_prior, tp.input_fingerprint, tp.compute_serial,
+                    tp.prior_serial, computed=True))
+        return staleness.step_currency(states)
 
     def _compute_step_work(self, step, params, progress_fn, prev_tp, depth_map, n_grey_levels,
                            prior_depth_map=None):
@@ -4400,161 +4543,118 @@ class GCodeGeneratorApp:
             )
 
     def _compute_step(self, step):
+        """Compute *step*. Where its cuts read the previous step's toolpath
+        (_step_reads_prior) and an earlier step's result is outdated or
+        missing (see staleness.py), offer to recompute those steps first;
+        results accumulate, so that is every step from the first such one
+        on."""
         if self.current_image is None:
             messagebox.showinfo("No image", "Please open an image first.")
             return
-
-        self._place_stl_sources()
-
         idx = self.steps.index(step)
-        try:
-            params = self._gather_step_params(step)
-        except _StepInputError as exc:
-            messagebox.showerror("Invalid input", f"Step {idx + 1}: {exc}")
-            return
-        except ValueError:
-            messagebox.showerror("Invalid input",
-                                 f"Please check the settings for Step {idx + 1}.")
-            return
-        depth_map, n_grey_levels = self._get_depth_map_for_step(step)
-
-        # ── Prior-step checks (all before the dialog opens) ─────────────────
-        prev_tp   = self.toolpaths[idx - 1] if idx > 0 else None
-        algorithm = params['algorithm']
-
-        if algorithm == "Contour":
-            # Contour reads the prior step's result only to drop air cuts.
-            if params['avoid_air'] and idx > 0 and prev_tp is None:
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        "Without its result Avoid air treats the stock as "
-                        "uncut and keeps the cuts through material that step "
-                        "would clear.\n\nContinue anyway?"):
+        indices = [idx]
+        _, reads_prior = self._step_fingerprint(step)
+        if reads_prior and idx > 0:
+            currency = self._step_currency()
+            first = next((i for i in range(idx) if not currency[i].result_current), None)
+            if first is not None:
+                if first == idx - 1:
+                    span, verb = f"Step {idx}", "is"
+                else:
+                    span, verb = f"Steps {first + 1}–{idx}", "are"
+                answer = messagebox.askyesnocancel(
+                    "Earlier steps outdated",
+                    f"Step {idx + 1} reads the result of Step {idx}, but {span} "
+                    f"{verb} outdated or not computed.\n\n"
+                    f"Recompute {span} first?\n\n"
+                    f"No computes Step {idx + 1} against the results as they "
+                    "are -- the full depth map where Step "
+                    f"{idx} has none.")
+                if answer is None:
                     return
-        elif ALGORITHM_FAMILY[algorithm] == "Undercut":
-            pass  # Undercut cuts the gaps of its own sources regardless of
-                  # any prior step -- a missing prev_tp only affects this
-                  # step's own result bookkeeping, not which pixels get cut,
-                  # so there is nothing to warn about here.
-        elif algorithm == "Cutout":
-            pass  # Cutout cuts based on its own depth_map threshold regardless
-                  # of any prior step -- a missing prev_tp only affects this
-                  # step's own result/accessible/alpha bookkeeping, not which
-                  # pixels get cut, so there is nothing to warn about here.
-        elif ALGORITHM_FAMILY[algorithm] == "Registration Holes":
-            pass  # Holes are placed on the stock alone; a prior step only
-                  # feeds this step's result/accessible/alpha bookkeeping.
-        elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
-            pass  # Pocket/Clean-up cuts based on its own Target depth
-                  # against the depth map regardless of any prior step -- a
-                  # missing prev_tp only affects this step's own
-                  # result/accessible bookkeeping, not which pixels get cut,
-                  # so there is nothing to warn about here.
-        else:
-            gating_mode = params['gating_mode']
-            if (gating_mode not in ("Full depth map", GATING_DEPTH_MAP_CHANGE)
-                    and idx > 0 and prev_tp is None):
-                surf_name = ("accessible surface"
-                             if gating_mode in ("Inaccessible by prior tool",
-                                                "Reachable inaccessible")
-                             else "result surface")
-                if not messagebox.askyesno(
-                        "Previous step not computed",
-                        f"Step {idx} has not been computed yet.\n\n"
-                        f"Without its {surf_name} this step will process the "
-                        f"full depth map.\n\nContinue anyway?"):
-                    return
-
-        # The reference step's depth map needs no computed step; it is
-        # built here because _get_depth_map_for_step reads Tk variables.
-        prior_depth_map = None
-        ref_idx = self._change_reference_index(idx)
-        if params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE and ref_idx is not None:
-            prior_depth_map, _ = self._get_depth_map_for_step(self.steps[ref_idx])
-
-        dlg = ProgressDialog(self.root,
-                             title=f"Computing Step {idx + 1} Tool Path")
-
-        def _worker():
-            try:
-                result = self._compute_step_work(
-                    step, params, dlg.report, prev_tp, depth_map, n_grey_levels,
-                    prior_depth_map)
-            except ProgressDialog.Cancelled:
-                self.root.after(0, lambda: dlg.close("Cancelled."))
-                return
-            except Exception as exc:
-                self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
-                self.root.after(0, lambda e=exc: messagebox.showerror(
-                    "Computation error", str(e)))
-                return
-
-            def _done():
-                self.toolpaths[idx] = result
-                self._store_cutting_metadata(result, params)
-                dlg.close("Completed.")
-                self._show_step_stats(idx, step, result)
-                self.display_step_var.set(idx + 1)
-                if not self.show_cut_moves_var.get():
-                    self.show_cut_moves_var.set(True)
-                self.toolpath_scale_var.set(100.0)
-                self.toolpath_scale_label.config(text="100%")
-                self._on_display_mode_changed()
-
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
+                if answer:
+                    indices = list(range(first, idx + 1))
+        self._run_steps(indices, display_idx=idx)
 
     def _compute_all_steps(self):
+        """Compute every step whose result is outdated or missing (see
+        staleness.py) -- every step from the first such one on, since
+        results accumulate."""
         if self.current_image is None:
             messagebox.showinfo("No image", "Please open an image first.")
             return
         if not self.steps:
             return
+        currency = self._step_currency()
+        indices = [i for i, c in enumerate(currency) if not c.result_current]
+        if not indices:
+            messagebox.showinfo("Compute All Steps", "Every step is up to date.")
+            return
+        self._run_steps(indices, display_idx=len(self.steps) - 1)
+
+    def _run_steps(self, indices, display_idx):
+        """Compute the steps at *indices* (ascending) in order on a worker
+        thread, each against the toolpath its previous step holds when it
+        starts, so a step computed earlier in the run feeds the next.
+        Every step's inputs are read and validated here first, on the main
+        thread, so the dialog never opens on bad input; each step uses its
+        own depth map (each step has its own source_visibility). Afterwards
+        the view shows step *display_idx*."""
         self._place_stl_sources()
 
-        # Validate every step upfront so the dialog never opens on bad input,
-        # and precompute each step's own depth map here on the main thread
-        # (each step has its own source_visibility, so these can differ).
-        all_params = []
-        all_depth_maps = []
-        for step in self.steps:
+        depth_maps = {}
+        def depth_map_of(i):
+            if i not in depth_maps:
+                depth_maps[i] = self._get_depth_map_for_step(self.steps[i])
+            return depth_maps[i]
+
+        jobs = []
+        for idx in indices:
+            step = self.steps[idx]
             try:
-                all_params.append(self._gather_step_params(step))
+                params = self._gather_step_params(step)
             except _StepInputError as exc:
-                messagebox.showerror("Invalid input",
-                                     f"Step {self.steps.index(step) + 1}: {exc}")
+                messagebox.showerror("Invalid input", f"Step {idx + 1}: {exc}")
                 return
             except ValueError:
-                idx = self.steps.index(step)
                 messagebox.showerror("Invalid input",
                                      f"Please check the settings for Step {idx + 1}.")
                 return
-            all_depth_maps.append(self._get_depth_map_for_step(step))
-        all_ref_idx = [self._change_reference_index(i) for i in range(len(self.steps))]
+            fingerprint, _ = self._step_fingerprint(step)
+            # The reference step's depth map needs no computed step.
+            ref_idx = self._change_reference_index(idx)
+            prior_depth_map = (depth_map_of(ref_idx)[0]
+                               if (params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE
+                                   and ref_idx is not None) else None)
+            depth_map, n_grey_levels = depth_map_of(idx)
+            jobs.append((idx, step, params, fingerprint, depth_map, n_grey_levels,
+                         prior_depth_map))
+        depth_maps.clear()
 
-        n   = len(self.steps)
-        dlg = ProgressDialog(self.root, title="Computing All Step Tool Paths")
+        n = len(jobs)
+        title = (f"Computing Step {indices[0] + 1} Tool Path" if n == 1
+                 else f"Computing Steps {indices[0] + 1}–{indices[-1] + 1} Tool Paths")
+        dlg = ProgressDialog(self.root, title=title)
 
         def _worker():
-            def step_progress(step_i):
+            def job_progress(job_i, idx):
                 def fn(pct, msg=""):
-                    scaled = step_i * 100.0 / n + pct / n
-                    dlg.report(scaled, f"Step {step_i + 1}/{n}: {msg}" if msg else "")
+                    scaled = job_i * 100.0 / n + pct / n
+                    dlg.report(scaled, f"Step {idx + 1} ({job_i + 1}/{n}): {msg}"
+                               if msg else "")
                 return fn
 
-            for i, (step, params, (depth_map, n_grey_levels)) in enumerate(
-                    zip(self.steps, all_params, all_depth_maps)):
-                idx     = params['idx']
+            for job_i, (idx, step, params, fingerprint, depth_map, n_grey_levels,
+                        prior_depth_map) in enumerate(jobs):
                 prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
-                ref_idx = all_ref_idx[idx]
-                prior_depth_map = all_depth_maps[ref_idx][0] if ref_idx is not None else None
                 try:
-                    dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
+                    if n > 1:
+                        dlg.report(job_i * 100.0 / n,
+                                   f"Starting Step {idx + 1} ({job_i + 1} of {n})…")
                     result = self._compute_step_work(
-                        step, params, step_progress(i), prev_tp, depth_map, n_grey_levels,
-                        prior_depth_map)
+                        step, params,
+                        dlg.report if n == 1 else job_progress(job_i, idx),
+                        prev_tp, depth_map, n_grey_levels, prior_depth_map)
                 except ProgressDialog.Cancelled:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
@@ -4564,17 +4664,21 @@ class GCodeGeneratorApp:
                         "Computation error", str(e)))
                     return
 
-                # Store immediately so the next step's prev_tp is up to date.
-                self.toolpaths[idx] = result
+                result.input_fingerprint = fingerprint
+                result.compute_serial    = next(self._compute_serials)
+                result.prior_serial      = (prev_tp.compute_serial
+                                            if prev_tp is not None else None)
                 self._store_cutting_metadata(result, params)
+                # Stored at once so the next step's prev_tp is this one.
+                self.toolpaths[idx] = result
 
                 def _update_ui(idx=idx, s=step, r=result):
                     self._show_step_stats(idx, s, r)
                 self.root.after(0, _update_ui)
 
             def _all_done():
-                dlg.close("All steps completed.")
-                self.display_step_var.set(len(self.steps))
+                dlg.close("Completed." if n == 1 else "All steps completed.")
+                self.display_step_var.set(display_idx + 1)
                 if not self.show_cut_moves_var.get():
                     self.show_cut_moves_var.set(True)
                 self.toolpath_scale_var.set(100.0)
@@ -4587,7 +4691,8 @@ class GCodeGeneratorApp:
 
     def _build_steps_info(self):
         info = []
-        for i, (step, tp) in enumerate(zip(self.steps, self.toolpaths)):
+        currency = self._step_currency()
+        for i, (step, tp, cur) in enumerate(zip(self.steps, self.toolpaths, currency)):
             profile = (tp.metadata.get('profile', step['profile_var'].get())
                        if tp else step['profile_var'].get())
             diam_mm = tp.metadata.get('radius_mm', 0) * 2 if tp else 0.0
@@ -4596,9 +4701,13 @@ class GCodeGeneratorApp:
             label = f"Step {i + 1} — {profile} ∅{diam_mm:.4g} mm"
             if tool_id:
                 label += f" ({tool_name})"
+            outdated = tp is not None and not cur.cuts_current
+            if outdated:
+                label += " — outdated"
             info.append({
                 'label':       label,
                 'computed':    tp is not None,
+                'outdated':    outdated,
                 'profile':     profile,
                 'diameter_mm': diam_mm,
                 'profile_key': tool_profile.curve_key(self._step_profile_curve(step))
@@ -4634,6 +4743,14 @@ class GCodeGeneratorApp:
                     == (b['profile'], b['diameter_mm'], b['profile_key']))
 
         selected = [steps_info[i] for i in indices]
+        outdated = [str(i + 1) for i in indices if steps_info[i]['outdated']]
+        if outdated and not messagebox.askokcancel(
+                "Outdated toolpaths",
+                f"Step{'s' if len(outdated) > 1 else ''} {', '.join(outdated)} "
+                f"{'have' if len(outdated) > 1 else 'has'} changed since "
+                "computed; the exported G-code will not reflect the changes. "
+                "Export anyway?"):
+            return
         if any(not _same_tool(a, b)
                for i, a in enumerate(selected) for b in selected[i + 1:]):
             proceed = messagebox.askokcancel(

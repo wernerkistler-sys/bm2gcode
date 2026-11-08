@@ -462,8 +462,15 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 | Item | Shortcut | Description |
 |---|---|---|
-| Compute Current Step | F5 | Compute the toolpath for the currently active step tab. |
-| Compute All Steps | F6 | Compute all steps in sequence. Required when any step uses a gating mode that references a prior step's result. |
+| Compute Current Step | F5 | Compute the toolpath for the currently active step tab. If the step's cuts read the previous step's toolpath (a Process Region other than Full depth map or Depth map change, or Contour's Avoid cutting air) and an earlier step is outdated or not computed, it asks whether to recompute those steps first. **No** computes this step against the results as they are. |
+| Compute All Steps | F6 | Compute, in sequence, every step whose result is outdated or not computed. Steps that are up to date are skipped. |
+
+**Outdated steps.** Every step's result map builds on the previous step's (it is what the 3D preview shows, and what the next step's Process Region and Avoid cutting air read). So a step's toolpath depends on its own inputs, and its result also depends on every earlier step. A step's own inputs are its parameters, feeds and linked tool included (stats and export use the values it was computed with), its depth map (the canvas settings and the placement, blend and content of each source it sees), and the machine settings Z safe and rapid feed. The info line below the steps marks a computed step:
+
+- **⚠ Outdated**: its own inputs changed since it was computed. Or its cuts read the previous step, and that step was recomputed, removed or inserted, or is itself outdated. Its toolpath and G-code no longer match the settings.
+- **ⓘ Preview outdated**: its toolpath is current, but an earlier step changed, so its result map (the preview, and the next step's input) is not.
+
+Changing a value back makes the step current again. Ramp-in, back-off and arc-rounded corners only affect G-code emission and never make a step outdated; Cutout tabs change the cut and do. **Export Toolpath…** marks outdated steps in its list and asks before exporting them.
 
 ---
 
