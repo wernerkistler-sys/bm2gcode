@@ -1,4 +1,5 @@
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import copy
 import dataclasses
@@ -435,6 +436,13 @@ class GCodeGeneratorApp:
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
         self._info_frame = ttk.Frame(p)
         self._info_frame.pack(fill=tk.X)
+        # The selected step's info line is bold and in an accent blue, so it
+        # stands out from the other steps' lines.
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        self._selected_info_font = bold
+        ttk.Style().configure("SelectedStepInfo.TLabel", font=bold,
+                              foreground="#1a5fb4")
 
         self._add_step()   # start with one step
 
@@ -1155,6 +1163,7 @@ class GCodeGeneratorApp:
                 txt = s['info_var'].get()
                 s['info_var'].set(f"Step {i + 1}:" + txt.split(":", 1)[1])
 
+        self._highlight_selected_step_info()
         self._update_remove_buttons()
 
     def _update_remove_buttons(self):
@@ -4680,6 +4689,7 @@ class GCodeGeneratorApp:
         -- since source visibility is per-step -- refresh every source
         tab's Visible checkbox and the live preview to match."""
         tab_id = self._steps_nb.select()
+        self._highlight_selected_step_info()
         if not tab_id or not hasattr(self, 'display_mode_var'):
             return
         selected = self._steps_nb.index(tab_id)
@@ -4687,6 +4697,18 @@ class GCodeGeneratorApp:
         self._sync_layer_visible_checkboxes()
         self._recompute_composite()
         self._on_display_mode_changed()
+
+    def _highlight_selected_step_info(self):
+        """Show the selected step tab's info line in bold and every other
+        step's in the normal label style."""
+        tab_id = self._steps_nb.select()
+        for s in self.steps:
+            lbl = s.get('info_label')
+            if lbl is None or not lbl.winfo_exists():
+                continue
+            selected = bool(tab_id) and str(s['tab']) == str(tab_id)
+            lbl.configure(
+                style="SelectedStepInfo.TLabel" if selected else "TLabel")
 
     def _sync_layer_visible_checkboxes(self):
         """Refresh every source tab's Visible checkbox to reflect the
