@@ -2348,7 +2348,12 @@ class GCodeGeneratorApp:
         # reuse Phase-A results from the stale depth map.
         for s in self.steps:
             s['_cutout_rings_cache'] = None
-        self._render()
+        # A visibility edit can make the Depth Map Change view (un)available,
+        # so the View menu's states are refreshed along with the render.
+        if hasattr(self, '_view_menu'):
+            self._on_display_mode_changed()
+        else:
+            self._render()
 
     def _on_layers_structure_changed(self):
         """Shared tail for anything that changes which sources exist, their
@@ -4073,9 +4078,9 @@ class GCodeGeneratorApp:
         _get_depth_map_for_step) rather than read here, both because this
         runs off the main thread and because each step must be computed
         against its OWN source_visibility, not whichever step tab happens
-        to be selected. prior_depth_map is the prior step's depth map,
-        precomputed the same way, for the "Depth map change" Process Region
-        (None for the first step).
+        to be selected. prior_depth_map is the depth map of the step
+        "Depth map change" compares against (see _change_reference_index),
+        precomputed the same way, or None where there is none.
 
         Returns a toolpath result. Raises ProgressDialog.Cancelled or any
         algorithm exception on failure.
@@ -4452,11 +4457,12 @@ class GCodeGeneratorApp:
                         f"full depth map.\n\nContinue anyway?"):
                     return
 
-        # The prior step's depth map needs no computed prior step; it is
+        # The reference step's depth map needs no computed step; it is
         # built here because _get_depth_map_for_step reads Tk variables.
         prior_depth_map = None
-        if params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE and idx > 0:
-            prior_depth_map, _ = self._get_depth_map_for_step(self.steps[idx - 1])
+        ref_idx = self._change_reference_index(idx)
+        if params.get('gating_mode') == GATING_DEPTH_MAP_CHANGE and ref_idx is not None:
+            prior_depth_map, _ = self._get_depth_map_for_step(self.steps[ref_idx])
 
         dlg = ProgressDialog(self.root,
                              title=f"Computing Step {idx + 1} Tool Path")
@@ -4517,6 +4523,7 @@ class GCodeGeneratorApp:
                                      f"Please check the settings for Step {idx + 1}.")
                 return
             all_depth_maps.append(self._get_depth_map_for_step(step))
+        all_ref_idx = [self._change_reference_index(i) for i in range(len(self.steps))]
 
         n   = len(self.steps)
         dlg = ProgressDialog(self.root, title="Computing All Step Tool Paths")
@@ -4532,7 +4539,8 @@ class GCodeGeneratorApp:
                     zip(self.steps, all_params, all_depth_maps)):
                 idx     = params['idx']
                 prev_tp = self.toolpaths[idx - 1] if idx > 0 else None
-                prior_depth_map = all_depth_maps[idx - 1][0] if idx > 0 else None
+                ref_idx = all_ref_idx[idx]
+                prior_depth_map = all_depth_maps[ref_idx][0] if ref_idx is not None else None
                 try:
                     dlg.report(i * 100.0 / n, f"Starting Step {i + 1} of {n}…")
                     result = self._compute_step_work(
@@ -4715,7 +4723,8 @@ class GCodeGeneratorApp:
                      and not has_accessible)
             and not (m in (DISPLAY_STEP_RES, DISPLAY_STEP_RESULT, DISPLAY_STEP_3D) and not step_computed)
             and not (m == DISPLAY_DIFF_RES_UNCUT and not (has_accessible and has_prev_result))
-            and not (m == DISPLAY_DIFF_DEPTH_MAP and not (has_step and idx > 0))
+            and not (m == DISPLAY_DIFF_DEPTH_MAP
+                     and self._change_reference_index(idx) is None)
             and not (m == DISPLAY_DIFF_UNCUT_UNCUT and not (
                 has_accessible
                 and idx > 0
@@ -5118,31 +5127,36 @@ class GCodeGeneratorApp:
             composite_raw = np.zeros((H, W), dtype=np.float32)
         return self._finish_depth_map(composite_raw, n_grey_levels)
 
-    def _prior_step(self, step):
-        """The step before *step*, or None for the first (or an unlisted) step."""
-        idx = next((i for i, s in enumerate(self.steps) if s is step), None)
-        return self.steps[idx - 1] if idx else None
+    def _effective_visibility(self, step):
+        """Which sources *step* sees, one bool per source -- its own
+        source_visibility, falling back to each source's own .visible where
+        that list is missing or short, as layers.composite does."""
+        vis = step.get('source_visibility')
+        return [bool(vis[i]) if vis is not None and i < len(vis) else bool(layer.visible)
+                for i, layer in enumerate(self.layers)]
 
-    def _depth_map_differs_from_prior(self, step):
-        """Whether *step*'s depth map differs from the prior step's. Equal
-        source visibility means equal depth maps, so both are composited
-        only when the visibility differs. Call from the main thread."""
-        prior = self._prior_step(step)
-        if prior is None:
-            return False
-        if list(step.get('source_visibility') or []) == list(prior.get('source_visibility') or []):
-            return False
-        return not np.array_equal(self._get_depth_map_for_step(step)[0],
-                                  self._get_depth_map_for_step(prior)[0])
+    def _change_reference_index(self, idx):
+        """Index of the step "Depth map change" compares step *idx* against:
+        the most recent earlier step whose source visibility differs from
+        step *idx*'s (and so whose depth map may differ), or None if every
+        earlier step sees the same sources."""
+        if not 0 <= idx < len(self.steps):
+            return None
+        own = self._effective_visibility(self.steps[idx])
+        for i in range(idx - 1, -1, -1):
+            if self._effective_visibility(self.steps[i]) != own:
+                return i
+        return None
 
     def _gating_mode_values(self, step):
         """Process Region choices for *step*: GATING_MODES, with "Depth map
-        change" only where the step's depth map differs from the prior
-        step's -- or where the step already uses it, so the setting is never
-        changed behind the user's back."""
+        change" only where an earlier step sees different sources (see
+        _change_reference_index) -- or where the step already uses it, so
+        the setting is never changed behind the user's back."""
         var = step.get('gating_mode_var')
+        idx = next((i for i, s in enumerate(self.steps) if s is step), None)
         if ((var is not None and var.get() == GATING_DEPTH_MAP_CHANGE)
-                or self._depth_map_differs_from_prior(step)):
+                or (idx is not None and self._change_reference_index(idx) is not None)):
             return list(GATING_MODES)
         return [m for m in GATING_MODES if m != GATING_DEPTH_MAP_CHANGE]
 
@@ -5530,9 +5544,10 @@ class GCodeGeneratorApp:
 
                 prior_idx = step_idx - 1
                 if gating_mode == GATING_DEPTH_MAP_CHANGE:
-                    if 0 <= prior_idx < len(self.steps):
+                    ref_idx = self._change_reference_index(step_idx)
+                    if ref_idx is not None:
                         prior_depth_map, _ = self._get_depth_map_for_step(
-                            self.steps[prior_idx])
+                            self.steps[ref_idx])
                         ref = np.clip(depth_map_change(depth_map, prior_depth_map), 0.0, 1.0)
                     else:
                         ref = depth_map.copy()
@@ -5693,20 +5708,21 @@ class GCodeGeneratorApp:
                 mode = DISPLAY_ORIGINAL
 
         elif mode == DISPLAY_DIFF_DEPTH_MAP:
-            prev_idx = step_idx - 1
-            if 0 <= prev_idx < len(self.steps) and step_idx < len(self.steps):
-                # depth_map vs. prior step's depth map, each from its own
-                # source visibility, with depth_map_change's sideways
-                # tolerance (its positive part is what the "Depth map
-                # change" Process Region gates on):
-                # positive → this step asks for material the prior step's depth map keeps
-                # negative → this step's depth map is shallower than the prior step's
+            ref_idx = self._change_reference_index(step_idx)
+            if ref_idx is not None:
+                # depth_map vs. the depth map of the most recent earlier step
+                # that sees different sources (_change_reference_index),
+                # each from its own source visibility, with
+                # depth_map_change's sideways tolerance (its positive part is
+                # what the "Depth map change" Process Region gates on):
+                # positive → this step asks for material the reference step's depth map keeps
+                # negative → this step's depth map is shallower than the reference step's
                 depth_map, _ = self._get_depth_map()
-                prior_depth_map, _ = self._get_depth_map_for_step(self.steps[prev_idx])
+                prior_depth_map, _ = self._get_depth_map_for_step(self.steps[ref_idx])
                 img   = depth_map_change(depth_map, prior_depth_map)
                 cmap  = _DIFF_CMAP
                 vmin, vmax = -1.0, 1.0
-                title = f"Depth Map Change (Step {step_idx + 1})"
+                title = f"Depth Map Change (Step {step_idx + 1} vs. Step {ref_idx + 1})"
             else:
                 mode = DISPLAY_ORIGINAL
 
