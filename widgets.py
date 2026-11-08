@@ -2546,6 +2546,40 @@ class ApplyMaterialDialog(tk.Toplevel):
         self.destroy()
 
 
+def export_tool_groups(steps_info):
+    """Group the computed steps of *steps_info* (see ``ExportToolpathDialog``)
+    by tool, in order of each tool's first step.
+
+    Steps linked to a library tool group by its id; unlinked steps group by
+    profile, diameter and (for Custom) the profile curve. Returns a list of
+    ``(label, indices)`` pairs; labels are unique, a repeated one gets a
+    ``#n`` suffix.
+    """
+    groups = {}
+    for i, info in enumerate(steps_info):
+        if not info['computed']:
+            continue
+        tool_id = info.get('tool_id', "")
+        key = (('id', tool_id) if tool_id else
+               ('geom', info['profile'], info['diameter_mm'],
+                info.get('profile_key', "")))
+        if key not in groups:
+            label = f"{info['profile']} ∅{info['diameter_mm']:.4g} mm"
+            if tool_id and info.get('tool_name'):
+                label += f" ({info['tool_name']})"
+            groups[key] = [label, []]
+        groups[key][1].append(i)
+
+    result, used = [], set()
+    for label, indices in groups.values():
+        unique, n = label, 2
+        while unique in used:
+            unique, n = f"{label} #{n}", n + 1
+        used.add(unique)
+        result.append((unique, indices))
+    return result
+
+
 class ExportToolpathDialog(tk.Toplevel):
     """Modal dialog for selecting which computed steps to include in a single
     exported G-code file.
@@ -2559,7 +2593,9 @@ class ExportToolpathDialog(tk.Toplevel):
         """
         steps_info      — list of dicts, one per step:
                           'label' (str), 'computed' (bool),
-                          'profile' (str), 'diameter_mm' (float)
+                          'profile' (str), 'diameter_mm' (float), and
+                          optionally 'profile_key' (str), 'tool_id' (str),
+                          'tool_name' (str) — see ``export_tool_groups``
         precheck_indices — list of indices to pre-check, or None to pre-check
                            all computed steps
         """
@@ -2577,6 +2613,19 @@ class ExportToolpathDialog(tk.Toplevel):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
 
+        # ── Tool selector: checks exactly the steps of the chosen tool ───
+        self._tool_groups = export_tool_groups(steps_info)
+        self._syncing_tool = False
+        tool_row = ttk.Frame(outer)
+        tool_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(tool_row, text="Tool").pack(side=tk.LEFT, padx=(0, 6))
+        self._tool_var = tk.StringVar()
+        tool_cb = ttk.Combobox(
+            tool_row, textvariable=self._tool_var, state="readonly",
+            values=[self.ALL_TOOLS] + [lbl for lbl, _ in self._tool_groups])
+        tool_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tool_cb.bind("<<ComboboxSelected>>", self._on_tool_selected)
+
         # ── Steps checkboxes ─────────────────────────────────────────────
         sf = SectionFrame(outer, "Steps")
         sf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -2591,7 +2640,7 @@ class ExportToolpathDialog(tk.Toplevel):
             else:
                 var.set(False)
                 state = tk.DISABLED
-            var.trace_add("write", self._update_filename)
+            var.trace_add("write", self._on_check_changed)
             self._check_vars.append(var)
             ttk.Checkbutton(sf, text=info['label'], variable=var,
                             state=state).pack(anchor=tk.W, pady=1)
@@ -2613,10 +2662,45 @@ class ExportToolpathDialog(tk.Toplevel):
         ph = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
         self.geometry(f"+{pw}+{ph}")
 
-        self._update_filename()
+        self._on_check_changed()
         self.wait_window()
 
+    ALL_TOOLS = "All"
+
     # ------------------------------------------------------------------ #
+    def _on_tool_selected(self, _event=None):
+        choice = self._tool_var.get()
+        if choice == self.ALL_TOOLS:
+            wanted = {i for _, idx in self._tool_groups for i in idx}
+        else:
+            wanted = next((set(idx) for lbl, idx in self._tool_groups
+                           if lbl == choice), set())
+        self._syncing_tool = True
+        try:
+            for i, (var, info) in enumerate(zip(self._check_vars,
+                                                self._steps_info)):
+                if info['computed']:
+                    var.set(i in wanted)
+        finally:
+            self._syncing_tool = False
+        self._on_check_changed()
+
+    def _on_check_changed(self, *_):
+        """Refresh the suggested filename and show in the tool selector the
+        entry whose steps are exactly the checked ones (blank if none is)."""
+        if self._syncing_tool:
+            return
+        checked = {i for i, (var, info) in enumerate(zip(self._check_vars,
+                                                         self._steps_info))
+                   if var.get() and info['computed']}
+        computed = {i for _, idx in self._tool_groups for i in idx}
+        if checked and checked == computed:
+            self._tool_var.set(self.ALL_TOOLS)
+        else:
+            self._tool_var.set(next((lbl for lbl, idx in self._tool_groups
+                                     if checked == set(idx)), ""))
+        self._update_filename()
+
     def _update_filename(self, *_):
         seen = []
         seen_set = set()

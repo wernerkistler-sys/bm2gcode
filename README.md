@@ -417,7 +417,7 @@ Being a Z-only change, a tab doesn't alter the toolpath's outline, so it's other
 | Save Project | Ctrl+S | Save the current canvas, sources, and step configuration to the project's `.prj` file; for an untitled project, asks for a file name as Save Project As… does. |
 | Save Project As… | Ctrl+Shift+S | Save the project to a new `.prj` file, which becomes the project's file for later saves. |
 | Open Source… | Ctrl+O | Load a grayscale image or import an STL mesh as the canvas's base source, replacing the whole project (see below). |
-| Export Toolpath… | — | Export G-code for selected computed steps to a `.nc` file. |
+| Export Toolpath… | — | Export G-code for selected computed steps to a `.nc` file. The **Tool** list at the top checks exactly the computed steps that use the chosen tool (**All** checks every computed step); it shows the entry matching the current checkboxes. |
 | Settings… | — | Configure machine parameters (see below). |
 | Exit | Ctrl+Q | Quit the application. |
 

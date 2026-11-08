@@ -4595,6 +4595,7 @@ class GCodeGeneratorApp:
                 'profile_key': tool_profile.curve_key(self._step_profile_curve(step))
                                if profile == "Custom" else "",
                 'tool_id':     tool_id,
+                'tool_name':   tool_name,
             })
         return info
 

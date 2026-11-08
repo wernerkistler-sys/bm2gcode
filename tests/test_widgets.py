@@ -61,6 +61,37 @@ for cls in classes:
     check(f"{cls.name}: every command exists{missing or ''}", not missing)
 
 
+print("export tool groups")
+try:
+    sys.path.insert(0, ROOT)
+    from widgets import export_tool_groups
+except Exception as exc:          # no tkinter: widgets.py can't be imported
+    print(f"  skipped ({exc})")
+else:
+    def _info(computed, profile, diam, tool_id="", tool_name="", key=""):
+        return {'label': "", 'computed': computed, 'profile': profile,
+                'diameter_mm': diam, 'profile_key': key,
+                'tool_id': tool_id, 'tool_name': tool_name}
+    _groups = export_tool_groups([
+        _info(True,  "Ball", 6.0),
+        _info(True,  "Flat", 3.175, "t1", "Endmill"),
+        _info(False, "Ball", 6.0),
+        _info(True,  "Ball", 6.0),
+        _info(True,  "Flat", 3.175, "t1", "Endmill"),
+        _info(True,  "Flat", 3.175, "t2", "Endmill"),
+        _info(True,  "Custom", 4.0, key="a"),
+        _info(True,  "Custom", 4.0, key="b"),
+    ])
+    check("one group per tool, uncomputed steps left out",
+          [idx for _, idx in _groups] == [[0, 3], [1, 4], [5], [6], [7]])
+    check("labels name the tool, repeats get a suffix",
+          [lbl for lbl, _ in _groups] == [
+              "Ball ∅6 mm", "Flat ∅3.175 mm (Endmill)",
+              "Flat ∅3.175 mm (Endmill) #2", "Custom ∅4 mm",
+              "Custom ∅4 mm #2"])
+    check("no computed steps, no groups",
+          export_tool_groups([_info(False, "Ball", 6.0)]) == [])
+
 print("range entry")
 try:
     import tkinter as tk
