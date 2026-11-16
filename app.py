@@ -62,6 +62,8 @@ from algorithms import (compute_raster_toolpath, compute_vcarve_toolpath,
                         compute_cutout_toolpath, compute_cutout_silhouette_mask,
                         _compute_cutout_rings, _compute_cutout_from_rings,
                         compute_pocket_toolpath, compute_pocket_mask, _build_kernel,
+                        compute_level_clearing_toolpath, level_clearing_surface,
+                        plan_clearing_levels, level_clearing_mask,
                         compute_vcarve_synth_achievable_depth,
                         compute_registration_holes_toolpath, registration_hole_centers,
                         registration_flip_axis, registration_auto_spacing,
@@ -1606,7 +1608,7 @@ class GCodeGeneratorApp:
             or hide it for algorithms without one."""
             alg = algorithm_var.get()
             family = ALGORITHM_FAMILY[alg]
-            if alg == "Contour":
+            if alg == "Contour" or family == "Level Clearing":
                 step['z_range'].pack(in_=step['contour_frame'], fill=tk.X, pady=2,
                                      after=step['contour_z_increment'])
             elif family == "Undercut":
@@ -1705,9 +1707,36 @@ class GCodeGeneratorApp:
                 step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
                 step['pocket_boundary_offset'].pack_forget()
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
+                if not step['contour_lateral_tol'].winfo_manager():
+                    step['contour_lateral_tol'].pack(fill=tk.X, pady=2)
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['contour_frame'])
                 step['vbit_angle'].set_state("normal")
                 step['cutout_frame'].pack_forget()
+            elif family == "Level Clearing":
+                # Contour's level controls (without Lateral tolerance) over
+                # Pocket's infill controls; no Process Region, like Pocket.
+                for key in ('vcarve_frame', 'cutout_frame', 'min_fw', 'max_fw',
+                            'gating_frame', 'raster_final_stepdown',
+                            'pocket_boundary_offset', 'contour_lateral_tol'):
+                    step[key].pack_forget()
+                step['profile_cb'].config(state="readonly", values=_RASTER_PROFILES)
+                if profile not in _RASTER_PROFILES:
+                    step['profile_var'].set("End Mill")
+                if profile == "V-Bit":
+                    step['vbit_frame'].pack(fill=tk.X, after=step['diameter'])
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['vbit_frame'])
+                else:
+                    step['vbit_frame'].pack_forget()
+                    step['stepdown'].pack(fill=tk.X, pady=2, after=step['diameter'])
+                step['extra_offset'].pack(fill=tk.X, pady=2, after=step['stepdown'])
+                step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
+                step['raster_dir_cb'].config(values=POCKET_PATTERNS)
+                if step['raster_dir_var'].get() not in POCKET_PATTERNS:
+                    step['raster_dir_var'].set("Onion Skin (Inside-Out)")
+                step['raster_frame'].pack(fill=tk.X, after=step['contour_frame'])
+                step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
+                step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])
+                step['vbit_angle'].set_state("normal")
             elif alg == "Cutout":
                 step['raster_frame'].pack_forget()
                 step['vcarve_frame'].pack_forget()
@@ -1863,7 +1892,7 @@ class GCodeGeneratorApp:
             # dedicated ordering (_order_zigzag_pass /
             # _order_fixed_orientation_pass) that never reads it, so the
             # checkbox has nothing to do there regardless of Cut direction.
-            pocket_2opt_moot = (family == "Pocket"
+            pocket_2opt_moot = (family in ("Pocket", "Level Clearing")
                                  and step['raster_dir_var'].get() not in WOUND_DIRECTIONS)
             step['tsp_2opt_cb'].config(
                 state="disabled" if (locked or pocket_2opt_moot) else "normal")
@@ -1882,6 +1911,27 @@ class GCodeGeneratorApp:
         _place_z_range()
         profile_var.trace_add("write", _refresh_layout)
         algorithm_var.trace_add("write", _refresh_layout)
+
+        step['_last_algorithm'] = algorithm_var.get()
+
+        def _on_algorithm_switched(*_):
+            """Switching to Level Clearing sets its level spacing (the Z
+            increment field it shares with Contour, whose default suits
+            finishing) to the step's Max step-down. Copying or loading a
+            step writes its fields after the algorithm, so their values
+            win."""
+            alg = algorithm_var.get()
+            if (ALGORITHM_FAMILY.get(alg) == "Level Clearing"
+                    and alg != step['_last_algorithm']):
+                try:
+                    stepdown = float(step['stepdown'].get())
+                except (ValueError, tk.TclError):
+                    stepdown = 0.0
+                if stepdown > 0.0:
+                    step['contour_z_increment'].set(step['stepdown'].get())
+            step['_last_algorithm'] = alg
+
+        algorithm_var.trace_add("write", _on_algorithm_switched)
         reghole_pattern_var.trace_add("write", _refresh_layout)
         reghole_diag_dir_var.trace_add("write", _refresh_layout)
 
@@ -4021,6 +4071,21 @@ class GCodeGeneratorApp:
                 'cut_direction':       step['cut_dir_var'].get(),
                 'z_range':             self._step_z_range(step),
             })
+        elif ALGORITHM_FAMILY[algorithm] == "Level Clearing":
+            tool     = self._step_tool(step)
+            stepover = float(step['stepover'].get())
+            params.update({
+                'tool':                tool,
+                'step_mm':             tool.diameter_mm * stepover / 100.0,
+                'raster_offset_pct':   float(step['raster_offset'].get()),
+                'contour_z_increment_mm': float(step['contour_z_increment'].get()),
+                'contour_adaptive':    step['contour_adaptive_var'].get(),
+                'max_step_down_mm':    float(step['stepdown'].get()),
+                'use_2opt':            step['tsp_2opt_var'].get(),
+                'raster_dir':          step['raster_dir_var'].get(),
+                'cut_direction':       step['cut_dir_var'].get(),
+                'z_range':             self._step_z_range(step),
+            })
         elif algorithm == "Cutout":
             tool = Tool("End Mill", float(step['diameter'].get()), 90.0)
             params.update({
@@ -4182,7 +4247,7 @@ class GCodeGeneratorApp:
         into its own result map."""
         algorithm = params['algorithm']
         family = ALGORITHM_FAMILY[algorithm]
-        if algorithm == "Contour":
+        if algorithm == "Contour" or family == "Level Clearing":
             return bool(params['avoid_air'])
         if algorithm == "Cutout" or family in ("Undercut", "Registration Holes", "Pocket"):
             return False
@@ -4222,6 +4287,16 @@ class GCodeGeneratorApp:
                     tp.prior_serial, computed=True))
         return staleness.step_currency(states)
 
+    @staticmethod
+    def _erosion_cache_key(params):
+        """Key of the step's achievable-depth surface in the erosion cache:
+        everything the planning-kernel erosion depends on."""
+        tool = params['tool']
+        return (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
+                tool_profile.curve_key(tool.profile_curve), params['max_depth'],
+                params['eff_width_mm'], params['eff_height_mm'],
+                params['extra_offset_mm'], params['source_visibility'])
+
     def _compute_step_work(self, step, params, progress_fn, prev_tp, depth_map, n_grey_levels,
                            prior_depth_map=None):
         """Synchronous algorithm computation — call from a background thread.
@@ -4244,9 +4319,7 @@ class GCodeGeneratorApp:
             ALGORITHM_FAMILY[algorithm], STEP_PEAK_BYTES_PER_PX_DEFAULT))
 
         tool = params['tool']
-        erosion_cache_key = (tool.profile, tool.diameter_mm, tool.vbit_angle_deg,
-                             tool_profile.curve_key(tool.profile_curve), params['max_depth'], params['eff_width_mm'], params['eff_height_mm'],
-                             params['extra_offset_mm'], params['source_visibility'])
+        erosion_cache_key = self._erosion_cache_key(params)
 
         if ALGORITHM_FAMILY[algorithm] == "V-Carving":
             gating_mode = params['gating_mode']
@@ -4426,6 +4499,34 @@ class GCodeGeneratorApp:
                 previous_result    = prev_tp.result     if prev_tp is not None else None,
                 previous_alpha     = prev_tp.alpha      if prev_tp is not None else None,
                 progress           = progress_fn,
+            )
+        elif ALGORITHM_FAMILY[algorithm] == "Level Clearing":
+            return compute_level_clearing_toolpath(
+                depth_map         = depth_map,
+                n_grey_levels     = n_grey_levels,
+                tool              = params['tool'],
+                step_mm           = params['step_mm'],
+                z_increment_mm    = params['contour_z_increment_mm'],
+                max_depth         = params['max_depth'],
+                width_mm          = params['eff_width_mm'],
+                height_mm         = params['eff_height_mm'],
+                raster_dir        = params['raster_dir'],
+                origin            = params['origin'],
+                feed_rate         = params['feed_rate'],
+                previous_result   = prev_tp.result if prev_tp is not None else None,
+                raster_offset_pct = params['raster_offset_pct'],
+                use_2opt          = params['use_2opt'],
+                cut_direction     = params['cut_direction'],
+                max_step_down_mm  = params['max_step_down_mm'],
+                adaptive_levels   = params['contour_adaptive'],
+                z_range           = params['z_range'],
+                extra_offset_mm   = params['extra_offset_mm'],
+                avoid_air         = params['avoid_air'],
+                z_safe            = self._settings['z_safe'],
+                feed_rapid        = self._settings['feed_rapid'],
+                progress          = progress_fn,
+                erosion_cache     = self._erosion_cache,
+                erosion_cache_key = erosion_cache_key,
             )
         elif ALGORITHM_FAMILY[algorithm] == "Pocket":   # Pocket, V-Carving Clean-up
             # Pocket's own boundary_offset_mm is a lateral-only mask push
@@ -5667,16 +5768,16 @@ class GCodeGeneratorApp:
                 threshold_mm = params['threshold_mm'] if params is not None else 0.0
                 max_depth    = params['max_depth']    if params is not None else 5.0
 
-                # Cutout and Pocket (and V-Carving Clean-up, which shares
-                # Pocket's pipeline) all cut against the full depth map
-                # regardless of any prior step -- none has a Process Region
-                # selector (see "Step / Operation / Cutout"/"Step /
-                # Operation / Pocket" in README.md), and their own
+                # Cutout, Pocket (and V-Carving Clean-up, which shares
+                # Pocket's pipeline) and Level Clearing all cut against the
+                # full depth map regardless of any prior step -- none has a
+                # Process Region selector (see "Step / Operation / Cutout"/
+                # "Step / Operation / Pocket" in README.md), and their own
                 # compute_*_toolpath functions never read gating_mode at
                 # all. Mirror that here instead of reading whatever stale
                 # mode the widget still holds from a different algorithm.
                 gating_mode = "Full depth map"
-                if (ALGORITHM_FAMILY[algorithm] not in ("Cutout", "Pocket",
+                if (ALGORITHM_FAMILY[algorithm] not in ("Cutout", "Pocket", "Level Clearing",
                                                         "Registration Holes")
                         and 0 <= step_idx < len(self.steps)
                         and self.steps[step_idx].get('gating_mode_var') is not None):
@@ -5796,6 +5897,18 @@ class GCodeGeneratorApp:
                         boundary_offset_mm=params['pocket_boundary_offset_mm'],
                         reference_surface=reference_surface,
                         erosion_cache=self._erosion_cache, erosion_cache_key=cache_key)
+                elif ALGORITHM_FAMILY[algorithm] == "Level Clearing":
+                    # Every tool-centre position some level clears: the
+                    # first (shallowest) level's mask holds all deeper ones.
+                    center_depth = level_clearing_surface(
+                        depth_map, params['tool'], px_per_mm, max_depth,
+                        params['extra_offset_mm'], self._erosion_cache,
+                        self._erosion_cache_key(params))[0]
+                    levels = plan_clearing_levels(
+                        center_depth, params['z_range'], params['contour_z_increment_mm'],
+                        max_depth, self.n_grey_levels)
+                    mask = (level_clearing_mask(center_depth, levels[0], self.n_grey_levels)
+                            if levels else np.zeros_like(depth_map, dtype=bool))
                 elif ALGORITHM_FAMILY[algorithm] == "V-Carving":
                     threshold_norm = resolve_vcarve_threshold_norm(ref, threshold_mm, max_depth)
                     _, mask = compute_vcarve_mask(

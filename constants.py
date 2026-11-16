@@ -19,7 +19,8 @@ ALGORITHMS        = ["Raster Scan", "Contour",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
                      "V-Carving Clean-up",
-                     "Cutout", "Pocket", "Registration Holes", "Undercut"]
+                     "Cutout", "Pocket", "Level Clearing", "Registration Holes",
+                     "Undercut"]
 
 # Which compute_*_toolpath pipeline each Algorithm dropdown entry uses.
 # V-Carving Clean-up displays under the V-Carving group but is really a
@@ -37,6 +38,7 @@ ALGORITHM_FAMILY  = {
     "V-Carving Clean-up":        "Pocket",
     "Cutout":                    "Cutout",
     "Pocket":                    "Pocket",
+    "Level Clearing":            "Level Clearing",
     "Registration Holes":        "Registration Holes",
     "Undercut":                  "Undercut",
 }

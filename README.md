@@ -124,6 +124,7 @@ Each cutting step appears as a numbered tab. Use the **Add step** and **Remove t
 | [V-Carving Clean-up](#step--operation--v-carving-clean-up) | Pocket-clears the flat floor that a preceding V-Carving (Hybrid) step's V-bit couldn't reach, without touching its sloped walls. | Flattening the bottom of wide V-carved areas with an end mill. |
 | [Cutout](#step--operation--cutout) | Cuts straight down around the outer silhouette, through the full stock thickness, with optional tabs. | Freeing the finished part from the stock. |
 | [Pocket](#step--operation--pocket) | Clears a flat-bottomed recess at a fixed Target depth with zig-zag, coil, spiral, or onion-skin infill. | Flat recesses, or facing/flattening the whole stock. |
+| [Level Clearing](#step--operation--level-clearing) | Clears the relief level by level, top-down: at each level, a flat Pocket infill of every area the tool can reach that deep. | Fast roughing of reliefs and deep cavities, ahead of a Raster Scan or Contour finish. |
 | [Registration Holes](#step--operation--registration-holes) | Bores pin holes symmetric about a flip axis, independent of the depth map. | Aligning the stock for two-sided milling. |
 | [Undercut](#step--operation--undercut) | Cuts sideways under the overhangs of STL sources in rings at each depth level, with a cutter whose head is wider than its neck (Lollipop, T-Slot or Dovetail), plunging and retracting only in open sky. | Undercut walls, lips and dovetail grooves no vertical plunge can reach. |
 
@@ -223,6 +224,23 @@ The tool used for Clean-up (profile, diameter, feed rate, etc.) is independent o
 
 ---
 
+##### Step / Operation / Level Clearing
+
+Roughs the relief as a stack of flat pockets. The levels lie Z increment apart, from the top of the Z range down to the deepest point the tool can reach. At each level, every position where the tool can be centred and reach that depth is cleared flat with [Pocket](#step--operation--pocket)'s infill. The area a level clears always lies inside the area the level above it cleared, so each level removes at most one level spacing of material, in a single pass. All cutting happens at constant depth, and the infill follows the outline of each level's area, which shrinks as the levels go deeper. Slopes are left as terraces at most one level spacing high, so a Raster Scan or Contour step usually follows to finish them.
+
+Each separate area is cleared to the bottom before the tool moves to the next: after a level's area, the tool continues into the areas below it, nearest first. Within one area, the infill is ordered and linked as in Pocket; short links follow the floors already cleared instead of rising to the stock surface. The tool retracts between areas.
+
+| Parameter | Description |
+|---|---|
+| Z increment | Spacing of the levels (mm). The field is shared with Contour; switching a step to Level Clearing sets it to the step's Max step-down. The deepest level is always the deepest depth the tool can reach, so with uniform levels the bottom spacing may be smaller. |
+| Adaptive (checkbox beside Z increment) | Moves levels onto flat floors. Each level, except the deepest, owns the depths from halfway to the level above it to halfway to the level below. If a flat floor lies in that range, the level moves onto it (onto the floor with the most area, if there are several), so the floor is cut exactly to its depth instead of keeping up to one level spacing of stock. A floor counts when the tool can sit on it over an area about 1.5 tool diameters across. The number of levels doesn't change, and levels with no floor near them stay where uniform levels would be. That makes Adaptive a refinement after a uniform step: with the same Z increment and **Avoid cutting air** on, the levels the first step already cut are air and get removed, and only the moved levels cut. |
+| Z range | Depth band of the levels, min – max in % of Max cut depth (default 0 – 100). Every level lies deeper than min and no deeper than max. Material above min is assumed to be removed already by an earlier step. |
+| Step-over, Line offset, Scan direction, Cut direction | As for [Pocket](#step--operation--pocket), applied to each level's areas. Onion Skin (Inside-Out) suits roughing best: every level's material is enclosed on all sides, so the tool enters at the centre (with the [Ramp-in](#step--dress-up) dress-up) and works outward. |
+
+Max step-down under [Step / Tool](#step--tool) is a hard limit on the level spacing: wherever Adaptive or Z range would leave two levels further apart, evenly spaced levels are added between them. Extra offset leaves stock on walls and floors, as in Contour. There's no Process Region selector, as for Pocket; with **Avoid cutting air**, the parts of each level that an earlier step already cleared are removed, so a second Level Clearing step only takes off what the first left, for example with a smaller tool in the corners.
+
+---
+
 ##### Step / Operation / Registration Holes
 
 Bores holes for registration pins, so the stock can be turned over and carved on its back side in exact alignment with the front. The holes are placed on the stock alone — the depth map, Process Region and prior steps play no part in where they go — and are symmetric about a chosen flip axis, so after flipping, the same pins fit the same holes. Hole depth is absolute and typically goes through the stock into the spoilboard: the pins then stay in the spoilboard while the stock is turned over. Restricted to an End Mill tool.
@@ -305,7 +323,7 @@ Cutout's **Split level** and Pocket's **Target depth** are the same underlying f
 
 ##### Step / Operation / Path Optimization
 
-**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments. Not shown for [Contour](#step--operation--contour), whose rings are ordered along the contour graph instead (see [Contour Pipeline](#contour-pipeline)). Greyed out and has no effect when **Cut direction** is set to Climb or Conventional, since a locked direction cannot be reordered — see [Climb / conventional cut direction](#climb--conventional-cut-direction). For [Pocket](#step--operation--pocket), it's also greyed out whenever **Scan direction** is Zig-Zag or Onion Skin, regardless of Cut direction — both use their own dedicated ordering (region-sequential for Zig-Zag, fixed-orientation for Onion Skin — see [Pocket Pipeline](#pocket-pipeline)) that never consults 2-opt; only Coil's and Spiral's ordering can fall back to it.
+**Optimize path order (2-opt)** — reorders path segments using a 2-opt TSP solver to reduce total rapid travel distance between segments. Not shown for [Contour](#step--operation--contour), whose rings are ordered along the contour graph instead (see [Contour Pipeline](#contour-pipeline)). Greyed out and has no effect when **Cut direction** is set to Climb or Conventional, since a locked direction cannot be reordered — see [Climb / conventional cut direction](#climb--conventional-cut-direction). For [Pocket](#step--operation--pocket) and [Level Clearing](#step--operation--level-clearing), it's also greyed out whenever **Scan direction** is Zig-Zag or Onion Skin, regardless of Cut direction — both use their own dedicated ordering (region-sequential for Zig-Zag, fixed-orientation for Onion Skin — see [Pocket Pipeline](#pocket-pipeline)) that never consults 2-opt; only Coil's and Spiral's ordering can fall back to it.
 
 **Avoid cutting air** — removes the parts of every pass where the tool would only feed through air, because an earlier step has already removed the material there, or because the move stays at the stock surface (Z=0) where there's nothing to cut. Applies to every algorithm and to every pass, including the final pass and single-pass steps: a refining step's finishing pass over an area the previous step already cut to depth is skipped as well. An air run at the start or end of a segment is always trimmed; an air run in the middle of a segment is removed (splitting it in two) only if it's long enough that the extra retract and plunge take less time than feeding straight through — the same break-even rule as Contour's Lateral tolerance, using Safe height and Rapid feed from Settings. The step's result map is unchanged. Off by default. See [Air-cut pruning](#air-cut-pruning).
 
@@ -347,6 +365,10 @@ levels (CDF), the spacing of the levels. Contour's actual Z-level spacing is
 otherwise the separate **Z increment** field under
 [Step / Operation / Contour](#step--operation--contour), which Max step-down
 doesn't limit.
+
+Level Clearing shows **Max step-down** as the largest allowed spacing of
+its levels; their spacing itself is Z increment — see
+[Step / Operation / Level Clearing](#step--operation--level-clearing).
 
 Cutout shows its own independent Max/Final step-down pair too, alongside
 its own Cut depth and Boundary offset fields — see
@@ -676,6 +698,20 @@ Pocket shares Raster's kernel + accessibility (morphological opening) stage, but
 Pocket only clears the interior — it does not cut a wall-finishing pass around the pocket boundary. Every scan direction's own infill lines still stop at the interior mask's pixel-grid boundary, the same stair-stepped edge Raster leaves at any masked boundary — Zig-Zag's contour linking (step 6) only smooths the connecting move between lines, not each line's own endpoint. Onion Skin is the exception: its rings are extracted via sub-pixel marching squares (`skimage.find_contours`) directly, so its outermost ring traces a smoother boundary than the per-pixel stair-step.
 
 V-Carving Clean-up runs this identical pipeline with one substitution: step 1's achievable-depth erosion runs against `compute_vcarve_synth_achievable_depth`'s output — the nearest preceding V-Carving (Hybrid) step's own idealized-V-bit achievable-depth surface (see [V-Carving Pipeline](#v-carving-pipeline)) — instead of the raw depth map, so the clearing tool's kernel is eroded against the V-bit's own achievable-depth surface rather than the flat depth map. Target depth still defaults to 0, but that now means literal Z=0 (see [Step / Operation / Pocket](#step--operation--pocket)) — check its **Auto** box to track the depth map's own deepest point instead (same Auto behaviour as ordinary Pocket; it reads the raw depth map, not this step's own V-bit-eroded reference surface), mirroring what "0 = auto" used to give by default; see [Step / Operation / V-Carving Clean-up](#step--operation--v-carving-clean-up).
+
+---
+
+### Level Clearing Pipeline
+
+Level Clearing runs Pocket's infill at a series of levels. It shares Contour's achievable-depth surface and level planning, and Pocket's per-region infill, ordering and linking.
+
+1. **Kernel + tool-centre surface** — The same planning-kernel grey erosion as Contour (cached under the same key, so a Contour step with the same tool reuses it), lowered by Extra offset.
+2. **Level planning** — The band is the Z range with its max raised to the deepest point of the tool-centre surface, so that point is always the deepest level. Uniform levels are min + i·Z increment, the last one at the band's bottom. With Adaptive, each level but the deepest moves to the flat floor with the most flat pixels within its own depth range: from halfway to the level above (min, for the first) to halfway to the level below. A pixel is flat when its 3×3 neighbourhood spans less than half a grey level. A floor is a depth window one grey level wide that holds at least a quarter tool footprint of flat pixels, at least as many as the overlapping windows, and twice as many as any window one to one and a half grey levels away. The last rule passes a floor surrounded by slopes but not the even terraces of a quantised ramp. The level goes to the floor's shallowest value. Max step-down then adds evenly spaced levels into any wider gap.
+3. **Per-level infill** — At level z, the tool-centre positions whose erosion reaches z (with Pocket's half-grey-level tolerance) are cleared with Pocket's per-region infill (see [Pocket Pipeline](#pocket-pipeline) step 3) at depth z, one flat pass per level. A deeper level's set lies inside a shallower one's, so the area it sweeps was already cleared to the level above, and it removes at most one level spacing. If Avoid cutting air is on, each level's air runs are removed (see [Air-cut pruning](#air-cut-pruning)). A position within one pixel of air counts as air there, since the earlier step's path was simplified by up to a pixel, and a level retracing one of its levels would otherwise keep slivers along every steep wall.
+4. **Region forest** — Each connected region at one level lies inside exactly one region of the level above, its parent.
+5. **Ordering** — Depth-first through the forest: after a region, the nearest uncut child of the deepest region that still has one, so each cavity is cleared to the bottom before the next. A region whose segments were all removed as air counts as cut. Within a region, segments are ordered as in Pocket's step 5.
+6. **Linking** — Within a region, as in Pocket's step 6. The geodesic links follow the floor left by the regions cut so far (each region at its own level), capped at the current level, so a link that leaves the current region stays on a cleared floor rather than rising to the stock surface. Between regions the tool retracts.
+7. **Simplification + result simulation** — Same as Raster. The accessible surface is the tool's reach from the tool-centre surface rounded down to the deepest level at or above it (the band's min above the first level), i.e. the terraces the step actually leaves.
 
 ---
 

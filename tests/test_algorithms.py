@@ -27,7 +27,9 @@ from algorithms import (_onion_skin_chains, _ring_chain_to_points,
                         _fill_level_gaps, _prune_contours,
                         compute_contour_toolpath, _geodesic_link,
                         _plan_passes, make_multipass, band_levels, check_z_range,
-                        depth_map_change, depth_map_change_reference)
+                        depth_map_change, depth_map_change_reference,
+                        compute_level_clearing_toolpath, plateau_levels,
+                        plan_clearing_levels, level_clearing_surface)
 from tool import Tool
 from toolpath import ToolPath
 import tool_profile
@@ -1789,6 +1791,177 @@ check("a 1 px wide new line keeps its full depth",
       bool(np.allclose(depth_map_change(_line, np.zeros_like(_line))[:, 10], 0.5)))
 check("a removed feature reads negative",
       bool(np.allclose(depth_map_change(np.zeros_like(_wall), _wall)[:, 25], -0.8)))
+
+# --------------------------------------------------------------------------
+# Level Clearing: Pocket clearing at stacked levels
+# --------------------------------------------------------------------------
+print("Level Clearing")
+
+LC_PX = 5.0                      # px/mm
+LC_MAX = 10.0                    # mm
+_lc_rr, _lc_cc = np.mgrid[0:100, 0:200]
+
+
+def _lc_two_bowls():
+    """Bowl A (left, 9 mm deep) and bowl B (right, with a flat floor at
+    5.5 mm), 2 mm apart at the stock surface."""
+    a = np.clip(0.9 - np.hypot(_lc_rr - 50, _lc_cc - 48) / 45.0, 0, 1)
+    b = np.clip(0.8 - np.hypot(_lc_rr - 50, _lc_cc - 152) / 50.0, 0, 1)
+    d = np.maximum(a, b).astype(np.float32)
+    d[(_lc_rr - 50) ** 2 + (_lc_cc - 152) ** 2 < 16 ** 2] = 0.55
+    return d
+
+
+def _lc(depth, tool, **kw):
+    args = dict(step_mm=1.2, z_increment_mm=1.0, max_depth=LC_MAX,
+                width_mm=depth.shape[1] / LC_PX, height_mm=depth.shape[0] / LC_PX,
+                raster_dir="Onion Skin (Inside-Out)", cut_direction="Climb",
+                max_step_down_mm=1.0, progress=_noop_progress)
+    args.update(kw)
+    return compute_level_clearing_toolpath(depth, 256, tool, **args)
+
+
+def _lc_engagement(tp, tool, shape, previous=None):
+    """Largest depth (mm) any segment point cuts below the material left by
+    everything before it (and by *previous*)."""
+    kern, foot = _build_kernel(tool, LC_PX, LC_MAX)
+    H, W = shape
+    worst = 0.0
+    for i, seg in enumerate(tp.segments):
+        before = simulate_toolpath_result(ToolPath(segments=tp.segments[:i]), shape,
+                                          LC_PX, LC_PX, 0.0, 0.0, LC_MAX, kern, foot)
+        if previous is not None:
+            before = np.maximum(before, previous)
+        free = compute_air_free_depth(before, kern, foot, shape)
+        for x, y, z in seg:
+            c = min(W - 1, max(0, int(round(x * LC_PX))))
+            r = min(H - 1, max(0, int(round((H - 1) - y * LC_PX))))
+            worst = max(worst, (-z / LC_MAX - float(free[r, c])) * LC_MAX)
+    return worst
+
+
+lc_tool = Tool(profile="End Mill", diameter_mm=3.0)
+lc_depth = _lc_two_bowls()
+tp_lc = _lc(lc_depth, lc_tool)
+lc_levels = tp_lc.metadata['levels_mm']
+check("uniform levels are spaced no more than Z increment",
+      all(b - a <= 1.0 + 1e-6 for a, b in zip([0.0] + lc_levels, lc_levels)))
+# A 3 mm end mill doesn't reach the tip of bowl A's 9 mm cone.
+lc_center = level_clearing_surface(lc_depth, lc_tool, LC_PX, LC_MAX)[0]
+check("the deepest level is the deepest tool-centre depth (bowl A's floor)",
+      lc_levels[-1] < 8.0 and abs(lc_levels[-1] - float(lc_center.max()) * LC_MAX) < 1e-5)
+cut_z = {round(-p[2], 4) for s in tp_lc.segments for p in s}
+check("every point lies on a level (cuts flat, links on cleared floors)",
+      all(any(abs(z - lv) < 1e-3 for lv in [0.0] + lc_levels) for z in cut_z))
+check("no move cuts more than one level spacing below the material left",
+      _lc_engagement(tp_lc, lc_tool, lc_depth.shape) <= 1.0 + 0.05)
+sides = ["A" if s[0][0] < 20.0 else "B" for s in tp_lc.segments]
+check("depth-first: one bowl is cleared to the bottom before the other",
+      sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1]) == 1)
+for rdir in ("Zig-Zag (0°)", "Coil (Outside-In)", "Spiral (Inside-Out)",
+             "Onion Skin (Outside-In)"):
+    tp_r = _lc(lc_depth, lc_tool, raster_dir=rdir, z_increment_mm=2.0,
+               max_step_down_mm=2.0)
+    deep = [s for s in tp_r.segments]
+    check(f"{rdir}: non-empty, and never cuts more than one level spacing",
+          len(deep) > 0
+          and _lc_engagement(tp_r, lc_tool, lc_depth.shape) <= 2.0 + 0.05)
+
+# plateau_levels
+GRID4 = [0.25, 0.5, 0.75, 1.0]
+pl = np.zeros((120, 120), dtype=np.float32)
+pl[:] = np.linspace(0.0, 1.0, 120)[None, :]          # steep ramp: no plateaus
+pl[10:60, 10:60] = 0.37                               # large plateau
+pl[80:92, 80:92] = 0.71                               # small shelf
+lv = plateau_levels(pl, GRID4, 0.0, 256, 60)
+check("plateau_levels keeps the level count", len(lv) == 4)
+check("a large plateau moves the nearest level onto it",
+      np.allclose(lv, [0.37, 0.5, 0.71, 1.0], atol=1e-6))
+check("a small shelf above the area threshold moves its level too",
+      any(abs(z - 0.71) < 1e-6 for z in lv))
+ramp = np.tile(np.linspace(0.0, 1.0, 120, dtype=np.float32), (120, 1))
+check("a ramp has no plateaus: the grid stays",
+      plateau_levels(ramp, GRID4, 0.0, 256, 60) == GRID4)
+qramp = (np.round(np.tile(np.linspace(0.0, 0.3, 120), (120, 1)) * 255) / 255).astype(np.float32)
+check("a gently sloping quantised ramp's terraces are no plateaus",
+      plateau_levels(qramp, [0.1, 0.2, 0.3], 0.0, 256, 60) == [0.1, 0.2, 0.3])
+# Ten shelves 4 grey levels apart, all within the 0.5 level's window; the
+# fifth is twice as wide as the others.
+shelves = np.zeros((100, 110), dtype=np.float32)
+col = 0
+for i in range(10):
+    w = 20 if i == 4 else 10
+    shelves[:, col:col + w] = 0.4 + i * 4 / 255
+    col += w
+lv_s = plateau_levels(shelves, GRID4, 0.0, 256, 60)
+check("a shelf cluster moves one level only",
+      len(lv_s) == 4 and sum(1 for a, b in zip(lv_s, GRID4) if a != b) == 1)
+check("that level goes to the largest shelf",
+      any(abs(z - (0.4 + 16 / 255)) < 1e-6 for z in lv_s))
+
+# Adaptive levels cut a floor exactly; uniform ones leave stock on it.
+tp_ad = _lc(lc_depth, lc_tool, adaptive_levels=True)
+check("Adaptive puts a level on bowl B's floor",
+      any(abs(z - 5.5) < 1e-3 for z in tp_ad.metadata['levels_mm']))
+floor_px = (50, 152)
+check("Adaptive clears bowl B's floor to its depth",
+      abs(tp_ad.result[floor_px] * LC_MAX - 5.5) < 0.05)
+tp_u2 = _lc(lc_depth, lc_tool, z_increment_mm=2.0, max_step_down_mm=2.0)
+check("uniform 2 mm levels leave stock on bowl B's floor",
+      tp_u2.result[floor_px] * LC_MAX < 5.5 - 0.5)
+
+# Refinement: Adaptive with Avoid cutting air after a uniform first step.
+tp_ref = _lc(lc_depth, lc_tool, z_increment_mm=2.0, max_step_down_mm=2.0,
+             adaptive_levels=True, previous_result=tp_u2.result, avoid_air=True)
+step1_levels = tp_u2.metadata['levels_mm']
+cut_z_ref = [-s[0][2] for s in tp_ref.segments]
+check("refinement: no cuts at the first step's levels "
+      "(already cleared there: pure air)",
+      not any(abs(z - lv1) < 1e-3 for z in cut_z_ref for lv1 in step1_levels))
+check("refinement reaches bowl B's floor",
+      abs(tp_ref.result[floor_px] * LC_MAX - 5.5) < 0.05)
+
+
+def _cut_len(tp):
+    return sum(float(np.sum(np.hypot(np.diff(np.asarray(s)[:, 0]),
+                                     np.diff(np.asarray(s)[:, 1]))))
+               for s in tp.segments if len(s) > 1)
+
+
+check("refinement: levels off the plateaus stay on the first step's grid",
+      sum(1 for z in tp_ref.metadata['levels_mm']
+          if not any(abs(z - lv1) < 1e-3 for lv1 in step1_levels)) == 1)
+check("refinement cuts a small fraction of the first step's length",
+      _cut_len(tp_ref) < 0.2 * _cut_len(tp_u2))
+check("refinement never cuts deeper than its own level spacing below "
+      "what both steps left",
+      _lc_engagement(tp_ref, lc_tool, lc_depth.shape, previous=tp_u2.result) <= 2.0 + 0.05)
+small_tool = Tool(profile="End Mill", diameter_mm=1.0)
+sq = np.zeros((100, 200), dtype=np.float32)
+sq[20:80, 30:170] = 0.5                               # square pocket: rounded corners first
+tp_big = _lc(sq, lc_tool, z_increment_mm=5.0, max_step_down_mm=5.0)
+tp_small = _lc(sq, small_tool, z_increment_mm=5.0, max_step_down_mm=5.0,
+               previous_result=tp_big.result, avoid_air=True, step_mm=0.4)
+check("smaller-tool refinement cuts something (the corners)",
+      len(tp_small.segments) > 0)
+corner_ok = all(min(abs(x - 6.0), abs(x - 34.0)) < 2.0 and min(abs(y - 4.0), abs(y - 16.0)) < 2.0
+                for s in tp_small.segments for x, y, _z in s[::4])
+check("smaller-tool refinement cuts only near the corners", corner_ok)
+
+# Z range
+tp_band = _lc(lc_depth, lc_tool, z_range=(0.3, 0.6))
+lvb = tp_band.metadata['levels_mm']
+check("Z range: every level lies in (min, max]",
+      all(3.0 < z <= 6.0 + 1e-6 for z in lvb) and abs(lvb[-1] - 6.0) < 1e-6)
+tp_none = _lc(lc_depth, lc_tool, z_range=(0.95, 1.0))
+check("Z range below the deepest point: no levels, no segments",
+      tp_none.metadata['n_levels'] == 0 and not tp_none.segments)
+tp_flat = _lc(np.zeros((40, 40), dtype=np.float32), lc_tool)
+check("flat depth map: no segments", not tp_flat.segments)
+check("plan_clearing_levels caps the band at the deepest point",
+      plan_clearing_levels(np.full((5, 5), 0.42, np.float32), (0.0, 1.0), 2.0,
+                           LC_MAX, 256)[-1] == np.float32(0.42))
+
 
 print()
 if FAILURES:
