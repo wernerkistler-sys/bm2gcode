@@ -245,17 +245,28 @@ class GCodeGeneratorApp:
                               command=self._on_exit)
         menubar.add_cascade(label="File", menu=file_menu)
 
-        compute_menu = tk.Menu(menubar, tearoff=0)
-        compute_menu.add_command(
+        self._steps_menu = tk.Menu(menubar, tearoff=0)
+        self._steps_menu.add_command(
+            label="Add Step Before Current Step",
+            command=lambda: self._add_step(before=True))
+        self._steps_menu.add_command(
+            label="Add Step After Current Step",
+            command=self._add_step)
+        self._steps_menu.add_command(
+            label="Remove Current Step…",
+            command=lambda: self._confirm_remove_step(
+                self.steps[self._steps_nb.index("current")]))
+        self._steps_menu.add_separator()
+        self._steps_menu.add_command(
             label="Compute Current Step",
             accelerator="F5",
             command=lambda: self._compute_step(
                 self.steps[self._steps_nb.index("current")]))
-        compute_menu.add_command(
+        self._steps_menu.add_command(
             label="Compute All Steps",
             accelerator="F6",
             command=self._compute_all_steps)
-        menubar.add_cascade(label="Compute", menu=compute_menu)
+        menubar.add_cascade(label="Steps", menu=self._steps_menu)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Tool Library…", accelerator="Ctrl+T",
@@ -1037,8 +1048,10 @@ class GCodeGeneratorApp:
         self._on_layers_structure_changed()
         self._select_layer_tab(dup)
 
-    def _add_step(self):
-        """Insert a new step tab after the currently selected tab."""
+    def _add_step(self, before=False):
+        """Insert a new step tab after the currently selected tab, or before
+        it when *before* is true. The new step copies the selected step's
+        settings."""
         # Capture the currently selected step for cloning its settings.
         src = None
         if self.steps:
@@ -1047,10 +1060,12 @@ class GCodeGeneratorApp:
             except Exception:
                 src = self.steps[-1]
 
-        # Insert position: after the selected tab, or 0 on first call.
+        # Insert position: after (or before) the selected tab, or 0 on
+        # first call.
         if self.steps:
             try:
-                insert_at = self._steps_nb.index("current") + 1
+                current = self._steps_nb.index("current")
+                insert_at = current if before else current + 1
             except Exception:
                 insert_at = len(self.steps)
         else:
@@ -1098,7 +1113,7 @@ class GCodeGeneratorApp:
                    ).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=(2, 0))
         step['remove_btn'] = ttk.Button(
             bf, text="Remove this step",
-            command=lambda s=step: self._remove_step(s))
+            command=lambda s=step: self._confirm_remove_step(s))
         step['remove_btn'].grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=(2, 0))
 
         # Info label (shown in the G-code Info area below the notebook)
@@ -1155,6 +1170,19 @@ class GCodeGeneratorApp:
                     'arc_rapids_enabled', 'arc_radius_mm'):
             dst[f'{key}_var'].set(src[f'{key}_var'].get())
 
+    def _confirm_remove_step(self, step):
+        """Ask before removing *step*; the last remaining step stays."""
+        if len(self.steps) <= 1:
+            return
+        idx = self.steps.index(step)
+        if messagebox.askyesno(
+                "Remove Step",
+                f"Remove Step {idx + 1} ({step['algorithm_var'].get()})?"
+                + ("\nIts computed toolpath will be discarded."
+                   if self.toolpaths[idx] is not None else ""),
+                icon=messagebox.WARNING):
+            self._remove_step(step)
+
     def _remove_step(self, step):
         """Remove a step tab and its associated data."""
         idx = self.steps.index(step)
@@ -1174,6 +1202,7 @@ class GCodeGeneratorApp:
         state = tk.DISABLED if len(self.steps) <= 1 else tk.NORMAL
         for s in self.steps:
             s['remove_btn'].config(state=state)
+        self._steps_menu.entryconfig("Remove Current Step…", state=state)
 
     def _build_step_widgets(self, frame, step):
         """Populate a step tab with all tool-parameter widgets.

@@ -35,7 +35,7 @@ python bm2gcode.py
 2. Review the **Canvas** tab — physical width/height, precision, max cut depth, and other canvas-wide settings (see [Canvas](#canvas) below).
 3. Optionally add more sources with **Add Source** (on the Canvas tab, or on any source's own tab) and arrange them with each source's Offset, Rotation, Scale, and Blend mode (see [Sources](#sources) below).
 4. Configure one or more **steps** — choose algorithm, tool, region targeting, and which sources it should see for each.
-5. **Compute → Compute All Steps** (F6) — generate toolpaths.
+5. **Steps → Compute All Steps** (F6) — generate toolpaths.
 6. Use the **View** menu (hotkeys 0–9) to inspect the 3D path, simulated result, residual depth, processing mask, etc.
 7. **File → Export Toolpath…** — save a `.nc` G-code file for your CNC machine.
 
@@ -105,7 +105,7 @@ Each step has its own Visible/hidden choice for every source on the canvas: when
 
 ### Steps
 
-Each cutting step appears as a numbered tab. Use the **Add step** and **Remove this step** buttons at the bottom of each tab to manage the sequence; **Add step** copies all settings — including dress-up — from the step it was added after. The **Dress-up…** button opens that step's tool path dress-up settings (see [Step / Dress-up](#step--dress-up) below). Each tab also contains an **Operation** group and a **Tool** group.
+Each cutting step appears as a numbered tab. Use the **Add step** and **Remove this step** buttons at the bottom of each tab, or the **Steps** menu, to manage the sequence; **Add step** inserts a step after the current one, and **Steps → Add Step Before Current Step** inserts one before it (the only way to put a step ahead of Step 1). A new step copies all settings — including dress-up — from the step that was current when it was added. Removing a step asks for confirmation first; the last remaining step can't be removed. The **Dress-up…** button opens that step's tool path dress-up settings (see [Step / Dress-up](#step--dress-up) below). Each tab also contains an **Operation** group and a **Tool** group.
 
 ---
 
@@ -386,7 +386,7 @@ Undercut shows no step-down field here. Its level spacing is the
 
 #### Step / Dress-up
 
-The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a step added with **Add step** inherits the settings of the step it was added after, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
+The **Dress-up…** button on each step's tab opens that step's tool path dress-up settings. Ramp-in, back-off, and arc-rounding are optional, off-by-default G-code refinements that only change how the tool travels between cuts — the cut geometry itself is unaffected; see [G-code generation](#g-code-generation) for how they fit into path emission. Tabs is the exception: available only for Cutout steps, it changes the cut geometry itself, applied earlier in the Cutout pipeline rather than at G-code emission time — see [Cutout Pipeline](#cutout-pipeline). Dress-up settings are per-step: a newly added step inherits the settings of the step that was current when it was added, and different steps (e.g. a roughing pass vs. a finishing pass) can use different dress-up configurations.
 
 Undercut steps don't use ramp-in or back-off: their checkboxes are greyed out and, if set, ignored. Both move the tool sideways along the cut while it rises, and under an overhang that could hit the part. Arc-rounding still applies, since it only rounds corners at safe height.
 
@@ -480,10 +480,13 @@ Tool path dress-ups (ramp-in, back-off, arc-rounding) are configured per step in
 
 ---
 
-#### Compute Menu
+#### Steps Menu
 
 | Item | Shortcut | Description |
 |---|---|---|
+| Add Step Before Current Step | | Insert a new step before the currently active step tab, with a copy of its settings. |
+| Add Step After Current Step | | Insert a new step after the currently active step tab, with a copy of its settings (same as the tab's **Add step** button). |
+| Remove Current Step… | | Remove the currently active step after confirmation (same as the tab's **Remove this step** button). Disabled while only one step exists. |
 | Compute Current Step | F5 | Compute the toolpath for the currently active step tab. If the step's cuts read the previous step's toolpath (a Process Region other than Full depth map or Depth map change, or Contour's Avoid cutting air) and an earlier step is outdated or not computed, it asks whether to recompute those steps first. **No** computes this step against the results as they are. |
 | Compute All Steps | F6 | Compute, in sequence, every step whose result is outdated or not computed. Steps that are up to date are skipped. |
 
