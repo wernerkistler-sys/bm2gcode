@@ -1681,7 +1681,14 @@ check("band levels lie in (lo, hi] and end at hi",
       len(_bl) == 4 and all(0.3 < z <= 0.7 for z in _bl) and _bl[-1] == 0.7)
 check("full band levels match the uniform levels",
       band_levels((0.0, 1.0), 0.3, 1.0) == [min(i * 0.3 / 1.0, 1.0) for i in range(1, 5)])
-for _bad in ((0.5, 0.5), (0.6, 0.4), (-0.1, 1.0), (0.0, 1.1)):
+check("a band with min == max is its single level",
+      band_levels((0.4, 0.4), 1.0, 10.0) == [0.4]
+      and check_z_range((0.5, 0.5)) == (0.5, 0.5))
+check("passes of an empty band: one pass at its depth",
+      _plan_passes(4.0, 2.0, 1.0, 4.0) == [4.0] and _plan_passes(4.0, 0.0, 1.0, 4.0) == [4.0])
+check("Z range 0 % – 0 % (the stock surface) is accepted",
+      check_z_range((0.0, 0.0)) == (0.0, 0.0) and band_levels((0.0, 0.0), 1.0, 10.0) == [0.0])
+for _bad in ((0.6, 0.4), (-0.1, 1.0), (0.0, 1.1)):
     try:
         check_z_range(_bad)
         check(f"Z range {_bad} is rejected", False)
@@ -1713,6 +1720,21 @@ check("Raster: the band takes fewer passes",
       _zr_band.metadata['n_passes'] < _zr_full.metadata['n_passes']
       and _zr_band.metadata['z_range'] == (0.3, 0.7))
 
+_zr_one = compute_raster_toolpath(dome, z_range=(0.5, 0.5), **_zr_kw)
+_zr_one_z = np.array([-p[2] for s in _zr_one.segments if len(s) > 1 for p in s])
+check("Raster: min == max cuts flat at that depth",
+      _zr_one_z.size > 0 and np.mean(np.abs(_zr_one_z - 2.5) < 0.05) > 0.95
+      and _zr_one.metadata['n_passes'] == 1
+      and float(_zr_one.result.max()) <= 0.5 + 1e-6)
+
+_zr_face = compute_raster_toolpath(dome, z_range=(0.0, 0.0), **_zr_kw)
+_zr_face_z = np.array([p[2] for s in _zr_face.segments for p in s])
+check("Raster: 0 % – 0 % faces the whole stock surface at Z 0",
+      _zr_face_z.size > 0 and np.all(np.abs(_zr_face_z) < 1e-6)
+      and _zr_face.metadata['n_passes'] == 1
+      and all(abs(abs(s[-1][0] - s[0][0]) - 11.9) < 0.05
+              for s in _zr_face.segments if s[0][1] == s[-1][1]))
+
 
 def _contour_levels(**kwargs):
     tp = compute_contour_toolpath(dome, 256, Tool(profile="Ball", diameter_mm=0.6),
@@ -1731,6 +1753,13 @@ check("Contour: every cut lies in the band",
       bool(_zc_lv) and min(_zc_lv) >= 0.3 - 0.01 and max(_zc_lv) <= 0.7 + 1e-4)
 check("Contour: the band's floor is its deepest level",
       abs(max(_zc_lv) - 0.7) < 1e-3)
+_zc_one, _zc_one_lv = _contour_levels(z_range=(0.5, 0.5))
+check("Contour: min == max cuts that single level",
+      len(_zc_one_lv) == 1 and abs(_zc_one_lv[0] - 0.5) < 1e-3)
+_zca_one, _zca_one_lv = _contour_levels(z_range=(0.5, 0.5), adaptive_levels=True,
+                                        max_step_down_mm=0.4)
+check("Contour (adaptive, Max step-down): min == max cuts that single level",
+      len(_zca_one_lv) == 1 and abs(_zca_one_lv[0] - 0.5) < 1e-3)
 check("Contour: accessible is capped at the band's floor",
       float(_zc_band.accessible.max()) <= 0.7 + 1e-6)
 _zca_band, _zca_lv = _contour_levels(z_range=(0.3, 0.7), adaptive_levels=True,
@@ -1954,6 +1983,19 @@ check("Z range: every level lies in (min, max]",
 tp_none = _lc(lc_depth, lc_tool, z_range=(0.95, 1.0))
 check("Z range below the deepest point: no levels, no segments",
       tp_none.metadata['n_levels'] == 0 and not tp_none.segments)
+tp_one = _lc(lc_depth, lc_tool, z_range=(0.4, 0.4))
+check("Z range min == max: one level at that depth",
+      len(tp_one.metadata['levels_mm']) == 1
+      and abs(tp_one.metadata['levels_mm'][0] - 4.0) < 1e-6 and tp_one.segments)
+check("Z range min == max below the deepest point: no levels",
+      plan_clearing_levels(np.full((5, 5), 0.42, np.float32), (0.6, 0.6), 2.0,
+                           LC_MAX, 256) == [])
+for _pat in ("Onion Skin (Inside-Out)", "Zig-Zag (0°)", "Zig-Zag (45°)"):
+    tp_face = _lc(lc_depth, lc_tool, z_range=(0.0, 0.0), raster_dir=_pat)
+    _face_z = [p[2] for s in tp_face.segments for p in s]
+    check(f"Z range 0 % – 0 % faces the stock surface ({_pat})",
+          tp_face.metadata['levels_mm'] == [0.0] and _face_z
+          and max(abs(z) for z in _face_z) < 1e-4)
 tp_flat = _lc(np.zeros((40, 40), dtype=np.float32), lc_tool)
 check("flat depth map: no segments", not tp_flat.segments)
 check("plan_clearing_levels caps the band at the deepest point",

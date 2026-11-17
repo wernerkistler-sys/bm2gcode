@@ -4008,10 +4008,11 @@ class GCodeGeneratorApp:
 
     def _step_z_range(self, step):
         """The step's Z range as a normalised (lo, hi) pair; raises
-        _StepInputError unless 0 % <= min < max <= 100 %."""
+        _StepInputError unless 0 % <= min <= max <= 100 % (min == max is
+        the single level max; 0 % – 0 % faces the stock surface)."""
         lo_pct, hi_pct = (float(v) for v in step['z_range'].get())
-        if not 0.0 <= lo_pct < hi_pct <= 100.0:
-            raise _StepInputError(f"Z range min ({lo_pct:g} %) must be below "
+        if not 0.0 <= lo_pct <= hi_pct <= 100.0:
+            raise _StepInputError(f"Z range min ({lo_pct:g} %) must not exceed "
                                   f"its max ({hi_pct:g} %).")
         return lo_pct / 100.0, hi_pct / 100.0
 

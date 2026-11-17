@@ -417,6 +417,8 @@ def _plan_passes(max_depth_mm, stepdown_mm, final_stepdown_mm=0.0, top_mm=0.0):
     to stepdown_mm = max_depth_mm − top_mm).
     """
     band_mm = max_depth_mm - top_mm
+    if band_mm <= 0.0:
+        return [max_depth_mm]
     if stepdown_mm <= 0.0:
         if final_stepdown_mm <= 0.0:
             return [max_depth_mm]
@@ -2419,6 +2421,15 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
         off_norm = extra_offset_mm / max_depth
         center_depth_contour_raster = np.clip(center_depth_contour_raster - off_norm, 0.0, 1.0)
         accessible_raster = np.clip(accessible_raster - off_norm, 0.0, 1.0)
+    resid_tol_mm = max_depth / (n_grey_levels - 1)
+    resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
+    band = None
+    if z_lo > 0.0:
+        # Tool-centre criterion, so not widened by the footprint like the
+        # Process Region gate: spans start and end where the tool tip
+        # crosses lo. Taken before the cap at hi, so with lo == hi the
+        # positions deeper than lo are cut flat at it.
+        band = (center_depth_contour_raster > z_lo + 0.5 * resid_tol).astype(np.float32)
     if z_hi < 1.0:
         # New arrays: the cached surfaces stay uncapped for other steps.
         center_depth_contour_raster = np.minimum(center_depth_contour_raster, z_hi)
@@ -2433,9 +2444,6 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     n_passes        = len(pass_plan)
     final_norm      = final_stepdown_mm / max_depth
     step_px = max(1, int(round(step_mm * px_per_mm)))   # for progress display only
-
-    resid_tol_mm = max_depth / (n_grey_levels - 1)
-    resid_tol    = 1.0 / (n_grey_levels - 1)   # normalised [0,1]
 
     RASTER_ANGLE_FAMILY = {"Horizontal": "X", "Vertical": "Y",
                            "Diagonal (45°)": "D45", "Diagonal (135°)": "D135"}
@@ -2474,11 +2482,7 @@ def compute_raster_toolpath(depth_map, n_grey_levels, tool,
     if prior_mask is not None:
         progress(40, f"Threshold {work_surface_tol*max_depth*1000:.0f} µm: "
                      f"{int(np.sum(prior_mask))}/{H*W} pixels in mask.")
-    if z_lo > 0.0:
-        # Tool-centre criterion, so not widened by the footprint like the
-        # Process Region gate: spans start and end where the tool tip
-        # crosses lo.
-        band = (center_depth_contour_raster > z_lo + 0.5 * resid_tol).astype(np.float32)
+    if band is not None:
         prior_mask = band if prior_mask is None else prior_mask * band
 
     all_segments     = []
@@ -2753,7 +2757,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                    max_depth):
     """Pocket's per-region infill of *pocket_mask* at one flat depth.
 
-    level_norm / level_mm : the floor depth, normalised (> 0) and in mm.
+    level_norm / level_mm : the floor depth, normalised and in mm.
     pattern               : _pocket_pattern(raster_dir, cut_direction).
 
     Returns (segs, seg_region_ids, region_contours, labeled_regions,
@@ -2769,6 +2773,11 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     # mask (not the pooled
     # pocket_mask) so two disjoint regions with overlapping bounding boxes
     # never double-generate a line over each other's pixels.
+    # Zig-Zag's scan lines gate on flat_depth * region_mask > mask_resid_tol,
+    # which can't tell inside from outside at a level of 0 (the stock
+    # surface), so the floor depth is kept at least 1e-6 as in
+    # pocket_surface_and_mask.
+    level_norm = max(level_norm, 1e-6)
     flat_depth = np.where(pocket_mask, level_norm, 0.0).astype(np.float32)
     mask_resid_tol = level_norm * 0.5   # (flat_depth * region_mask) is 0 or level_norm
 
@@ -3469,10 +3478,13 @@ def plan_clearing_levels(center_depth, z_range, z_increment_mm, max_depth,
     tool-centre positions cover min_area_px (callers pass a quarter of the
     tool footprint: a floor about 1.5 tool diameters across). Max step-down
     > 0 then fills every gap wider than it (_fill_level_gaps). No levels
-    when the surface never goes deeper than the band's top.
+    when the surface never goes deeper than the band's top. A band with
+    lo == hi is that single level, when the surface reaches it.
     """
     lo, hi = check_z_range(z_range)
     eps = 0.5 / max(n_grey_levels - 1, 1)
+    if lo == hi:
+        return [hi] if float(center_depth.max()) >= hi - eps else []
     hi = min(hi, float(center_depth.max()))
     if hi <= lo + eps:
         return []
@@ -4809,10 +4821,11 @@ def _contour_threshold(z_norm, n_grey_levels):
 
 def check_z_range(z_range):
     """Return z_range as a (lo, hi) float pair, or raise ValueError unless
-    0 <= lo < hi <= 1."""
+    0 <= lo <= hi <= 1. lo == hi is the single level hi (0: the stock
+    surface)."""
     lo, hi = float(z_range[0]), float(z_range[1])
-    if not (0.0 <= lo < hi <= 1.0):
-        raise ValueError(f"Z range must satisfy 0 % <= min < max <= 100 % "
+    if not (0.0 <= lo <= hi <= 1.0):
+        raise ValueError(f"Z range must satisfy 0 % <= min <= max <= 100 % "
                          f"(got {lo * 100:g} % – {hi * 100:g} %).")
     return lo, hi
 
@@ -4820,7 +4833,8 @@ def check_z_range(z_range):
 def band_levels(z_range, z_increment_mm, max_depth):
     """Uniform normalised depth levels lo + i·z_increment_mm (i >= 1) inside
     z_range = (lo, hi), the last one capped at hi, so hi itself is always
-    the deepest level and lo never is one."""
+    the deepest level and lo is one only when lo == hi (the single level
+    hi)."""
     import math
     lo, hi = z_range
     n = max(1, math.ceil((hi - lo) * max_depth / z_increment_mm))

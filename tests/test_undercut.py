@@ -1004,6 +1004,11 @@ check("a Z band keeps only the levels inside it",
       len(tp_zb.segments) > 0 and _zlo < _zb[0] and _zb[-1] <= _zhi + 1e-6
       and len(_zb) < len(_zall))
 check("the band's floor is a level", abs(_zb[-1] - _zhi) < 1e-6)
+tp_z1 = compute_undercut_toolpath(depth, gaps, tool, 0.5, 30.0, HC, SIZE_MM, SIZE_MM,
+                                  previous_result=prev, z_range=(_zall[-1], _zall[-1]))
+_z1 = sorted({round(-p[2] / HC, 6) for s in tp_z1.segments for p in s})
+check("min == max cuts that single level",
+      len(tp_z1.segments) > 0 and len(_z1) == 1 and abs(_z1[0] - _zall[-1]) < 1e-6)
 
 print()
 if FAILURES:
