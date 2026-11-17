@@ -1839,9 +1839,10 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     between them), the branch is split there into separate chains, left
     for Stage 6 ordering and linking to join.
 
-    detours maps id(ring) to that ring's spine detours, (vertex, loop)
-    pairs that _splice_detours cuts into the ring's traversal; they leave
-    the ring and return to it at the same vertex, so they play no part in
+    detours maps id(ring) to (ring, detours of that ring): (vertex, loop)
+    pairs that _splice_detours cuts into the ring's traversal. Each entry
+    is taken out of detours as its ring is cut. A detour leaves the ring
+    and returns to it at the same vertex, so detours play no part in
     choosing seams.
 
     Returns
@@ -1966,7 +1967,9 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
             else:
                 lap = body if e == 0 else body[::-1]
                 at = lambda v: v if e == 0 else len(body) - 1 - v
-            parts.append(_splice_detours(lap, at, (detours or {}).get(id(rings[j]), [])))
+            entry = detours.pop(id(rings[j]), None) if detours else None
+            ring_detours = entry[1] if entry is not None and entry[0] is rings[j] else []
+            parts.append(_splice_detours(lap, at, ring_detours))
         chains.append(np.vstack(parts))
     return chains
 
@@ -2232,7 +2235,9 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
             chains.append(_spine_detour(walk, 0))
             return
         ring, vi, wi = found
-        detours.setdefault(id(ring), []).append((vi, _spine_detour(walk, wi)))
+        # Each entry holds its ring, so that the ring stays alive (and its
+        # id unused by any other ring) until the stitcher takes the entry.
+        detours.setdefault(id(ring), (ring, []))[1].append((vi, _spine_detour(walk, wi)))
 
     def _reaches(cand, inner, j, reach_r):
         """The pixels of cand within reach_r of inner, the next level's

@@ -387,6 +387,43 @@ for name, regions, pct in (("L", [sp_l], 60),
           longest <= 2 * R_SP + 2.0)
     check(f"{name} at {pct} %: spines add no chains ({len(old)} -> {len(new)})",
           len(new) == len(old))
+# A region that forks many times closes branches (whose rings are then
+# freed) while others go on extracting rings. A spine's detour must stay
+# with the ring it was attached to, never move to a later ring that happens
+# to reuse a freed ring's id, which turned it into a long straight cut.
+sp_fork_field = gaussian_filter(np.random.default_rng(1).random((700, 700)), 14)
+sp_fork_lab, _ = nd_label(np.pad(sp_fork_field > np.percentile(sp_fork_field, 40), 2))
+sp_fork_sizes = np.bincount(sp_fork_lab.ravel())
+sp_fork_sizes[0] = 0
+sp_fork = sp_fork_lab == np.argmax(sp_fork_sizes)
+sp_fork_step = 0.6 * 2 * 20
+sp_fork_area = int(round(np.pi * (0.5 * sp_fork_step) ** 2))
+sp_fork_old = _onion_skin_chains(sp_fork, sp_fork_step, sp_fork_area)
+sp_fork_new = _onion_skin_chains(sp_fork, sp_fork_step, sp_fork_area, tool_radius_px=20)
+sp_fork_longest = [max(float(np.hypot(*np.diff(c, axis=0).T).max()) for c in cs)
+                   for cs in (sp_fork_old, sp_fork_new)]
+check(f"forking region: spines add no long move (longest {sp_fork_longest[1]:.0f} px, "
+      f"rings only {sp_fork_longest[0]:.0f} px)",
+      sp_fork_longest[1] <= max(sp_fork_longest[0], 2 * 20 + 2.0))
+check("forking region: every move stays inside the region",
+      all_moves_inside(sp_fork, sp_fork_new))
+# The same guard, deterministically: a detour entry filed under a ring's id
+# but holding another ring (as when a freed ring's id is reused) is not
+# spliced into it, and an entry is taken out once used.
+from algorithms import _stitch_onion_rings, _spine_detour
+sp_ring_a = np.array([[10.0, 10.0], [10.0, 30.0], [30.0, 30.0], [30.0, 10.0], [10.0, 10.0]])
+sp_ring_b = sp_ring_a + 2.0
+sp_box = np.zeros((50, 50), dtype=np.float32)
+sp_box[5:40, 5:40] = 1.0
+sp_loop = _spine_detour(np.array([[20.0, 20.0], [20.0, 25.0]]), 0)
+sp_stale = {id(sp_ring_b): (sp_ring_a, [(0, sp_loop)])}
+sp_out = _stitch_onion_rings([sp_ring_b], sp_box, 5, detours=sp_stale)
+check("a detour entry holding another ring is not spliced in",
+      len(sp_out) == 1 and len(sp_out[0]) == len(sp_ring_b))
+sp_own = {id(sp_ring_b): (sp_ring_b, [(0, sp_loop)])}
+sp_out = _stitch_onion_rings([sp_ring_b], sp_box, 5, detours=sp_own)
+check("a ring's own detour is spliced in and its entry taken out",
+      len(sp_out[0]) == len(sp_ring_b) + len(sp_loop) + 1 and not sp_own)
 check("spines are reproducible (medial_axis tie-breaking is seeded)",
       all(same_chains(_onion_skin_chains(r, sp_step, sp_min_area, tool_radius_px=R_SP),
                       _onion_skin_chains(r, sp_step, sp_min_area, tool_radius_px=R_SP))
