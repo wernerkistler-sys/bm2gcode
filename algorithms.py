@@ -1748,8 +1748,59 @@ def _ring_tangents(body, idx, window_px):
     return unit(body[idx] - body[behind]), unit(body[ahead] - body[idx])
 
 
+def _spine_detour(walk, i):
+    """The out-and-back path along a spine walk (_spine_walks) starting
+    and ending at its point i: on along the walk to its end, back along
+    it to its start, and on to point i again."""
+    walk = np.asarray(walk, dtype=float)
+    loop = np.vstack([walk, walk[-2:0:-1]])
+    return np.vstack([np.roll(loop, -i, axis=0), loop[i:i + 1]])
+
+
+def _nearest_inside_link(walk, rings, safe_mask_f, max_len=np.inf, n_checked=32):
+    """(ring, ring vertex index, walk index) of the shortest straight link
+    between a point of walk and a vertex of one of rings that stays
+    inside safe_mask_f and is at most max_len long, or None. The
+    n_checked shortest of each walk point's nearest-vertex links are
+    checked."""
+    from scipy.spatial import cKDTree
+    pairs = []
+    for ri, ring in enumerate(rings):
+        d, vi = cKDTree(ring).query(walk)
+        pairs.extend(zip(d, [ri] * len(walk), vi, range(len(walk))))
+    pairs = sorted((p for p in pairs if p[0] <= max_len), key=lambda p: p[0])[:n_checked]
+    if not pairs:
+        return None
+    ok = np.atleast_1d(_link_is_inside(
+        np.array([walk[wi] for _, _, _, wi in pairs]),
+        np.array([rings[ri][vi] for _, ri, vi, _ in pairs]), safe_mask_f))
+    for (_, ri, vi, wi), good in zip(pairs, ok):
+        if good:
+            return rings[ri], int(vi), int(wi)
+    return None
+
+
+def _splice_detours(lap, at, ring_detours):
+    """lap, a ring's traversal, with every detour cut in at its ring
+    vertex: (vertex, loop) pairs, the vertex as an index into the ring's
+    own vertex array (at maps it to its position in lap), the loop the
+    out-and-back path along a spine from its attachment point
+    (_spine_detour), reached from the vertex and left back to it by a
+    straight move each."""
+    if not ring_detours:
+        return lap
+    pieces, start = [], 0
+    for pos, loop in sorted(((at(v), loop) for v, loop in ring_detours),
+                            key=lambda item: item[0]):
+        pieces.append(lap[start:pos + 1])
+        pieces.append(loop)
+        start = pos
+    pieces.append(lap[start:])
+    return np.vstack(pieces)
+
+
 def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
-                        max_checked_pairs=1024, s_links_per_exit=3):
+                        max_checked_pairs=1024, s_links_per_exit=3, detours=None):
     """Stitch one onion-skin branch's rings (already in visiting order and
     winding sense) into continuous chain(s), choosing every ring's seam --
     the vertex it is entered and left on -- jointly over the whole
@@ -1787,6 +1838,11 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     (e.g. an outer ring and a hole ring with no straight line of sight
     between them), the branch is split there into separate chains, left
     for Stage 6 ordering and linking to join.
+
+    detours maps id(ring) to that ring's spine detours, (vertex, loop)
+    pairs that _splice_detours cuts into the ring's traversal; they leave
+    the ring and return to it at the same vertex, so they play no part in
+    choosing seams.
 
     Returns
     -------
@@ -1905,9 +1961,12 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
             body, entry_idx, exit_idx = cands[j]
             e = int(entry_idx[c])
             if exit_idx[c] == e:
-                parts.append(np.vstack([np.roll(body, -e, axis=0), body[e:e + 1]]))
+                lap = np.vstack([np.roll(body, -e, axis=0), body[e:e + 1]])
+                at = lambda v: (v % len(body) - e) % len(body)
             else:
-                parts.append(body if e == 0 else body[::-1])
+                lap = body if e == 0 else body[::-1]
+                at = lambda v: v if e == 0 else len(body) - 1 - v
+            parts.append(_splice_detours(lap, at, (detours or {}).get(id(rings[j]), [])))
         chains.append(np.vstack(parts))
     return chains
 
@@ -1934,7 +1993,116 @@ def _order_level_rings(rings, prev_ring):
     return ordered
 
 
-def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
+def _spine_walks(spine_mask, min_spur_px=3.0, smooth_iters=3):
+    """One continuous open walk per 8-connected component of spine_mask, as
+    Nx2 (row, col) float polylines through its pixel centres.
+
+    A component's pixels are joined into a tree (the minimum spanning tree
+    of their 8-neighbour graph, edges weighted by length, which also breaks
+    any loop open). The walk runs along the tree's longest path, from one
+    end to the other, and detours out and back along every side branch on
+    the way, each side branch visited before the path continues. Side
+    branches reaching no more than min_spur_px from the longest path are
+    left out: they are pixel noise of the medial axis, and the longest path
+    clears everything they would within that distance anyway. The tree's
+    nodes are then smoothed smooth_iters times, each node except the
+    tree's ends moving halfway to the mean of its neighbours, which keeps
+    every point well within a pixel of the medial axis. A single-pixel
+    component gives a two-point walk on that pixel.
+    """
+    from scipy.ndimage import label
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import minimum_spanning_tree, dijkstra
+
+    labeled, n = label(spine_mask, structure=np.ones((3, 3), dtype=bool))
+    walks = []
+    for cid in range(1, n + 1):
+        rows, cols = np.nonzero(labeled == cid)
+        pts = np.column_stack([rows, cols]).astype(float)
+        m = len(pts)
+        if m == 1:
+            walks.append(np.vstack([pts, pts]))
+            continue
+        index = {(int(r), int(c)): i for i, (r, c) in enumerate(zip(rows, cols))}
+        ii, jj, ww = [], [], []
+        for i, (r, c) in enumerate(zip(rows.tolist(), cols.tolist())):
+            for dr, dc in ((0, 1), (1, -1), (1, 0), (1, 1)):
+                j = index.get((r + dr, c + dc))
+                if j is not None:
+                    ii.append(i)
+                    jj.append(j)
+                    ww.append(np.hypot(dr, dc))
+        graph = coo_matrix((ww, (ii, jj)), shape=(m, m)).tocsr()
+        tree = minimum_spanning_tree(graph)
+        tree = (tree + tree.T).tocsr()
+
+        dist0 = dijkstra(tree, directed=False, indices=0)
+        a = int(np.argmax(dist0))
+        dist_a, pred = dijkstra(tree, directed=False, indices=a,
+                                return_predecessors=True)
+        b = int(np.argmax(dist_a))
+        main = [b]
+        while main[-1] != a:
+            main.append(int(pred[main[-1]]))
+        main.reverse()                                # a ... b
+        on_main = np.zeros(m, dtype=bool)
+        on_main[main] = True
+
+        # Each node's reach: how far its subtree (hanging off the main
+        # path, away from it) extends below it.
+        children = [[] for _ in range(m)]
+        order = []
+        stack = list(main)
+        seen = on_main.copy()
+        while stack:
+            u = stack.pop()
+            order.append(u)
+            for v, w in zip(tree.indices[tree.indptr[u]:tree.indptr[u + 1]],
+                            tree.data[tree.indptr[u]:tree.indptr[u + 1]]):
+                if not seen[v]:
+                    seen[v] = True
+                    children[u].append((int(v), float(w)))
+                    stack.append(int(v))
+        reach = np.zeros(m)
+        for u in reversed(order):
+            for v, w in children[u]:
+                reach[u] = max(reach[u], reach[v] + w)
+
+        walk = []
+
+        def visit_side(u):
+            # Iterative out-and-back traversal of u's kept side branches.
+            todo = [(u, iter(children[u]))]
+            while todo:
+                node, it = todo[-1]
+                for v, w in it:
+                    if reach[v] + w > min_spur_px:
+                        walk.append(v)
+                        todo.append((v, iter(children[v])))
+                        break
+                else:
+                    todo.pop()
+                    if todo:
+                        walk.append(todo[-1][0])
+
+        for u in main:
+            walk.append(u)
+            visit_side(u)
+
+        # Laplacian smoothing over the tree, its ends pinned, takes out the
+        # one-pixel zig-zag of a ridge that runs between two pixel rows.
+        deg = np.diff(tree.indptr)
+        free = deg > 1
+        inv_deg = 1.0 / np.maximum(deg, 1)
+        for _ in range(smooth_iters):
+            avg = (tree.astype(bool).astype(float) @ pts) * inv_deg[:, None]
+            pts[free] = 0.5 * (pts[free] + avg[free])
+        walks.append(pts[walk])
+    return walks
+
+
+def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
+                       tool_radius_px=None):
     """Concentric-ring toolpath chain(s) clearing one connected pocket
     region: erosion level k is the set of region pixels farther than
     k * step_px from the region's outside (one Euclidean distance transform
@@ -1985,6 +2153,24 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     branch that happens to erode away quickly cannot leave a much deeper
     sibling branch's rings stranded behind it in cut order.
 
+    With tool_radius_px given, rings that leave material standing get
+    spines. A ring at level j cuts everything within the tool radius R of
+    it, and the next level's ring everything within R of that, so the
+    rings alone clear the region wherever every point lies within R of
+    one of them. Where the next level doesn't reach -- the inside of a
+    branch's last ring, a finger of a ring that the next level stops
+    short of, or a stray fragment discarded above -- points deeper than
+    j * step_px + R stay uncut. With a step-over wider than R that band
+    is a strip along the region's medial axis; _level_spines finds it and
+    covers it with medial axis walks (_spine_walks). Each walk is spliced
+    into a ring as an out-and-back detour (attach_spine), joined to it
+    by one short straight move each way: into the next level's ring,
+    whose cusp the medial axis runs into at the spine's root, or, where
+    there is none within two tool radii, into its own level's ring. A
+    ring carrying several spines simply makes several detours, and the
+    rings' seams are chosen without regard to them. Without
+    tool_radius_px there are no spines.
+
     region_mask is padded by one False pixel on every side before any
     processing (compensated for in the returned coordinates), since the
     caller crops each region to its tight bounding box, which touches the
@@ -2001,7 +2187,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     (unpadded) coordinate frame. An undivided island is one chain unless
     _stitch_onion_rings had to split it where no inside link exists.
     """
-    from scipy.ndimage import label, distance_transform_edt
+    from scipy.ndimage import label, distance_transform_edt, binary_erosion
     from skimage.measure import find_contours
 
     chains = []
@@ -2013,57 +2199,192 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False):
     dist2 = np.rint(np.square(distance_transform_edt(padded)))
     branches = [{'mask': padded, 'rings': [], 'level': 0}]
 
+    detours = {}
+
     def close_branch(rings):
-        chains.extend(_stitch_onion_rings(rings, safe_mask_f, step_px))
+        chains.extend(_stitch_onion_rings(rings, safe_mask_f, step_px, detours=detours))
+
+    def extract_rings(mask):
+        level = [r for r in find_contours(mask.astype(np.float32), 0.5) if len(r) >= 3]
+        return [r[::-1] for r in level] if reverse_rings else level
+
+    # Spines clear what the rings leave standing: with a step-over wider
+    # than the tool radius, the ridge of an area the next level doesn't
+    # reach; at any step-over, a stray fragment the next level drops.
+    spine_r = float(tool_radius_px) if tool_radius_px is not None else None
+    dist = np.sqrt(dist2) if spine_r is not None else None
+    skeleton, nearest_out = [], []
+
+    def attach_spine(walk, inner_rings, own_rings):
+        """Splice walk into a ring as an out-and-back detour
+        (_spine_detour), linked at the ring vertex and spine point nearest
+        each other by a straight move that stays inside the region:
+        preferably on the next level's rings (inner_rings), where the
+        medial axis the spine follows runs into a cusp of the ring, within
+        two tool radii; otherwise on its own level's rings (own_rings),
+        which every point of the spine lies within one step-over of. With
+        no inside link to either, the spine is a chain of its own."""
+        found = _nearest_inside_link(walk, inner_rings, safe_mask_f,
+                                     max_len=2.0 * spine_r + 1.0)
+        if found is None:
+            found = _nearest_inside_link(walk, own_rings, safe_mask_f)
+        if found is None:
+            chains.append(_spine_detour(walk, 0))
+            return
+        ring, vi, wi = found
+        detours.setdefault(id(ring), []).append((vi, _spine_detour(walk, wi)))
+
+    def _reaches(cand, inner, j, reach_r):
+        """The pixels of cand within reach_r of inner, the next level's
+        kept components (whose rings lie within half a pixel of their
+        pixels, which reach_r allows for). Most are found along their own
+        ray: from a pixel's nearest outside point through the pixel, the
+        distance to the outside grows at unit rate, so the ray enters the
+        next level t = (j + 1) * step_px - dist past the pixel; where the
+        pixel one further along lies in inner and that is within reach_r,
+        so is inner. The rest -- near the ridge, where the ray stops
+        rising before that level -- are measured exactly, against inner's
+        boundary pixels."""
+        from scipy.spatial import cKDTree
+        if not nearest_out:
+            nearest_out.append(distance_transform_edt(
+                padded, return_distances=False, return_indices=True))
+        pr, pc = np.nonzero(cand)
+        nr, nc = nearest_out[0][0][pr, pc], nearest_out[0][1][pr, pc]
+        d = dist[pr, pc]
+        t = (j + 1) * step_px - d + 1.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            qr = np.rint(pr + (pr - nr) * t / d).astype(np.intp)
+            qc = np.rint(pc + (pc - nc) * t / d).astype(np.intp)
+        ok = ((t <= reach_r) & (qr >= 0) & (qr < inner.shape[0])
+              & (qc >= 0) & (qc < inner.shape[1]))
+        hit = np.zeros(len(pr), dtype=bool)
+        hit[ok] = inner[qr[ok], qc[ok]]
+        rest = np.nonzero(~hit)[0]
+        if len(rest):
+            edge = inner & ~binary_erosion(inner)
+            tree = cKDTree(np.column_stack(np.nonzero(edge)))
+            near, _ = tree.query(np.column_stack([pr[rest], pc[rest]]),
+                                 distance_upper_bound=reach_r)
+            hit[rest] = near <= reach_r
+        out = np.zeros_like(cand)
+        out[pr[hit], pc[hit]] = True
+        return out
+
+    def _level_spines(cur, inner_masks, j):
+        """Spine walks clearing what the rings of cur (level j, at distance
+        j * step_px from the outside) and of inner_masks (the next level's
+        kept components) leave standing in cur. A pixel of cur is
+        dist - j * step_px from cur's own ring (along its ray to the nearest
+        outside point, which stays in cur). Every deeper ring lies inside
+        the next level's kept components, beyond their own rings, so a
+        pixel outside those components stays uncut where both its distance
+        to cur's ring and to theirs exceed spine_r. Above a step-over of
+        spine_r, that band runs along the region's medial
+        axis, and the medial axis pixels inside it are its spine. Pixels
+        of the band farther than spine_r from those (beside a spine's end)
+        add the nearest medial axis pixel, or, where none is within reach,
+        their own ridge point: their component's deepest pixel."""
+        # Rings are traced to within half a pixel of their level, so a
+        # pixel only counts as uncut beyond spine_r plus that half pixel.
+        reach_r = spine_r + 0.5
+        cand = cur & (dist - j * step_px > reach_r)
+        for m in inner_masks:
+            cand &= ~m
+        if not np.any(cand):
+            return []
+        if inner_masks:
+            inner = np.logical_or.reduce(inner_masks)
+            cand &= ~_reaches(cand, inner, j, reach_r)
+            if not np.any(cand):
+                return []
+        # Everything below runs in a window around what is left uncut,
+        # wide enough to hold every medial axis pixel that could reach it.
+        rows, cols = np.nonzero(cand)
+        margin = int(np.ceil(reach_r)) + 2
+        r0, c0 = max(rows.min() - margin, 0), max(cols.min() - margin, 0)
+        win = (slice(r0, rows.max() + margin + 1), slice(c0, cols.max() + margin + 1))
+        uncut = cand[win]
+        if not skeleton:
+            from skimage.morphology import medial_axis
+            # A fixed rng: medial_axis breaks ties in random order.
+            skeleton.append(medial_axis(padded, rng=0))
+        skel = skeleton[0][win] & cur[win]
+        spine = skel & uncut
+        resid = uncut
+        if np.any(spine):
+            resid = uncut & (distance_transform_edt(~spine) > spine_r)
+        if np.any(resid):
+            if np.any(skel):
+                d_skel, (sr, sc) = distance_transform_edt(~skel, return_indices=True)
+                reach = resid & (d_skel <= spine_r)
+                spine[sr[reach], sc[reach]] = True
+            else:
+                reach = np.zeros_like(resid)
+            far = resid & ~reach
+            if np.any(far):
+                far_lab, n_far = label(far, structure=np.ones((3, 3), dtype=bool))
+                win_dist = dist[win]
+                for cid in range(1, n_far + 1):
+                    comp_d = np.where(far_lab == cid, win_dist, -1.0)
+                    spine[np.unravel_index(np.argmax(comp_d), comp_d.shape)] = True
+        return [w + (r0, c0) for w in _spine_walks(spine)]
 
     while branches:
         next_round = []
         for br in branches:
             cur, rings, k = br['mask'], br['rings'], br['level'] + 1
 
-            level = [r for r in find_contours(cur.astype(np.float32), 0.5) if len(r) >= 3]
+            level = br['level_rings'] if 'level_rings' in br else extract_rings(cur)
             if not level:
                 close_branch(rings)
                 continue
-            if reverse_rings:
-                level = [r[::-1] for r in level]
             rings.extend(_order_level_rings(level, rings[-1] if rings else None))
 
             if np.sum(cur) < min_area_px:
-                close_branch(rings)
-                continue
-            # Level k within this branch: a pixel's disk(step_px) is
-            # 4-connected and lies inside level k-1, so it lies inside the
-            # pixel's own component there, the branch's mask.
-            nxt = cur & (dist2 > float(k * step_px) ** 2)
-            if not np.any(nxt):
-                close_branch(rings)
-                continue
-            labeled, n_comp = label(nxt)
-            if n_comp <= 1:
-                next_round.append({'mask': nxt, 'rings': rings, 'level': k})
+                surviving = []
             else:
-                # A split can throw off a stray fragment of just a few
-                # pixels -- erosion detaching a sliver at a concave cusp of
-                # the boundary rather than a genuine second lobe. Filter
-                # those out *before* deciding whether this erosion step is
-                # a genuine fork: discarding noise must not, by itself,
-                # force this branch's chain to close off and restart, or a
-                # single ordinary lobe that merely sheds a stray pixel
-                # would get split into two chains for no real reason.
-                surviving = [labeled == cid for cid in range(1, n_comp + 1)
-                            if np.sum(labeled == cid) >= min_area_px]
-                if len(surviving) <= 1:
-                    if surviving:
-                        next_round.append({'mask': surviving[0], 'rings': rings,
-                                           'level': k})
-                    else:
-                        close_branch(rings)
+                # Level k within this branch: a pixel's disk(step_px) is
+                # 4-connected and lies inside level k-1, so it lies inside
+                # the pixel's own component there, the branch's mask.
+                nxt = cur & (dist2 > float(k * step_px) ** 2)
+                labeled, n_comp = label(nxt)
+                if n_comp <= 1:
+                    surviving = [nxt] if n_comp else []
                 else:
-                    close_branch(rings)
-                    for comp_mask in surviving:
-                        next_round.append({'mask': comp_mask, 'rings': [],
-                                           'level': k})
+                    # A split can throw off a stray fragment of just a few
+                    # pixels -- erosion detaching a sliver at a concave
+                    # cusp of the boundary rather than a genuine second
+                    # lobe. Filter those out *before* deciding whether this
+                    # erosion step is a genuine fork: discarding noise must
+                    # not, by itself, force this branch's chain to close
+                    # off and restart, or a single ordinary lobe that
+                    # merely sheds a stray pixel would get split into two
+                    # chains for no real reason.
+                    surviving = [labeled == cid for cid in range(1, n_comp + 1)
+                                 if np.sum(labeled == cid) >= min_area_px]
+
+            nexts = [{'mask': comp_mask, 'level': k} for comp_mask in surviving]
+            if spine_r is not None:
+                # The next level's rings are extracted here, so that this
+                # level's spines can be attached to them.
+                inner = []
+                for nx in nexts:
+                    nx['level_rings'] = extract_rings(nx['mask'])
+                    inner.extend(nx['level_rings'])
+                for walk in _level_spines(cur, surviving, k - 1):
+                    attach_spine(walk, inner, level)
+
+            if not nexts:
+                close_branch(rings)
+            elif len(nexts) == 1:
+                nexts[0]['rings'] = rings
+                next_round.append(nexts[0])
+            else:
+                close_branch(rings)
+                for nx in nexts:
+                    nx['rings'] = []
+                    next_round.append(nx)
         branches = next_round
 
     return [c - 1.0 for c in chains]
@@ -2754,11 +3075,13 @@ def _pocket_pattern(raster_dir, cut_direction):
 
 def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                    raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy,
-                   max_depth):
+                   max_depth, tool_radius_mm=None):
     """Pocket's per-region infill of *pocket_mask* at one flat depth.
 
     level_norm / level_mm : the floor depth, normalised and in mm.
     pattern               : _pocket_pattern(raster_dir, cut_direction).
+    tool_radius_mm        : the tool's radius, for Onion Skin's spines
+                            (_onion_skin_chains); None for none.
 
     Returns (segs, seg_region_ids, region_contours, labeled_regions,
     flat_depth, n_regions): the full-depth segments, the pocket region
@@ -2823,8 +3146,11 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
             step_px = max(1, int(round(step_mm * px_per_mm)))
             min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
             local_mask = labeled_regions[box] == region_id
-            chains = _onion_skin_chains(local_mask, step_px, min_area_px,
-                                        reverse_rings=(cut_direction == "Conventional"))
+            chains = _onion_skin_chains(
+                local_mask, step_px, min_area_px,
+                reverse_rings=(cut_direction == "Conventional"),
+                tool_radius_px=(None if tool_radius_mm is None
+                                else tool_radius_mm * px_per_mm))
             if raster_dir == "Onion Skin (Inside-Out)":
                 # Reverses both which chain is visited first (so a chain
                 # that finished deeper -- i.e. later in erosion order -- is
@@ -3290,7 +3616,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     (full_depth_segs, seg_region_ids, region_contours, labeled_regions,
      flat_depth, n_regions) = _pocket_infill(
         pocket_mask, target_z_norm, pocket_depth_mm, pattern, step_mm,
-        raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy, max_depth)
+        raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy, max_depth,
+        tool_radius_mm=0.5 * tool.diameter_mm)
     progress(40, f"Phase 1: generated infill for {n_regions} pocket region(s).")
     IS_ZIGZAG, IS_ONION = pattern.is_zigzag, pattern.is_onion
 
@@ -3632,7 +3959,8 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
         (segs, seg_ids, region_contours, labeled, _flat,
          n_regions) = _pocket_infill(mask, z, z_mm, pattern, step_mm,
                                      raster_offset_pct, cut_direction,
-                                     px_per_mm, H, _ox, _oy, max_depth)
+                                     px_per_mm, H, _ox, _oy, max_depth,
+                                     tool_radius_mm=0.5 * tool.diameter_mm)
         if avoid_air and segs:
             segs, seg_ids, air = prune_air_segments(
                 segs, free, px_per_mm, H, _ox, _oy, max_depth, tol_norm,

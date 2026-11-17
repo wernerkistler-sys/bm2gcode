@@ -301,6 +301,141 @@ check("thick annulus: every move stays inside the region",
 
 
 # --------------------------------------------------------------------------
+# spines: with a step-over above half the tool diameter, a ring the next
+# level doesn't reach leaves a strip along the region's ridge uncut (as does
+# a stray fragment the erosion drops, at any step-over); given the tool
+# radius, the chain adds medial-axis spines that clear it. Spines change
+# nothing where the rings clear everything themselves.
+# --------------------------------------------------------------------------
+print("spines clear what the rings leave standing")
+
+from scipy.ndimage import distance_transform_edt, gaussian_filter, label as nd_label
+from skimage.draw import line as draw_line
+
+
+def uncut_px(mask, chains, radius):
+    """Region pixels farther than radius (+1 px for rasterising the path)
+    from every chain."""
+    path = np.zeros(mask.shape, dtype=bool)
+    for c in chains:
+        for (r0, c0), (r1, c1) in zip(c[:-1], c[1:]):
+            rr_, cc_ = draw_line(int(round(r0)), int(round(c0)), int(round(r1)), int(round(c1)))
+            ok = (rr_ >= 0) & (rr_ < mask.shape[0]) & (cc_ >= 0) & (cc_ < mask.shape[1])
+            path[rr_[ok], cc_[ok]] = True
+    return int(np.sum(mask & (distance_transform_edt(~path) > radius + 1.0)))
+
+
+def same_chains(a, b):
+    return len(a) == len(b) and all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+R_SP = 30
+sp_rect = np.zeros((300, 400), dtype=bool)
+sp_rect[50:250, 50:350] = True                    # half-width 100 px
+sp_l = np.zeros((300, 300), dtype=bool)
+sp_l[20:280, 20:90] = True
+sp_l[210:280, 20:280] = True                      # arms 70 px wide
+sp_blob_field = gaussian_filter(np.random.default_rng(3).random((400, 400)), 25)
+sp_blob = np.pad(sp_blob_field > np.percentile(sp_blob_field, 45), 2)
+sp_blob_lab, sp_blob_n = nd_label(sp_blob)
+
+for name, regions, pcts in (("rectangle", [sp_rect], (95, 100)),
+                            ("L", [sp_l], (60, 80)),
+                            ("random blob", [sp_blob_lab == i for i in range(1, sp_blob_n + 1)],
+                             (50, 80, 100))):
+    for pct in pcts:
+        step = 2 * R_SP * pct / 100.0
+        min_area = max(4, int(round(np.pi * (0.5 * step) ** 2)))
+        before = after = 0
+        inside = True
+        for region in regions:
+            old = _onion_skin_chains(region, step, min_area)
+            new = _onion_skin_chains(region, step, min_area, tool_radius_px=R_SP)
+            before += uncut_px(region, old, R_SP)
+            after += uncut_px(region, new, R_SP)
+            inside &= all_moves_inside(region, new)
+        check(f"{name} at {pct} %: rings alone leave material ({before} px)", before > 0)
+        check(f"{name} at {pct} %: spines clear it all ({after} px left)", after == 0)
+        check(f"{name} at {pct} %: every move stays inside the region", inside)
+
+for name, mask, pct in (("rectangle", sp_rect, 50), ("rectangle", sp_rect, 80),
+                        ("L", sp_l, 40), ("L", sp_l, 50)):
+    step = 2 * R_SP * pct / 100.0
+    min_area = max(4, int(round(np.pi * (0.5 * step) ** 2)))
+    check(f"{name} at {pct} %: rings clear everything, so no spines are added",
+          same_chains(_onion_skin_chains(mask, step, min_area),
+                      _onion_skin_chains(mask, step, min_area, tool_radius_px=R_SP)))
+
+sp_step = 0.8 * 2 * R_SP
+sp_min_area = int(round(np.pi * (0.5 * sp_step) ** 2))
+sp_l_new = _onion_skin_chains(sp_l, sp_step, sp_min_area, tool_radius_px=R_SP)
+check("L at 80 %: ring and spines form one chain", len(sp_l_new) == 1)
+# Every spine hangs off a ring by one short straight move each way, however
+# many spines a ring carries: no move is longer than two tool radii (the
+# farthest a spine is attached to the next level's ring), and spines add no
+# chains.
+for name, regions, pct in (("L", [sp_l], 60),
+                           ("rectangle", [sp_rect], 100),
+                           ("random blob", [sp_blob_lab == i for i in range(1, sp_blob_n + 1)], 60),
+                           ("random blob", [sp_blob_lab == i for i in range(1, sp_blob_n + 1)], 100)):
+    step = 2 * R_SP * pct / 100.0
+    min_area = max(4, int(round(np.pi * (0.5 * step) ** 2)))
+    old = [c for r in regions for c in _onion_skin_chains(r, step, min_area)]
+    new = [c for r in regions for c in _onion_skin_chains(r, step, min_area, tool_radius_px=R_SP)]
+    longest = max(float(np.hypot(*np.diff(c, axis=0).T).max()) for c in new)
+    check(f"{name} at {pct} %: no move longer than two tool radii ({longest:.1f} px)",
+          longest <= 2 * R_SP + 2.0)
+    check(f"{name} at {pct} %: spines add no chains ({len(old)} -> {len(new)})",
+          len(new) == len(old))
+check("spines are reproducible (medial_axis tie-breaking is seeded)",
+      all(same_chains(_onion_skin_chains(r, sp_step, sp_min_area, tool_radius_px=R_SP),
+                      _onion_skin_chains(r, sp_step, sp_min_area, tool_radius_px=R_SP))
+          for r in [sp_blob_lab == i for i in range(1, sp_blob_n + 1)]))
+
+# End to end: a 26 mm wide L-shaped recess cleared with a 12 mm end mill at
+# 80 % leaves a 2 mm strip along each arm's centre line without spines.
+sp_H = 400
+sp_ppm = 5.0
+sp_depth = np.zeros((sp_H, sp_H), dtype=np.float32)
+sp_depth[20:380, 20:150] = 1.0
+sp_depth[250:380, 20:380] = 1.0
+sp_tool = Tool(profile="End Mill", diameter_mm=12.0, vbit_angle_deg=90.0)
+sp_recess = sp_depth > 0.5
+
+
+def recess_uncut(tp):
+    path = np.zeros(sp_recess.shape, dtype=bool)
+    for seg in tp.segments:
+        pts = [(int(round(sp_H - 1 - y * sp_ppm)), int(round(x * sp_ppm)))
+               for x, y, z in seg if z < -2.9]
+        for (r0, c0), (r1, c1) in zip(pts[:-1], pts[1:]):
+            rr_, cc_ = draw_line(r0, c0, r1, c1)
+            path[rr_, cc_] = True
+    # Only the straight arms: an end mill can't reach the recess's corners.
+    arms = np.zeros_like(sp_recess)
+    arms[60:340, 20:150] = True
+    arms[250:380, 60:340] = True
+    return int(np.sum(arms & (distance_transform_edt(~path) > 30 + 1.5)))
+
+
+for scan in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
+    tp = compute_pocket_toolpath(
+        depth_map=sp_depth, n_grey_levels=256, tool=sp_tool, step_mm=9.6,
+        stepdown_mm=0.0, max_depth=3.0, width_mm=80.0, height_mm=80.0,
+        raster_dir=scan, target_z_mm=3.0, feed_rate=800.0, cut_direction="Climb",
+        origin="Bottom-Left", progress=lambda pct, msg: None)
+    check(f"Pocket, {scan}, 80 %: the recess is cleared ({recess_uncut(tp)} px left)",
+          recess_uncut(tp) == 0)
+    check(f"Pocket, {scan}, 80 %: one continuous segment", len(tp.segments) == 1)
+tp = compute_level_clearing_toolpath(
+    depth_map=sp_depth, n_grey_levels=256, tool=sp_tool, step_mm=9.6,
+    z_increment_mm=3.0, max_depth=3.0, width_mm=80.0, height_mm=80.0,
+    raster_dir="Onion Skin (Outside-In)", progress=lambda pct, msg: None)
+check(f"Level Clearing, 80 %: the recess is cleared ({recess_uncut(tp)} px left)",
+      recess_uncut(tp) == 0)
+
+
+# --------------------------------------------------------------------------
 # S-shaped ring transitions: wherever a ring is big enough to hold arcs of
 # one step-over radius, the chain changes ring along a tangent-continuous
 # biarc, so its heading (measured over a few px, to see past find_contours'
