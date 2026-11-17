@@ -1020,8 +1020,7 @@ print("avoid_air in compute_pocket_toolpath")
 # Two disjoint pocket regions, the left one's left half already cleared to
 # the floor: splitting must keep each piece's region id so regions are
 # still never interleaved.
-for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Coil (Outside-In)",
-             "Spiral (Outside-In)"):
+for rdir in ("Zig-Zag (0°)", "Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
     prev_two = np.zeros((30, 30), dtype=np.float32)
     prev_two[:, :6] = 1.0
     tp_two_air = compute_pocket_toolpath(
@@ -1169,16 +1168,16 @@ for w_mm, h_mm in ((40.0, 25.0), (30.0, 30.0)):
     check(f"{tag}: runs between the 0% turns, never on them "
           f"(closest {d.min() / step_px:.2f} step)", d.min() >= 0.25 * step_px)
 
-tp_two_morph = compute_pocket_toolpath(
-    depth_two, n_grey_levels=256, tool=zz_tool,
-    step_mm=1.0, stepdown_mm=2.0, max_depth=5.0,
-    width_mm=30.0, height_mm=30.0, raster_dir="Spiral (Inside-Out)",
-    target_z_mm=2.0, cut_direction="Climb", progress=_noop_progress)
-sides = ["A" if sg[0][0] < 11.0 else "B" for sg in tp_two_morph.segments]
-check("pocket: Spiral clears both regions",
-      len(tp_two_morph.segments) > 0 and set(sides) == {"A", "B"})
-check("pocket: Spiral never interleaves regions",
-      sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1]) <= 1)
+for rdir in ("Coil (Outside-In)", "Spiral (Inside-Out)"):
+    try:
+        compute_pocket_toolpath(
+            depth_two, n_grey_levels=256, tool=zz_tool, step_mm=1.0,
+            stepdown_mm=2.0, max_depth=5.0, width_mm=30.0, height_mm=30.0,
+            raster_dir=rdir, target_z_mm=2.0, progress=_noop_progress)
+        rejected = False
+    except ValueError:
+        rejected = True
+    check(f"pocket: {rdir} is not a Pocket scan direction", rejected)
 
 
 # --------------------------------------------------------------------------
@@ -1858,8 +1857,7 @@ check("no move cuts more than one level spacing below the material left",
 sides = ["A" if s[0][0] < 20.0 else "B" for s in tp_lc.segments]
 check("depth-first: one bowl is cleared to the bottom before the other",
       sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1]) == 1)
-for rdir in ("Zig-Zag (0°)", "Coil (Outside-In)", "Spiral (Inside-Out)",
-             "Onion Skin (Outside-In)"):
+for rdir in ("Zig-Zag (0°)", "Zig-Zag (45°)", "Onion Skin (Outside-In)"):
     tp_r = _lc(lc_depth, lc_tool, raster_dir=rdir, z_increment_mm=2.0,
                max_step_down_mm=2.0)
     deep = [s for s in tp_r.segments]

@@ -40,7 +40,7 @@ _OVERHANG_OPEN_COLOR    = "#ffc400"
 _OVERHANG_REACHED_COLOR = "#2ea8ff"
 
 from constants import (
-    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS, POCKET_ZIGZAG, WOUND_DIRECTIONS,
+    TOOL_PROFILES, RASTER_DIRECTIONS, POCKET_PATTERNS,
     CUT_DIRECTIONS, UNDERCUT_OPEN_MODES, ALGORITHMS,
     ALGORITHM_FAMILY, DEFAULTS, REG_HOLE_PATTERNS, DIAG_DIRECTIONS, LAYER_MIRRORS,
     STEP_PEAK_BYTES_PER_PX, STEP_PEAK_BYTES_PER_PX_DEFAULT,
@@ -1761,7 +1761,7 @@ class GCodeGeneratorApp:
                 step['contour_frame'].pack(fill=tk.X, after=step['alg_row'])
                 step['raster_dir_cb'].config(values=POCKET_PATTERNS)
                 if step['raster_dir_var'].get() not in POCKET_PATTERNS:
-                    step['raster_dir_var'].set("Onion Skin (Inside-Out)")
+                    step['raster_dir_var'].set(POCKET_PATTERNS[0])
                 step['raster_frame'].pack(fill=tk.X, after=step['contour_frame'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])
@@ -1872,7 +1872,7 @@ class GCodeGeneratorApp:
                                           after=step['raster_final_stepdown'])
                 step['raster_dir_cb'].config(values=POCKET_PATTERNS)
                 if step['raster_dir_var'].get() not in POCKET_PATTERNS:
-                    step['raster_dir_var'].set(POCKET_ZIGZAG[0])
+                    step['raster_dir_var'].set(POCKET_PATTERNS[0])
                 step['raster_frame'].pack(fill=tk.X, after=step['gating_frame'])
                 step['cut_dir_row'].pack(fill=tk.X, pady=2, after=step['raster_frame'])
                 step['tsp_frame'].pack(fill=tk.X, after=step['cut_dir_row'])
@@ -1915,18 +1915,12 @@ class GCodeGeneratorApp:
 
             locked = ((family != "V-Carving") or alg == "V-Carving (Hybrid)") \
                      and step['cut_dir_var'].get() != "Either"
-            # Pocket's own per-pass ordering (see compute_pocket_toolpath's
-            # Stage 6) only ever consults use_2opt for a Coil or Spiral scan
-            # direction -- Zig-Zag and Onion Skin each use their own
-            # dedicated ordering (_order_zigzag_pass /
-            # _order_fixed_orientation_pass) that never reads it, so the
-            # checkbox has nothing to do there regardless of Cut direction.
-            pocket_2opt_moot = (family in ("Pocket", "Level Clearing")
-                                 and step['raster_dir_var'].get() not in WOUND_DIRECTIONS)
-            step['tsp_2opt_cb'].config(
-                state="disabled" if (locked or pocket_2opt_moot) else "normal")
-            # Contour orders its rings along the contour graph, never by 2-opt.
-            if alg == "Contour":
+            step['tsp_2opt_cb'].config(state="disabled" if locked else "normal")
+            # Contour orders its rings along the contour graph, and Pocket
+            # and Level Clearing use their scan pattern's own ordering
+            # (_order_zigzag_pass / _order_fixed_orientation_pass), never
+            # 2-opt.
+            if alg == "Contour" or family in ("Pocket", "Level Clearing"):
                 step['tsp_2opt_cb'].pack_forget()
             elif not step['tsp_2opt_cb'].winfo_manager():
                 step['tsp_2opt_cb'].pack(anchor=tk.W, pady=2, before=step['avoid_air_cb'])
@@ -3831,6 +3825,13 @@ class GCodeGeneratorApp:
                 rdir = d.get('raster_dir', '')
                 if rdir in ("Spiral (Outside-In)", "Spiral (Inside-Out)"):
                     d['raster_dir'] = "Coil" + rdir[len("Spiral"):]
+        # Pocket-family steps (Pocket, V-Carving Clean-up, Level Clearing)
+        # scan only with POCKET_PATTERNS; a saved Coil or Spiral direction
+        # falls back to the first of them.
+        for d in step_dicts:
+            if (ALGORITHM_FAMILY.get(d.get('algorithm')) in ("Pocket", "Level Clearing")
+                    and d.get('raster_dir') not in POCKET_PATTERNS):
+                d['raster_dir'] = POCKET_PATTERNS[0]
 
         for step, d in zip(self.steps, step_dicts):
             self._apply_step_dict(step, d)
@@ -4110,7 +4111,6 @@ class GCodeGeneratorApp:
                 'contour_z_increment_mm': float(step['contour_z_increment'].get()),
                 'contour_adaptive':    step['contour_adaptive_var'].get(),
                 'max_step_down_mm':    float(step['stepdown'].get()),
-                'use_2opt':            step['tsp_2opt_var'].get(),
                 'raster_dir':          step['raster_dir_var'].get(),
                 'cut_direction':       step['cut_dir_var'].get(),
                 'z_range':             self._step_z_range(step),
@@ -4136,7 +4136,6 @@ class GCodeGeneratorApp:
                 'raster_offset_pct':        float(step['raster_offset'].get()),
                 'pocket_stepdown_mm':       float(step['stepdown'].get()),
                 'pocket_final_stepdown_mm': float(step['raster_final_stepdown'].get()),
-                'use_2opt':                 step['tsp_2opt_var'].get(),
                 'raster_dir':               step['raster_dir_var'].get(),
                 'cut_direction':            step['cut_dir_var'].get(),
                 'pocket_target_z_mm':       threshold_mm,
@@ -4544,7 +4543,6 @@ class GCodeGeneratorApp:
                 feed_rate         = params['feed_rate'],
                 previous_result   = prev_tp.result if prev_tp is not None else None,
                 raster_offset_pct = params['raster_offset_pct'],
-                use_2opt          = params['use_2opt'],
                 cut_direction     = params['cut_direction'],
                 max_step_down_mm  = params['max_step_down_mm'],
                 adaptive_levels   = params['contour_adaptive'],
@@ -4607,7 +4605,6 @@ class GCodeGeneratorApp:
                 previous_result       = prev_tp.result if prev_tp is not None else None,
                 raster_offset_pct = params['raster_offset_pct'],
                 feed_rate         = params['feed_rate'],
-                use_2opt          = params['use_2opt'],
                 cut_direction     = params['cut_direction'],
                 avoid_air         = params['avoid_air'],
                 z_safe            = self._settings['z_safe'],

@@ -2732,16 +2732,15 @@ class _PocketPattern:
                      "Zig-Zag (90°)": "Y", "Zig-Zag (135°)": "D135"}
     FORCE_REVERSE = {"Climb":        {"X": False, "Y": True, "D45": True,  "D135": True},
                      "Conventional": {"X": True,  "Y": False, "D45": False, "D135": False}}
-    WOUND_OUTSIDE_IN_SENSE = {"Climb": "CW", "Conventional": "CCW", "Either": "CW"}
+    ONION_SKIN = ("Onion Skin (Inside-Out)", "Onion Skin (Outside-In)")
 
     def __init__(self, raster_dir, cut_direction):
+        if raster_dir not in self.ONION_SKIN and raster_dir not in self.ZIGZAG_FAMILY:
+            raise ValueError(f"unknown Pocket scan direction: {raster_dir!r}")
         self.raster_dir = raster_dir
-        self.is_coil = raster_dir in ("Coil (Outside-In)", "Coil (Inside-Out)")
-        self.is_spiral = raster_dir in ("Spiral (Outside-In)", "Spiral (Inside-Out)")
-        self.is_wound = self.is_coil or self.is_spiral   # one continuous wound path per area
-        self.is_onion = raster_dir in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)")
+        self.is_onion = raster_dir in self.ONION_SKIN
         self.is_zigzag = raster_dir in self.ZIGZAG_FAMILY
-        self.direction = self.ZIGZAG_FAMILY.get(raster_dir)   # None for Coil/Spiral/Onion Skin
+        self.direction = self.ZIGZAG_FAMILY.get(raster_dir)   # None for Onion Skin
         self.lock_direction = cut_direction in self.FORCE_REVERSE
 
 
@@ -2765,21 +2764,18 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     """
     from scipy.ndimage import label, find_objects
 
-    # Each connected pocket region gets its own grid/coil/spiral, sized and
-    # centred on that region's own bounding box rather than the full stock,
-    # so a Coil or Spiral pattern is concentric with the pocket, not the
-    # canvas. Gating uses the region's own label mask (not the pooled
+    # Each connected pocket region gets its own infill, generated within
+    # that region's own bounding box. Gating uses the region's own label
+    # mask (not the pooled
     # pocket_mask) so two disjoint regions with overlapping bounding boxes
     # never double-generate a line over each other's pixels.
     flat_depth = np.where(pocket_mask, level_norm, 0.0).astype(np.float32)
     mask_resid_tol = level_norm * 0.5   # (flat_depth * region_mask) is 0 or level_norm
 
     raster_dir = pattern.raster_dir
-    IS_COIL, IS_SPIRAL = pattern.is_coil, pattern.is_spiral
     IS_ONION, IS_ZIGZAG = pattern.is_onion, pattern.is_zigzag
     direction = pattern.direction
     FORCE_REVERSE = _PocketPattern.FORCE_REVERSE
-    WOUND_OUTSIDE_IN_SENSE = _PocketPattern.WOUND_OUTSIDE_IN_SENSE
     lock_direction = pattern.lock_direction
 
     labeled_regions, n_regions = label(pocket_mask)
@@ -2791,10 +2787,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     # *pocket* is visited when for travel efficiency, without ever
     # separating one pocket's own segments/chains (e.g. produced when Onion
     # Skin's erosion forked into sibling branches) from each other or
-    # disturbing their deliberate depth/visiting sequence. Pocket's own
-    # ordering reads it for Zig-Zag and Onion Skin only, since Coil's and
-    # Spiral's generation order already keeps each region's segments
-    # together; Level Clearing reads it for every pattern.
+    # disturbing their deliberate depth/visiting sequence.
     seg_region_ids = []
     # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
     # per interior hole/island), used by Stage 6 to bridge gaps by walking
@@ -2817,31 +2810,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 for ring in _region_contour_rings(local_mask)
             ]
 
-        if IS_SPIRAL:
-            sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
-            rc = _spiral_px(r_lo, r_hi, c_lo, c_hi, step_mm * px_per_mm,
-                                  sense, raster_offset_pct)
-            if raster_dir == "Spiral (Inside-Out)":
-                rc = rc[::-1]
-            full_depth_segs.extend(
-                _curve_points(rc, flat_depth, region_mask_f, mask_resid_tol,
-                              px_per_mm, H, _ox, _oy, max_depth))
-        elif IS_COIL:
-            local_row_ids, _ = _grid_line_ids(r_hi - r_lo, px_per_mm, step_mm, raster_offset_pct)
-            local_col_ids, _ = _grid_line_ids(c_hi - c_lo, px_per_mm, step_mm, raster_offset_pct)
-            row_ids = [r + r_lo for r in local_row_ids]
-            col_ids = [c + c_lo for c in local_col_ids]
-            sense = WOUND_OUTSIDE_IN_SENSE[cut_direction]
-            legs = _coil_legs(row_ids, col_ids, sense)
-            if raster_dir == "Coil (Inside-Out)":
-                legs = [(axis, fixed, e, s) for axis, fixed, s, e in reversed(legs)]
-            for axis, fixed_idx, start_idx, end_idx in legs:
-                lo, hi = (start_idx, end_idx) if start_idx <= end_idx else (end_idx, start_idx)
-                full_depth_segs.extend(
-                    _line_points(axis, fixed_idx, lo, hi, start_idx > end_idx,
-                                 flat_depth, region_mask_f, mask_resid_tol,
-                                 px_per_mm, H, _ox, _oy, max_depth))
-        elif IS_ONION:
+        if IS_ONION:
             step_px = max(1, int(round(step_mm * px_per_mm)))
             min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
             local_mask = labeled_regions[box] == region_id
@@ -2853,8 +2822,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 # visited before a shallower sibling chain from the same
                 # split) and each chain's own point order (so within a
                 # chain, cutting starts at its own deepest ring and works
-                # back out) -- same "reverse the whole path, order and
-                # direction together" idea as Coil's and Spiral's Inside-Out.
+                # back out).
                 chains = [c[::-1] for c in reversed(chains)]
             offset = np.array([r_lo, c_lo])
             for chain in chains:
@@ -2900,7 +2868,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
 
 
 def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
-                                tool_pos, pattern, use_2opt, link_threshold_mm,
+                                tool_pos, pattern, link_threshold_mm,
                                 labeled_regions, region_contours, link_surface,
                                 final_norm, px_per_mm, H, W, _ox, _oy, max_depth):
     """Order one pass of Pocket infill segments and bridge the short gaps
@@ -2918,33 +2886,23 @@ def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
     n_links_contour, n_links)): the ordered cut segments with the link
     segments between them, and the tool position after the last cut.
     """
-    IS_ONION, IS_ZIGZAG, IS_WOUND = pattern.is_onion, pattern.is_zigzag, pattern.is_wound
+    IS_ONION, IS_ZIGZAG = pattern.is_onion, pattern.is_zigzag
     direction, lock_direction = pattern.direction, pattern.lock_direction
     RING_SNAP_TOL_PX = 2.0   # how close a segment endpoint must sit to a region's own contour ring
     ceil_norm = ceil_mm / max_depth
     cur = (float(tool_pos[0]), float(tool_pos[1]))
     # Onion Skin's own correctness (winding sense, Outside-In vs.
     # Inside-Out) is fully decided at generation time (_pocket_infill),
-    # never by visiting order -- so, unlike Horizontal/Vertical/Coil/Spiral,
-    # its ordering is independent of lock_direction: a chain is only ever
-    # left untouched or permuted by _order_fixed_orientation_pass, never
-    # reversed, in both cases.
+    # never by visiting order -- so its ordering is independent of
+    # lock_direction: a chain is only ever left untouched or permuted by
+    # _order_fixed_orientation_pass, never reversed, in both cases.
     if IS_ONION and _is_contiguous_chain(pass_segs):
         ordered_segs = pass_segs
     elif IS_ONION:
         ordered_segs = _order_fixed_orientation_pass(pass_segs, cur, group_ids=pass_ids)
-    elif IS_ZIGZAG:
+    else:
         ordered_segs = _order_zigzag_pass(pass_segs, pass_ids, direction, cur,
                                           lock_direction)
-    elif lock_direction and IS_WOUND:
-        ordered_segs = pass_segs
-    elif lock_direction:
-        ordered_segs = _order_locked_raster_pass(pass_segs, direction, cur)
-    elif IS_WOUND and _is_contiguous_chain(pass_segs):
-        ordered_segs = pass_segs
-    else:
-        ordered_segs = _order_free_raster_pass(pass_segs, cur, use_2opt,
-                                                link_threshold_mm)
 
     out = []
     n_cut = n_links_inserted = n_links_contour = n_links = 0
@@ -3109,7 +3067,7 @@ def compute_pocket_mask(depth_map, tool, px_per_mm, max_depth, target_z_mm,
     if target_z_mm is None:
         target_z_mm = max_depth
     # Floored just above 0 rather than allowed to land exactly there: Zig-Zag
-    # and Coil (see compute_pocket_toolpath) reuse compute_raster_toolpath's
+    # (see compute_pocket_toolpath) reuses compute_raster_toolpath's
     # own _line_points/_diag_line_points to build scan lines, which decide
     # which pixels are active by multiplying this normalised depth by the
     # region mask and comparing against a tolerance -- the same real
@@ -3141,7 +3099,6 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                              feed_rate=800.0,
                              previous_result=None,
                              raster_offset_pct=0.0,
-                             use_2opt=False,
                              cut_direction="Climb",
                              final_stepdown_mm=0.0,
                              boundary_offset_mm=0.0,
@@ -3158,11 +3115,10 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     Every position where the tool can be centred and still reach target_z_mm
     without its footprint overhanging shallower material (i.e. the tool-
     centre erosion, not the dilated/opened accessible surface) is treated as
-    pocket interior; that interior is cleared flat at target_z_mm using the
-    same scan-line/coil/spiral infill machinery as compute_raster_toolpath,
-    one tool-accessibility-bounded connected region at a time so a Coil or
-    Spiral pattern is centred on and sized to each pocket rather than the
-    stock.
+    pocket interior; that interior is cleared flat at target_z_mm with
+    concentric rings following each pocket's own outline (Onion Skin) or
+    Zig-Zag scan lines, one tool-accessibility-bounded connected region at a
+    time.
 
     Parameters
     ----------
@@ -3174,11 +3130,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     max_depth         : total maximum cut depth in mm (depth map's own scale)
     width_mm          : physical image width in mm
     height_mm         : physical image height in mm
-    raster_dir        : "Zig-Zag (0°)" | "Zig-Zag (45°)" | "Zig-Zag (90°)" |
-                        "Zig-Zag (135°)" | "Coil (Outside-In)" |
-                        "Coil (Inside-Out)" | "Spiral (Outside-In)" |
-                        "Spiral (Inside-Out)" | "Onion Skin (Outside-In)" /
-                        "(Inside-Out)". Zig-Zag scans parallel lines at the
+    raster_dir        : "Onion Skin (Inside-Out)" | "Onion Skin (Outside-In)" |
+                        "Zig-Zag (0°)" | "Zig-Zag (45°)" | "Zig-Zag (90°)" |
+                        "Zig-Zag (135°)". Zig-Zag scans parallel lines at the
                         given angle within each region, same line-generation
                         machinery as compute_raster_toolpath's Horizontal/
                         Vertical/Diagonal directions (applied independently
@@ -3187,12 +3141,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                         boundary contour wherever both gap endpoints lie on
                         it, falling back to the same geodesic search Raster
                         uses otherwise (e.g. a gap spanning two different
-                        regions). Coil traces the region's perimeter
-                        inward in concentric rectangular rings (Outside-In)
-                        or the reverse (Inside-Out); Spiral does the
-                        same with rings that morph from the region's bounding
-                        rectangle into a linear spiral at its center (see
-                        _spiral_px). Onion Skin instead
+                        regions). Onion Skin
                         offsets concentric rings inward from each region's
                         own boundary by step_mm, stitched into one
                         continuous chain per undivided island, so the
@@ -3362,7 +3311,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         if IS_ZIGZAG or IS_ONION:
             pass_region_ids = pruned_region_ids
         progress(70, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
-    link_threshold_mm = 2.0 * step_mm   # 2-opt's own "free stitch" cost-model distance
+    link_threshold_mm = 2.0 * step_mm   # longest gap bridged by a link instead of a retract
 
     # ── Stage 6 · Per-pass ordering + terrain link insertion ─────────────
     # For Zig-Zag, a short gap between two segments both belonging to the
@@ -3401,7 +3350,7 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
         # Stage 5).
         out, tool_pos, counts = _order_and_link_pocket_pass(
             pass_segs, pass_region_ids[pi], ceil_mm, is_final, tool_pos,
-            pattern, use_2opt, link_threshold_mm, labeled_regions,
+            pattern, link_threshold_mm, labeled_regions,
             region_contours, flat_depth, final_norm,
             px_per_mm, H, W, _ox, _oy, max_depth)
         all_segments.extend(out)
@@ -3548,7 +3497,6 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
                                     feed_rate=800.0,
                                     previous_result=None,
                                     raster_offset_pct=0.0,
-                                    use_2opt=False,
                                     cut_direction="Climb",
                                     max_step_down_mm=0.0,
                                     adaptive_levels=False,
@@ -3742,7 +3690,7 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
         if segs:
             out, tool_pos, counts = _order_and_link_pocket_pass(
                 segs, [rid] * len(segs), levels_mm[k], True, tool_pos,
-                pattern, use_2opt, link_threshold_mm, labeled,
+                pattern, link_threshold_mm, labeled,
                 region_contours, cleared, 0.0,
                 px_per_mm, H, W, _ox, _oy, max_depth)
             all_segments.extend(out)
