@@ -2096,40 +2096,74 @@ class GCodeGeneratorApp:
         self._build_image_canvas(canvas_frame)
 
     def _build_toolpath_scale(self, parent):
-        """Horizontal scale to preview how far the tool has progressed along the toolpath."""
+        """Two horizontal scales selecting the slice of the toolpath to preview.
+
+        "From" (top) and "To" (bottom) bound the shown part of the path as
+        percentages of its points. They are linked so From never exceeds To:
+        moving either one past the other pushes the other along with it.
+        """
+        self.toolpath_from_var = tk.DoubleVar(value=0.0)
         self.toolpath_scale_var = tk.DoubleVar(value=100.0)
         self._toolpath_scale_render_id = None
 
-        ttk.Label(parent, text="Toolpath progress").pack(side=tk.LEFT, padx=(0, 6))
-        self.toolpath_scale_label = ttk.Label(parent, text="100%", width=5, anchor=tk.E)
-        self.toolpath_scale_label.pack(side=tk.RIGHT, padx=(6, 0))
-        scale = ttk.Scale(parent, from_=0, to=100, orient=tk.HORIZONTAL,
-                          variable=self.toolpath_scale_var,
-                          command=self._on_toolpath_scale_changed)
-        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        def build_row(text, var, label_text, on_change, on_wheel):
+            row = ttk.Frame(parent)
+            row.pack(side=tk.TOP, fill=tk.X)
+            ttk.Label(row, text=text, width=16).pack(side=tk.LEFT, padx=(0, 6))
+            label = ttk.Label(row, text=label_text, width=5, anchor=tk.E)
+            label.pack(side=tk.RIGHT, padx=(6, 0))
+            scale = ttk.Scale(row, from_=0, to=100, orient=tk.HORIZONTAL,
+                              variable=var, command=on_change)
+            scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            # The wheel steps the scale anywhere over its row, one percent
+            # per notch (wheel up advances); "break" keeps the sidebar's
+            # bind_all wheel handler from also scrolling.
+            for w in (row, *row.winfo_children()):
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    w.bind(seq, on_wheel)
+            return label
 
-        # The wheel steps the scale anywhere over the bar, one percent per
-        # notch (wheel up advances); "break" keeps the sidebar's bind_all
-        # wheel handler from also scrolling.
-        for w in (parent, scale, *parent.winfo_children()):
-            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                w.bind(seq, self._on_toolpath_scale_wheel)
+        self.toolpath_from_label = build_row(
+            "Toolpath from", self.toolpath_from_var, "0%",
+            lambda _v=None: self._on_toolpath_scale_changed(moved="from"),
+            lambda e: self._on_toolpath_scale_wheel(e, self.toolpath_from_var, "from"))
+        self.toolpath_scale_label = build_row(
+            "Toolpath to", self.toolpath_scale_var, "100%",
+            lambda _v=None: self._on_toolpath_scale_changed(moved="to"),
+            lambda e: self._on_toolpath_scale_wheel(e, self.toolpath_scale_var, "to"))
 
-    def _on_toolpath_scale_wheel(self, event):
+    def _reset_toolpath_scale(self):
+        """Show the whole toolpath (From 0 %, To 100 %)."""
+        self.toolpath_from_var.set(0.0)
+        self.toolpath_scale_var.set(100.0)
+        self.toolpath_from_label.config(text="0%")
+        self.toolpath_scale_label.config(text="100%")
+
+    def _on_toolpath_scale_wheel(self, event, var, moved):
         if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
             step = -1.0
         elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
             step = 1.0
         else:
             return "break"
-        old = self.toolpath_scale_var.get()
+        old = var.get()
         new = min(100.0, max(0.0, round(old) + step))
         if new != old:
-            self.toolpath_scale_var.set(new)
-            self._on_toolpath_scale_changed()
+            var.set(new)
+            self._on_toolpath_scale_changed(moved=moved)
         return "break"
 
-    def _on_toolpath_scale_changed(self, _value=None):
+    def _on_toolpath_scale_changed(self, moved="to"):
+        # The scale just moved pushes the other one along when it would
+        # otherwise pass it, so From <= To always holds.
+        lo = self.toolpath_from_var.get()
+        hi = self.toolpath_scale_var.get()
+        if lo > hi:
+            if moved == "from":
+                self.toolpath_scale_var.set(lo)
+            else:
+                self.toolpath_from_var.set(hi)
+        self.toolpath_from_label.config(text=f"{round(self.toolpath_from_var.get())}%")
         self.toolpath_scale_label.config(text=f"{round(self.toolpath_scale_var.get())}%")
         # A full redraw can take longer than the interval between drag
         # motion events, so the render runs once Tk is idle: motion events
@@ -4809,8 +4843,7 @@ class GCodeGeneratorApp:
                 self.display_step_var.set(display_idx + 1)
                 if not self.show_cut_moves_var.get():
                     self.show_cut_moves_var.set(True)
-                self.toolpath_scale_var.set(100.0)
-                self.toolpath_scale_label.config(text="100%")
+                self._reset_toolpath_scale()
                 self._on_display_mode_changed()
 
             self.root.after(0, _all_done)
@@ -5540,33 +5573,36 @@ class GCodeGeneratorApp:
         return None
 
     def _toolpath_progress_segments(self, tp):
-        """Return tp.segments truncated to the leading x% of path points.
+        """Return the slice of tp.segments between the From and To scales.
 
-        x is the position of the toolpath-progress scale below the canvas, letting
-        the user scrub through how far the tool has travelled along the path.
+        From and To are percentages of the path's points; the scales below
+        the canvas let the user scrub through any stretch of the tool's
+        travel. A segment straddling either bound is cut at it.
         """
         segments = tp.segments
-        pct = max(0.0, min(1.0, self.toolpath_scale_var.get() / 100.0))
-        if pct >= 1.0:
+        lo = max(0.0, min(1.0, self.toolpath_from_var.get() / 100.0))
+        hi = max(0.0, min(1.0, self.toolpath_scale_var.get() / 100.0))
+        if lo <= 0.0 and hi >= 1.0:
             return segments
         total_points = sum(len(pts) for pts in segments)
         if total_points == 0:
             return segments
-        n_keep   = int(round(total_points * pct))
-        truncated = []
+        n_start = int(round(total_points * lo))
+        n_end   = int(round(total_points * hi))
+        sliced = []
         count = 0
         for pts in segments:
-            if count >= n_keep:
+            if count >= n_end:
                 break
-            remaining = n_keep - count
-            if len(pts) <= remaining:
-                truncated.append(pts)
-                count += len(pts)
-            else:
-                truncated.append(pts[:remaining])
-                count = n_keep
-                break
-        return truncated
+            seg_start = count
+            count += len(pts)
+            if count <= n_start:
+                continue
+            a = max(0, n_start - seg_start)
+            b = min(len(pts), n_end - seg_start)
+            if b > a:
+                sliced.append(pts if (a == 0 and b == len(pts)) else pts[a:b])
+        return sliced
 
     # ------------------------------------------------------------------ #
     #  3D rendering
