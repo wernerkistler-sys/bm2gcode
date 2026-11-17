@@ -1536,7 +1536,7 @@ class GCodeGeneratorApp:
 
         # ── Raster step-down controls (shown for Raster Scan only) ───────
         stepdown = LabeledEntry(tool_lf, "Max step-down", "mm", DEFAULTS["step_stepdown"],
-                                minval=0.01, maxval=50.0, increment=0.1)
+                                minval=0.0, maxval=50.0, increment=0.1)
         stepdown.pack(fill=tk.X, pady=2)   # initially shown (default = Raster Scan)
         step['stepdown'] = stepdown
 
