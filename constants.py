@@ -12,14 +12,13 @@ CUT_DIRECTIONS    = ["Either", "Climb", "Conventional"]
 UNDERCUT_OPEN_MODES = {"Cut": "cut",
                        "Skip, back uncut": "solid",
                        "Skip, back already cut": "air"}
-ALGORITHMS        = ["Raster Scan", "Contour",
+ALGORITHMS        = ["Raster Scan", "Level Clearing", "Pocket", "Contour",
                      "V-Carving (Depth Map)",
                      "V-Carving (Sub-pixel)",
                      "V-Carving (Feature Width)",
                      "V-Carving (Hybrid)",
                      "V-Carving Clean-up",
-                     "Cutout", "Pocket", "Level Clearing", "Registration Holes",
-                     "Undercut"]
+                     "Undercut", "Cutout", "Registration Holes"]
 
 # Which compute_*_toolpath pipeline each Algorithm dropdown entry uses.
 # V-Carving Clean-up displays under the V-Carving group but is really a
