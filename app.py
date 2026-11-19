@@ -4816,7 +4816,8 @@ class GCodeGeneratorApp:
                     self.root.after(0, lambda: dlg.close("Cancelled."))
                     return
                 except Exception as exc:
-                    self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}"))
+                    self.root.after(0, lambda e=exc: dlg.close(f"Error: {e}",
+                                                           keep_open=True))
                     self.root.after(0, lambda e=exc: messagebox.showerror(
                         "Computation error", str(e)))
                     return

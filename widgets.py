@@ -21,7 +21,10 @@ import tool_profile
 class ProgressDialog(tk.Toplevel):
     """Modal progress dialog with a scrollable message log, a progress bar,
     a Cancel button (active during computation) and a Close button (enabled
-    when computation finishes or is cancelled).
+    when computation finishes or is cancelled).  With "Close automatically"
+    checked, the dialog destroys itself when computation finishes, unless
+    ``close`` was called with ``keep_open=True``; the checkbox state is shared
+    by every dialog of the session.
 
     Thread-safe: call ``report(pct, message)`` from any thread.
     The dialog polls an internal queue via ``after()`` so all Tk updates
@@ -50,6 +53,8 @@ class ProgressDialog(tk.Toplevel):
 
     _POLL_MS = 40   # how often (ms) the dialog polls the queue
 
+    _auto_close = False   # "Close automatically" state, shared across dialogs
+
     def __init__(self, parent, title="Computing…"):
         super().__init__(parent)
         self.title(title)
@@ -60,6 +65,8 @@ class ProgressDialog(tk.Toplevel):
 
         self._q          = queue.Queue()
         self._cancelled  = False   # set by Cancel button, read by worker via report()
+        self._keep_open  = False   # set by close(keep_open=True)
+        self._auto_close_var = tk.BooleanVar(value=ProgressDialog._auto_close)
 
         # ── Layout ────────────────────────────────────────────────────
         outer = ttk.Frame(self, padding=16)
@@ -95,6 +102,10 @@ class ProgressDialog(tk.Toplevel):
                   anchor=tk.E).grid(row=2, column=1, sticky=tk.E, padx=(6, 0))
 
         # Buttons
+        ttk.Checkbutton(outer, text="Close automatically",
+                        variable=self._auto_close_var,
+                        command=self._on_auto_close_toggled).grid(
+            row=3, column=0, sticky=tk.W, pady=(8, 0))
         btn_row = ttk.Frame(outer)
         btn_row.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(8, 0))
         self._close_btn = ttk.Button(btn_row, text="Close",
@@ -124,10 +135,12 @@ class ProgressDialog(tk.Toplevel):
         pct = max(0.0, min(100.0, float(pct)))
         self._q.put((pct, message))
 
-    def close(self, final_message: str = "Completed."):
+    def close(self, final_message: str = "Completed.", keep_open: bool = False):
         """Signal that computation has finished.  Appends ``final_message``
-        to the log, disables Cancel, and enables Close.  Does NOT destroy
-        the dialog — the user does that by clicking Close."""
+        to the log, disables Cancel, and enables Close.  The dialog is
+        destroyed right away if "Close automatically" is checked and
+        ``keep_open`` is false; otherwise the user closes it with Close."""
+        self._keep_open = keep_open
         self._q.put(None)           # sentinel: computation done
         self._q.put((100.0, final_message))
 
@@ -136,6 +149,9 @@ class ProgressDialog(tk.Toplevel):
         self._cancelled = True
         self._cancel_btn.config(state=tk.DISABLED)
         self._append("Cancelling…")
+
+    def _on_auto_close_toggled(self):
+        ProgressDialog._auto_close = self._auto_close_var.get()
 
     def _on_close(self):
         self.grab_release()
@@ -174,7 +190,9 @@ class ProgressDialog(tk.Toplevel):
                     self._close_btn.config(state=tk.NORMAL)
         except queue.Empty:
             pass
-        if not done:
+        if done and self._auto_close_var.get() and not self._keep_open:
+            self._on_close()
+        elif not done:
             try:
                 self.after(self._POLL_MS, self._poll)
             except tk.TclError:
