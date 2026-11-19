@@ -15,18 +15,13 @@ import numpy as np
 import threading
 import weakref
 
-# Diverging colormap that is dark at zero (like "hot") and bright at both extremes.
-# Negative half: black → blue → cyan → white  (cold mirror of hot)
-# Positive half: black → red → yellow → white  (standard hot)
-_cold_cmap = mcolors.LinearSegmentedColormap.from_list(
-    '_cold', [(0, 0, 0), (0, 0, 1), (0, 1, 1), (1, 1, 1)])
+# Diverging colormap that is dark at zero and bright at both extremes, with
+# distinct end colours so the sign of an extreme value is never ambiguous.
+# Negative half: cyan → blue → black   (most-negative → zero)
+# Positive half: black → red → yellow  (zero → most-positive)
 _DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
     'diff_hot',
-    np.vstack([
-        _cold_cmap(np.linspace(1, 0, 128)),   # white/cyan → black  (most-negative → zero)
-        plt.cm.hot(np.linspace(0, 1, 128)),    # black → yellow/white (zero → most-positive)
-    ])
-)
+    [(0, 1, 1), (0, 0, 1), (0, 0, 0), (1, 0, 0), (1, 1, 0)])
 
 # Distinct, saturated facecolor shown through wherever a ToolPath.alpha
 # array marks a pixel as physically cut through (a real hole) -- the
