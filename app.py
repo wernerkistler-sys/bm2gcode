@@ -1914,7 +1914,7 @@ class GCodeGeneratorApp:
             # Contour orders its rings along the contour graph, and Pocket
             # and Level Clearing use their scan pattern's own ordering
             # (_order_zigzag_pass, or for Onion Skin _order_onion_pass
-            # along each region's fork tree), never 2-opt.
+            # along each region's level graph), never 2-opt.
             if alg == "Contour" or family in ("Pocket", "Level Clearing"):
                 step['tsp_2opt_cb'].pack_forget()
             elif not step['tsp_2opt_cb'].winfo_manager():

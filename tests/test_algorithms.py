@@ -102,23 +102,51 @@ check("the chain reaches well inward of the outer radius (multiple rings, not ju
 
 
 # --------------------------------------------------------------------------
-# an annulus (pocket around an island / a hole) is one connected component --
-# find_contours already returns both its outer and inner ring in one call
+# an annulus (pocket around an island / a hole): the outer boundary and the
+# hole's boundary are separate tracks, like a hill and a crater in Contour,
+# each its own chain, independent of the other
 # --------------------------------------------------------------------------
 print("annulus")
 
 outer_r, inner_r = 40, 30
 annulus = disk_mask((100, 100), (50, 50), outer_r) & ~disk_mask((100, 100), (50, 50), inner_r)
 # step_px bigger than the annulus's own thickness (10 px) collapses it to
-# nothing after the very first ring extraction, so the whole returned chain
-# is exactly that first iteration's outer+inner ring pair.
-chains = _onion_skin_chains(annulus, step_px=15, min_area_px=20)
-check("an annulus stays one connected chain (not a split)", len(chains) == 1)
-d = dist_from(chains[0], (50, 50))
-check("the chain includes points near the annulus's outer boundary",
-      abs(d.max() - outer_r) < 3.0)
-check("the chain includes points near the annulus's inner (hole) boundary",
-      abs(d.min() - inner_r) < 3.0)
+# nothing after the very first ring extraction: one outer and one hole ring.
+chains, parents = _onion_skin_chains(annulus, step_px=15, min_area_px=20,
+                                     return_parents=True)
+check("an annulus's outer and hole rings are two chains", len(chains) == 2)
+d = [dist_from(c, (50, 50)) for c in chains]
+check("one chain runs along the annulus's outer boundary",
+      sum(abs(x.min() - outer_r) < 3.0 and abs(x.max() - outer_r) < 3.0 for x in d) == 1)
+check("one chain runs along the annulus's inner (hole) boundary",
+      sum(abs(x.min() - inner_r) < 3.0 and abs(x.max() - inner_r) < 3.0 for x in d) == 1)
+check("neither chain waits for the other", parents == [[], []])
+
+# A thick annulus: the outer track shrinks inward, the hole's track grows
+# outward, each one chain, and no chain jumps between them.
+annulus_t = disk_mask((100, 100), (50, 50), 45) & ~disk_mask((100, 100), (50, 50), 10)
+chains, parents = _onion_skin_chains(annulus_t, step_px=4, min_area_px=20,
+                                     return_parents=True)
+d = [dist_from(c, (50, 50)) for c in chains]
+check("a thick annulus gives an outer chain and a hole chain, nothing else",
+      len(chains) == 2 and parents == [[], []])
+check("the outer chain starts at the outer boundary, the hole chain at the hole",
+      sorted(round(float(x[0])) for x in d) in ([10, 45], [10, 44], [11, 45], [11, 44]))
+
+# Two holes close together: their tracks grow until they meet, and the ring
+# around both is cut after both.
+two_holes = (disk_mask((100, 140), (50, 70), 46)
+             & ~disk_mask((100, 140), (50, 52), 6) & ~disk_mask((100, 140), (50, 88), 6))
+chains, parents = _onion_skin_chains(two_holes, step_px=4, min_area_px=20,
+                                     return_parents=True)
+hole_a = [i for i, c in enumerate(chains) if dist_from(c, (50, 52)).min() < 8
+          and dist_from(c, (50, 88)).min() > 20]
+hole_b = [i for i, c in enumerate(chains) if dist_from(c, (50, 88)).min() < 8
+          and dist_from(c, (50, 52)).min() > 20]
+merged = [i for i, ps in enumerate(parents) if len(ps) >= 2]
+check("each hole has a chain of its own", len(hole_a) == 1 and len(hole_b) == 1)
+check("the ring where the holes' tracks meet waits for both holes' chains",
+      any(set(parents[i]) >= {hole_a[0], hole_b[0]} for i in merged))
 
 
 # --------------------------------------------------------------------------
@@ -146,19 +174,11 @@ check("every other chain stays local to a single lobe (post-split, independent p
 
 
 # --------------------------------------------------------------------------
-# regression test: when a split produces two sibling branches of very
-# different remaining depth, the shallow sibling's chain must not be
-# stranded until after the deep sibling's entire remaining descent
-# finishes. A depth-first "fully recurse this branch, then start its
-# sibling" implementation would bury the small lobe's chain at the very
-# end, well behind rings that are actually shallower (closer to the
-# surface) than much of the big lobe's own later rings. The big lobe is
-# placed first in scan order (top-left) so scipy.ndimage.label assigns it
-# component 1 -- a depth-first bug would fully finish it before even
-# starting component 2 (the small lobe), regardless of which is actually
-# shallower.
+# a split into two lobes of very different remaining depth: each lobe's
+# chain is cut after the joined outline's chain, and neither lobe waits for
+# the other.
 # --------------------------------------------------------------------------
-print("sibling branches of unequal depth stay interleaved (regression)")
+print("sibling branches of unequal depth both follow the joined outline")
 
 shape2 = (100, 220)
 big_c, small_c = (50, 50), (50, 190)
@@ -166,7 +186,8 @@ big_r, small_r = 45, 12
 neck2 = np.zeros(shape2, dtype=bool)
 neck2[47:53, 50:190] = True
 uneven = disk_mask(shape2, big_c, big_r) | disk_mask(shape2, small_c, small_r) | neck2
-chains2 = _onion_skin_chains(uneven, step_px=4, min_area_px=20)
+chains2, parents2 = _onion_skin_chains(uneven, step_px=4, min_area_px=20,
+                                       return_parents=True)
 
 is_small_lobe = [dist_from(c, small_c).min() < small_r / 2 for c in chains2]
 is_big_lobe = [dist_from(c, big_c).min() < big_r / 2 and not is_small_lobe[i]
@@ -174,10 +195,10 @@ is_big_lobe = [dist_from(c, big_c).min() < big_r / 2 and not is_small_lobe[i]
 check("both the small and big lobe end up with their own post-split chain",
       any(is_small_lobe) and any(is_big_lobe))
 small_idx = is_small_lobe.index(True)
-last_big_idx = max(i for i, v in enumerate(is_big_lobe) if v)
-check("the small lobe's chain is not stranded after the big lobe's entire "
-      "remaining descent (depth-first recursion bug)",
-      small_idx < last_big_idx)
+big_idx = is_big_lobe.index(True)
+check("both lobes' chains follow the same chain, the joined outline",
+      len(parents2[small_idx]) == 1 and parents2[small_idx] == parents2[big_idx]
+      and parents2[parents2[small_idx][0]] == [])
 
 
 # --------------------------------------------------------------------------
@@ -638,7 +659,7 @@ check("a closed piece ends where it started", np.allclose(end, ring[order[0][2]]
 
 
 # --------------------------------------------------------------------------
-# _order_onion_pass: chains along their fork tree, a chain's segments in
+# _order_onion_pass: chains along their precedence graph, a chain's segments in
 # their own order, and separate trees interleaved nearest-first.
 # --------------------------------------------------------------------------
 print("_order_onion_pass")

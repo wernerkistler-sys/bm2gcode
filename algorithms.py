@@ -830,7 +830,7 @@ def _order_by_precedence(polylines, piece_node, parents, current_pos, *,
     Among the pieces that may be cut, greedy nearest-neighbour picks the
     one whose start lies nearest the tool. Contour (_order_contours_graph)
     uses this with one node per hill or crater at each level, Onion Skin
-    (_order_onion_pass) with the fork tree of each region's ring chains.
+    (_order_onion_pass) with the level graph of each region's ring chains.
 
     polylines  : per piece, an (N, 2) array of (x, y) mm.
     piece_node : per piece, its node.
@@ -922,14 +922,15 @@ def _order_by_precedence(polylines, piece_node, parents, current_pos, *,
 
 
 def _order_onion_pass(pass_segs, pass_chains, chain_parents, origin):
-    """Order one pass of Onion Skin segments along the fork tree of their
-    ring chains (_order_by_precedence), never reversing a segment.
+    """Order one pass of Onion Skin segments along the level graph of
+    their ring chains (_order_by_precedence), never reversing a segment.
 
     pass_chains   : per segment, the chain it was cut from (air pruning
                     can split a chain into several segments or drop it).
     chain_parents : per chain, the chains that must be cut before it
-                    (_pocket_infill: for Outside-In the chain it lies
-                    inside, for Inside-Out the chains inside it).
+                    (_pocket_infill: for Outside-In the chains one step
+                    further out it follows, for Inside-Out the chains
+                    that follow it).
 
     A chain's segments are cut in their own order, one after the other,
     so a chain keeps its rings' outside-in or inside-out sequence. Chains
@@ -1880,10 +1881,10 @@ def _splice_detours(lap, at, ring_detours):
 
 def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
                         max_checked_pairs=1024, s_links_per_exit=3, detours=None):
-    """Stitch one onion-skin branch's rings (already in visiting order and
-    winding sense) into continuous chain(s), choosing every ring's seam --
-    the vertex it is entered and left on -- jointly over the whole
-    branch.
+    """Stitch one onion-skin track's rings (one per level, already in
+    visiting order and winding sense; see _chain_onion_rings) into
+    continuous chain(s), choosing every ring's seam -- the vertex it is
+    entered and left on -- jointly over the whole track.
 
     Every ring is traversed in full, from its seam back round to it, and
     consecutive rings are joined by a link from one ring's exit to the
@@ -1894,12 +1895,11 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     Rings about one step_px apart need the entry to sit roughly
     sqrt(3) * step_px further along the next ring than the exit, for arcs
     of that radius. Where no such biarc fits (tangents pointing apart, a
-    ring too small for the radius, an outer ring and a hole ring at the
-    same erosion level), a straight link is used instead, at a cost
+    ring too small for the radius), a straight link is used instead, at a cost
     penalty of 8 * step_px so a biarc is always preferred where one
     exists.
 
-    The seams minimise the branch's total link cost, solved exactly over
+    The seams minimise the track's total link cost, solved exactly over
     each ring's seam candidates (_ring_seam_candidates) as a shortest path
     through a layered graph -- one layer per ring, one node per
     candidate. A globally chosen seam line routes itself along the
@@ -1913,10 +1913,9 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     for pairs within 4 * step_px of each other, and the s_links_per_exit
     shortest valid ones per exit candidate are checked; straight links
     are considered for the max_checked_pairs shortest pairs, all checked.
-    Every other pair is excluded. If no pair between two rings is allowed
-    (e.g. an outer ring and a hole ring with no straight line of sight
-    between them), the branch is split there into separate chains, left
-    for Stage 6 ordering and linking to join.
+    Every other pair is excluded. If no pair between two rings is allowed,
+    the track is split there into separate chains, left for Stage 6
+    ordering and linking to join.
 
     detours maps id(ring) to (ring, detours of that ring): (vertex, loop)
     pairs that _splice_detours cuts into the ring's traversal. Each entry
@@ -2053,28 +2052,6 @@ def _stitch_onion_rings(rings, safe_mask_f, step_px, max_cands=200,
     return chains
 
 
-def _order_level_rings(rings, prev_ring):
-    """Visiting order for one erosion level's rings (its outer boundary
-    plus any hole/island rings): greedily, whichever remaining ring comes
-    closest (minimum vertex-to-vertex distance) to the ring visited just
-    before it, starting from prev_ring, the previous level's last ring.
-    With no prev_ring (a branch's first level), the first ring
-    find_contours returned goes first.
-    """
-    from scipy.spatial import cKDTree
-    remaining = list(rings)
-    ordered = []
-    while remaining:
-        if prev_ring is None:
-            i = 0
-        else:
-            tree = cKDTree(prev_ring)
-            i = int(np.argmin([tree.query(r)[0].min() for r in remaining]))
-        prev_ring = remaining.pop(i)
-        ordered.append(prev_ring)
-    return ordered
-
-
 def _spine_walks(spine_mask, min_spur_px=3.0, smooth_iters=3):
     """One continuous open walk per 8-connected component of spine_mask, as
     Nx2 (row, col) float polylines through its pixel centres.
@@ -2183,15 +2160,97 @@ def _spine_walks(spine_mask, min_spur_px=3.0, smooth_iters=3):
     return walks
 
 
+def _chain_onion_rings(rings, ring_nodes, node_parents, loose, safe_mask_f,
+                       step_px, detours):
+    """Join an onion-skin region's rings into chains along its level graph
+    (_LevelGraph), and say which chain must be cut after which.
+
+    rings        : every ring, level by level, outermost level first.
+    ring_nodes   : each ring's node in the level graph.
+    node_parents : the level graph's parents.
+    loose        : (spine chain, rings of its own level in its branch) for
+                   each spine that is a chain of its own.
+
+    A ring's parent rings are the rings of its node's parent nodes, looking
+    through nodes that hold none. A track is a run of rings, one per level,
+    each the only child of the ring before it, which is its only parent:
+    the outer boundary of an undivided region shrinking inward, or a hole's
+    boundary growing outward. A track ends where material merges (two
+    holes, or a hole and the outside, meeting: the merged ring has several
+    parents) or air splits (the region forking: the ring has several
+    children), and the rings after that start tracks of their own. Each
+    track is stitched into chain(s) by _stitch_onion_rings, each cut after
+    the one before it where the stitcher split it; a track's first chain
+    is cut after the last chain of each of its parent tracks. A loose
+    spine is cut after the last chain of each track holding a ring of its
+    own level in its branch.
+
+    Returns (chains, parents): (row, col) polylines in the padded frame,
+    each running outside-in, and per chain the chains it is cut after.
+    """
+    node_rings = [[] for _ in node_parents]
+    for i, n in enumerate(ring_nodes):
+        node_rings[n].append(i)
+    memo = {}
+
+    def rings_above(n):
+        if n not in memo:
+            above = set()
+            for p in node_parents[n]:
+                above.update(node_rings[p] if node_rings[p] else rings_above(p))
+            memo[n] = sorted(above)
+        return memo[n]
+
+    ring_parents = [rings_above(n) for n in ring_nodes]
+    n_children = [0] * len(rings)
+    for ps in ring_parents:
+        for p in ps:
+            n_children[p] += 1
+    # Rings come level by level, so a ring's parents precede it.
+    track_of = [0] * len(rings)
+    tracks, track_parents = [], []
+    for i, ps in enumerate(ring_parents):
+        if len(ps) == 1 and n_children[ps[0]] == 1:
+            tracks[track_of[ps[0]]].append(i)
+            track_of[i] = track_of[ps[0]]
+        else:
+            track_of[i] = len(tracks)
+            tracks.append([i])
+            track_parents.append(sorted({track_of[p] for p in ps}))
+
+    chains, parents = [], []
+    track_end = []   # per track: the chains a chain after it is cut after
+    for t, ids in enumerate(tracks):
+        after = sorted({c for p in track_parents[t] for c in track_end[p]})
+        for chain in _stitch_onion_rings([rings[i] for i in ids], safe_mask_f,
+                                         step_px, detours=detours):
+            chains.append(chain)
+            parents.append(after)
+            after = [len(chains) - 1]
+        track_end.append(after)
+
+    index = {id(r): i for i, r in enumerate(rings)}
+    for chain, own in loose:
+        chains.append(chain)
+        parents.append(sorted({c for r in own
+                               for c in track_end[track_of[index[id(r)]]]}))
+    return chains, parents
+
+
 def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
                        tool_radius_px=None, return_parents=False):
     """Concentric-ring toolpath chain(s) clearing one connected pocket
     region: erosion level k is the set of region pixels farther than
     k * step_px from the region's outside (one Euclidean distance transform
     of region_mask, thresholded at each level), and each level's
-    boundary is extracted via find_contours as its rings, stitching
-    consecutive rings into one continuous chain with _stitch_onion_rings,
-    which picks every ring's seam jointly for the cheapest total
+    boundary is extracted via find_contours as its rings: its outer
+    boundary and one ring around each hole. The rings are joined level by
+    level into tracks along the level graph (_chain_onion_rings): the
+    outer boundary shrinking inward is one track, each hole's boundary
+    growing outward another, until boundaries meet or the region forks.
+    Each track's consecutive rings are stitched into one continuous chain
+    with _stitch_onion_rings, which picks every ring's seam jointly for
+    the cheapest total
     ring-to-ring links, joins rings with a tangent-continuous S-shaped
     biarc wherever one fits (a straight link otherwise), and only ever
     uses a link that stays inside region_mask. Every pixel on erosion
@@ -2201,11 +2260,9 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     ring a link of about step_px back to level k's ring exists and lies
     within that disk, i.e. inside the region. Level 1 is exactly
     region_mask eroded by disk(step_px), and every level is the region's
-    Euclidean inward offset by k * step_px to within a pixel. Same-level
-    rings (an
-    outer boundary plus hole/island rings) are visited in
-    _order_level_rings' nearest-ring order. Every ring is emitted the
-    moment its mask is non-empty (before the area/erosion check below),
+    Euclidean inward offset by k * step_px to within a pixel. The same
+    holds for a hole's ring at level k+1 and its ring at level k. Every
+    ring is emitted the moment its mask is non-empty (before the area/erosion check below),
     so a region smaller than one step_px still gets its own single
     perimeter ring rather than nothing.
 
@@ -2222,16 +2279,15 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     boundary rather than a genuine second lobe -- since it would otherwise
     become its own tiny standalone toolpath segment. Only once that leaves
     more than one substantial component does this count as a genuine fork
-    (a dumbbell-shaped neck fully eroded away): the branch built so far is
-    closed off and each surviving component continues as its own
-    independent branch -- no attempt is made to bridge across the split,
-    since that would re-cross material the tool has already cleared. If
-    filtering leaves at most one substantial component, the branch simply
-    continues with it (its chain is not closed off), so shedding a stray
-    fragment never splits an otherwise-ordinary lobe's chain in two.
-    Sibling branches spawned from the same split are advanced one erosion
-    round at a time in lockstep, and a branch's chains are listed when it
-    closes, so the list holds chains in no cutting order of their own;
+    (a dumbbell-shaped neck fully eroded away): each surviving component
+    continues as its own independent branch, and its rings start tracks of
+    their own -- no attempt is made to bridge across the split, since that
+    would re-cross material the tool has already cleared. If filtering
+    leaves at most one substantial component, the branch simply continues
+    with it: a dropped fragment takes no ring, so it never splits an
+    otherwise-ordinary lobe's track in two. All branches are advanced one
+    erosion level at a time, so each level's rings go into the level graph
+    together. The chains are listed in no cutting order of their own;
     return_parents gives the order they must be cut in.
 
     With tool_radius_px given, rings that leave material standing get
@@ -2265,45 +2321,29 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     -------
     list of Nx2 (row, col) float pixel-space polylines, each running
     outside-in, in region_mask's own (unpadded) coordinate frame. An
-    undivided island is one chain unless _stitch_onion_rings had to split
-    it where no inside link exists. With return_parents, (chains, parents)
-    instead: parents[i] lists the chains that chain i must be cut after,
-    cutting outside-in -- the one before it where its branch was split,
-    or for a branch's first chain the last chain of the branch it forked
-    from. A spine that is a chain of its own follows the last chain of its
-    branch. Every chain has at most one parent.
+    undivided island without holes is one chain unless _stitch_onion_rings
+    had to split it where no inside link exists. With return_parents,
+    (chains, parents) instead: parents[i] lists the chains that chain i
+    must be cut after, cutting outside-in (see _chain_onion_rings). A
+    chain where boundaries merge has several parents.
     """
     from scipy.ndimage import label, distance_transform_edt, binary_erosion
     from skimage.measure import find_contours
-
-    chains = []
-    parents = []
 
     padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
     safe_mask_f = padded.astype(np.float32)
     # Squared distance of every pixel to the nearest outside pixel, rounded
     # to the exact integer it is; level k is where it exceeds (k*step_px)^2.
     dist2 = np.rint(np.square(distance_transform_edt(padded)))
-    # after: the chain a branch's first chain is cut after (None for the
-    # region's first); loose: the spines that are chains of their own.
-    branches = [{'mask': padded, 'rings': [], 'level': 0, 'after': None, 'loose': []}]
-
+    branches = [{'mask': padded, 'level': 0}]
+    # Every ring of every level goes into one level graph: air is the
+    # level's mask, material everything outside it, holes included.
+    graph = _LevelGraph()
+    all_rings, ring_nodes = [], []
+    # Spines that are chains of their own, each with its own level's rings
+    # in its branch.
+    loose = []
     detours = {}
-
-    def close_branch(br):
-        """Stitch br's rings into chains, each cut after the one before
-        it, then add br's loose spines after the last of them. Returns the
-        chain a branch forked from br is cut after."""
-        after = br['after']
-        for chain in _stitch_onion_rings(br['rings'], safe_mask_f, step_px,
-                                         detours=detours):
-            chains.append(chain)
-            parents.append([] if after is None else [after])
-            after = len(chains) - 1
-        for chain in br['loose']:
-            chains.append(chain)
-            parents.append([] if after is None else [after])
-        return after
 
     def extract_rings(mask):
         level = [r for r in find_contours(mask.astype(np.float32), 0.5) if len(r) >= 3]
@@ -2316,7 +2356,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     dist = np.sqrt(dist2) if spine_r is not None else None
     skeleton, nearest_out = [], []
 
-    def attach_spine(walk, inner_rings, own_rings, loose):
+    def attach_spine(walk, inner_rings, own_rings):
         """Splice walk into a ring as an out-and-back detour
         (_spine_detour), linked at the ring vertex and spine point nearest
         each other by a straight move that stays inside the region:
@@ -2325,13 +2365,13 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         two tool radii; otherwise on its own level's rings (own_rings),
         which every point of the spine lies within one step-over of. With
         no inside link to either, the spine is a chain of its own, added
-        to loose."""
+        to loose with own_rings."""
         found = _nearest_inside_link(walk, inner_rings, safe_mask_f,
                                      max_len=2.0 * spine_r + 1.0)
         if found is None:
             found = _nearest_inside_link(walk, own_rings, safe_mask_f)
         if found is None:
-            loose.append(_spine_detour(walk, 0))
+            loose.append((_spine_detour(walk, 0), own_rings))
             return
         ring, vi, wi = found
         # Each entry holds its ring, so that the ring stays alive (and its
@@ -2436,14 +2476,16 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
 
     while branches:
         next_round = []
+        level_mask = np.zeros_like(padded)
+        level_rings = []
         for br in branches:
-            cur, rings, k = br['mask'], br['rings'], br['level'] + 1
+            cur, k = br['mask'], br['level'] + 1
 
             level = br['level_rings'] if 'level_rings' in br else extract_rings(cur)
+            level_mask |= cur
+            level_rings.extend(level)
             if not level:
-                close_branch(br)
                 continue
-            rings.extend(_order_level_rings(level, rings[-1] if rings else None))
 
             if np.sum(cur) < min_area_px:
                 surviving = []
@@ -2477,20 +2519,14 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
                     nx['level_rings'] = extract_rings(nx['mask'])
                     inner.extend(nx['level_rings'])
                 for walk in _level_spines(cur, surviving, k - 1):
-                    attach_spine(walk, inner, level, br['loose'])
-
-            if not nexts:
-                close_branch(br)
-            elif len(nexts) == 1:
-                nexts[0].update(rings=rings, after=br['after'], loose=br['loose'])
-                next_round.append(nexts[0])
-            else:
-                after = close_branch(br)
-                for nx in nexts:
-                    nx.update(rings=[], after=after, loose=[])
-                    next_round.append(nx)
+                    attach_spine(walk, inner, level)
+            next_round.extend(nexts)
+        all_rings.extend(level_rings)
+        ring_nodes.extend(graph.add_level(~level_mask, level_rings))
         branches = next_round
 
+    chains, parents = _chain_onion_rings(all_rings, ring_nodes, graph.parents,
+                                         loose, safe_mask_f, step_px, detours)
     chains = [c - 1.0 for c in chains]
     return (chains, parents) if return_parents else chains
 
@@ -3225,7 +3261,7 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     # pocket region produced it -- Zig-Zag orders whole regions by it.
     seg_region_ids = []
     # Onion Skin only, parallel to full_depth_segs: the chains each chain
-    # must be cut after, along its region's fork tree.
+    # must be cut after, along its region's level graph.
     chain_parents = [] if IS_ONION else None
     # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
     # per interior hole/island), used by Stage 6 to bridge gaps by walking
@@ -3260,8 +3296,8 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 return_parents=True)
             if raster_dir == "Onion Skin (Inside-Out)":
                 # Each chain runs backwards, from its deepest ring out, and
-                # the fork tree is inverted: a chain is cut after every
-                # chain inside it rather than after the one it lies in.
+                # the graph is inverted: a chain is cut after every chain
+                # that follows it rather than after the ones it follows.
                 chains = [c[::-1] for c in chains]
                 inverted = [[] for _ in chains]
                 for i, ps in enumerate(parents):
@@ -3343,7 +3379,7 @@ def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
     cur = (float(tool_pos[0]), float(tool_pos[1]))
     # Onion Skin's winding sense and its Outside-In vs. Inside-Out sequence
     # are decided at generation time (_pocket_infill) -- each chain's own
-    # direction and the fork tree it is ordered along -- so its ordering
+    # direction and the level graph it is ordered along -- so its ordering
     # never reverses a chain, whatever lock_direction says.
     if IS_ONION:
         ordered_segs = _order_onion_pass(pass_segs, pass_ids, chain_parents, cur)
@@ -5419,48 +5455,60 @@ def _extract_z_contours(surface, z_levels, n_grey_levels, cut_direction="Climb")
     return all_z_contours
 
 
-def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
-    """The contour graph: which contours must be cut before which.
+class _LevelGraph:
+    """Which pieces of a stack of nested levels must be cut before which,
+    built one level at a time (add_level), shallowest first.
 
-    At level k, the material L_k = {surface < threshold_k} and the air
-    D_k = {surface >= threshold_k} are each split into 8-connected
-    components. Every contour at level k runs between one L_k component and
-    one D_k component, so a node is such a pair (k, l, d) of components
-    meeting across a pixel edge. Material only grows with depth
-    (L_k is inside L_{k+1}) and air only shrinks (D_{k+1} is inside D_k),
-    so every L_k component lies in one L_{k+1} component and every D_{k+1}
-    component in one D_k component. Node (k, l, d) must be cut before node
-    (k+1, l', d') when l lies in l' and d' lies in d: separate hills are
-    told apart by their material, separate craters by their air, and no
-    ring of either level separates two nodes so joined. Hills merging below
-    a saddle give a node several parents, a crater floor splitting gives
-    several children. On a vertical wall, where the contours of several
-    levels coincide, the same pixel pair carries every level's labels, so
-    those contours are joined too. 8-connectivity can only merge
-    components, i.e. add precedence, never drop it.
+    At level k, the material L_k and the air D_k (its complement) are each
+    split into 8-connected components. Every boundary at level k runs
+    between one L_k component and one D_k component, so a node is such a
+    pair (k, l, d) of components meeting across a pixel edge. Material only
+    grows from level to level (L_k is inside L_{k+1}) and air only shrinks
+    (D_{k+1} is inside D_k), so every L_k component lies in one L_{k+1}
+    component and every D_{k+1} component in one D_k component. Node
+    (k, l, d) must be cut before node (k+1, l', d') when l lies in l' and d'
+    lies in d: separate pieces of material are told apart by their material,
+    separate pieces of air by their air, and no boundary of either level
+    separates two nodes so joined. Material merging gives a node several
+    parents, air splitting gives a node several children. Where the
+    boundaries of several levels coincide, the same pixel pair carries
+    every level's labels, so those boundaries are joined too.
+    8-connectivity can only merge components, i.e. add precedence, never
+    drop it.
 
-    Each piece (a whole ring, or a run left by pruning or clipping) is
-    assigned from the labels of the pixels around its own points: the pair
-    most of its points lie between. A piece whose points match no node
-    (which a contour of the same surface and threshold can't produce) waits
-    for every node of a shallower level.
+    Contour (_contour_graph) stacks its depth thresholds: material is what
+    stands above the level, air what lies below it. Onion Skin
+    (_onion_skin_chains) stacks its erosion levels: air is the shrunk
+    region, material everything outside it, holes included.
 
-    Returns (parents, piece_node): parents[n] lists the nodes that must be
-    complete before node n is cut; piece_node[z_norm][i] is the node of
-    all_z_contours[z_norm][i]. Nodes without pieces stay in the graph, so
-    precedence passes through levels a piece was pruned from.
+    parents[n] lists the nodes that must be complete before node n.
+    Nodes without pieces stay in the graph, so precedence passes through
+    them.
     """
-    from scipy.ndimage import label
 
-    eight = np.ones((3, 3), bool)
-    H, W = surface.shape
-    parents = []
-    piece_node = {}
-    prev = None    # (material, L labels, D labels, n_D, nodes by key) one level up
-    for z_norm in z_levels:
-        mat = surface < _contour_threshold(z_norm, n_grey_levels)
-        L, _ = label(mat, structure=eight)
-        D, n_d = label(~mat, structure=eight)
+    _EIGHT = np.ones((3, 3), bool)
+
+    def __init__(self):
+        self.parents = []
+        self._prev = None   # (material, L labels, D labels, n_D, nodes by key) one level up
+
+    def add_level(self, mat, pieces):
+        """Add the next level, its material mask mat and its pieces (each
+        an Nx2 (row, col) polyline on the boundary). Returns each piece's
+        node.
+
+        Each piece (a whole ring, or a run left by pruning or clipping) is
+        assigned from the labels of the pixels around its own points: the
+        pair most of its points lie between. A piece whose points match no
+        node (which a boundary of this same material can't produce) waits
+        for every node of a shallower level.
+        """
+        from scipy.ndimage import label
+
+        H, W = mat.shape
+        parents = self.parents
+        L, _ = label(mat, structure=self._EIGHT)
+        D, n_d = label(~mat, structure=self._EIGHT)
         pairs = []
         for a, b in ((np.s_[:, :-1], np.s_[:, 1:]), (np.s_[:-1, :], np.s_[1:, :])):
             for la, db in ((L[a], D[b]), (L[b], D[a])):
@@ -5471,8 +5519,8 @@ def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
         nodes = {int(key): first + i for i, key in enumerate(keys)}
         parents.extend([] for _ in range(len(keys)))
 
-        if prev is not None:
-            mat_p, L_p, D_p, n_d_p, nodes_p = prev
+        if self._prev is not None:
+            mat_p, L_p, D_p, n_d_p, nodes_p = self._prev
             parent_l = np.zeros(L_p.max() + 1, np.int64)
             parent_l[L_p[mat_p]] = L[mat_p]
             parent_d = np.zeros(n_d + 1, np.int64)
@@ -5486,7 +5534,7 @@ def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
                 parents[n] = above.get((l, int(parent_d[d])), [])
 
         assigned = []
-        for c in all_z_contours.get(z_norm, []):
+        for c in pieces:
             rows = (np.clip(np.floor(c[:, 0]), 0, H - 1).astype(np.int64),
                     np.clip(np.ceil(c[:, 0]), 0, H - 1).astype(np.int64))
             cols = (np.clip(np.floor(c[:, 1]), 0, W - 1).astype(np.int64),
@@ -5506,9 +5554,30 @@ def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
                 node = len(parents)
                 parents.append(list(range(first)))
             assigned.append(node)
-        piece_node[z_norm] = assigned
-        prev = (mat, L, D, n_d, nodes)
-    return parents, piece_node
+        self._prev = (mat, L, D, n_d, nodes)
+        return assigned
+
+
+def _contour_graph(surface, z_levels, n_grey_levels, all_z_contours):
+    """The contour graph (_LevelGraph): which contours must be cut before
+    which. At each level the material is {surface < threshold_k}, the air
+    {surface >= threshold_k}, so separate hills are told apart by their
+    material, separate craters by their air; hills merging below a saddle
+    give a node several parents, a crater floor splitting gives several
+    children. On a vertical wall, the contours of several levels coincide
+    and are joined.
+
+    Returns (parents, piece_node): parents[n] lists the nodes that must be
+    complete before node n is cut; piece_node[z_norm][i] is the node of
+    all_z_contours[z_norm][i].
+    """
+    graph = _LevelGraph()
+    piece_node = {}
+    for z_norm in z_levels:
+        piece_node[z_norm] = graph.add_level(
+            surface < _contour_threshold(z_norm, n_grey_levels),
+            all_z_contours.get(z_norm, []))
+    return graph.parents, piece_node
 
 
 def _order_contours_graph(all_z_contours, z_levels, surface, n_grey_levels, *,
