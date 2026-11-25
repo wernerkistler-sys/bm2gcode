@@ -817,61 +817,140 @@ def _order_free_raster_pass(pass_segs, origin, use_2opt, link_threshold_mm):
     ]
 
 
-def _order_fixed_orientation_pass(pass_segs, origin, group_ids=None):
-    """Greedy nearest-neighbour ordering of pass_segs that only reorders
-    which segment is visited when -- never reverses a segment's own point
-    order, unlike _order_free_raster_pass. Used for Onion Skin, where
-    each segment is one region's whole ring chain (or one of several, if
-    that region's own erosion forked into sibling branches): reversing it
-    would silently swap that region's Outside-In/Inside-Out winding (a
-    deliberate per-toolpath choice) whenever the chain's far end happens
-    to be closer to the current tool position than its own start, which
-    _order_free_raster_pass's nearest-endpoint search would otherwise do
-    without restriction. No 2-opt refinement is applied here -- unlike
-    reversible segments, improving a fixed-orientation visiting order by
-    block reversal also requires recomputing the reversed block's own
-    internal connections rather than a simple swap, so this stays a plain
-    greedy pass; pocket region counts are small enough that this has
-    little travel-time cost.
+def _order_by_precedence(polylines, piece_node, parents, current_pos, *,
+                         closed=None, allow_flip=False, progress=None,
+                         progress_lo=0, progress_hi=100, what="pieces"):
+    """Order pieces along a precedence graph, nearest-first among those
+    that may be cut.
 
-    group_ids, if given (one id per pass_segs entry, same length),
-    reorders whole groups rather than individual segments: every segment
-    sharing a group id is kept together and in its original relative
-    order, so a group is entered at its first segment's own start and
-    exited at its last segment's own end, and reordering only ever moves
-    a whole group as one unit. This is what lets several onion-skin
-    chains produced by the same pocket region stay adjacent and keep
-    their deliberate depth sequence, while still letting genuinely
-    separate pockets be visited in whichever order minimises travel.
-    Omitting group_ids (or passing None) is equivalent to giving every
-    segment its own distinct group -- the original ungrouped behaviour.
+    Every piece belongs to one node, and a node may hold any number of
+    pieces, none included. A node is complete once all of its pieces are
+    cut, and its pieces may be cut once every node in parents[node] is
+    complete; a node without pieces completes as soon as its parents do.
+    Among the pieces that may be cut, greedy nearest-neighbour picks the
+    one whose start lies nearest the tool. Contour (_order_contours_graph)
+    uses this with one node per hill or crater at each level, Onion Skin
+    (_order_onion_pass) with the fork tree of each region's ring chains.
+
+    polylines  : per piece, an (N, 2) array of (x, y) mm.
+    piece_node : per piece, its node.
+    parents    : per node, the nodes that must be complete before it.
+    current_pos: (x, y) tool position before the first piece.
+    closed     : per piece, whether it is a closed ring that may start at
+                 any of about 20 points along itself (None: none is).
+    allow_flip : pieces may also run backwards.
+    what       : what the pieces are, for the progress messages.
+
+    Returns (order, end_pos): order holds (piece, flip, start) per piece
+    in cutting order -- flip whether it runs backwards, start the index
+    into the (flipped) polyline it starts at, after which a closed piece
+    runs round back to that point -- and end_pos is the (x, y) tool
+    position after the last piece.
     """
-    if group_ids is None:
-        groups = [[i] for i in range(len(pass_segs))]
-    else:
-        groups = []
-        group_index = {}
-        for i, gid in enumerate(group_ids):
-            if gid not in group_index:
-                group_index[gid] = len(groups)
-                groups.append([])
-            groups[group_index[gid]].append(i)
+    if progress is None:
+        progress = lambda pct, msg: None
+    n_nodes = len(parents)
+    children = [[] for _ in range(n_nodes)]
+    for n, ps in enumerate(parents):
+        for p in ps:
+            children[p].append(n)
+    waiting = [len(ps) for ps in parents]
+    by_node = [[] for _ in range(n_nodes)]
+    for i, n in enumerate(piece_node):
+        by_node[n].append(i)
+    left = [len(b) for b in by_node]
+    if closed is None:
+        closed = [False] * len(polylines)
 
-    unvisited = list(range(len(groups)))
+    # Start candidates of every piece: (piece, flip, index into the
+    # oriented polyline) and their position in mm.
+    cand_piece, cand_flip, cand_idx, cand_xy = [], [], [], []
+    for i, (c, is_closed) in enumerate(zip(polylines, closed)):
+        n = len(c)
+        idx = np.arange(0, n, max(1, n // 20)) if is_closed else np.array([0])
+        for flip in ((False, True) if allow_flip else (False,)):
+            rc = c[::-1] if flip else c
+            cand_piece.append(np.full(len(idx), i))
+            cand_flip.append(np.full(len(idx), flip))
+            cand_idx.append(idx)
+            cand_xy.append(rc[idx])
+    if polylines:
+        cand_piece = np.concatenate(cand_piece)
+        cand_flip = np.concatenate(cand_flip)
+        cand_idx = np.concatenate(cand_idx)
+        cand_xy = np.vstack(cand_xy)
+    available = np.zeros(len(polylines), bool)
+
+    def release(n):
+        stack = [n]
+        while stack:
+            n = stack.pop()
+            if left[n]:
+                available[by_node[n]] = True
+                continue
+            for ch in children[n]:
+                waiting[ch] -= 1
+                if waiting[ch] == 0:
+                    stack.append(ch)
+
+    for n in range(n_nodes):
+        if waiting[n] == 0:
+            release(n)
+
     order = []
-    cur = origin
-    while unvisited:
-        best_ui, best_dist = 0, float('inf')
-        for ui, gi in enumerate(unvisited):
-            first = pass_segs[groups[gi][0]]
-            d = ((first[0][0] - cur[0]) ** 2 + (first[0][1] - cur[1]) ** 2) ** 0.5
-            if d < best_dist:
-                best_ui, best_dist = ui, d
-        gi = unvisited.pop(best_ui)
-        order.append(gi)
-        last = pass_segs[groups[gi][-1]]
-        cur = (last[-1][0], last[-1][1])
-    return [pass_segs[i] for gi in order for i in groups[gi]]
+    cur = np.array(current_pos, dtype=float)
+    n_pieces = len(polylines)
+    n_report = max(1, n_pieces // 20)
+    for step in range(n_pieces):
+        if step % n_report == 0:
+            progress(progress_lo + (progress_hi - progress_lo) * step // n_pieces,
+                     f"Ordering {what} ({step}/{n_pieces})…")
+        d2 = np.sum((cand_xy - cur) ** 2, axis=1)
+        d2[~available[cand_piece]] = np.inf
+        k = int(np.argmin(d2))
+        i = int(cand_piece[k])
+        flip, start = bool(cand_flip[k]), int(cand_idx[k])
+        order.append((i, flip, start))
+        rc = polylines[i][::-1] if flip else polylines[i]
+        cur = np.array(rc[start] if closed[i] else rc[-1], dtype=float)
+        available[i] = False
+        n = piece_node[i]
+        left[n] -= 1
+        if left[n] == 0:
+            release(n)
+    return order, (float(cur[0]), float(cur[1]))
+
+
+def _order_onion_pass(pass_segs, pass_chains, chain_parents, origin):
+    """Order one pass of Onion Skin segments along the fork tree of their
+    ring chains (_order_by_precedence), never reversing a segment.
+
+    pass_chains   : per segment, the chain it was cut from (air pruning
+                    can split a chain into several segments or drop it).
+    chain_parents : per chain, the chains that must be cut before it
+                    (_pocket_infill: for Outside-In the chain it lies
+                    inside, for Inside-Out the chains inside it).
+
+    A chain's segments are cut in their own order, one after the other,
+    so a chain keeps its rings' outside-in or inside-out sequence. Chains
+    whose predecessors are all cut are then picked nearest-first, the way
+    Contour picks among its features. Chain c is node c, which holds no
+    segment; segment j is node n_chains + j, after the segment before it
+    in the same chain or, for a chain's first segment, after node c.
+    Node c waits for the last segment of each of its parent chains, or
+    for the parent's own node where none of its segments is left.
+    """
+    n_chains = len(chain_parents)
+    piece_node = [n_chains + j for j in range(len(pass_segs))]
+    seg_parents = []
+    last = list(range(n_chains))   # the node a chain's next segment follows
+    for c in pass_chains:
+        seg_parents.append([last[c]])
+        last[c] = n_chains + len(seg_parents) - 1
+    parents = [[last[p] for p in ps] for ps in chain_parents] + seg_parents
+    polylines = [np.asarray(seg, dtype=float)[:, :2] for seg in pass_segs]
+    order, _ = _order_by_precedence(polylines, piece_node, parents, origin)
+    return [pass_segs[i] for i, _, _ in order]
 
 
 def _order_locked_raster_pass(pass_segs, direction, cur):
@@ -2105,7 +2184,7 @@ def _spine_walks(spine_mask, min_spur_px=3.0, smooth_iters=3):
 
 
 def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
-                       tool_radius_px=None):
+                       tool_radius_px=None, return_parents=False):
     """Concentric-ring toolpath chain(s) clearing one connected pocket
     region: erosion level k is the set of region pixels farther than
     k * step_px from the region's outside (one Euclidean distance transform
@@ -2151,10 +2230,9 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     continues with it (its chain is not closed off), so shedding a stray
     fragment never splits an otherwise-ordinary lobe's chain in two.
     Sibling branches spawned from the same split are advanced one erosion
-    round at a time in lockstep (rather than fully finishing one branch's
-    entire remaining descent before even starting its sibling's), so a
-    branch that happens to erode away quickly cannot leave a much deeper
-    sibling branch's rings stranded behind it in cut order.
+    round at a time in lockstep, and a branch's chains are listed when it
+    closes, so the list holds chains in no cutting order of their own;
+    return_parents gives the order they must be cut in.
 
     With tool_radius_px given, rings that leave material standing get
     spines. A ring at level j cuts everything within the tool radius R of
@@ -2185,27 +2263,47 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
 
     Returns
     -------
-    list of Nx2 (row, col) float pixel-space polylines, each already in
-    final chain-visiting order (outside-in), in region_mask's own
-    (unpadded) coordinate frame. An undivided island is one chain unless
-    _stitch_onion_rings had to split it where no inside link exists.
+    list of Nx2 (row, col) float pixel-space polylines, each running
+    outside-in, in region_mask's own (unpadded) coordinate frame. An
+    undivided island is one chain unless _stitch_onion_rings had to split
+    it where no inside link exists. With return_parents, (chains, parents)
+    instead: parents[i] lists the chains that chain i must be cut after,
+    cutting outside-in -- the one before it where its branch was split,
+    or for a branch's first chain the last chain of the branch it forked
+    from. A spine that is a chain of its own follows the last chain of its
+    branch. Every chain has at most one parent.
     """
     from scipy.ndimage import label, distance_transform_edt, binary_erosion
     from skimage.measure import find_contours
 
     chains = []
+    parents = []
 
     padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
     safe_mask_f = padded.astype(np.float32)
     # Squared distance of every pixel to the nearest outside pixel, rounded
     # to the exact integer it is; level k is where it exceeds (k*step_px)^2.
     dist2 = np.rint(np.square(distance_transform_edt(padded)))
-    branches = [{'mask': padded, 'rings': [], 'level': 0}]
+    # after: the chain a branch's first chain is cut after (None for the
+    # region's first); loose: the spines that are chains of their own.
+    branches = [{'mask': padded, 'rings': [], 'level': 0, 'after': None, 'loose': []}]
 
     detours = {}
 
-    def close_branch(rings):
-        chains.extend(_stitch_onion_rings(rings, safe_mask_f, step_px, detours=detours))
+    def close_branch(br):
+        """Stitch br's rings into chains, each cut after the one before
+        it, then add br's loose spines after the last of them. Returns the
+        chain a branch forked from br is cut after."""
+        after = br['after']
+        for chain in _stitch_onion_rings(br['rings'], safe_mask_f, step_px,
+                                         detours=detours):
+            chains.append(chain)
+            parents.append([] if after is None else [after])
+            after = len(chains) - 1
+        for chain in br['loose']:
+            chains.append(chain)
+            parents.append([] if after is None else [after])
+        return after
 
     def extract_rings(mask):
         level = [r for r in find_contours(mask.astype(np.float32), 0.5) if len(r) >= 3]
@@ -2218,7 +2316,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     dist = np.sqrt(dist2) if spine_r is not None else None
     skeleton, nearest_out = [], []
 
-    def attach_spine(walk, inner_rings, own_rings):
+    def attach_spine(walk, inner_rings, own_rings, loose):
         """Splice walk into a ring as an out-and-back detour
         (_spine_detour), linked at the ring vertex and spine point nearest
         each other by a straight move that stays inside the region:
@@ -2226,13 +2324,14 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         medial axis the spine follows runs into a cusp of the ring, within
         two tool radii; otherwise on its own level's rings (own_rings),
         which every point of the spine lies within one step-over of. With
-        no inside link to either, the spine is a chain of its own."""
+        no inside link to either, the spine is a chain of its own, added
+        to loose."""
         found = _nearest_inside_link(walk, inner_rings, safe_mask_f,
                                      max_len=2.0 * spine_r + 1.0)
         if found is None:
             found = _nearest_inside_link(walk, own_rings, safe_mask_f)
         if found is None:
-            chains.append(_spine_detour(walk, 0))
+            loose.append(_spine_detour(walk, 0))
             return
         ring, vi, wi = found
         # Each entry holds its ring, so that the ring stays alive (and its
@@ -2342,7 +2441,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
 
             level = br['level_rings'] if 'level_rings' in br else extract_rings(cur)
             if not level:
-                close_branch(rings)
+                close_branch(br)
                 continue
             rings.extend(_order_level_rings(level, rings[-1] if rings else None))
 
@@ -2378,21 +2477,22 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
                     nx['level_rings'] = extract_rings(nx['mask'])
                     inner.extend(nx['level_rings'])
                 for walk in _level_spines(cur, surviving, k - 1):
-                    attach_spine(walk, inner, level)
+                    attach_spine(walk, inner, level, br['loose'])
 
             if not nexts:
-                close_branch(rings)
+                close_branch(br)
             elif len(nexts) == 1:
-                nexts[0]['rings'] = rings
+                nexts[0].update(rings=rings, after=br['after'], loose=br['loose'])
                 next_round.append(nexts[0])
             else:
-                close_branch(rings)
+                after = close_branch(br)
                 for nx in nexts:
-                    nx['rings'] = []
+                    nx.update(rings=[], after=after, loose=[])
                     next_round.append(nx)
         branches = next_round
 
-    return [c - 1.0 for c in chains]
+    chains = [c - 1.0 for c in chains]
+    return (chains, parents) if return_parents else chains
 
 
 def _ring_chain_to_points(chain_px, z_mm, px_per_mm, H, _ox, _oy):
@@ -3088,9 +3188,11 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     tool_radius_mm        : the tool's radius, for Onion Skin's spines
                             (_onion_skin_chains); None for none.
 
-    Returns (segs, seg_region_ids, region_contours, labeled_regions,
-    flat_depth, n_regions): the full-depth segments, the pocket region
-    (label) each segment belongs to, the Zig-Zag boundary rings per region
+    Returns (segs, seg_region_ids, chain_parents, region_contours,
+    labeled_regions, flat_depth, n_regions): the full-depth segments, the
+    pocket region (label) each segment belongs to, for Onion Skin the
+    segments (ring chains) each segment must be cut after (None for other
+    patterns; see _order_onion_pass), the Zig-Zag boundary rings per region
     (empty for other patterns), the region labels, the flat floor surface
     (level_norm inside the mask, 0 outside) and the number of regions.
     """
@@ -3120,12 +3222,11 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
 
     full_depth_segs = []
     # Parallel to full_depth_segs, one entry per element, recording which
-    # pocket region produced it -- so ordering can group and permute which
-    # *pocket* is visited when for travel efficiency, without ever
-    # separating one pocket's own segments/chains (e.g. produced when Onion
-    # Skin's erosion forked into sibling branches) from each other or
-    # disturbing their deliberate depth/visiting sequence.
+    # pocket region produced it -- Zig-Zag orders whole regions by it.
     seg_region_ids = []
+    # Onion Skin only, parallel to full_depth_segs: the chains each chain
+    # must be cut after, along its region's fork tree.
+    chain_parents = [] if IS_ONION else None
     # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
     # per interior hole/island), used by Stage 6 to bridge gaps by walking
     # the region's actual contour instead of a geodesic search -- see
@@ -3151,24 +3252,29 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
             step_px = max(1, int(round(step_mm * px_per_mm)))
             min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
             local_mask = labeled_regions[box] == region_id
-            chains = _onion_skin_chains(
+            chains, parents = _onion_skin_chains(
                 local_mask, step_px, min_area_px,
                 reverse_rings=(cut_direction == "Conventional"),
                 tool_radius_px=(None if tool_radius_mm is None
-                                else tool_radius_mm * px_per_mm))
+                                else tool_radius_mm * px_per_mm),
+                return_parents=True)
             if raster_dir == "Onion Skin (Inside-Out)":
-                # Reverses both which chain is visited first (so a chain
-                # that finished deeper -- i.e. later in erosion order -- is
-                # visited before a shallower sibling chain from the same
-                # split) and each chain's own point order (so within a
-                # chain, cutting starts at its own deepest ring and works
-                # back out).
-                chains = [c[::-1] for c in reversed(chains)]
+                # Each chain runs backwards, from its deepest ring out, and
+                # the fork tree is inverted: a chain is cut after every
+                # chain inside it rather than after the one it lies in.
+                chains = [c[::-1] for c in chains]
+                inverted = [[] for _ in chains]
+                for i, ps in enumerate(parents):
+                    for p in ps:
+                        inverted[p].append(i)
+                parents = inverted
             offset = np.array([r_lo, c_lo])
-            for chain in chains:
+            base = len(full_depth_segs)
+            for chain, ps in zip(chains, parents):
                 full_depth_segs.append(
                     _ring_chain_to_points(chain + offset, level_mm,
                                          px_per_mm, H, _ox, _oy))
+                chain_parents.append([base + p for p in ps])
         elif direction in ("X", "Y"):
             if direction == "X":
                 spacing_lo, spacing_hi = r_lo, r_hi
@@ -3203,19 +3309,23 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 full_depth_segs.extend(new_segs)
         seg_region_ids.extend([region_id] * (len(full_depth_segs) - n_before))
 
-    return (full_depth_segs, seg_region_ids, region_contours, labeled_regions,
-            flat_depth, n_regions)
+    return (full_depth_segs, seg_region_ids, chain_parents, region_contours,
+            labeled_regions, flat_depth, n_regions)
 
 
 def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
                                 tool_pos, pattern, link_threshold_mm,
                                 labeled_regions, region_contours, link_surface,
-                                final_norm, px_per_mm, H, W, _ox, _oy, max_depth):
+                                final_norm, px_per_mm, H, W, _ox, _oy, max_depth,
+                                chain_parents=None):
     """Order one pass of Pocket infill segments and bridge the short gaps
     between consecutive ones.
 
-    pass_ids        : the pocket region of each segment of pass_segs
-                      (read for Zig-Zag and Onion Skin).
+    pass_ids        : per segment of pass_segs, for Zig-Zag the pocket
+                      region it belongs to, for Onion Skin the chain it
+                      was cut from (an index into chain_parents).
+    chain_parents   : Onion Skin only: _pocket_infill's chain_parents,
+                      which _order_onion_pass orders the chains along.
     tool_pos        : (x, y) mm where the tool is before the pass.
     labeled_regions, region_contours : _pocket_infill's region labels and
                       Zig-Zag boundary rings, for contour-walk links.
@@ -3231,15 +3341,12 @@ def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
     RING_SNAP_TOL_PX = 2.0   # how close a segment endpoint must sit to a region's own contour ring
     ceil_norm = ceil_mm / max_depth
     cur = (float(tool_pos[0]), float(tool_pos[1]))
-    # Onion Skin's own correctness (winding sense, Outside-In vs.
-    # Inside-Out) is fully decided at generation time (_pocket_infill),
-    # never by visiting order -- so its ordering is independent of
-    # lock_direction: a chain is only ever left untouched or permuted by
-    # _order_fixed_orientation_pass, never reversed, in both cases.
-    if IS_ONION and _is_contiguous_chain(pass_segs):
-        ordered_segs = pass_segs
-    elif IS_ONION:
-        ordered_segs = _order_fixed_orientation_pass(pass_segs, cur, group_ids=pass_ids)
+    # Onion Skin's winding sense and its Outside-In vs. Inside-Out sequence
+    # are decided at generation time (_pocket_infill) -- each chain's own
+    # direction and the fork tree it is ordered along -- so its ordering
+    # never reverses a chain, whatever lock_direction says.
+    if IS_ONION:
+        ordered_segs = _order_onion_pass(pass_segs, pass_ids, chain_parents, cur)
     else:
         ordered_segs = _order_zigzag_pass(pass_segs, pass_ids, direction, cur,
                                           lock_direction)
@@ -3618,8 +3725,8 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
 
     # ── Stage 4 · Per-region infill generation (40–70 %) ─────────────────
     pattern = _pocket_pattern(raster_dir, cut_direction)
-    (full_depth_segs, seg_region_ids, region_contours, labeled_regions,
-     flat_depth, n_regions) = _pocket_infill(
+    (full_depth_segs, seg_region_ids, chain_parents, region_contours,
+     labeled_regions, flat_depth, n_regions) = _pocket_infill(
         pocket_mask, target_z_norm, pocket_depth_mm, pattern, step_mm,
         raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy, max_depth,
         tool_radius_mm=0.5 * tool.diameter_mm)
@@ -3637,20 +3744,22 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     # Every point of every region shares the one uniform target_z_norm, so
     # make_multipass's per-pass keep/drop decision is identical for every
     # segment in a given pass: a non-empty pass reproduces full_depth_segs
-    # (hence seg_region_ids) unchanged
-    # in count and order. pass_region_ids holds each pass's own per-segment
-    # region ids, which air pruning (splitting or dropping segments) remaps.
-    pass_region_ids = [seg_region_ids] * n_passes
+    # unchanged in count and order. pass_ids holds each pass's own
+    # per-segment ids -- the region for Zig-Zag, the chain (the segment's
+    # own index in full_depth_segs) for Onion Skin -- which air pruning
+    # (splitting or dropping segments) remaps.
+    seg_ids = list(range(len(full_depth_segs))) if IS_ONION else seg_region_ids
+    pass_ids = [seg_ids] * n_passes
     air_pruned_mm = 0.0
     if avoid_air:
         progress(70, "Removing air-cutting portions of each pass…")
-        pass_list, pruned_region_ids, air_pruned_mm = _prune_air_passes(
+        pass_list, pruned_ids, air_pruned_mm = _prune_air_passes(
             pass_list, previous_result, kernel_pocket, footprint_pocket, (H, W),
             px_per_mm, _ox, _oy, max_depth, 1.0 / (n_grey_levels - 1),
             feed_rate, feed_rapid, z_safe,
-            parent_ids=seg_region_ids if (IS_ZIGZAG or IS_ONION) else None)
+            parent_ids=seg_ids if (IS_ZIGZAG or IS_ONION) else None)
         if IS_ZIGZAG or IS_ONION:
-            pass_region_ids = pruned_region_ids
+            pass_ids = pruned_ids
         progress(70, f"Removed {air_pruned_mm:.0f} mm of air cutting.")
     link_threshold_mm = 2.0 * step_mm   # longest gap bridged by a link instead of a retract
 
@@ -3687,13 +3796,13 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
                  f"Pass {pi+1}/{n_passes} at z={ceil_mm:.3f} mm "
                  f"({'final' if is_final else 'roughing'}): "
                  f"{len(pass_segs)} segment(s).")
-        # pass_region_ids[pi] is aligned one-to-one with pass_segs (see
-        # Stage 5).
+        # pass_ids[pi] is aligned one-to-one with pass_segs (see Stage 5).
         out, tool_pos, counts = _order_and_link_pocket_pass(
-            pass_segs, pass_region_ids[pi], ceil_mm, is_final, tool_pos,
+            pass_segs, pass_ids[pi], ceil_mm, is_final, tool_pos,
             pattern, link_threshold_mm, labeled_regions,
             region_contours, flat_depth, final_norm,
-            px_per_mm, H, W, _ox, _oy, max_depth)
+            px_per_mm, H, W, _ox, _oy, max_depth,
+            chain_parents=chain_parents)
         all_segments.extend(out)
         total_segs += counts[0]
         n_links_inserted += counts[1]
@@ -3953,7 +4062,8 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
             return _retract_breakeven_mm(feed_rate, feed_rapid, z_safe, depth_mm)
     tol_norm = 1.0 / (n_grey_levels - 1)
     # One entry per level: (labeled_regions, region_contours, region boxes,
-    # {region id: [segment, ...]}).
+    # {region id: ([segment, ...], [its infill segment index, ...])},
+    # chain_parents).
     level_data = []
     air_pruned_mm = 0.0
     n_regions_per_level = []
@@ -3961,27 +4071,33 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
         progress(40 + 20 * k / max(len(levels), 1),
                  f"Level {k + 1}/{len(levels)} at z={z_mm:.3f} mm: infill…")
         mask = level_clearing_mask(center_depth, z, n_grey_levels)
-        (segs, seg_ids, region_contours, labeled, _flat,
+        (segs, seg_region_ids, chain_parents, region_contours, labeled, _flat,
          n_regions) = _pocket_infill(mask, z, z_mm, pattern, step_mm,
                                      raster_offset_pct, cut_direction,
                                      px_per_mm, H, _ox, _oy, max_depth,
                                      tool_radius_mm=0.5 * tool.diameter_mm)
+        # src: the infill segment (for Onion Skin, the chain) each segment
+        # comes from.
+        src = list(range(len(segs)))
         if avoid_air and segs:
-            segs, seg_ids, air = prune_air_segments(
+            segs, src, air = prune_air_segments(
                 segs, free, px_per_mm, H, _ox, _oy, max_depth, tol_norm,
-                breakeven_fn=breakeven, parent_ids=seg_ids)
+                breakeven_fn=breakeven, parent_ids=src)
             air_pruned_mm += air
         by_region = {}
-        for seg, rid in zip(segs, seg_ids):
-            by_region.setdefault(int(rid), []).append(seg)
-        level_data.append((labeled, region_contours, find_objects(labeled), by_region))
+        for seg, si in zip(segs, src):
+            entry = by_region.setdefault(int(seg_region_ids[si]), ([], []))
+            entry[0].append(seg)
+            entry[1].append(si)
+        level_data.append((labeled, region_contours, find_objects(labeled),
+                           by_region, chain_parents))
         n_regions_per_level.append(n_regions)
 
     # ── Stage 5 · Region forest (60 %) ────────────────────────────────────
     # A region's parent is the region one level up holding any of its
     # pixels (the level masks nest, so all of them).
     children = {}   # (k, rid) -> [(k + 1, child rid), ...]; (-1, 0) is the root
-    for k, (labeled, _rc, boxes, _br) in enumerate(level_data):
+    for k, (labeled, _rc, boxes, _br, _cp) in enumerate(level_data):
         for rid, box in enumerate(boxes, start=1):
             if box is None:
                 continue
@@ -4007,7 +4123,7 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
 
     def node_segments(node):
         k, rid = node
-        return level_data[k][3].get(rid, [])
+        return level_data[k][3].get(rid, ([], []))[0]
 
     def node_distance(node):
         segs = node_segments(node)
@@ -4027,17 +4143,19 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
         node = min(kids, key=node_distance)
         kids.remove(node)
         k, rid = node
-        labeled, region_contours, boxes, _br = level_data[k]
+        labeled, region_contours, boxes, by_region, chain_parents = level_data[k]
         box = boxes[rid - 1]
         in_region = labeled[box] == rid
         cleared[box][in_region] = np.maximum(cleared[box][in_region], levels[k])
-        segs = node_segments(node)
+        segs, src = by_region.get(rid, ([], []))
         if segs:
             out, tool_pos, counts = _order_and_link_pocket_pass(
-                segs, [rid] * len(segs), levels_mm[k], True, tool_pos,
+                segs, src if pattern.is_onion else [rid] * len(segs),
+                levels_mm[k], True, tool_pos,
                 pattern, link_threshold_mm, labeled,
                 region_contours, cleared, 0.0,
-                px_per_mm, H, W, _ox, _oy, max_depth)
+                px_per_mm, H, W, _ox, _oy, max_depth,
+                chain_parents=chain_parents)
             all_segments.extend(out)
             n_cut += counts[0]
             n_links_inserted += counts[1]
@@ -5403,12 +5521,13 @@ def _order_contours_graph(all_z_contours, z_levels, surface, n_grey_levels, *,
     graph (_contour_graph) is complete, i.e. all of its pieces are cut: each
     hill and each crater is cut strictly top-down, its next ring only after
     the ring above it, while separate features are independent. Among the
-    pieces that may be cut, greedy nearest-neighbour picks the next one, so
-    the tool follows one feature down until it reaches a join (hills merging
-    below a saddle), then the nearest other branch. A closed piece may start
-    at any of about 20 points along itself. Open pieces start at either end
-    and closed ones run either way unless lock_direction is set: a contour's
-    climb/conventional sense comes entirely from its own orientation.
+    pieces that may be cut, greedy nearest-neighbour (_order_by_precedence)
+    picks the next one, so the tool follows one feature down until it
+    reaches a join (hills merging below a saddle), then the nearest other
+    branch. A closed piece may start at any of about 20 points along
+    itself. Open pieces start at either end and closed ones run either way
+    unless lock_direction is set: a contour's climb/conventional sense
+    comes entirely from its own orientation.
 
     surface is the achievable-depth surface the contours were extracted
     from, at the thresholds of _contour_threshold.
@@ -5426,89 +5545,41 @@ def _order_contours_graph(all_z_contours, z_levels, surface, n_grey_levels, *,
 
     progress(progress_lo, "Building the contour graph…")
     parents, piece_node = _contour_graph(surface, z_levels, n_grey_levels, all_z_contours)
-    n_nodes = len(parents)
-    children = [[] for _ in range(n_nodes)]
-    for n, ps in enumerate(parents):
-        for p in ps:
-            children[p].append(n)
-    waiting = [len(ps) for ps in parents]
 
-    pieces = []        # (Nx2 pixel polyline, z_mm, node, closed)
-    by_node = [[] for _ in range(n_nodes)]
+    pieces = []        # (Nx2 pixel polyline, z_mm, closed)
+    nodes = []
     for z_norm in z_levels:
         for c, n in zip(all_z_contours.get(z_norm, []), piece_node.get(z_norm, [])):
             if len(c) < 2:
                 continue
-            by_node[n].append(len(pieces))
-            pieces.append((c, -z_norm * max_depth, n,
+            nodes.append(n)
+            pieces.append((c, -z_norm * max_depth,
                            bool(np.linalg.norm(c[0] - c[-1]) < 1.5)))
-    left = [len(b) for b in by_node]
-
-    # Start candidates of every piece: (piece, flip, index into the
-    # oriented polyline) and their position in mm.
-    cand_piece, cand_flip, cand_idx, cand_xy = [], [], [], []
-    for i, (c, _, _, closed) in enumerate(pieces):
-        n = len(c)
-        idx = np.arange(0, n, max(1, n // 20)) if closed else np.array([0])
-        for flip in ((False,) if lock_direction else (False, True)):
-            rc = c[::-1] if flip else c
-            cand_piece.append(np.full(len(idx), i))
-            cand_flip.append(np.full(len(idx), flip))
-            cand_idx.append(idx)
-            cand_xy.append(np.column_stack([rc[idx, 1] / px_per_mm - ox,
-                                            (H - 1 - rc[idx, 0]) / px_per_mm - oy]))
-    if pieces:
-        cand_piece = np.concatenate(cand_piece)
-        cand_flip = np.concatenate(cand_flip)
-        cand_idx = np.concatenate(cand_idx)
-        cand_xy = np.vstack(cand_xy)
-    available = np.zeros(len(pieces), bool)
-
-    def release(n):
-        stack = [n]
-        while stack:
-            n = stack.pop()
-            if left[n]:
-                available[by_node[n]] = True
-                continue
-            for ch in children[n]:
-                waiting[ch] -= 1
-                if waiting[ch] == 0:
-                    stack.append(ch)
-
-    for n in range(n_nodes):
-        if waiting[n] == 0:
-            release(n)
 
     progress(progress_lo, f"Ordering {len(pieces)} contour piece(s)…")
+    polylines = [np.column_stack([c[:, 1] / px_per_mm - ox,
+                                  (H - 1 - c[:, 0]) / px_per_mm - oy])
+                 for c, _, _ in pieces]
+    order, new_pos = _order_by_precedence(
+        polylines, nodes, parents, current_pos,
+        closed=[closed for _, _, closed in pieces],
+        allow_flip=not lock_direction, progress=progress,
+        progress_lo=progress_lo, progress_hi=progress_hi, what="contours")
+
     segments = []
-    cur = np.array(current_pos, dtype=float)
-    n_report = max(1, len(pieces) // 20)
-    for step in range(len(pieces)):
-        if step % n_report == 0:
-            progress(progress_lo + (progress_hi - progress_lo) * step // len(pieces),
-                     f"Ordering contours ({step}/{len(pieces)})…")
-        d2 = np.sum((cand_xy - cur) ** 2, axis=1)
-        d2[~available[cand_piece]] = np.inf
-        k = int(np.argmin(d2))
-        i = int(cand_piece[k])
-        c, z_mm, n, closed = pieces[i]
-        if cand_flip[k]:
+    for i, flip, start in order:
+        c, z_mm, closed = pieces[i]
+        if flip:
             c = c[::-1]
-        if cand_idx[k] > 0:
-            c = np.roll(c, -int(cand_idx[k]), axis=0)
+        if start > 0:
+            c = np.roll(c, -start, axis=0)
         if closed:
             c = np.vstack([c, c[:1]])
         segments.append([(col / px_per_mm - ox, (H - 1 - row) / px_per_mm - oy, z_mm)
                          for row, col in c])
-        cur = np.array(segments[-1][-1][:2])
-        available[i] = False
-        left[n] -= 1
-        if left[n] == 0:
-            release(n)
 
     progress(progress_hi, f"Ordering complete ({len(segments)} segments).")
-    return segments, (float(cur[0]), float(cur[1]))
+    return segments, new_pos
 
 
 def compute_contour_toolpath(

@@ -1,6 +1,6 @@
 """Plain assert-based tests for the onion-skin pocket-clearing helpers
 (algorithms.py's _onion_skin_chains / _ring_chain_to_points /
-_order_fixed_orientation_pass).
+_order_by_precedence / _order_onion_pass).
 
 Run with: python tests/test_algorithms.py
 """
@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from algorithms import (_onion_skin_chains, _ring_chain_to_points,
-                        _order_fixed_orientation_pass, compute_pocket_toolpath,
+                        _order_by_precedence, _order_onion_pass,
+                        _pocket_infill, _pocket_pattern, compute_pocket_toolpath,
                         _diag_grid_line_ids, _diag_line_bounds, _diag_line_points,
                         _region_contour_rings, _make_contour_ring, _biarc, _sample_biarc,
                         _nearest_ring_vertex, _ring_arc_between,
@@ -598,32 +599,121 @@ check("row/col offsets scale by px_per_mm correctly for the second point",
 
 
 # --------------------------------------------------------------------------
-# _order_fixed_orientation_pass: regression test for a real bug -- ordering
-# multiple onion-skin regions under an unlocked cut direction must never
-# reverse a whole region's chain, since that silently swaps its
-# Outside-In/Inside-Out winding. Each segment here stands in for one
-# region's whole ring chain (as compute_pocket_toolpath emits it): its own
-# entry/exit points must survive untouched, no matter which one the
-# nearest-neighbour search would rather enter from.
+# _order_by_precedence: the ordering Contour and Onion Skin share.
 # --------------------------------------------------------------------------
-print("_order_fixed_orientation_pass")
+print("_order_by_precedence")
 
-# seg_a's *exit* point sits exactly at the origin -- a reversal-capable
-# ordering pass (like _order_free_raster_pass) would jump at the chance to
-# enter it there at zero cost, reversing it. seg_b's entry is merely close
-# (not free) but requires no reversal. A fixed-orientation pass must still
-# prefer seg_b, since it never considers entering a segment from its exit.
-seg_a = [(10.0, 0.0), (0.0, 0.0)]
-seg_b = [(5.0, 0.0), (5.0, 1.0)]
-pass_segs = [seg_a, seg_b]
-ordered = _order_fixed_orientation_pass(pass_segs, origin=(0.0, 0.0))
-check("no segment's point order is altered (identity, not just equal-valued)",
-      ordered[0] is pass_segs[0] or ordered[0] is pass_segs[1])
-check("the near-zero-cost *reversed* entry into seg_a is never taken -- "
-      "seg_b (whose own entry point is merely close) is visited first",
-      ordered[0] == seg_b)
-check("both segments are present exactly once, each unreversed",
-      len(ordered) == 2 and seg_a in ordered and seg_b in ordered)
+def _poly(*pts):
+    return np.array(pts, dtype=float)
+
+# Without allow_flip a piece is never entered from its end, even where that
+# end is right at the tool: piece 0 ends at the origin, piece 1 merely
+# starts near it.
+order, _ = _order_by_precedence([_poly((10, 0), (0, 0)), _poly((5, 0), (5, 1))],
+                                [0, 1], [[], []], (0.0, 0.0))
+check("without allow_flip no piece is reversed, so the nearer start goes first",
+      order == [(1, False, 0), (0, False, 0)])
+order, _ = _order_by_precedence([_poly((10, 0), (0, 0)), _poly((5, 0), (5, 1))],
+                                [0, 1], [[], []], (0.0, 0.0), allow_flip=True)
+check("with allow_flip a piece may be entered from its end",
+      order[0] == (0, True, 0))
+
+# A child waits for its parent however near it is, a node without pieces
+# passes its parents' completion straight on, and among available pieces
+# the nearest goes first.
+polys = [_poly((100, 0), (100, 1)),   # piece 0, node 0
+         _poly((0, 0), (0, 1)),       # piece 1, node 2 (after node 1, empty, after node 0)
+         _poly((50, 0), (50, 1))]     # piece 2, node 3 (no parents)
+order, end = _order_by_precedence(polys, [0, 2, 3], [[], [0], [1], []], (0.0, 0.0))
+check("a piece is cut only once its parents are complete, nearest-first otherwise",
+      [i for i, _, _ in order] == [2, 0, 1])
+check("the end position is the last piece's last point", end == (0.0, 1.0))
+
+# A closed piece may start part-way round and returns to that point.
+ring = _poly(*[(10 + 5 * np.cos(t), 5 * np.sin(t)) for t in np.linspace(0, 2 * np.pi, 40, endpoint=False)])
+order, end = _order_by_precedence([ring], [0], [[]], (5.0, 0.0), closed=[True])
+check("a closed piece starts at its candidate nearest the tool",
+      order[0][2] > 0 and np.hypot(*(ring[order[0][2]] - (5.0, 0.0))) < 1.0)
+check("a closed piece ends where it started", np.allclose(end, ring[order[0][2]]))
+
+
+# --------------------------------------------------------------------------
+# _order_onion_pass: chains along their fork tree, a chain's segments in
+# their own order, and separate trees interleaved nearest-first.
+# --------------------------------------------------------------------------
+print("_order_onion_pass")
+
+def _seg(x0, x1):
+    return [(x0, 0.0, -1.0), (x1, 0.0, -1.0)]
+
+# Chain 0 (a root) at x=0, chain 1 (its child) at x=100, chain 2 (another
+# root) at x=50: after chain 0, chain 2 is nearer than chain 1.
+segs = [_seg(0, 1), _seg(100, 101), _seg(50, 51)]
+ordered = _order_onion_pass(segs, [0, 1, 2], [[], [0], []], (0.0, 0.0))
+check("separate trees are interleaved nearest-first",
+      [segs.index(x) for x in ordered] == [0, 2, 1])
+
+# Chain 0 split by air pruning into two segments, the second of them next
+# to the tool: it still comes after the first, and chain 1 (child of 0)
+# after both.
+segs = [_seg(80, 90), _seg(0, 1), _seg(91, 92)]
+ordered = _order_onion_pass(segs, [0, 0, 1], [[], [0]], (0.0, 0.0))
+check("a chain's segments keep their own order",
+      [segs.index(x) for x in ordered] == [0, 1, 2])
+
+# A parent chain left without segments (all air) passes its precedence on.
+segs = [_seg(100, 101), _seg(0, 1)]
+ordered = _order_onion_pass(segs, [1, 2], [[], [0], [0]], (0.0, 0.0))
+check("a chain without segments does not block its children",
+      [segs.index(x) for x in ordered] == [1, 0])
+
+
+# --------------------------------------------------------------------------
+# Onion Skin fork tree: three lobes in a row, joined by a wide and a narrow
+# neck, fork twice (the narrow neck first). Cutting must never reach a
+# chain before the chain around it (Outside-In) or leave a chain before
+# every chain inside it is cut (Inside-Out).
+# --------------------------------------------------------------------------
+print("Onion Skin fork tree ordering")
+
+shape_ft = (80, 260)
+mask_ft = (disk_mask(shape_ft, (40, 40), 32) | disk_mask(shape_ft, (40, 130), 32)
+           | disk_mask(shape_ft, (40, 220), 32))
+mask_ft[30:51, 40:130] = True     # wide neck
+mask_ft[36:45, 130:220] = True    # narrow neck
+chains_ft, parents_ft = _onion_skin_chains(mask_ft, step_px=4, min_area_px=20,
+                                           return_parents=True)
+
+def _tree_depth(i, parents):
+    return 0 if not parents[i] else 1 + _tree_depth(parents[i][0], parents)
+
+check("_onion_skin_chains with return_parents matches it without",
+      same_chains(chains_ft, _onion_skin_chains(mask_ft, step_px=4, min_area_px=20)))
+check("every chain has at most one parent", all(len(p) <= 1 for p in parents_ft))
+check("the region forks twice, one fork inside the other (a nested tree)",
+      sum(1 for ps in parents_ft if not ps) == 1
+      and max(_tree_depth(i, parents_ft) for i in range(len(chains_ft))) >= 2
+      and sum(1 for i in range(len(chains_ft))
+              if sum(1 for ps in parents_ft if ps == [i]) >= 2) >= 2)
+
+for raster_dir in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
+    pattern_ft = _pocket_pattern(raster_dir, "Climb")
+    (segs_ft, _rids, cparents_ft, _rc, _lab, _flat,
+     _n) = _pocket_infill(mask_ft, 1.0, 3.0, pattern_ft, 4.0, 0.0, "Climb",
+                          1.0, shape_ft[0], 0.0, 0.0, 3.0)
+    ordered_ft = _order_onion_pass(segs_ft, list(range(len(segs_ft))),
+                                   cparents_ft, (0.0, 0.0))
+    pos = {id(seg): k for k, seg in enumerate(ordered_ft)}
+    check(f"{raster_dir}: every chain is cut once",
+          sorted(pos.values()) == list(range(len(segs_ft))))
+    check(f"{raster_dir}: no chain is cut before its predecessors",
+          all(pos[id(segs_ft[p])] < pos[id(segs_ft[i])]
+              for i, ps in enumerate(cparents_ft) for p in ps))
+    # Outside-In: the tree's root first; Inside-Out: it last.
+    root_ft = next(i for i, ps in enumerate(parents_ft) if not ps)
+    expect = 0 if raster_dir.endswith("(Outside-In)") else len(segs_ft) - 1
+    check(f"{raster_dir}: the outermost chain is cut {'first' if expect == 0 else 'last'}",
+          pos[id(segs_ft[root_ft])] == expect)
 
 
 # --------------------------------------------------------------------------
@@ -730,13 +820,12 @@ check("the pocket nearest the tool's actual start is visited first, "
 
 
 # --------------------------------------------------------------------------
-# regression test: the original reported bug, combined -- one pocket whose
-# own erosion forks into sibling lobes, alongside a second, wholly separate
-# pocket. The forked pocket's own chains (parent + each lobe) must all stay
-# adjacent, in one contiguous run, never interleaved with the unrelated
-# pocket's chain in between.
+# One pocket whose own erosion forks into sibling lobes, alongside a second,
+# wholly separate pocket. Separate pockets are independent trees that may be
+# interleaved nearest-first, but within the forked pocket the outer chain
+# (around both lobes) must still be cut before either lobe's chain.
 # --------------------------------------------------------------------------
-print("a forked pocket's chains never interleave with an unrelated pocket (regression)")
+print("a forked pocket next to an unrelated pocket keeps its fork order")
 
 shape6 = (100, 300)
 big_c6, small_c6, third_c6 = (50, 50), (50, 190), (10, 280)
@@ -767,9 +856,14 @@ is_third = [dist_from(np.array(seg), third_mm6).min() < 15 for seg in tp6.segmen
 check("the unrelated pocket contributes exactly one chain",
       sum(is_third) == 1)
 forked_indices = [i for i, v in enumerate(is_third) if not v]
-check("the forked pocket's chains form one contiguous run "
-      "(no unrelated-pocket chain sandwiched in between)",
-      forked_indices == list(range(min(forked_indices), max(forked_indices) + 1)))
+# The outer chain is the one reaching the forked pocket's left edge.
+left_edge_mm6 = _mm6((big_c6[0], big_c6[1] - 45))
+outer6 = min(forked_indices,
+             key=lambda i: dist_from(np.array(tp6.segments[i]), left_edge_mm6).min())
+check("the forked pocket has its outer chain plus the lobes' chains",
+      len(forked_indices) >= 3)
+check("the forked pocket's outer chain is cut before either lobe's chain",
+      outer6 == forked_indices[0])
 
 
 # --------------------------------------------------------------------------
