@@ -3775,6 +3775,24 @@ class GCodeGeneratorApp:
             return
         self._project_path = path
 
+        # Drop the current project's sources, composite and results before
+        # any setting below is written: each write runs its trace at once,
+        # and with no sources left those traces neither composite nor draw
+        # a depth map. It also frees the old project's rasters, meshes and
+        # cached surfaces before the new sources are read.
+        self.layers        = []
+        self.current_image = None
+        self._image_aspect = None
+        self.n_grey_levels = 256
+        self.toolpaths     = [None] * len(self.steps)
+        for s in self.steps:
+            s['_cutout_rings_cache'] = None
+        self._erosion_cache.clear()
+        self._refresh_step_infos()
+        self._refresh_layer_tabs()
+        self._render()
+        self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
         # ── Global image-size parameters ──────────────────────────────
         g = project.get('global', {})
         c = project.get('canvas', {})
