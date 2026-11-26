@@ -13,6 +13,9 @@ Recommendations 1–5 and 7 were followed up on 2026-11-04; see
 records where the Undercut step's time goes and what could speed it up
 (recommendation 8); its first idea was followed up on 2026-11-05, see
 [Follow-up: early termination in the compiled kernel](#follow-up-early-termination-in-the-compiled-kernel).
+[Memory across the app at 100 Mpx](#memory-across-the-app-at-100-mpx)
+(2026-11-26) looks beyond the algorithms at what the whole app holds and
+peaks at for a 500×500 mm stock, and adds recommendations 9–13.
 
 ## Summary
 
@@ -650,6 +653,149 @@ different heights with `SKY` sentinels, and random footprints with tied
 structure values. Raising the bound by 0.05 makes 67 checks fail. All test
 scripts pass.
 
+## Memory across the app at 100 Mpx
+
+Done on 2026-11-26 against commit `c6b8afc`, on the Linux machine of the
+follow-ups (AMD Ryzen 5 7600, 12 threads, 15.8 GB RAM, Python 3.13, numpy 2.4,
+scipy 1.17, scikit-image 0.26, matplotlib 3.10, numba 0.68). The sections
+above measured the algorithms at 12 Mpx. This one looks at the whole app, at
+the canvas sizes a large stock reaches: the view, the data every step and
+source keeps, and the computation peaks. Nothing in it has been implemented
+yet; its recommendations are 9–13 below.
+
+**Summary.**
+
+- At 20 px/mm a 500×500 mm stock is **100 Mpx**: every byte per canvas pixel
+  (B/px) costs 100 MB, and one float32 map is 400 MB. A 1000×500 mm stock is
+  200 Mpx, and every figure below doubles.
+- The largest consumers are not the algorithms but the **view** (64 B/px
+  held while a shaded view is shown, up to 144 B/px while it redraws) and
+  the **arrays every computed step keeps** (8 B/px each).
+- A realistic project at 100 Mpx holds an estimated **~15 GB** before it
+  computes anything, and **25–30 GB** while Level Clearing computes: more
+  than a 16 GB machine has.
+- Of the computation peaks, **Level Clearing** (107–132 B/px with one worker)
+  and **V-Carving** (90 B/px) are highest after Undercut. Level Clearing
+  holds a full region-label array per level, so its peak grows with the
+  number of levels.
+
+**Method.** `bench/bench_memory.py` runs one computation per process on a
+2000×2000 px canvas at 20 px/mm (a 100×100 mm stock) with a synthetic smooth
+relief (zoomed Gaussian-filtered noise). Tools: Ball 6 mm (Raster, Contour),
+End Mill 6 mm (Pocket, Level Clearing, Cutout), V-Bit 60° 12 mm (V-Carving);
+step-over 1 mm (Raster) or 2.4 mm (Pocket, Level Clearing), 3 mm step-down,
+1 mm Z increment, 10 mm max depth, and a previous result of half the depth
+map. It reports:
+
+- **peak traced**, `tracemalloc`'s peak (numpy allocations, not scipy's or
+  scikit-image's internal C buffers);
+- **peak RSS**, the process's `ru_maxrss` above its baseline, which also
+  counts freed memory the allocator keeps;
+- **held**, what the finished computation keeps.
+
+With `snapshot` it also lists the allocations that make up the peak, from a
+`tracemalloc` snapshot at each new high; that slows the run several times
+over, so its RSS figure is discarded. The view cases draw the canvas with
+matplotlib's Agg backend in a 12×9 in figure at 100 dpi, the way `app.py`
+does (`imshow(..., interpolation="none")`), plain and with `LightSource`
+shading. Figures marked *estimated* come from the code's array types, not a
+run.
+
+```
+python bench/bench_memory.py all                       # every case, one process each
+python bench/bench_memory.py levelclear 2000 one-worker snapshot
+```
+
+### What the app holds
+
+| What | B/px | At 100 Mpx |
+|---|---|---|
+| A shaded view on screen: float64 RGB (32 B/px) plus matplotlib's copy | 64 | 6.4 GB |
+| Each computed step: `result` + `accessible`, float32 (Cutout adds `alpha`, 4 B/px) | 8 | 0.8 GB per step |
+| Each STL source placed on the canvas: `PlacedRaster` raw + alpha, float32 | 8 | 0.8 GB |
+| Its dexels, where Undercut uses them: int64 offsets, float64 tops and crossings (*estimated*) | ≥ 32 | ≥ 3.2 GB |
+| Erosion cache, per tool signature (two float32 maps; evicts under memory pressure, see [its follow-up](#follow-up-erosion-cache)) | 8 | 0.8 GB per tool |
+
+A finished step keeps nothing canvas-sized beyond its maps: after RDP its
+segments are small (27,187 points for a 0.25 mm finishing Raster at 4 Mpx),
+as the [path storage follow-up](#follow-up-path-storage-and-toolpathresample)
+found too.
+
+### Peaks
+
+| What | Peak traced, B/px | Peak RSS, B/px | At 100 Mpx (traced) |
+|---|---|---|---|
+| View redraw, plain | 73 | – | 7.3 GB |
+| View redraw, shaded | 144 | – | 14.4 GB |
+| Composite of two image sources | 44 | 36 | 4.4 GB |
+| Raster | 57 | 126 | 5.7 GB |
+| Contour | 45 | 65 | 4.5 GB |
+| V-Carving | 90 | 111 | 9.0 GB |
+| Cutout | 33 | 46 | 3.3 GB |
+| Pocket, Onion Skin (one worker) | 51 | 74 | 5.1 GB |
+| Pocket, Zig-Zag | 51 | 87 | 5.1 GB |
+| Level Clearing, Onion Skin (one worker) | 132 | 198 | 13.2 GB |
+| Level Clearing, Zig-Zag | 107 | 154 | 10.7 GB |
+| Undercut (from [its follow-up](#follow-up-undercut-memory), umbilic torus) | ~270 | – | ~27 GB |
+
+The composite is rebuilt on every redraw and before every step computation.
+
+With the default thread pool, Pocket and Level Clearing with Onion Skin run
+several regions at once, up to half the memory available when each region
+starts (`_RegionRunner`); on this machine Level Clearing then peaked at
+289 B/px. That extra is the pool's budget being used on purpose, and it
+shrinks to one region at a time when memory runs short, so the one-worker
+figures are the step's own need.
+
+What the peaks consist of, from the snapshots:
+
+- **Level Clearing:** 43.5 B/px are the int32 region labels of all 11 levels
+  (`scipy.ndimage.label`), which `level_data` holds until the cutting order
+  is done. That part grows with the number of levels: a 30 mm relief at
+  1 mm per level would need about 120 B/px for labels alone. The rest is one
+  region's Onion Skin job, which spans most of the canvas: the nearest-point
+  indices of `distance_transform_edt` (int64, 16 B/px), `dist2` and `dist`
+  (float64, 8 B/px each), the EDT's own float64 result, `medial_axis`'s
+  internals, and the toolpath points as tuples (11 B/px).
+- **V-Carving:** about 60 B/px are `skimage.morphology.medial_axis`
+  internals: a float64 copy of the distances, int64 row and column indices,
+  a tie-breaker permutation and the `lexsort` order of all masked pixels.
+- **Raster:** about 15 B/px are toolpath points as Python tuples during
+  depth slicing (`make_multipass`) and line building (`_line_points`); the
+  rest is morphology, the simulation's `achieved` map and the result maps.
+- **Contour:** 16 B/px are the int32 material and air labels of the contour
+  graph (`_LevelGraph`), two levels at a time.
+- **View:** `imshow` normalises and colour-maps the whole array before
+  scaling it to the screen; `LightSource.shade_rgb` works in float64 on the
+  whole canvas.
+
+### A realistic project at 100 Mpx
+
+Six steps (Level Clearing, Raster finish, Pocket, V-Carving, Cutout,
+Registration Holes), one STL source without Undercut, three tools in the
+erosion cache, a shaded view on screen (*estimated* from the tables above):
+
+| | B/px | At 100 Mpx |
+|---|---|---|
+| Steps (6 × 8, Cutout +4) | 52 | 5.2 GB |
+| STL source on the canvas | 8 | 0.8 GB |
+| Image sources at canvas resolution (two) | 8 | 0.8 GB |
+| Erosion cache (three tools) | 24 | 2.4 GB |
+| Shaded view | 64 | 6.4 GB |
+| **Held** | **156** | **15.6 GB** |
+| Plus Level Clearing's own peak | 132 | 13.2 GB |
+
+The erosion cache frees itself before a step computes (`make_room`), so the
+peak is about 25–30 GB rather than the full 29 GB sum.
+
+`STEP_PEAK_BYTES_PER_PX_DEFAULT = 100`, which `make_room` uses for every
+algorithm but Undercut, underestimates Level Clearing (107–132 B/px plus the
+pool) and is close to the limit for V-Carving (90 B/px).
+
+Recommendations 9–12 together should bring this project from about 15.6 GB
+held to roughly 2–3 GB, and its peak to roughly half (*estimated*, not
+measured).
+
 ## Recommendations
 
 Ordered by expected payoff.
@@ -658,13 +804,23 @@ Ordered by expected payoff.
    (see the follow-up). For the dense Raster intermediate, simplify the
    full-depth segments before `make_multipass`, as V-Carving does, instead of
    converting every path to `(N, 3)` arrays. Keep `ToolPath.segments` as
-   lists of tuples.
+   lists of tuples. At 100 Mpx the tuples still matter only during
+   computation (about 15 of Raster's 57 B/px, see
+   [Memory across the app](#memory-across-the-app-at-100-mpx)), not in the
+   finished steps.
 2. **Terrain links.** Done with `scipy.sparse.csgraph.dijkstra`, not
    `MCP_Geometric`, whose per-pixel cost can't express 3-D arc length (see
    the follow-up).
 3. **Pocket onion skin.** Done: one `distance_transform_edt` per region,
-   thresholded at k · step (see the follow-up). Remaining option: crop each
-   level to its shrinking bounding box before `find_contours` and `label`.
+   thresholded at k · step (see the follow-up). Since done as well, with
+   identical output: each erosion branch works in its own shrinking window,
+   the level graph included (`c6b8afc`; 1.5× on one 4000×4000 px region),
+   and the regions of a pocket, and of all Level Clearing levels, compute in
+   parallel on a thread pool bounded by the CPUs and the available memory
+   (`9e48769`; about 2× for Onion Skin Level Clearing at 2000×2000 px).
+   Remaining option: `medial_axis` only on the windows the spines need,
+   about 40 % of a large region's time, but it would change the spines
+   slightly.
 4. **Morphology memory.** Done: the algorithms pass float32 maps, and the
    scipy row path reuses one `output=` buffer per tile (see the follow-up).
    Results are the float32 rounding of the float64 ones, as before.
@@ -682,3 +838,34 @@ Ordered by expected payoff.
    V-Bit erosions (see the follow-up). Remaining option: a coarser grid
    for Undercut, if a 0.1 mm grid is acceptable (~16× less morphology per
    halving of px/mm).
+9. **Draw views at screen resolution** (see
+   [Memory across the app](#memory-across-the-app-at-100-mpx)). The largest
+   single win, contained in `app.py`'s view code. Hand matplotlib only the
+   visible part of the canvas, reduced to the viewport's pixel count (a few
+   Mpx at most), and redraw it on zoom or pan. Shading and the overhang
+   overlay are then computed on that small image too. This removes the
+   64 B/px held and the 73–144 B/px redraw peaks, whatever the canvas size,
+   and makes redraws faster. Optionally, cache the composite per source
+   visibility (4 B/px each) instead of rebuilding it on every redraw.
+10. **Store step maps more compactly.** `result` and `accessible` as uint16
+    would halve them, with steps of 0.15 µm at 10 mm depth, far below one
+    grey level (1/255). Steps that are neither shown nor computed could also
+    be kept compressed (smooth maps should compress several-fold; not
+    measured) or in memory-mapped temporary files the operating system can
+    page out. Trade-off: toolpaths change by sub-micron amounts, so outputs
+    are no longer bit-identical with earlier ones.
+11. **Level Clearing: keep each region's cropped mask instead of a full
+    label array per level.** Removes the cost that grows with the number of
+    levels (43.5 B/px at 11 levels). Small and local, with identical output.
+12. **Narrower types inside the algorithms**, continuing recommendation 4.
+    Distance transforms come back as float64, nearest-point indices as
+    int64, and `medial_axis` builds several float64 and int64 arrays
+    internally (most of V-Carving's peak). float32 or int32 where the values
+    allow would cut 20–40 % from the Pocket, Level Clearing and V-Carving
+    peaks; keeping the output identical needs care. Set per-algorithm values
+    in `STEP_PEAK_BYTES_PER_PX` along the way.
+13. **Tiling, as the last resort.** The local stages (grey morphology, the
+    removal simulation) could run tile by tile with a halo of one tool
+    radius. Path planning (regions, contour graphs) needs the whole canvas,
+    so this would be a redesign, worth it only if 200 Mpx and more must fit
+    on 16 GB after 9–12.
