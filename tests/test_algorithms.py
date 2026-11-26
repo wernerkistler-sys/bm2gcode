@@ -2407,6 +2407,68 @@ check("a cancelled Level Clearing leaves its pool shut down",
       _made and _made[0]._pool._shutdown and _made[0]._running == 0)
 
 
+
+# --------------------------------------------------------------------------
+# Onion Skin rings trace a region half a pixel outside its pixels; where the
+# region touches the canvas edge they run along the edge pixels instead of
+# off the canvas, so linking never indexes outside it.
+# --------------------------------------------------------------------------
+print("onion skin at the canvas edge")
+
+_edge_mask = np.ones((60, 90), dtype=bool)              # touches every edge
+_edge_mask &= ~disk_mask(_edge_mask.shape, (30, 45), 9)  # around a hole
+for _pat in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
+    _segs = _pocket_infill(_edge_mask, 0.5, 1.5, _pocket_pattern(_pat, "Climb"),
+                           4.0, 0.0, "Climb", 1.0, _edge_mask.shape[0],
+                           0.0, 0.0, 3.0, tool_radius_mm=2.0)[0]
+    _pts = np.array([p[:2] for seg in _segs for p in seg])
+    check(f"{_pat}: rings of a region touching the edge stay on the canvas",
+          _pts[:, 0].min() >= 0 and _pts[:, 0].max() <= _edge_mask.shape[1] - 1
+          and _pts[:, 1].min() >= 0 and _pts[:, 1].max() <= _edge_mask.shape[0] - 1)
+    check(f"{_pat}: and reach the canvas edge",
+          _pts[:, 0].min() == 0 and _pts[:, 1].max() == _edge_mask.shape[0] - 1)
+    # The same region away from the edge, on a larger canvas: clipping
+    # adds no repeated point to the rings (a clipped chain drops all of
+    # its repeats, the ones its stitching made too).
+    _off = np.zeros((80, 110), dtype=bool)
+    _off[10:70, 10:100] = _edge_mask
+    _off_segs = _pocket_infill(_off, 0.5, 1.5, _pocket_pattern(_pat, "Climb"),
+                               4.0, 0.0, "Climb", 1.0, _off.shape[0],
+                               0.0, 0.0, 3.0, tool_radius_mm=2.0)[0]
+
+    def _repeats(segs):
+        return sum(seg[i] == seg[i + 1] for seg in segs for i in range(len(seg) - 1))
+    check(f"{_pat}: clipping to the canvas repeats no point",
+          _repeats(_segs) <= _repeats(_off_segs))
+
+# A relief whose upper levels' regions run into the canvas edge.
+_edge_relief = gaussian_filter(np.random.default_rng(0).random((120, 120)), 10)
+_edge_relief = ((_edge_relief - _edge_relief.min())
+                / (_edge_relief.max() - _edge_relief.min())).astype(np.float32)
+_face_depth = np.zeros((80, 120), dtype=np.float32)
+_face_depth[30:50, 40:80] = 1.0
+for _pat in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
+    try:
+        _tp = compute_pocket_toolpath(
+            _face_depth, 256, Tool(profile="End Mill", diameter_mm=4.0), 1.6,
+            3.0, 5.0, 40.0, 80.0 / 3.0, _pat, target_z_mm=0.0,
+            progress=lambda p, m: None)
+        _ok = bool(_tp.segments)
+    except Exception as _e:
+        print(f"    {type(_e).__name__}: {_e}")
+        _ok = False
+    check(f"{_pat}: a facing pass over the whole canvas computes", _ok)
+    try:
+        _tp = compute_level_clearing_toolpath(
+            _edge_relief, 256, Tool(profile="End Mill", diameter_mm=4.0), 1.6,
+            1.0, 5.0, 30.0, 30.0, _pat, progress=lambda p, m: None)
+        _ok = bool(_tp.segments)
+    except Exception as _e:
+        print(f"    {type(_e).__name__}: {_e}")
+        _ok = False
+    check(f"{_pat}: Level Clearing with regions at the canvas edge computes", _ok)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

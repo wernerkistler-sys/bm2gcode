@@ -3371,10 +3371,25 @@ def _start_pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 for p in ps:
                     inverted[p].append(i)
             parents = inverted
-        segs = [_ring_chain_to_points(chain + offset, level_mm,
-                                      px_per_mm, H, _ox, _oy)
+        segs = [_ring_chain_to_points(_clip_to_canvas(chain + offset),
+                                      level_mm, px_per_mm, H, _ox, _oy)
                 for chain in chains]
         return segs, parents, None
+
+    canvas_max = np.array(labeled_regions.shape) - 1
+
+    def _clip_to_canvas(chain):
+        """A ring traces its region half a pixel outside the region's
+        pixels, so where the region touches the canvas edge it runs half a
+        pixel off the canvas: it runs along the edge pixels instead, with
+        the points that clipping makes repeat (at a canvas corner)
+        dropped."""
+        clipped = np.clip(chain, 0, canvas_max)
+        if np.array_equal(clipped, chain):
+            return chain
+        keep = np.ones(len(clipped), dtype=bool)
+        keep[1:] = np.any(clipped[1:] != clipped[:-1], axis=1)
+        return clipped[keep]
 
     def zigzag_region(local_mask, offset, box):
         r_lo, r_hi = box[0].start, box[0].stop - 1
