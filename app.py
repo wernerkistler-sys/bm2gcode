@@ -153,6 +153,7 @@ class GCodeGeneratorApp:
         self._last_width_mm  = float(DEFAULTS["width_mm"])          # see _on_canvas_size_changed
         self._last_height_mm = float(DEFAULTS["height_mm"])
         self._last_min_px_per_mm = float(DEFAULTS["min_px_per_mm"])  # see _on_min_px_per_mm_changed
+        self._applying_project = False   # see _confirm_canvas_shape
         self._stl_placement_pending = None   # after_idle id, see _schedule_stl_placement
         self.steps     = []   # list of step-widget dicts, built by _build_sidebar
         self.toolpaths = []   # list of ToolPath|None, parallel to self.steps
@@ -623,8 +624,10 @@ class GCodeGeneratorApp:
         this physical size, the floor wins uncapped -- that combination can
         only arise from editing Width/Height/Min. px/mm/Max Megapixels,
         each of which gates the change through _confirm_canvas_shape before
-        committing, so by the time this runs it's already something the
-        user explicitly chose to allow. *layers* defaults to self.layers."""
+        committing, or from opening a project, which gates its combination
+        once before applying it, so by the time this runs it's already
+        something the user explicitly chose to allow. *layers* defaults to
+        self.layers."""
         try:
             floor_density = float(self.min_px_per_mm.get())
         except ValueError:
@@ -694,7 +697,8 @@ class GCodeGeneratorApp:
                 "this may be slow.")
         self._on_layers_structure_changed()
 
-    def _confirm_canvas_shape(self, width_mm, height_mm, density, max_mp=None):
+    def _confirm_canvas_shape(self, width_mm, height_mm, density, max_mp=None,
+                              question="Proceed anyway?"):
         """Ask before committing to a Width/Height/Min.-px/mm/Max-Megapixels
         combination whose Min. px/mm floor alone -- ignoring any bitmap --
         would already exceed the Max Megapixels ceiling for this physical
@@ -705,7 +709,15 @@ class GCodeGeneratorApp:
         shape already changed doesn't help, since by the time it's on
         screen the expensive work triggered by that same change is already
         queued -- the gate has to sit in front of the change, not after
-        it."""
+        it. *question* closes the dialog's text.
+
+        While a project's settings are being applied (_applying_project)
+        this always allows the change: Open Project asks once, up front,
+        for the project's final combination, and New Project writes the
+        defaults; asking per field would judge half-applied combinations
+        of the old and the new project's values."""
+        if self._applying_project:
+            return True
         if max_mp is None:
             try:
                 max_mp = float(self.max_megapixels.get())
@@ -722,7 +734,7 @@ class GCodeGeneratorApp:
             f"This would create a {W}x{H} px canvas (~{W * H / 1e6:.0f} MP).\n\n"
             "Compositing and generating toolpaths at this resolution can "
             "take a long time and may make the app unresponsive.\n\n"
-            "Proceed anyway?")
+            + question)
 
     def _on_canvas_size_changed(self, *_):
         """Width/Height changed. Scale-% is canvas-size-relative (see
@@ -3646,10 +3658,14 @@ class GCodeGeneratorApp:
             return
 
         self._aspect_lock_var.set(True)
-        self.width_mm.set(DEFAULTS['width_mm'])
-        self.height_mm.set(DEFAULTS['height_mm'])
-        self.min_px_per_mm.set(DEFAULTS['min_px_per_mm'])
-        self.max_megapixels.set(DEFAULTS['max_megapixels'])
+        self._applying_project = True
+        try:
+            self.width_mm.set(DEFAULTS['width_mm'])
+            self.height_mm.set(DEFAULTS['height_mm'])
+            self.min_px_per_mm.set(DEFAULTS['min_px_per_mm'])
+            self.max_megapixels.set(DEFAULTS['max_megapixels'])
+        finally:
+            self._applying_project = False
         self.max_depth.set(DEFAULTS['max_depth'])
         self.margin_mm.set(DEFAULTS['margin_mm'])
         self.margin_depth_pct.set(DEFAULTS['margin_depth_pct'])
@@ -3771,10 +3787,64 @@ class GCodeGeneratorApp:
             messagebox.showerror("Load Error", "Unsupported project file version.")
             return
 
+        # Judge the project's own canvas once, before anything changes: a
+        # No leaves the open project untouched.
+        g = project.get('global', {})
+        c = project.get('canvas', {})
+
+        def _num(value, default):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        if not self._confirm_canvas_shape(
+                _num(g.get('width_mm'), DEFAULTS['width_mm']),
+                _num(g.get('height_mm'), DEFAULTS['height_mm']),
+                _num(self._project_min_px_per_mm(g, c), DEFAULTS['min_px_per_mm']),
+                max_mp=_num(g.get('max_megapixels'), DEFAULTS['max_megapixels']),
+                question="Open this project anyway?"):
+            return
+
         if not self._confirm_discard("opening another project"):
             return
         self._project_path = path
+        self._applying_project = True
+        try:
+            self._apply_project(project, path, version)
+        finally:
+            self._applying_project = False
 
+    def _project_min_px_per_mm(self, g, c):
+        """The Min. px/mm a project file's 'global' (*g*) and 'canvas' (*c*)
+        sections stand for. Pre-v4 projects have no Min. px/mm field: an
+        equivalent floor comes from the old fixed Precision (mm/px, the
+        exact density every source was rasterized/placed against), or if
+        even that predates v3, from the old base-layer-defined canvas
+        resolution, so re-opening reproduces close to the same effective
+        detail before the user adjusts it."""
+        min_px_per_mm = g.get('min_px_per_mm')
+        if min_px_per_mm is not None:
+            return min_px_per_mm
+        legacy_precision_mm = g.get('precision_mm')
+        try:
+            if legacy_precision_mm is not None and float(legacy_precision_mm) > 1e-9:
+                return 1.0 / float(legacy_precision_mm)
+        except (TypeError, ValueError):
+            pass
+        try:
+            width_mm_val = float(g.get('width_mm', DEFAULTS['width_mm']))
+        except (TypeError, ValueError):
+            width_mm_val = float(DEFAULTS['width_mm'])
+        saved_width_px = c.get('width_px')
+        if saved_width_px and width_mm_val > 1e-9:
+            return saved_width_px / width_mm_val
+        return DEFAULTS['min_px_per_mm']
+
+    def _apply_project(self, project, path, version):
+        """Replace the open project with the parsed project file *project*
+        (read from *path*, format *version*). Runs with _applying_project
+        set, see _confirm_canvas_shape."""
         # Drop the current project's sources, composite and results before
         # any setting below is written: each write runs its trace at once,
         # and with no sources left those traces neither composite nor draw
@@ -3799,31 +3869,7 @@ class GCodeGeneratorApp:
         self._aspect_lock_var.set(bool(g.get('aspect_locked', True)))
         self.width_mm.set(g.get('width_mm', DEFAULTS['width_mm']))
         self.height_mm.set(g.get('height_mm', DEFAULTS['height_mm']))
-        min_px_per_mm = g.get('min_px_per_mm')
-        if min_px_per_mm is None:
-            # Pre-v4 project: no Min. px/mm field existed yet -- derive an
-            # equivalent floor from the old fixed Precision (mm/px, the
-            # exact density every source was rasterized/placed against), or
-            # if even that predates v3, from the old base-layer-defined
-            # canvas resolution, so re-opening reproduces close to the same
-            # effective detail before the user adjusts it.
-            legacy_precision_mm = g.get('precision_mm')
-            try:
-                if legacy_precision_mm is not None and float(legacy_precision_mm) > 1e-9:
-                    min_px_per_mm = 1.0 / float(legacy_precision_mm)
-            except (TypeError, ValueError):
-                pass
-        if min_px_per_mm is None:
-            try:
-                width_mm_val = float(g.get('width_mm', DEFAULTS['width_mm']))
-            except (TypeError, ValueError):
-                width_mm_val = float(DEFAULTS['width_mm'])
-            saved_width_px = c.get('width_px')
-            if saved_width_px and width_mm_val > 1e-9:
-                min_px_per_mm = saved_width_px / width_mm_val
-            else:
-                min_px_per_mm = DEFAULTS['min_px_per_mm']
-        self.min_px_per_mm.set(str(min_px_per_mm))
+        self.min_px_per_mm.set(str(self._project_min_px_per_mm(g, c)))
         self.max_megapixels.set(g.get('max_megapixels', DEFAULTS['max_megapixels']))
         self.max_depth.set(g.get('max_depth', DEFAULTS['max_depth']))
         self.margin_mm.set(g.get('margin_mm', DEFAULTS['margin_mm']))
