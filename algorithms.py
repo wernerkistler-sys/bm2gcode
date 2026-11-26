@@ -1167,7 +1167,7 @@ def _grid_line_ids(boundary_px, px_per_mm, step_mm, raster_offset_pct):
 
 def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
                   center_depth_contour_raster, prior_mask, resid_tol,
-                  px_per_mm, H, _ox, _oy, max_depth):
+                  px_per_mm, H, _ox, _oy, max_depth, offset=(0, 0)):
     """Build zero or more point-list segments along one raster line (or a
     sub-range of a line, for coil legs), gated by prior_mask/mask_spans.
 
@@ -1181,6 +1181,9 @@ def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
     reverse   : if True, each resulting segment's points are reversed so
                 the segment travels from hi_idx toward lo_idx instead of
                 lo_idx toward hi_idx.
+    offset    : the canvas (row, col) of center_depth_contour_raster's and
+                prior_mask's [0, 0], for arrays cropped to a window of the
+                canvas; fixed_idx, lo_idx and hi_idx stay canvas indices.
 
     Returns
     -------
@@ -1188,17 +1191,15 @@ def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
     element, or several when prior_mask/mask_spans splits the range into
     disjoint active sub-spans.
     """
+    r0, c0 = offset
     if direction == "X":
-        line_depth = center_depth_contour_raster[fixed_idx, lo_idx:hi_idx + 1]
+        line_sel = np.s_[fixed_idx - r0, lo_idx - c0:hi_idx - c0 + 1]
     else:
-        line_depth = center_depth_contour_raster[lo_idx:hi_idx + 1, fixed_idx]
+        line_sel = np.s_[lo_idx - r0:hi_idx - r0 + 1, fixed_idx - c0]
+    line_depth = center_depth_contour_raster[line_sel]
 
     if prior_mask is not None:
-        if direction == "X":
-            line_mask = prior_mask[fixed_idx, lo_idx:hi_idx + 1]
-        else:
-            line_mask = prior_mask[lo_idx:hi_idx + 1, fixed_idx]
-        effective = (line_depth * line_mask).astype(np.float32)
+        effective = (line_depth * prior_mask[line_sel]).astype(np.float32)
         spans = mask_spans(effective > resid_tol)
     else:
         spans = [(0, len(line_depth) - 1)]
@@ -1209,7 +1210,7 @@ def _line_points(direction, fixed_idx, lo_idx, hi_idx, reverse,
         for local_px in range(s, e + 1):
             px = lo_idx + local_px
             row, col = (fixed_idx, px) if direction == "X" else (px, fixed_idx)
-            z_mm = float(center_depth_contour_raster[row, col]) * max_depth
+            z_mm = float(line_depth[local_px]) * max_depth
             x_mm = col / px_per_mm - _ox
             y_mm = (H - 1 - row) / px_per_mm - _oy
             points.append((x_mm, y_mm, -z_mm))
@@ -1265,7 +1266,7 @@ def _diag_line_bounds(family, k, r_lo, r_hi, c_lo, c_hi):
 
 def _diag_line_points(family, k, t_lo, t_hi, reverse,
                       center_depth_contour_raster, prior_mask, resid_tol,
-                      px_per_mm, H, _ox, _oy, max_depth):
+                      px_per_mm, H, _ox, _oy, max_depth, offset=(0, 0)):
     """Diagonal counterpart to _line_points: samples the 45-degree
     ("D45": row+col=k) or 135-degree ("D135": row-col=k) line between row
     parameters t_lo..t_hi (inclusive, t_lo <= t_hi), gated by
@@ -1276,6 +1277,8 @@ def _diag_line_points(family, k, t_lo, t_hi, reverse,
     reverse   : if True, each resulting segment's points are reversed so
                 the segment travels from t_hi toward t_lo instead of
                 t_lo toward t_hi.
+    offset    : the canvas (row, col) of center_depth_contour_raster's and
+                prior_mask's [0, 0], as in _line_points.
 
     Returns
     -------
@@ -1286,10 +1289,11 @@ def _diag_line_points(family, k, t_lo, t_hi, reverse,
     rows = np.arange(t_lo, t_hi + 1)
     cols = (k - rows) if family == "D45" else (rows - k)
 
-    line_depth = center_depth_contour_raster[rows, cols]
+    r0, c0 = offset
+    line_depth = center_depth_contour_raster[rows - r0, cols - c0]
 
     if prior_mask is not None:
-        line_mask = prior_mask[rows, cols]
+        line_mask = prior_mask[rows - r0, cols - c0]
         effective = (line_depth * line_mask).astype(np.float32)
         spans = mask_spans(effective > resid_tol)
     else:
@@ -1300,7 +1304,7 @@ def _diag_line_points(family, k, t_lo, t_hi, reverse,
         points = []
         for local_px in range(s, e + 1):
             row, col = int(rows[local_px]), int(cols[local_px])
-            z_mm = float(center_depth_contour_raster[row, col]) * max_depth
+            z_mm = float(line_depth[local_px]) * max_depth
             x_mm = col / px_per_mm - _ox
             y_mm = (H - 1 - row) / px_per_mm - _oy
             points.append((x_mm, y_mm, -z_mm))
@@ -3214,6 +3218,82 @@ def _pocket_pattern(raster_dir, cut_direction):
     return _PocketPattern(raster_dir, cut_direction)
 
 
+class _RegionRunner:
+    """Runs pocket regions' infill jobs (_start_pocket_infill) on a thread
+    pool: the regions are independent, and most of their array work
+    (labelling, distance transforms, contour tracing) releases the GIL.
+
+    A job starts once its estimated peak memory fits the budget beside the
+    jobs already running, or when no other job runs. The budget is
+    AVAILABLE_FRACTION of the memory available to the pool, read again
+    each time a job is about to start: the memory available now plus the
+    estimates of the running jobs (which the memory available now already
+    lacks), but never more than was available when the runner was made.
+    So memory taken by another program while the jobs run lowers the
+    budget, down to one job at a time. A job waiting for room checks again
+    every WAIT_S seconds, since memory freed elsewhere sends no signal.
+    Where memory can't be read, the budget is erosion_cache.FALLBACK_BYTES.
+    Use it as a context manager: leaving it cancels the jobs not yet
+    started and waits for the running ones.
+
+    memory : a function returning (total, available) bytes or None, as
+             erosion_cache.system_memory (the default).
+    """
+
+    AVAILABLE_FRACTION = 0.5
+    WAIT_S = 0.1
+
+    def __init__(self, max_workers=None, memory=None):
+        import os
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from erosion_cache import system_memory
+        self._memory = memory or system_memory
+        mem = self._memory()
+        self._available0 = None if mem is None else mem[1]
+        self._pool = ThreadPoolExecutor(max_workers=max_workers or os.cpu_count() or 1)
+        self._cond = threading.Condition()
+        self._running = 0
+
+    def _budget(self):
+        """The bytes the running jobs may hold together, from the memory
+        available now (called with the condition held)."""
+        from erosion_cache import FALLBACK_BYTES
+        mem = self._memory() if self._available0 is not None else None
+        if mem is None:
+            return FALLBACK_BYTES
+        return self.AVAILABLE_FRACTION * min(self._available0, mem[1] + self._running)
+
+    def submit(self, fn, nbytes):
+        """Run fn() on the pool once nbytes fit the budget; returns its
+        Future."""
+        def run():
+            with self._cond:
+                while self._running and self._running + nbytes > self._budget():
+                    self._cond.wait(self.WAIT_S)
+                self._running += nbytes
+            try:
+                return fn()
+            finally:
+                with self._cond:
+                    self._running -= nbytes
+                    self._cond.notify_all()
+        return self._pool.submit(run)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
+# Peak memory of one region's infill job per pixel of its bounding box
+# (measured: about 64 for _onion_skin_chains, 15 for a Zig-Zag region's
+# boundary rings plus its cropped masks).
+_ONION_REGION_BYTES_PER_PX = 80
+_ZIGZAG_REGION_BYTES_PER_PX = 32
+
+
 def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                    raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy,
                    max_depth, tool_radius_mm=None):
@@ -3231,24 +3311,40 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     patterns; see _order_onion_pass), the Zig-Zag boundary rings per region
     (empty for other patterns), the region labels, the flat floor surface
     (level_norm inside the mask, 0 outside) and the number of regions.
+
+    The regions are computed in parallel on a _RegionRunner of their own;
+    _start_pocket_infill shares one runner between several calls.
+    """
+    with _RegionRunner() as runner:
+        return _start_pocket_infill(
+            pocket_mask, level_norm, level_mm, pattern, step_mm,
+            raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy,
+            max_depth, runner, tool_radius_mm)()
+
+
+def _start_pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
+                         raster_offset_pct, cut_direction, px_per_mm, H, _ox, _oy,
+                         max_depth, runner, tool_radius_mm=None):
+    """Label *pocket_mask*'s regions and submit each region's infill to
+    *runner* (a _RegionRunner). Returns a function that waits for them and
+    returns _pocket_infill's result, the regions in label order whatever
+    order they finish in.
     """
     from scipy.ndimage import label, find_objects
 
     # Each connected pocket region gets its own infill, generated within
-    # that region's own bounding box. Gating uses the region's own label
-    # mask (not the pooled
-    # pocket_mask) so two disjoint regions with overlapping bounding boxes
-    # never double-generate a line over each other's pixels.
+    # that region's own bounding box from its own label mask (not the
+    # pooled pocket_mask), so two disjoint regions with overlapping
+    # bounding boxes never double-generate a line over each other's pixels.
     # Zig-Zag's scan lines gate on flat_depth * region_mask > mask_resid_tol,
     # which can't tell inside from outside at a level of 0 (the stock
     # surface), so the floor depth is kept at least 1e-6 as in
     # pocket_surface_and_mask.
     level_norm = max(level_norm, 1e-6)
-    flat_depth = np.where(pocket_mask, level_norm, 0.0).astype(np.float32)
     mask_resid_tol = level_norm * 0.5   # (flat_depth * region_mask) is 0 or level_norm
 
     raster_dir = pattern.raster_dir
-    IS_ONION, IS_ZIGZAG = pattern.is_onion, pattern.is_zigzag
+    IS_ONION = pattern.is_onion
     direction = pattern.direction
     FORCE_REVERSE = _PocketPattern.FORCE_REVERSE
     lock_direction = pattern.lock_direction
@@ -3256,62 +3352,46 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
     labeled_regions, n_regions = label(pocket_mask)
     region_boxes = find_objects(labeled_regions)
 
-    full_depth_segs = []
-    # Parallel to full_depth_segs, one entry per element, recording which
-    # pocket region produced it -- Zig-Zag orders whole regions by it.
-    seg_region_ids = []
-    # Onion Skin only, parallel to full_depth_segs: the chains each chain
-    # must be cut after, along its region's level graph.
-    chain_parents = [] if IS_ONION else None
-    # Zig-Zag only: each region's own boundary ring(s) (one outer, plus one
-    # per interior hole/island), used by Stage 6 to bridge gaps by walking
-    # the region's actual contour instead of a geodesic search -- see
-    # _region_contour_rings/_ContourRing.
-    region_contours = {}
-    for region_id, box in enumerate(region_boxes, start=1):
-        if box is None:
-            continue
+    def onion_region(local_mask, offset):
+        step_px = max(1, int(round(step_mm * px_per_mm)))
+        min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
+        chains, parents = _onion_skin_chains(
+            local_mask, step_px, min_area_px,
+            reverse_rings=(cut_direction == "Conventional"),
+            tool_radius_px=(None if tool_radius_mm is None
+                            else tool_radius_mm * px_per_mm),
+            return_parents=True)
+        if raster_dir == "Onion Skin (Inside-Out)":
+            # Each chain runs backwards, from its deepest ring out, and
+            # the graph is inverted: a chain is cut after every chain
+            # that follows it rather than after the ones it follows.
+            chains = [c[::-1] for c in chains]
+            inverted = [[] for _ in chains]
+            for i, ps in enumerate(parents):
+                for p in ps:
+                    inverted[p].append(i)
+            parents = inverted
+        segs = [_ring_chain_to_points(chain + offset, level_mm,
+                                      px_per_mm, H, _ox, _oy)
+                for chain in chains]
+        return segs, parents, None
+
+    def zigzag_region(local_mask, offset, box):
         r_lo, r_hi = box[0].start, box[0].stop - 1
         c_lo, c_hi = box[1].start, box[1].stop - 1
-        region_mask_f = (labeled_regions == region_id).astype(np.float32)
-        n_before = len(full_depth_segs)
-
-        if IS_ZIGZAG:
-            local_mask = labeled_regions[box] == region_id
-            offset = np.array([r_lo, c_lo])
-            region_contours[region_id] = [
-                _make_contour_ring(ring + offset)
-                for ring in _region_contour_rings(local_mask)
-            ]
-
-        if IS_ONION:
-            step_px = max(1, int(round(step_mm * px_per_mm)))
-            min_area_px = max(4, int(round(np.pi * (0.5 * step_px) ** 2)))
-            local_mask = labeled_regions[box] == region_id
-            chains, parents = _onion_skin_chains(
-                local_mask, step_px, min_area_px,
-                reverse_rings=(cut_direction == "Conventional"),
-                tool_radius_px=(None if tool_radius_mm is None
-                                else tool_radius_mm * px_per_mm),
-                return_parents=True)
-            if raster_dir == "Onion Skin (Inside-Out)":
-                # Each chain runs backwards, from its deepest ring out, and
-                # the graph is inverted: a chain is cut after every chain
-                # that follows it rather than after the ones it follows.
-                chains = [c[::-1] for c in chains]
-                inverted = [[] for _ in chains]
-                for i, ps in enumerate(parents):
-                    for p in ps:
-                        inverted[p].append(i)
-                parents = inverted
-            offset = np.array([r_lo, c_lo])
-            base = len(full_depth_segs)
-            for chain, ps in zip(chains, parents):
-                full_depth_segs.append(
-                    _ring_chain_to_points(chain + offset, level_mm,
-                                         px_per_mm, H, _ox, _oy))
-                chain_parents.append([base + p for p in ps])
-        elif direction in ("X", "Y"):
+        # Each region's own boundary ring(s) (one outer, plus one per
+        # interior hole/island), used by _order_and_link_pocket_pass to
+        # bridge gaps by walking the region's actual contour instead of a
+        # geodesic search -- see _region_contour_rings/_ContourRing.
+        contours = [_make_contour_ring(ring + offset)
+                    for ring in _region_contour_rings(local_mask)]
+        # The lines read the region's mask and floor cropped to its box.
+        region_mask_f = local_mask.astype(np.float32)
+        flat_local = np.where(local_mask, level_norm, 0.0).astype(np.float32)
+        box_origin = (r_lo, c_lo)
+        reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
+        segs = []
+        if direction in ("X", "Y"):
             if direction == "X":
                 spacing_lo, spacing_hi = r_lo, r_hi
                 span_lo,    span_hi    = c_lo, c_hi
@@ -3320,33 +3400,68 @@ def _pocket_infill(pocket_mask, level_norm, level_mm, pattern, step_mm,
                 span_lo,    span_hi    = r_lo, r_hi
             local_line_ids, _ = _grid_line_ids(spacing_hi - spacing_lo, px_per_mm,
                                                step_mm, raster_offset_pct)
-            line_ids = [i + spacing_lo for i in local_line_ids]
-            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
-            for line_idx in line_ids:
-                new_segs = _line_points(direction, line_idx, span_lo, span_hi, reverse,
-                                        flat_depth, region_mask_f, mask_resid_tol,
-                                        px_per_mm, H, _ox, _oy, max_depth)
-                full_depth_segs.extend(new_segs)
+            for line_idx in (i + spacing_lo for i in local_line_ids):
+                segs.extend(_line_points(direction, line_idx, span_lo, span_hi, reverse,
+                                         flat_local, region_mask_f, mask_resid_tol,
+                                         px_per_mm, H, _ox, _oy, max_depth,
+                                         offset=box_origin))
         else:
             k_offset = (r_lo + c_lo) if direction == "D45" else (r_lo - c_lo)
             local_k_ids, _ = _diag_grid_line_ids(r_hi - r_lo + 1, c_hi - c_lo + 1,
                                                  direction, px_per_mm, step_mm,
                                                  raster_offset_pct)
-            k_ids = [k + k_offset for k in local_k_ids]
-            reverse = lock_direction and FORCE_REVERSE[cut_direction][direction]
-            for k in k_ids:
+            for k in (k + k_offset for k in local_k_ids):
                 bounds = _diag_line_bounds(direction, k, r_lo, r_hi, c_lo, c_hi)
                 if bounds is None:
                     continue
                 t_lo, t_hi = bounds
-                new_segs = _diag_line_points(direction, k, t_lo, t_hi, reverse,
-                                             flat_depth, region_mask_f, mask_resid_tol,
-                                             px_per_mm, H, _ox, _oy, max_depth)
-                full_depth_segs.extend(new_segs)
-        seg_region_ids.extend([region_id] * (len(full_depth_segs) - n_before))
+                segs.extend(_diag_line_points(direction, k, t_lo, t_hi, reverse,
+                                              flat_local, region_mask_f, mask_resid_tol,
+                                              px_per_mm, H, _ox, _oy, max_depth,
+                                              offset=box_origin))
+        return segs, None, contours
 
-    return (full_depth_segs, seg_region_ids, chain_parents, region_contours,
-            labeled_regions, flat_depth, n_regions)
+    def region_job(region_id, box):
+        local_mask = labeled_regions[box] == region_id
+        offset = np.array([box[0].start, box[1].start])
+        if IS_ONION:
+            return onion_region(local_mask, offset)
+        return zigzag_region(local_mask, offset, box)
+
+    bytes_per_px = _ONION_REGION_BYTES_PER_PX if IS_ONION else _ZIGZAG_REGION_BYTES_PER_PX
+    jobs = []
+    for region_id, box in enumerate(region_boxes, start=1):
+        if box is None:
+            continue
+        nbytes = bytes_per_px * (box[0].stop - box[0].start) * (box[1].stop - box[1].start)
+        jobs.append((region_id, runner.submit(
+            lambda region_id=region_id, box=box: region_job(region_id, box), nbytes)))
+
+    def finish():
+        full_depth_segs = []
+        # Parallel to full_depth_segs, one entry per element, recording
+        # which pocket region produced it -- Zig-Zag orders whole regions
+        # by it.
+        seg_region_ids = []
+        # Onion Skin only, parallel to full_depth_segs: the chains each
+        # chain must be cut after, along its region's level graph.
+        chain_parents = [] if IS_ONION else None
+        # Zig-Zag only: each region's own boundary ring(s).
+        region_contours = {}
+        for region_id, future in jobs:
+            segs, parents, contours = future.result()
+            base = len(full_depth_segs)
+            full_depth_segs.extend(segs)
+            seg_region_ids.extend([region_id] * len(segs))
+            if IS_ONION:
+                chain_parents.extend([base + p for p in ps] for ps in parents)
+            else:
+                region_contours[region_id] = contours
+        flat_depth = np.where(labeled_regions > 0, level_norm, 0.0).astype(np.float32)
+        return (full_depth_segs, seg_region_ids, chain_parents, region_contours,
+                labeled_regions, flat_depth, n_regions)
+
+    return finish
 
 
 def _order_and_link_pocket_pass(pass_segs, pass_ids, ceil_mm, is_final,
@@ -3705,6 +3820,9 @@ def compute_pocket_toolpath(depth_map, n_grey_levels, tool,
     outermost line leaves the same stair-stepped boundary edge Raster
     already leaves at any masked boundary.
     """
+
+    if progress is None:
+        progress = lambda pct, msg: None
 
     # ── Stage 0 · Resample to square pixels if needed (pre-pass) ──────────
     H, W = depth_map.shape
@@ -4103,31 +4221,42 @@ def compute_level_clearing_toolpath(depth_map, n_grey_levels, tool,
     level_data = []
     air_pruned_mm = 0.0
     n_regions_per_level = []
-    for k, (z, z_mm) in enumerate(zip(levels, levels_mm)):
-        progress(40 + 20 * k / max(len(levels), 1),
-                 f"Level {k + 1}/{len(levels)} at z={z_mm:.3f} mm: infill…")
-        mask = level_clearing_mask(center_depth, z, n_grey_levels)
-        (segs, seg_region_ids, chain_parents, region_contours, labeled, _flat,
-         n_regions) = _pocket_infill(mask, z, z_mm, pattern, step_mm,
-                                     raster_offset_pct, cut_direction,
-                                     px_per_mm, H, _ox, _oy, max_depth,
-                                     tool_radius_mm=0.5 * tool.diameter_mm)
-        # src: the infill segment (for Onion Skin, the chain) each segment
-        # comes from.
-        src = list(range(len(segs)))
-        if avoid_air and segs:
-            segs, src, air = prune_air_segments(
-                segs, free, px_per_mm, H, _ox, _oy, max_depth, tol_norm,
-                breakeven_fn=breakeven, parent_ids=src)
-            air_pruned_mm += air
-        by_region = {}
-        for seg, si in zip(segs, src):
-            entry = by_region.setdefault(int(seg_region_ids[si]), ([], []))
-            entry[0].append(seg)
-            entry[1].append(si)
-        level_data.append((labeled, region_contours, find_objects(labeled),
-                           by_region, chain_parents))
-        n_regions_per_level.append(n_regions)
+    n_lv = max(len(levels), 1)
+    # Every level's regions are submitted to one runner before any is
+    # collected, so that the regions of all levels compute in parallel.
+    with _RegionRunner() as runner:
+        pending = []
+        for k, (z, z_mm) in enumerate(zip(levels, levels_mm)):
+            progress(40 + 5 * k / n_lv,
+                     f"Level {k + 1}/{len(levels)} at z={z_mm:.3f} mm: regions…")
+            mask = level_clearing_mask(center_depth, z, n_grey_levels)
+            pending.append(_start_pocket_infill(
+                mask, z, z_mm, pattern, step_mm, raster_offset_pct,
+                cut_direction, px_per_mm, H, _ox, _oy, max_depth, runner,
+                tool_radius_mm=0.5 * tool.diameter_mm))
+            del mask
+        for k, z_mm in enumerate(levels_mm):
+            progress(45 + 15 * k / n_lv,
+                     f"Level {k + 1}/{len(levels)} at z={z_mm:.3f} mm: infill…")
+            (segs, seg_region_ids, chain_parents, region_contours, labeled, _flat,
+             n_regions) = pending[k]()
+            pending[k] = None
+            # src: the infill segment (for Onion Skin, the chain) each
+            # segment comes from.
+            src = list(range(len(segs)))
+            if avoid_air and segs:
+                segs, src, air = prune_air_segments(
+                    segs, free, px_per_mm, H, _ox, _oy, max_depth, tol_norm,
+                    breakeven_fn=breakeven, parent_ids=src)
+                air_pruned_mm += air
+            by_region = {}
+            for seg, si in zip(segs, src):
+                entry = by_region.setdefault(int(seg_region_ids[si]), ([], []))
+                entry[0].append(seg)
+                entry[1].append(si)
+            level_data.append((labeled, region_contours, find_objects(labeled),
+                               by_region, chain_parents))
+            n_regions_per_level.append(n_regions)
 
     # ── Stage 5 · Region forest (60 %) ────────────────────────────────────
     # A region's parent is the region one level up holding any of its

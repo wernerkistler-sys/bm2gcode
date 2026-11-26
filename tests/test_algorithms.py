@@ -2290,6 +2290,123 @@ check("plan_clearing_levels caps the band at the deepest point",
                            LC_MAX, 256)[-1] == np.float32(0.42))
 
 
+
+# --------------------------------------------------------------------------
+# Pocket regions are computed in parallel (_RegionRunner): the result is the
+# same as computing them one at a time, in label order; a budget no job fits
+# still runs every job (one at a time); and a cancelled Level Clearing
+# leaves no job behind.
+# --------------------------------------------------------------------------
+print("parallel pocket regions")
+
+import algorithms as _alg
+from algorithms import _RegionRunner, _start_pocket_infill
+
+_pr_mask = np.zeros((120, 160), dtype=bool)
+for _c, _r in (((30, 30), 22), ((30, 95), 18), ((85, 50), 28), ((80, 125), 25)):
+    _pr_mask |= disk_mask(_pr_mask.shape, _c, _r)
+_pr_mask &= ~disk_mask(_pr_mask.shape, (85, 50), 8)   # a hole
+
+
+def _pr_infill(raster_dir, runner):
+    return _start_pocket_infill(
+        _pr_mask, 0.5, 1.5, _pocket_pattern(raster_dir, "Climb"), 4.0, 0.0,
+        "Climb", 1.0, _pr_mask.shape[0], 0.0, 0.0, 3.0, runner,
+        tool_radius_mm=2.0)()
+
+
+for _pat in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)",
+             "Zig-Zag (0°)", "Zig-Zag (90°)", "Zig-Zag (45°)", "Zig-Zag (135°)"):
+    with _RegionRunner(max_workers=1) as _one:
+        _serial = _pr_infill(_pat, _one)
+    with _RegionRunner(max_workers=8) as _many:
+        _par = _pr_infill(_pat, _many)
+    check(f"{_pat}: parallel regions give the serial infill",
+          _serial[0] == _par[0] and _serial[1] == _par[1]
+          and _serial[2] == _par[2]
+          and sorted(_serial[3]) == sorted(_par[3])
+          and np.array_equal(_serial[5], _par[5]) and _serial[6] == _par[6] == 4)
+
+with _RegionRunner(max_workers=1) as _one:
+    _onion_serial = _pr_infill("Onion Skin (Outside-In)", _one)
+with _RegionRunner(max_workers=4, memory=lambda: (1 << 30, 0)) as _tight:
+    _tight_out = _pr_infill("Onion Skin (Outside-In)", _tight)
+check("a budget no job fits still computes every region",
+      _tight_out[0] == _onion_serial[0])
+
+# Memory another program takes while the jobs run lowers the budget: once
+# the available memory drops, jobs no longer overlap.
+import threading as _threading
+import time as _time
+
+_mem_state = {'available': 1 << 40}
+_conc = {'now': 0, 'max': 0, 'max_after_drop': 0}
+_conc_lock = _threading.Lock()
+
+
+def _sleepy_job(drop):
+    with _conc_lock:
+        _conc['now'] += 1
+        _conc['max'] = max(_conc['max'], _conc['now'])
+        if _mem_state['available'] < (1 << 40):
+            _conc['max_after_drop'] = max(_conc['max_after_drop'], _conc['now'])
+        if drop:
+            _mem_state['available'] = 1000
+    _time.sleep(0.05)
+    with _conc_lock:
+        _conc['now'] -= 1
+
+
+with _RegionRunner(max_workers=4,
+                   memory=lambda: (1 << 41, _mem_state['available'])) as _dyn:
+    _first = _dyn.submit(lambda: _sleepy_job(True), 600)
+    _first.result()
+    _rest = [_dyn.submit(lambda: _sleepy_job(False), 600) for _ in range(6)]
+    for _f in _rest:
+        _f.result()
+check("a budget read while the jobs run limits them once memory drops",
+      _conc['max_after_drop'] == 1)
+with _RegionRunner(max_workers=4, memory=lambda: (1 << 41, 1 << 40)) as _roomy:
+    _conc['max'] = 0
+    _fs = [_roomy.submit(lambda: _sleepy_job(False), 600) for _ in range(4)]
+    for _f in _fs:
+        _f.result()
+check("with room for them, jobs overlap", _conc['max'] > 1)
+
+_made = []
+_orig_runner = _alg._RegionRunner
+
+
+class _TrackedRunner(_orig_runner):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        _made.append(self)
+
+
+class _Cancel(Exception):
+    pass
+
+
+def _cancel_at_infill(pct, msg):
+    if msg.endswith("infill…"):
+        raise _Cancel()
+
+
+_alg._RegionRunner = _TrackedRunner
+try:
+    _lc(lc_depth, lc_tool, raster_dir="Onion Skin (Outside-In)",
+        progress=_cancel_at_infill)
+    _raised = False
+except _Cancel:
+    _raised = True
+finally:
+    _alg._RegionRunner = _orig_runner
+check("cancelling Level Clearing's infill raises through",
+      _raised and len(_made) == 1)
+check("a cancelled Level Clearing leaves its pool shut down",
+      _made and _made[0]._pool._shutdown and _made[0]._running == 0)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
