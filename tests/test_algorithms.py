@@ -2469,6 +2469,56 @@ for _pat in ("Onion Skin (Outside-In)", "Onion Skin (Inside-Out)"):
     check(f"{_pat}: Level Clearing with regions at the canvas edge computes", _ok)
 
 
+
+# --------------------------------------------------------------------------
+# _LevelGraph.add_level on windows: each level's air given as the window
+# around it (with a pixel's margin of material) builds the same graph as
+# the full levels, for nested levels that fork and whose holes merge.
+# --------------------------------------------------------------------------
+print("level graph on windows")
+
+from algorithms import _LevelGraph
+from skimage.measure import find_contours as _find_contours
+
+# Two disks joined at a third whose holes merge; and a lobe with a hole,
+# joined to a larger body by a wide neck, whose air vanishes around the
+# hole while the body's survives: the hole one level up then lies outside
+# the next level's window.
+_lg_regions = []
+_lg_region = np.zeros((90, 140), dtype=bool)
+for _c, _r in (((45, 35), 30), ((45, 105), 30), ((45, 70), 12)):
+    _lg_region |= disk_mask(_lg_region.shape, _c, _r)
+for _c, _r in (((40, 30), 6), ((52, 40), 5), ((45, 105), 7)):
+    _lg_region &= ~disk_mask(_lg_region.shape, _c, _r)
+_lg_regions.append(("disks with holes", _lg_region, 3))
+_lg_region = np.zeros((90, 150), dtype=bool)
+_lg_region |= disk_mask(_lg_region.shape, (45, 40), 32)
+_lg_region |= disk_mask(_lg_region.shape, (45, 112), 20)
+_lg_region[25:66, 40:92] = True
+_lg_region &= ~disk_mask(_lg_region.shape, (45, 112), 8)
+_lg_regions.append(("lobe with a hole", _lg_region, 2))
+
+for _name, _lg_region, _lg_step in _lg_regions:
+    _lg_dist = distance_transform_edt(_lg_region)
+    _g_full, _g_win = _LevelGraph(), _LevelGraph()
+    _lg_nodes_full, _lg_nodes_win = [], []
+    for _k in range(40):
+        _air = _lg_dist > _lg_step * _k
+        if not _air.any():
+            break
+        _rings = [r for r in _find_contours(_air.astype(np.float32), 0.5) if len(r) >= 3]
+        _lg_nodes_full.append(_g_full.add_level(~_air, _rings))
+        _rr, _cc = np.nonzero(_air)
+        _win = np.s_[_rr.min() - 1:_rr.max() + 2, _cc.min() - 1:_cc.max() + 2]
+        _lg_nodes_win.append(_g_win.add_level(~_air[_win], _rings,
+                                              origin=(_rr.min() - 1, _cc.min() - 1)))
+    check(f"{_name}: windowed levels give the full levels' pieces' nodes",
+          _lg_nodes_full == _lg_nodes_win)
+    check(f"{_name}: windowed levels give the full levels' precedence",
+          _g_full.parents == _g_win.parents
+          and any(len(ps) > 1 for ps in _g_full.parents))
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

@@ -2331,7 +2331,7 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     must be cut after, cutting outside-in (see _chain_onion_rings). A
     chain where boundaries merge has several parents.
     """
-    from scipy.ndimage import label, distance_transform_edt, binary_erosion
+    from scipy.ndimage import label, distance_transform_edt, binary_erosion, find_objects
     from skimage.measure import find_contours
 
     padded = np.pad(region_mask, 1, mode="constant", constant_values=False)
@@ -2339,7 +2339,10 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     # Squared distance of every pixel to the nearest outside pixel, rounded
     # to the exact integer it is; level k is where it exceeds (k*step_px)^2.
     dist2 = np.rint(np.square(distance_transform_edt(padded)))
-    branches = [{'mask': padded, 'level': 0}]
+    # Each branch's mask is a window of the padded region, its bounding box
+    # with a margin of one pixel, at 'origin' in the padded region: the
+    # levels shrink, and so does the work on them.
+    branches = [{'mask': padded, 'origin': (0, 0), 'level': 0}]
     # Every ring of every level goes into one level graph: air is the
     # level's mask, material everything outside it, holes included.
     graph = _LevelGraph()
@@ -2349,9 +2352,27 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
     loose = []
     detours = {}
 
-    def extract_rings(mask):
-        level = [r for r in find_contours(mask.astype(np.float32), 0.5) if len(r) >= 3]
+    def extract_rings(mask, origin):
+        """The rings of a window of the padded region at origin, in the
+        padded region's pixels. find_contours visits a window's cells in the
+        same order as the whole region's, so they are the same rings."""
+        level = [r + origin for r in find_contours(mask.astype(np.float32), 0.5)
+                 if len(r) >= 3]
         return [r[::-1] for r in level] if reverse_rings else level
+
+    def in_window(mask, origin, win):
+        """The pixels win (slices of the padded region) of a window mask at
+        origin, False beyond the window."""
+        r0, c0 = win[0].start, win[1].start
+        r1 = min(win[0].stop, padded.shape[0])
+        c1 = min(win[1].stop, padded.shape[1])
+        out = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+        rr0, rr1 = max(r0, origin[0]), min(r1, origin[0] + mask.shape[0])
+        cc0, cc1 = max(c0, origin[1]), min(c1, origin[1] + mask.shape[1])
+        if rr0 < rr1 and cc0 < cc1:
+            out[rr0 - r0:rr1 - r0, cc0 - c0:cc1 - c0] = \
+                mask[rr0 - origin[0]:rr1 - origin[0], cc0 - origin[1]:cc1 - origin[1]]
+        return out
 
     # Spines clear what the rings leave standing: with a step-over wider
     # than the tool radius, the ridge of an area the next level doesn't
@@ -2382,10 +2403,10 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         # id unused by any other ring) until the stitcher takes the entry.
         detours.setdefault(id(ring), (ring, []))[1].append((vi, _spine_detour(walk, wi)))
 
-    def _reaches(cand, inner, j, reach_r):
+    def _reaches(cand, inner, origin, j, reach_r):
         """The pixels of cand within reach_r of inner, the next level's
         kept components (whose rings lie within half a pixel of their
-        pixels, which reach_r allows for). Most are found along their own
+        pixels, which reach_r allows for), both in the window at origin. Most are found along their own
         ray: from a pixel's nearest outside point through the pixel, the
         distance to the outside grows at unit rate, so the ray enters the
         next level t = (j + 1) * step_px - dist past the pixel; where the
@@ -2397,13 +2418,14 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         if not nearest_out:
             nearest_out.append(distance_transform_edt(
                 padded, return_distances=False, return_indices=True))
-        pr, pc = np.nonzero(cand)
+        lr, lc = np.nonzero(cand)
+        pr, pc = lr + origin[0], lc + origin[1]
         nr, nc = nearest_out[0][0][pr, pc], nearest_out[0][1][pr, pc]
         d = dist[pr, pc]
         t = (j + 1) * step_px - d + 1.0
         with np.errstate(divide="ignore", invalid="ignore"):
-            qr = np.rint(pr + (pr - nr) * t / d).astype(np.intp)
-            qc = np.rint(pc + (pc - nc) * t / d).astype(np.intp)
+            qr = np.rint(pr + (pr - nr) * t / d).astype(np.intp) - origin[0]
+            qc = np.rint(pc + (pc - nc) * t / d).astype(np.intp) - origin[1]
         ok = ((t <= reach_r) & (qr >= 0) & (qr < inner.shape[0])
               & (qc >= 0) & (qc < inner.shape[1]))
         hit = np.zeros(len(pr), dtype=bool)
@@ -2412,17 +2434,18 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         if len(rest):
             edge = inner & ~binary_erosion(inner)
             tree = cKDTree(np.column_stack(np.nonzero(edge)))
-            near, _ = tree.query(np.column_stack([pr[rest], pc[rest]]),
+            near, _ = tree.query(np.column_stack([lr[rest], lc[rest]]),
                                  distance_upper_bound=reach_r)
             hit[rest] = near <= reach_r
         out = np.zeros_like(cand)
-        out[pr[hit], pc[hit]] = True
+        out[lr[hit], lc[hit]] = True
         return out
 
-    def _level_spines(cur, inner_masks, j):
+    def _level_spines(cur, origin, inner, j):
         """Spine walks clearing what the rings of cur (level j, at distance
-        j * step_px from the outside) and of inner_masks (the next level's
-        kept components) leave standing in cur. A pixel of cur is
+        j * step_px from the outside; a window at origin) and of inner (the
+        next level's kept components in the same window, or None) leave
+        standing in cur. A pixel of cur is
         dist - j * step_px from cur's own ring (along its ray to the nearest
         outside point, which stays in cur). Every deeper ring lies inside
         the next level's kept components, beyond their own rings, so a
@@ -2436,28 +2459,30 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
         # Rings are traced to within half a pixel of their level, so a
         # pixel only counts as uncut beyond spine_r plus that half pixel.
         reach_r = spine_r + 0.5
-        cand = cur & (dist - j * step_px > reach_r)
-        for m in inner_masks:
-            cand &= ~m
+        cur_win = np.s_[origin[0]:origin[0] + cur.shape[0],
+                        origin[1]:origin[1] + cur.shape[1]]
+        cand = cur & (dist[cur_win] - j * step_px > reach_r)
+        if inner is not None:
+            cand &= ~inner
         if not np.any(cand):
             return []
-        if inner_masks:
-            inner = np.logical_or.reduce(inner_masks)
-            cand &= ~_reaches(cand, inner, j, reach_r)
+        if inner is not None:
+            cand &= ~_reaches(cand, inner, origin, j, reach_r)
             if not np.any(cand):
                 return []
         # Everything below runs in a window around what is left uncut,
         # wide enough to hold every medial axis pixel that could reach it.
         rows, cols = np.nonzero(cand)
+        rows, cols = rows + origin[0], cols + origin[1]
         margin = int(np.ceil(reach_r)) + 2
         r0, c0 = max(rows.min() - margin, 0), max(cols.min() - margin, 0)
         win = (slice(r0, rows.max() + margin + 1), slice(c0, cols.max() + margin + 1))
-        uncut = cand[win]
+        uncut = in_window(cand, origin, win)
         if not skeleton:
             from skimage.morphology import medial_axis
             # A fixed rng: medial_axis breaks ties in random order.
             skeleton.append(medial_axis(padded, rng=0))
-        skel = skeleton[0][win] & cur[win]
+        skel = skeleton[0][win] & in_window(cur, origin, win)
         spine = skel & uncut
         resid = uncut
         if np.any(spine):
@@ -2480,27 +2505,38 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
 
     while branches:
         next_round = []
-        level_mask = np.zeros_like(padded)
         level_rings = []
+        # The level's air, in the window around every branch's window. No
+        # branch reaches its own window's border, so neither does the air
+        # this window's border: the material outside it is one piece with
+        # the border's, as _LevelGraph.add_level needs.
+        l_r0 = min(br['origin'][0] for br in branches)
+        l_c0 = min(br['origin'][1] for br in branches)
+        l_r1 = max(br['origin'][0] + br['mask'].shape[0] for br in branches)
+        l_c1 = max(br['origin'][1] + br['mask'].shape[1] for br in branches)
+        level_air = np.zeros((l_r1 - l_r0, l_c1 - l_c0), dtype=bool)
         for br in branches:
-            cur, k = br['mask'], br['level'] + 1
+            cur, origin, k = br['mask'], br['origin'], br['level'] + 1
 
-            level = br['level_rings'] if 'level_rings' in br else extract_rings(cur)
-            level_mask |= cur
+            level = (br['level_rings'] if 'level_rings' in br
+                     else extract_rings(cur, origin))
+            level_air[origin[0] - l_r0:origin[0] - l_r0 + cur.shape[0],
+                      origin[1] - l_c0:origin[1] - l_c0 + cur.shape[1]] |= cur
             level_rings.extend(level)
             if not level:
                 continue
 
-            if np.sum(cur) < min_area_px:
-                surviving = []
-            else:
+            nexts, inner = [], None
+            if np.sum(cur) >= min_area_px:
                 # Level k within this branch: a pixel's disk(step_px) is
                 # 4-connected and lies inside level k-1, so it lies inside
                 # the pixel's own component there, the branch's mask.
-                nxt = cur & (dist2 > float(k * step_px) ** 2)
+                cur_win = np.s_[origin[0]:origin[0] + cur.shape[0],
+                                origin[1]:origin[1] + cur.shape[1]]
+                nxt = cur & (dist2[cur_win] > float(k * step_px) ** 2)
                 labeled, n_comp = label(nxt)
                 if n_comp <= 1:
-                    surviving = [nxt] if n_comp else []
+                    kept = [1] if n_comp else []
                 else:
                     # A split can throw off a stray fragment of just a few
                     # pixels -- erosion detaching a sliver at a concave
@@ -2511,22 +2547,33 @@ def _onion_skin_chains(region_mask, step_px, min_area_px, reverse_rings=False,
                     # off and restart, or a single ordinary lobe that
                     # merely sheds a stray pixel would get split into two
                     # chains for no real reason.
-                    surviving = [labeled == cid for cid in range(1, n_comp + 1)
-                                 if np.sum(labeled == cid) >= min_area_px]
-
-            nexts = [{'mask': comp_mask, 'level': k} for comp_mask in surviving]
+                    sizes = np.bincount(labeled.ravel(), minlength=n_comp + 1)
+                    kept = [cid for cid in range(1, n_comp + 1)
+                            if sizes[cid] >= min_area_px]
+                if kept:
+                    boxes = find_objects(labeled)
+                    for cid in kept:
+                        # cur keeps a pixel's margin, so its components'
+                        # boxes widened by one pixel stay inside its window.
+                        b = boxes[cid - 1]
+                        r0, r1 = b[0].start - 1, b[0].stop + 1
+                        c0, c1 = b[1].start - 1, b[1].stop + 1
+                        nexts.append({'mask': labeled[r0:r1, c0:c1] == cid,
+                                      'origin': (origin[0] + r0, origin[1] + c0),
+                                      'level': k})
+                    inner = nxt if len(kept) == n_comp else np.isin(labeled, kept)
             if spine_r is not None:
                 # The next level's rings are extracted here, so that this
                 # level's spines can be attached to them.
-                inner = []
+                inner_rings = []
                 for nx in nexts:
-                    nx['level_rings'] = extract_rings(nx['mask'])
-                    inner.extend(nx['level_rings'])
-                for walk in _level_spines(cur, surviving, k - 1):
-                    attach_spine(walk, inner, level)
+                    nx['level_rings'] = extract_rings(nx['mask'], nx['origin'])
+                    inner_rings.extend(nx['level_rings'])
+                for walk in _level_spines(cur, origin, inner, k - 1):
+                    attach_spine(walk, inner_rings, level)
             next_round.extend(nexts)
         all_rings.extend(level_rings)
-        ring_nodes.extend(graph.add_level(~level_mask, level_rings))
+        ring_nodes.extend(graph.add_level(~level_air, level_rings, origin=(l_r0, l_c0)))
         branches = next_round
 
     chains, parents = _chain_onion_rings(all_rings, ring_nodes, graph.parents,
@@ -5633,13 +5680,21 @@ class _LevelGraph:
     _EIGHT = np.ones((3, 3), bool)
 
     def __init__(self):
+        # (origin, material, L labels, D labels, n_D, nodes by key) one level up
+        self._prev = None
         self.parents = []
-        self._prev = None   # (material, L labels, D labels, n_D, nodes by key) one level up
 
-    def add_level(self, mat, pieces):
+    def add_level(self, mat, pieces, origin=(0, 0)):
         """Add the next level, its material mask mat and its pieces (each
         an Nx2 (row, col) polyline on the boundary). Returns each piece's
         node.
+
+        mat may be a window of the full frame, with its [0, 0] at the
+        frame's pixel origin and the pieces' points given in the frame:
+        everything outside the window is then material, and so must be
+        the window's border, which makes the material outside one piece
+        with the border's. Since air only shrinks, a level's air lies in
+        the window of the level above whatever the windows are.
 
         Each piece (a whole ring, or a run left by pruning or clipping) is
         assigned from the labels of the pixels around its own points: the
@@ -5650,6 +5705,7 @@ class _LevelGraph:
         from scipy.ndimage import label
 
         H, W = mat.shape
+        r_o, c_o = origin
         parents = self.parents
         L, _ = label(mat, structure=self._EIGHT)
         D, n_d = label(~mat, structure=self._EIGHT)
@@ -5664,11 +5720,21 @@ class _LevelGraph:
         parents.extend([] for _ in range(len(keys)))
 
         if self._prev is not None:
-            mat_p, L_p, D_p, n_d_p, nodes_p = self._prev
-            parent_l = np.zeros(L_p.max() + 1, np.int64)
-            parent_l[L_p[mat_p]] = L[mat_p]
+            (r_p, c_p), mat_p, L_p, D_p, n_d_p, nodes_p = self._prev
+            # The two windows' overlap, in each one's own pixels.
+            r_lo, r_hi = max(r_o, r_p), min(r_o + H, r_p + mat_p.shape[0])
+            c_lo, c_hi = max(c_o, c_p), min(c_o + W, c_p + mat_p.shape[1])
+            here = np.s_[r_lo - r_o:r_hi - r_o, c_lo - c_o:c_hi - c_o]
+            there = np.s_[r_lo - r_p:r_hi - r_p, c_lo - c_p:c_hi - c_p]
+            # Material one level up lies in material here; outside this
+            # window, in the piece along its border, which holds [0, 0].
+            parent_l = np.full(L_p.max() + 1, L[0, 0], np.int64)
+            parent_l[0] = 0
+            mat_o = mat_p[there]
+            parent_l[L_p[there][mat_o]] = L[here][mat_o]
             parent_d = np.zeros(n_d + 1, np.int64)
-            parent_d[D[~mat]] = D_p[~mat]
+            air_o = ~mat[here]
+            parent_d[D[here][air_o]] = D_p[there][air_o]
             above = {}
             for key, n in nodes_p.items():
                 l, d = divmod(key, n_d_p + 1)
@@ -5679,10 +5745,10 @@ class _LevelGraph:
 
         assigned = []
         for c in pieces:
-            rows = (np.clip(np.floor(c[:, 0]), 0, H - 1).astype(np.int64),
-                    np.clip(np.ceil(c[:, 0]), 0, H - 1).astype(np.int64))
-            cols = (np.clip(np.floor(c[:, 1]), 0, W - 1).astype(np.int64),
-                    np.clip(np.ceil(c[:, 1]), 0, W - 1).astype(np.int64))
+            rows = (np.clip(np.floor(c[:, 0]) - r_o, 0, H - 1).astype(np.int64),
+                    np.clip(np.ceil(c[:, 0]) - r_o, 0, H - 1).astype(np.int64))
+            cols = (np.clip(np.floor(c[:, 1]) - c_o, 0, W - 1).astype(np.int64),
+                    np.clip(np.ceil(c[:, 1]) - c_o, 0, W - 1).astype(np.int64))
             # The material (and the air) pixels of a 2x2 cell are 8-connected,
             # so they carry one label each and the maximum picks it.
             l = np.max([L[r, cc] for r in rows for cc in cols], axis=0).astype(np.int64)
@@ -5698,7 +5764,7 @@ class _LevelGraph:
                 node = len(parents)
                 parents.append(list(range(first)))
             assigned.append(node)
-        self._prev = (mat, L, D, n_d, nodes)
+        self._prev = ((r_o, c_o), mat, L, D, n_d, nodes)
         return assigned
 
 
